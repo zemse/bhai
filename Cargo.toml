@@ -14,3 +14,13 @@ categories = ["command-line-utilities", "development-tools"]
 include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
 
 [dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", features = ["serde"] }
+futures-util = "0.3.33"
+ratatui = "0.30.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls", "http2"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "io-util"] }
+tui-input = "0.15.3"
+uuid = { version = "1.24.0", features = ["v4"] }
