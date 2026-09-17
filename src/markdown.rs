@@ -247,7 +247,11 @@ impl Renderer {
             return;
         };
         if !lang.is_empty() {
-            self.emit(lang.chars().map(|c| (c, DIM)).collect());
+            let cells: Vec<Cell> = lang.chars().map(|c| (c, DIM)).collect();
+            let width = self.width.saturating_sub(self.prefix_width()).max(4);
+            for line in wrap(&cells, width) {
+                self.emit(line);
+            }
         }
         let width = self
             .width
@@ -441,6 +445,12 @@ mod tests {
     fn long_code_lines_are_split_not_reflowed() {
         let lines = render("```\nabcdefghij klm\n```", 8);
         assert_eq!(text(&lines), vec!["  abcdef", "  ghij k", "  lm"]);
+    }
+
+    #[test]
+    fn a_long_language_tag_fits_the_width() {
+        let lines = render("```abcdefghijkl\nx\n```", 8);
+        assert_eq!(text(&lines), vec!["abcdefgh", "ijkl", "  x"]);
     }
 
     #[test]
