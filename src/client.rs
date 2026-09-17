@@ -65,9 +65,12 @@ impl Usage {
     }
 }
 
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     session_id: String,
+    /// The prompt cache key; the session id unless this is a child's client.
+    cache_key: String,
     model: String,
     effort: String,
 }
@@ -79,9 +82,11 @@ impl Client {
             .build()
             .context("could not build HTTP client")?;
         let (model, effort) = model_settings();
+        let session_id = uuid::Uuid::new_v4().to_string();
         Ok(Self {
             http,
-            session_id: uuid::Uuid::new_v4().to_string(),
+            cache_key: session_id.clone(),
+            session_id,
             model,
             effort,
         })
@@ -96,6 +101,20 @@ impl Client {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The client for a child running as `identity`: its overrides, and a cache key of
+    /// its own so children of one identity share a cached prefix.
+    pub fn for_child(&self, identity: &crate::identity::Identity) -> Self {
+        let mut child = self
+            .clone()
+            .with_overrides(identity.model.clone(), identity.effort.clone());
+        child.cache_key = format!("{}-{}", self.session_id, identity.name);
+        child
     }
 
     /// Run one model call and return the assistant's output items verbatim,
@@ -119,7 +138,7 @@ impl Client {
             "store": false,
             "stream": true,
             "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": self.session_id,
+            "prompt_cache_key": self.cache_key,
         });
 
         let mut backoff = Duration::from_millis(500);

@@ -16,6 +16,8 @@ use crate::tools::{self, Registry};
 
 /// The identity used without `--as`.
 pub const DEFAULT: &str = "general";
+/// The built-in identity that only delegates; never offered as a child.
+pub const ROUTER: &str = "router";
 
 /// Agent file roots under the home directory, lowest precedence first.
 const HOME_DIRS: [&str; 2] = [".claude/agents", ".config/bhai/agents"];
@@ -23,9 +25,8 @@ const HOME_DIRS: [&str; 2] = [".claude/agents", ".config/bhai/agents"];
 const PROJECT_DIRS: [&str; 2] = [".claude/agents", ".bhai/agents"];
 
 const ROUTER_PROMPT: &str = "You are the router. You carry no skills and can only read \
-files, so do not do the work yourself: pick the specialised identity below that fits the \
-task and delegate to it. Until delegation is available, tell the user which identity to \
-start with `bhai --as <name>`.";
+files, so do not do the work yourself: pick the listed identity that fits the task and \
+delegate to it with the `agent` tool.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Identity {
@@ -133,12 +134,15 @@ fn general() -> Identity {
 
 fn router() -> Identity {
     Identity {
-        tools: Some(vec![tools::read::NAME.to_string()]),
+        tools: Some(vec![
+            tools::read::NAME.to_string(),
+            tools::agent::NAME.to_string(),
+        ]),
         skills: vec!["!*".to_string()],
         mcp: vec!["!*".to_string()],
         prompt: ROUTER_PROMPT.to_string(),
         ..Identity::builtin(
-            "router",
+            ROUTER,
             "No skills, read only; delegates to specialised identities.",
         )
     }
@@ -199,7 +203,7 @@ fn glob(pattern: &str, text: &str) -> bool {
 }
 
 /// The built-ins, then every agent file; a later definition replaces an earlier one
-/// of the same name. The router's prompt lists the others.
+/// of the same name.
 pub fn discover(roots: &Roots) -> Vec<Identity> {
     let mut roots_list = Vec::new();
     if let Some(home) = &roots.home {
@@ -216,18 +220,6 @@ pub fn discover(roots: &Roots) -> Vec<Identity> {
                 None => found.push(identity),
             }
         }
-    }
-    let listing = found
-        .iter()
-        .filter(|i| i.name != "router")
-        .map(|i| format!("- {}: {}", i.name, i.description))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if let Some(router) = found
-        .iter_mut()
-        .find(|i| i.name == "router" && i.path.is_none())
-    {
-        let _ = write!(router.prompt, "\n\nIdentities:\n{listing}");
     }
     found
 }
@@ -261,8 +253,14 @@ pub fn find(identities: &[Identity], name: &str) -> Result<Identity> {
     )
 }
 
-/// The system prompt for a session running as `identity`.
-pub fn build(config: &Config, roots: &Roots, identity: &Identity) -> SystemPrompt {
+/// The system prompt for a session running as `identity`. `identities` are listed for
+/// delegation when the identity has the `agent` tool; children get none.
+pub fn build(
+    config: &Config,
+    roots: &Roots,
+    identity: &Identity,
+    identities: &[Identity],
+) -> SystemPrompt {
     let mut config = config.clone();
     if let Some(sources) = &identity.instructions {
         config.load_global_claude &= sources.contains(&Source::GlobalClaude);
@@ -287,6 +285,9 @@ pub fn build(config: &Config, roots: &Roots, identity: &Identity) -> SystemPromp
         });
     }
     let mut prompt = prompt::system_prompt(&files, skills);
+    if identity.allows_tool(tools::agent::NAME) {
+        prompt = prompt.with_agents(identities);
+    }
     prompt.skipped = loaded.skipped;
     prompt.identity = identity.clone();
     prompt
@@ -304,7 +305,7 @@ pub fn baseline(prompt: &SystemPrompt) -> usize {
 
 /// What `bhai identities` prints: each identity, its source and its baseline cost.
 pub fn report(identities: &[Identity], config: &Config, roots: &Roots) -> String {
-    let cost = |i: &Identity| baseline(&build(config, roots, i)).div_ceil(4) as i64;
+    let cost = |i: &Identity| baseline(&build(config, roots, i, identities)).div_ceil(4) as i64;
     let general = identities
         .iter()
         .find(|i| i.name == DEFAULT)
@@ -480,8 +481,6 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
                 ("two", "claude project", "./.claude/agents"),
             ]
         );
-        assert!(found[1].prompt.contains("- one: bhai global"));
-        assert!(!found[1].prompt.contains("- router"));
         assert_eq!(find(&found, "one").unwrap().name, "one");
         let err = find(&found, "nope").unwrap_err().to_string();
         assert!(err.contains("general, router, one, two"), "{err}");
@@ -498,7 +497,7 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
             prompt: "Apple only.".into(),
             ..Identity::builtin("apple", "")
         };
-        let prompt = build(&Config::default(), &f.roots, &apple);
+        let prompt = build(&Config::default(), &f.roots, &apple, &[]);
         assert_eq!(prompt.skills.len(), 1);
         assert!(prompt.text.contains("- ios-dev:") && !prompt.text.contains("- pdf:"));
         assert!(prompt.text.contains("Apple only.\n\n# Skills"));
@@ -522,7 +521,7 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
             .unwrap_err();
         assert!(err.contains("No skill named `pdf`"), "{err}");
 
-        let router = build(&Config::default(), &f.roots, &router());
+        let router = build(&Config::default(), &f.roots, &router(), &[]);
         assert!(router.skills.is_empty());
         assert!(Registry::for_prompt(&router).get("skill").is_none());
         assert_eq!(router.identity.name, "router");
@@ -538,7 +537,7 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
             ..general()
         };
         let labels = |config: &Config| -> Vec<String> {
-            build(config, &f.roots, &only_project)
+            build(config, &f.roots, &only_project, &[])
                 .sources
                 .into_iter()
                 .map(|s| s.label)
@@ -564,8 +563,14 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         );
         let identities = discover(&f.roots);
         let config = Config::default();
-        let cost =
-            |name: &str| baseline(&build(&config, &f.roots, &find(&identities, name).unwrap()));
+        let cost = |name: &str| {
+            baseline(&build(
+                &config,
+                &f.roots,
+                &find(&identities, name).unwrap(),
+                &identities,
+            ))
+        };
         assert!(cost("rust-engineer") < cost(DEFAULT));
         assert!(cost("router") < cost(DEFAULT));
         let report = report(&identities, &config, &f.roots);
@@ -574,5 +579,34 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
             "{report}"
         );
         assert!(report.contains("tok vs general\n    Rust work"), "{report}");
+    }
+
+    #[test]
+    fn a_parent_with_the_agent_tool_lists_identities_to_delegate_to() {
+        let f = Fixture::new();
+        f.write(
+            "home/.config/bhai/agents/rust.md",
+            "---\nname: rust-engineer\ndescription: Rust work\n---\n",
+        );
+        let identities = discover(&f.roots);
+        let config = Config::default();
+        let parent = build(&config, &f.roots, &general(), &identities);
+        assert!(parent.text.contains("cheapest fitting identity"));
+        assert!(parent.text.ends_with("- general: Everything: all skills, tools and instructions, no extra prompt.\n- rust-engineer: Rust work"));
+        assert!(!parent.text.contains("- router"));
+        assert!(parent.agents_bytes > 0);
+
+        let router = build(&config, &f.roots, &router(), &identities);
+        assert!(router.text.contains("- rust-engineer: Rust work"));
+        assert!(Registry::for_prompt(&router).get("agent").is_none());
+
+        let child = build(&config, &f.roots, &general(), &[]);
+        assert!(!child.text.contains("# Delegation"));
+        let no_agent = Identity {
+            tools: Some(vec!["read".into()]),
+            ..general()
+        };
+        let reader = build(&config, &f.roots, &no_agent, &identities);
+        assert!(!reader.text.contains("# Delegation"));
     }
 }

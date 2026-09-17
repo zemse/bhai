@@ -161,6 +161,31 @@ impl Hub {
         hub
     }
 
+    /// This hub as `identity` sees it: the same connections, only its servers and tools.
+    /// Closing the servers stays with this hub.
+    pub fn narrowed(&self, identity: &Identity) -> Hub {
+        let servers = self
+            .servers
+            .iter()
+            .map(|server| {
+                let mut server = server.clone();
+                if !identity.allows_mcp_server(&server.name) {
+                    server.tools.clear();
+                } else {
+                    server
+                        .tools
+                        .retain(|t| identity.allows_mcp_tool(&server.name, &t.name));
+                }
+                server
+            })
+            .collect();
+        Hub {
+            servers,
+            peers: self.peers.clone(),
+            services: Mutex::new(Vec::new()),
+        }
+    }
+
     /// A hub of connected servers with these tools and no processes behind them.
     #[cfg(test)]
     pub fn offline(servers: Vec<(&str, Vec<ToolInfo>)>) -> Self {
@@ -665,5 +690,27 @@ mod tests {
         assert!(!section.contains("empty"));
         assert_eq!(Hub::offline(Vec::new()).prompt_section(), "");
         assert!(report(None).contains("off"));
+    }
+
+    #[test]
+    fn a_narrowed_hub_keeps_only_what_the_identity_allows() {
+        let hub = Hub::offline(vec![
+            (
+                "web",
+                vec![
+                    ToolInfo::test("web", "search", ""),
+                    ToolInfo::test("web", "fetch", ""),
+                ],
+            ),
+            ("xcode", vec![ToolInfo::test("xcode", "build", "")]),
+        ]);
+        let identity = Identity {
+            mcp: vec!["web__search".to_string()],
+            ..Identity::default()
+        };
+        let narrowed = hub.narrowed(&identity);
+        let names: Vec<_> = narrowed.tools().map(ToolInfo::full_name).collect();
+        assert_eq!(names, ["mcp__web__search"]);
+        assert_eq!(hub.tools().count(), 3);
     }
 }

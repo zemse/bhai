@@ -32,7 +32,7 @@ use ratatui::crossterm::execute;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::agent::{AgentEvent, Control};
+use crate::agent::{AgentEvent, Control, Delegation};
 use crate::app::App;
 use crate::config::{Config, Flags};
 use crate::permissions::Policy;
@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
     // `bhai --probe [prompt]` does one non-interactive model call, for checking that
     // auth and the wire format still work without entering the TUI.
     if args.first().is_some_and(|a| a == "--probe") {
-        let (prompt, _) = load(Flags::default(), identity::DEFAULT).await?;
+        let (prompt, _, _) = load(Flags::default(), identity::DEFAULT).await?;
         let hub = prompt.mcp.clone();
         let result = probe(prompt, args.get(1).cloned()).await;
         shutdown(hub).await;
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
-    let (prompt, policy) = load(
+    let (prompt, policy, delegation) = load(
         args.flags,
         args.identity.as_deref().unwrap_or(identity::DEFAULT),
     )
@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
     let usage_log = args
         .profile
         .then(|| profile::debug_dir().join("usage.jsonl"));
-    let (session, events) = start(model, prompt, policy, usage_log);
+    let (session, events) = start(model, prompt, policy, usage_log, delegation);
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         for notice in &notices {
@@ -170,17 +170,31 @@ struct Args {
 }
 
 /// Config and instruction files for the working directory, as the system prompt for
-/// the identity called `name` and the permission policy. Starts the MCP servers.
-async fn load(flags: Flags, name: &str) -> Result<(SystemPrompt, Policy)> {
+/// the identity called `name`, the permission policy, and what child agents need.
+/// Starts the MCP servers.
+async fn load(flags: Flags, name: &str) -> Result<(SystemPrompt, Policy, Delegation)> {
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
-    let identity = identity::find(&identity::discover(&roots), name)?;
+    let identities = identity::discover(&roots);
+    let identity = identity::find(&identities, name)?;
     let hub = mcp::start(&config, &roots, &identity).await;
-    let mut prompt = identity::build(&config, &roots, &identity).with_mcp(hub);
+    let mut prompt = identity::build(&config, &roots, &identity, &identities).with_mcp(hub.clone());
+    let delegation = Delegation {
+        identities,
+        sessions: roots.cwd.join(".bhai").join("sessions"),
+        // Children reuse the session's MCP connections, narrowed to their identity.
+        prompt: {
+            let (config, roots) = (config.clone(), roots.clone());
+            Arc::new(move |child: &identity::Identity| {
+                let narrowed = hub.as_ref().map(|hub| Arc::new(hub.narrowed(child)));
+                identity::build(&config, &roots, child, &[]).with_mcp(narrowed)
+            })
+        },
+    };
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
-    Ok((prompt, policy))
+    Ok((prompt, policy, delegation))
 }
 
 /// The policy from the config, Claude Code's settings and remembered approvals, plus
@@ -259,6 +273,7 @@ fn start(
     prompt: SystemPrompt,
     policy: Policy,
     usage_log: Option<PathBuf>,
+    delegation: Delegation,
 ) -> (Arc<Session>, broadcast::Receiver<session::Event>) {
     let (tx_user, rx_user) = mpsc::channel::<String>(16);
     let (tx_control, rx_control) = mpsc::channel::<Control>(16);
@@ -275,7 +290,14 @@ fn start(
     );
     let events = session.subscribe();
     tokio::spawn(agent::run(
-        prompt, policy, rx_user, rx_control, tx_agent, cancel, usage_log,
+        prompt,
+        policy,
+        rx_user,
+        rx_control,
+        tx_agent,
+        cancel,
+        usage_log,
+        Some(delegation),
     ));
     tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
     (session, events)
@@ -296,6 +318,7 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
         rx_control,
         tx_agent,
         Arc::clone(&cancel),
+        None,
         None,
     ));
 
@@ -322,6 +345,9 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
                 "\n[usage] input={} cached={} output={} reasoning={}",
                 u.input, u.cached, u.output, u.reasoning
             ),
+            AgentEvent::ChildUsage(u) => {
+                println!("\n[child usage] input={} output={}", u.input, u.output)
+            }
             AgentEvent::Error(message) => println!("\n[error] {message}"),
             AgentEvent::TurnEnd => break,
         }

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+pub mod agent;
 pub mod bash;
 pub mod edit;
 pub mod mcp;
@@ -15,7 +16,14 @@ pub mod skill;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 5] = [bash::NAME, read::NAME, write::NAME, edit::NAME, skill::NAME];
+pub const NAMES: [&str; 6] = [
+    bash::NAME,
+    read::NAME,
+    write::NAME,
+    edit::NAME,
+    skill::NAME,
+    agent::NAME,
+];
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
 const MAX_OUTPUT: usize = 20_000;
@@ -60,6 +68,12 @@ impl Registry {
             }));
             self.tools.push(Box::new(mcp::Call { hub }));
         }
+        self
+    }
+
+    /// The `agent` tool, for a parent session only.
+    pub fn with_agent(mut self, agent: agent::Agent) -> Self {
+        self.tools.push(Box::new(agent));
         self
     }
 
@@ -156,7 +170,7 @@ fn ceil_boundary(s: &str, mut i: usize) -> usize {
 
 /// A fresh empty directory for a test.
 #[cfg(test)]
-fn temp_dir() -> std::path::PathBuf {
+pub fn temp_dir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("bhai-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     dir

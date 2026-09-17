@@ -242,6 +242,10 @@ mod tests {
                 output: 2,
                 reasoning: 1,
             }));
+            let _ = tx_agent.send(AgentEvent::ChildUsage(Usage {
+                input: 30,
+                ..Usage::default()
+            }));
             let _ = tx_agent.send(AgentEvent::TurnEnd);
             // Stay alive so the session keeps accepting messages.
             let _ = rx_user.recv().await;
@@ -332,6 +336,7 @@ mod tests {
         assert_eq!(state["output_tokens"], 2);
         assert_eq!(state["cached_tokens"], 4);
         assert_eq!(state["last_usage"]["reasoning"], 1);
+        assert_eq!(state["children"]["input"], 30);
         assert!(state["pending"].is_null());
 
         // The stream saw the whole turn, approval id included.

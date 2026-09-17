@@ -180,6 +180,11 @@ impl App {
                 self.tokens_out += usage.output;
                 self.last_usage = Some(usage);
             }
+            // Children count towards the status bar total, not the cache rate.
+            Event::ChildUsage(usage) => {
+                self.tokens_in += usage.input;
+                self.tokens_out += usage.output;
+            }
             Event::Info(message) => self.entries.push(Entry::Info(message)),
             Event::Mode(mode) => self.mode = mode,
             Event::Error(message) => self.entries.push(Entry::Error(message)),

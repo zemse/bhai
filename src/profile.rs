@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::agent::ChildUsage;
 use crate::client::Usage;
 use crate::prompt::SystemPrompt;
 
@@ -35,6 +36,8 @@ pub struct Profile {
     pub categories: Vec<Category>,
     /// Every component of the context, largest first.
     pub items: Vec<Item>,
+    /// Child agents run so far, with their own usage; not part of this context.
+    pub children: Vec<ChildUsage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,7 +80,8 @@ pub fn build(
 ) -> Profile {
     let appended: usize = prompt.sources.iter().map(|s| s.bytes).sum::<usize>()
         + prompt.skills_bytes
-        + prompt.mcp_bytes;
+        + prompt.mcp_bytes
+        + prompt.agents_bytes;
     let mut items = vec![item(
         "system prompt".to_string(),
         "system prompt",
@@ -95,6 +99,13 @@ pub fn build(
             format!("skills listing ({})", prompt.skills.len()),
             "skills",
             prompt.skills_bytes,
+        ));
+    }
+    if prompt.agents_bytes > 0 {
+        items.push(item(
+            "agent identities listing".to_string(),
+            "agents",
+            prompt.agents_bytes,
         ));
     }
     if prompt.mcp_bytes > 0 {
@@ -172,6 +183,7 @@ pub fn build(
         calibration,
         categories,
         items,
+        children: Vec::new(),
     }
 }
 
@@ -229,6 +241,24 @@ impl Profile {
                 i.share
             );
         }
+
+        if !self.children.is_empty() {
+            out.push_str("\n## Children\n\n");
+            out.push_str("| child | identity | description | input | cached | output |\n");
+            out.push_str("|---|---|---|---:|---:|---:|\n");
+            for c in &self.children {
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {} | {} | {} |",
+                    c.id,
+                    c.identity,
+                    c.description.replace('|', "\\|"),
+                    c.input_tokens,
+                    c.cached_tokens,
+                    c.output_tokens
+                );
+            }
+        }
         out
     }
 
@@ -243,6 +273,15 @@ impl Profile {
         for i in self.items.iter().take(TOP_ITEMS) {
             let tokens = i.scaled_tokens.unwrap_or(i.tokens);
             let _ = write!(out, "\n{:>5.1}% {:>8} tok  {}", i.share, tokens, i.label);
+        }
+        if !self.children.is_empty() {
+            let input: u64 = self.children.iter().map(|c| c.input_tokens).sum();
+            let output: u64 = self.children.iter().map(|c| c.output_tokens).sum();
+            let _ = write!(
+                out,
+                "\nchildren: {} run, {input} input / {output} output tokens",
+                self.children.len()
+            );
         }
         out
     }
@@ -447,7 +486,23 @@ mod tests {
             input_tokens: 900,
             items: 5,
         };
-        let md = build(&plain("be brief"), &[], &history(), Some(measured)).markdown();
+        let mut profile = build(&plain("be brief"), &[], &history(), Some(measured));
+        assert!(!profile.markdown().contains("## Children"));
+        profile.children.push(ChildUsage {
+            id: "ab12cd".to_string(),
+            identity: "researcher".to_string(),
+            description: "find the docs".to_string(),
+            input_tokens: 120,
+            cached_tokens: 40,
+            output_tokens: 9,
+        });
+        let md = profile.markdown();
+        assert!(md.ends_with(
+            "## Children\n\n| child | identity | description | input | cached | output |\n\
+|---|---|---|---:|---:|---:|\n| ab12cd | researcher | find the docs | 120 | 40 | 9 |\n"
+        ));
+        let summary = profile.summary(Path::new("/x.json"));
+        assert!(summary.ends_with("children: 1 run, 120 input / 9 output tokens"));
         assert!(
             md.starts_with("# bhai context\n\nIdentity `general`: "),
             "{md}"

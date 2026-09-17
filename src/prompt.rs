@@ -24,6 +24,8 @@ pub struct SystemPrompt {
     pub mcp: Option<Arc<Hub>>,
     /// Bytes the MCP server lines add to the prompt.
     pub mcp_bytes: usize,
+    /// Bytes the delegation listing adds to the prompt.
+    pub agents_bytes: usize,
     /// Imports refused while loading the instruction files.
     pub skipped: Vec<String>,
     /// The identity the prompt was built for.
@@ -60,6 +62,28 @@ impl SystemPrompt {
         lines.extend(self.skipped.iter().cloned());
         lines.extend(self.mcp.iter().flat_map(|hub| hub.notices()));
         lines
+    }
+
+    /// Append the identities a child can run as, `router` left out.
+    pub fn with_agents(mut self, identities: &[Identity]) -> Self {
+        let listed: Vec<&Identity> = identities
+            .iter()
+            .filter(|i| i.name != crate::identity::ROUTER)
+            .collect();
+        if listed.is_empty() {
+            return self;
+        }
+        let start = self.text.len();
+        self.text.push_str(
+            "\n\n# Delegation\n\nThe `agent` tool runs a task in a child agent as one of these \
+identities. Delegate read-heavy or specialised work to the cheapest fitting identity; do \
+not delegate tightly coupled edits.\n",
+        );
+        for identity in listed {
+            let _ = write!(self.text, "\n- {}: {}", identity.name, identity.description);
+        }
+        self.agents_bytes = self.text.len() - start;
+        self
     }
 
     /// Append the MCP server lines; they go last, after the skills listing.
@@ -117,6 +141,7 @@ pub fn system_prompt(files: &[File], skills: Vec<Skill>) -> SystemPrompt {
         skills,
         mcp: None,
         mcp_bytes: 0,
+        agents_bytes: 0,
         skipped: Vec::new(),
         identity: Identity::default(),
     }

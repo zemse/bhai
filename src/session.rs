@@ -42,6 +42,8 @@ pub enum Event {
     ToolOutput(String),
     ToolRejected(String),
     Usage(Usage),
+    /// Usage of a child agent's model call.
+    ChildUsage(Usage),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
     /// The permission mode changed.
@@ -75,6 +77,8 @@ pub struct State {
     pub reasoning_tokens: u64,
     /// Usage of the most recent model call.
     pub last_usage: Option<Usage>,
+    /// Usage of every child agent, summed; not in the counts above.
+    pub children: Usage,
     pub pending: Option<Approval>,
 }
 
@@ -98,6 +102,7 @@ impl fmt::Display for SubmitError {
 struct Inner {
     working: bool,
     total: Usage,
+    children: Usage,
     last_usage: Option<Usage>,
     next_id: u64,
     pending: Option<(Approval, oneshot::Sender<Answer>)>,
@@ -151,6 +156,7 @@ impl Session {
             output_tokens: inner.total.output,
             reasoning_tokens: inner.total.reasoning,
             last_usage: inner.last_usage,
+            children: inner.children,
             pending: inner.pending.as_ref().map(|(approval, _)| approval.clone()),
         }
     }
@@ -265,12 +271,13 @@ impl Session {
             AgentEvent::ToolOutput(s) => Event::ToolOutput(s),
             AgentEvent::ToolRejected(s) => Event::ToolRejected(s),
             AgentEvent::Usage(usage) => {
-                inner.total.input += usage.input;
-                inner.total.cached += usage.cached;
-                inner.total.output += usage.output;
-                inner.total.reasoning += usage.reasoning;
+                add(&mut inner.total, usage);
                 inner.last_usage = Some(usage);
                 Event::Usage(usage)
+            }
+            AgentEvent::ChildUsage(usage) => {
+                add(&mut inner.children, usage);
+                Event::ChildUsage(usage)
             }
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Error(s) => Event::Error(s),
@@ -291,6 +298,13 @@ impl Session {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+fn add(total: &mut Usage, usage: Usage) {
+    total.input += usage.input;
+    total.cached += usage.cached;
+    total.output += usage.output;
+    total.reasoning += usage.reasoning;
 }
 
 /// Feed the agent's events into the session until the agent goes away.
@@ -446,5 +460,15 @@ mod tests {
         assert_eq!((state.input_tokens, state.output_tokens), (7, 3));
         assert_eq!((state.cached_tokens, state.reasoning_tokens), (2, 1));
         assert_eq!(state.last_usage, Some(usage(4, 2, 2, 0)));
+
+        // A child's usage is counted apart and leaves the last call alone.
+        session.on_agent(AgentEvent::ChildUsage(usage(10, 5, 3, 1)));
+        session.on_agent(AgentEvent::ChildUsage(usage(1, 0, 1, 0)));
+        let state = session.state();
+        assert_eq!(state.input_tokens, 7);
+        assert_eq!(state.children, usage(11, 5, 4, 1));
+        assert_eq!(state.last_usage, Some(usage(4, 2, 2, 0)));
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["children"]["input"], 11);
     }
 }
