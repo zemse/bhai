@@ -68,7 +68,7 @@ fn entry<'a>(lines: &[&'a str], key: &str) -> Option<(&'a str, Vec<&'a str>)> {
     let first = lines[index][key.len()..].trim_start()[1..].trim();
     let more = lines[index + 1..]
         .iter()
-        .take_while(|line| line.trim().is_empty() || line.starts_with([' ', '\t']))
+        .take_while(|line| line.trim().is_empty() || line.starts_with([' ', '\t', '-']))
         .map(|line| line.trim())
         .collect();
     Some((first, more))
@@ -104,5 +104,7 @@ mod tests {
         assert_eq!(lists(text, "empty").unwrap(), Vec::<String>::new());
         assert_eq!(lists(text, "missing"), None);
         assert_eq!(split(text).unwrap().1, "body");
+        let flush = "---\nskills:\n- '!*'\n- pdf\nname: x\n---\n";
+        assert_eq!(lists(flush, "skills").unwrap(), ["!*", "pdf"]);
     }
 }
