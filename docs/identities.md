@@ -25,7 +25,8 @@ Keys:
   (`Read`, `Write`, `Edit`, `Bash`) map to bhai's, unknown ones are ignored. A list
   gets MCP only if it names `mcp_search`, `mcp_call` or `mcp` (both)
 - `skills`: name globs, `!pat` excludes; missing means all
-- `mcp`: server globs, stored for when MCP lands
+- `mcp`: server globs, `server__tool` globs for a single tool, `!pat` excludes; missing
+  means all. A server no running identity allows is never started
 - `instructions`: any of `global_claude`, `global_agents`, `project`; missing keeps the
   config
 

@@ -6,19 +6,55 @@
 cargo install bhai
 ```
 
-`bhai --serve [port]` also starts a localhost debug server (default 7878) with `/state`, `/events` (SSE), `/prompt`, `/approve` (optional body `{"remember": "exact"|"prefix"}`), `/reject` and `/interrupt`. add `--headless` to run it without the tui.
+inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/auth.json`), so log in with codex first, then run `bhai` in the directory you want to work in.
 
-> wip - most of the features mentioned are not built yet. at this point this is just a hobby project.
+> wip, a hobby project. everything under "what it does" is built; the wishlist at the bottom is not.
 
-## feature set
+## what it does
 
-- minimal tool set: bash, read, write, edit, web search.
-- programable context compaction so very long sessions can sustain.
+- **tools**: bash, read, write, edit, skill and agent, plus any mcp tool. running commands stream their output into the transcript while they run.
+- **permissions**: three modes (ask, auto, bypass), claude code rule syntax with `*` wildcards, approvals bhai remembers, and a trust step before a repo's own allow rules count. [docs](docs/permissions.md)
+- **identities**: `bhai --as <name>` narrows the skills, tools, instructions and model a session carries. fixed for the session, so the prompt cache holds. [docs](docs/identities.md)
+- **subagents**: the agent delegates a task to a child with a fresh context, under any identity, up to three at a time. [docs](docs/subagents.md)
+- **workflows**: a handful of child steps in dependency order under one token budget, started only by you. [docs](docs/workflows.md)
+- **skills**: `SKILL.md` directories listed in the prompt, bodies loaded on demand. [docs](docs/skills.md)
+- **mcp**: stdio and streamable http servers, read from claude code's config as well as bhai's. schemas stay out of the tool list; the model finds tools with `mcp_search` and runs them with `mcp_call`. [docs](docs/mcp.md)
+- **sessions**: every turn appended to `.bhai/sessions/<id>.jsonl`, `--resume` to continue one, automatic compaction when the window fills. [docs](docs/sessions.md)
+- **token accounting**: where the context actually goes, per entry, with hover badges in the tui and a full report from `/context`. [docs](docs/context.md)
+- **prompt cache guard**: every request is checked for being an append-only extension of the one before it; `--cache-check` proves the backend serves it, `--strict-cache` refuses to send a request that would break it. [docs](docs/context.md#the-cache-guard)
+- **tui**: markdown rendering, a `/diff` pane, mouse, multi-line input, prompt history, collapsible tool output and rate-limit headroom in the status bar. [docs](docs/tui.md)
+- **debug server**: `--serve` exposes the running session over localhost http, `--headless` runs it without the tui. [docs](docs/server.md)
+
+## slash commands
+
+| command | what it does |
+| --- | --- |
+| `/context` | write the token profile and transcript to `.bhai/debug/` |
+| `/compact` | summarise the history now |
+| `/diff` | open the working tree diff pane |
+| `/permissions` | print the modes, rules and where they came from |
+| `/trust`, `/untrust` | honour, or stop honouring, the repo's own allow rules |
+| `/as [name]` | show the session's identity and how to switch |
+| `/skills` | list the loaded skills and what each costs |
+| `/mcp` | list the mcp servers, their tools and any that failed |
+| `/workflows` | list the workflow definitions |
+| `/workflow <name> [input]` | run one |
+
+## flags
+
+```
+bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--as <identity>]
+     [--resume [id]] [--workflow <name> [input] [--workflow-yes]]
+     [--serve [port] [--headless]] [--profile] [--strict-cache]
+     [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]
+```
+
+`identities` and `sessions` print what is available and exit. `--probe` does one non-interactive model call to check auth and the wire format. `--profile` logs the response headers of every call to `.bhai/debug/headers.jsonl`. `--trust` trusts the repo's allow rules at startup. `--no-global`, `--no-project` and `--bare` drop instruction files and skills, `--bare` all of them.
+
+## not built yet
+
 - customisable web search: multiple free and paid options pluggable.
-- permission modes including explicit approval, bypass and auto mode.
 - fuzzy multipass edits + openai's custom patch format.
-- subagents with agent to agent support (only between parent child).
-- prompt caching and optional compaction just before cache expiry.
 - hooks for tool calls and skill invocations.
 - daemon for centralised session management.
 - graph based memory.
