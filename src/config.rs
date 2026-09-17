@@ -78,14 +78,29 @@ impl Source {
     }
 }
 
-/// A stdio MCP server started with `command` and `args`, with `env` added.
+/// An MCP server: stdio with `command`, `args` and `env` added, or streamable HTTP at `url`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct McpServer {
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: Headers,
+}
+
+/// HTTP headers for an MCP server. Debug output names them but hides the values.
+#[derive(Clone, Default, PartialEq, Deserialize)]
+#[serde(transparent)]
+pub struct Headers(pub BTreeMap<String, String>);
+
+impl std::fmt::Debug for Headers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.keys()).finish()
+    }
 }
 
 /// One config file: only the keys it sets override what came before.
@@ -410,7 +425,8 @@ mod tests {
         let (home, cwd) = (dir.join("home"), dir.join("cwd"));
         write(
             &home.join(".config/bhai/config.toml"),
-            "[mcp]\nenabled = true\n[mcp.servers.fs]\ncommand = \"fs-mcp\"\nargs = [\"/tmp\"]\n",
+            "[mcp]\nenabled = true\n[mcp.servers.fs]\ncommand = \"fs-mcp\"\nargs = [\"/tmp\"]\n\
+             [mcp.servers.web]\nurl = \"http://x\"\nheaders = { Authorization = \"Bearer s3\" }\n",
         );
         write(
             &cwd.join(".bhai/config.toml"),
@@ -419,9 +435,13 @@ mod tests {
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert!(config.mcp);
         let names: Vec<_> = config.mcp_servers.keys().collect();
-        assert_eq!(names, ["fs"]);
+        assert_eq!(names, ["fs", "web"]);
         assert_eq!(config.mcp_servers["fs"].args, ["/tmp"]);
         assert!(config.mcp_servers["fs"].env.is_empty());
+        let web = &config.mcp_servers["web"];
+        assert_eq!(web.url.as_deref(), Some("http://x"));
+        assert_eq!(web.headers.0["Authorization"], "Bearer s3");
+        assert!(!format!("{web:?}").contains("s3"));
         write(&cwd.join(".bhai/config.toml"), "mcp = false\n");
         assert!(!Config::load(Some(&home), &cwd).unwrap().mcp);
         std::fs::remove_dir_all(dir).unwrap();

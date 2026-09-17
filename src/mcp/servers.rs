@@ -1,14 +1,15 @@
 //! Where MCP servers are configured: `~/.claude.json` (top level, then the project's
 //! entry), the repo's `.mcp.json`, then bhai's global config. A later definition
 //! replaces an earlier one of the same name. A repo's `.mcp.json` servers only start
-//! once approved in `~/.claude.json`, as Claude Code asks for.
+//! once approved in `~/.claude.json`, as Claude Code asks for. `${VAR}` in HTTP header
+//! values is expanded from the environment.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::config::McpServer;
+use crate::config::{Headers, McpServer};
 use crate::instructions::{self, Roots};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +20,10 @@ pub struct Server {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// The streamable HTTP endpoint; `None` for a stdio server.
+    pub url: Option<String>,
+    /// Sent with every HTTP request, already expanded.
+    pub headers: Headers,
     /// Why it is not started, if it is not.
     pub skip: Option<String>,
 }
@@ -59,6 +64,12 @@ pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
         }
     }
     for (name, server) in bhai {
+        let (headers, unset) = expand_headers(&server.headers.0);
+        let skip = if server.url.is_none() && server.command.is_empty() {
+            Some("no command".to_string())
+        } else {
+            unset
+        };
         add(
             &mut found,
             Server {
@@ -67,7 +78,9 @@ pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
                 command: server.command.clone(),
                 args: server.args.clone(),
                 env: server.env.clone(),
-                skip: None,
+                url: server.url.clone(),
+                headers,
+                skip,
             },
         );
     }
@@ -125,12 +138,22 @@ fn server(name: &str, entry: &Value, source: &str) -> Server {
         "stdio"
     });
     let command = text("command").unwrap_or_default().to_string();
-    let skip = if kind != "stdio" {
-        Some(format!("{kind} servers are not supported yet"))
-    } else if command.is_empty() {
-        Some("no command".to_string())
-    } else {
-        None
+    let url = text("url").map(str::to_string);
+    let raw: BTreeMap<String, String> = entry
+        .get("headers")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+        .collect();
+    let (headers, unset) = expand_headers(&raw);
+    let skip = match kind {
+        "stdio" if command.is_empty() => Some("no command".to_string()),
+        "stdio" => None,
+        "http" if url.is_none() => Some("no url".to_string()),
+        "http" => unset,
+        "sse" => Some("legacy sse transport not supported".to_string()),
+        _ => Some(format!("{kind} servers are not supported")),
     };
     let strings = |key: &str| -> Vec<String> {
         entry
@@ -154,8 +177,51 @@ fn server(name: &str, entry: &Value, source: &str) -> Server {
         command,
         args: strings("args"),
         env,
+        url,
+        headers,
         skip,
     }
+}
+
+/// Header values with `${VAR}` expanded, and why the server cannot start if a var is unset.
+fn expand_headers(raw: &BTreeMap<String, String>) -> (Headers, Option<String>) {
+    let mut unset = None;
+    let mut headers = BTreeMap::new();
+    for (name, value) in raw {
+        match expand(value, &|var| std::env::var(var).ok()) {
+            Ok(value) => {
+                headers.insert(name.clone(), value);
+            }
+            Err(var) => {
+                unset.get_or_insert(format!("header {name} needs unset env var {var}"));
+            }
+        }
+    }
+    (Headers(headers), unset)
+}
+
+/// `value` with each `${VAR}` or `${VAR:-default}` replaced, or the first unset `VAR`.
+fn expand(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let inner = &rest[start + 2..start + len];
+        let (var, default) = match inner.split_once(":-") {
+            Some((var, default)) => (var, Some(default)),
+            None => (inner, None),
+        };
+        match lookup(var).or(default.map(str::to_string)) {
+            Some(found) => out.push_str(&found),
+            None => return Err(var.to_string()),
+        }
+        rest = &rest[start + len + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 fn read(path: &Path) -> Option<Value> {
@@ -184,8 +250,15 @@ mod tests {
                 "mcpServers": {
                     "a": {"type": "stdio", "command": "a-global", "args": ["x"], "env": {"K": "v"}},
                     "b": {"command": "b-global"},
-                    "web": {"type": "http", "url": "https://x"},
-                    "sse": {"url": "https://y"},
+                    "web": {"type": "http", "url": "https://x", "headers": {
+                        "Authorization": "Bearer ${BHAI_TEST_UNSET_VAR:-s3cret}",
+                    }},
+                    "untyped": {"url": "https://y"},
+                    "sse": {"type": "sse", "url": "https://z"},
+                    "nourl": {"type": "http"},
+                    "unset": {"type": "http", "url": "https://w", "headers": {
+                        "X-Key": "${BHAI_TEST_UNSET_VAR}",
+                    }},
                 },
                 "projects": {
                     project_key: {
@@ -210,6 +283,8 @@ mod tests {
             command: command.to_string(),
             args: Vec::new(),
             env: BTreeMap::new(),
+            url: None,
+            headers: Headers::default(),
         };
         let bhai = BTreeMap::from([
             ("b".to_string(), bhai_server("b-bhai")),
@@ -226,7 +301,10 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            ["a", "b", "new", "off", "ok", "p__q", "sse", "web", "x__y"]
+            [
+                "a", "b", "new", "nourl", "off", "ok", "p__q", "sse", "unset", "untyped", "web",
+                "x__y"
+            ]
         );
         let invalid = Some("invalid name (contains __)".to_string());
         assert_eq!(get("p__q").skip, invalid);
@@ -238,8 +316,20 @@ mod tests {
         assert!(get("new").skip.as_ref().unwrap().contains("not approved"));
         assert_eq!(get("a").command, "a-global");
         assert!(get("a").skip.is_none());
-        assert!(get("web").skip.as_ref().unwrap().contains("http"));
-        assert!(get("sse").skip.as_ref().unwrap().contains("http"));
+        assert_eq!(get("web").skip, None);
+        assert_eq!(get("web").url.as_deref(), Some("https://x"));
+        assert_eq!(get("web").headers.0["Authorization"], "Bearer s3cret");
+        assert!(!format!("{:?}", get("web")).contains("s3cret"));
+        assert_eq!(get("untyped").skip, None);
+        assert_eq!(get("untyped").url.as_deref(), Some("https://y"));
+        let skip = |name: &str| get(name).skip.clone().unwrap();
+        assert_eq!(skip("sse"), "legacy sse transport not supported");
+        assert_eq!(skip("nourl"), "no url");
+        assert_eq!(
+            skip("unset"),
+            "header X-Key needs unset env var BHAI_TEST_UNSET_VAR"
+        );
+        assert!(get("a").url.is_none());
 
         assert_eq!(get("a").args, ["x"]);
         assert_eq!(get("a").env["K"], "v");
@@ -247,5 +337,15 @@ mod tests {
         let b = servers.iter().find(|s| s.name == "b").unwrap();
         assert_eq!(b.command, "b-project");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_values_expand_env_vars() {
+        let lookup = |var: &str| (var == "TOKEN").then(|| "abc".to_string());
+        assert_eq!(expand("Bearer ${TOKEN}", &lookup).unwrap(), "Bearer abc");
+        assert_eq!(expand("${TOKEN}-${NOPE:-x}", &lookup).unwrap(), "abc-x");
+        assert_eq!(expand("${TOKEN:-x}", &lookup).unwrap(), "abc");
+        assert_eq!(expand("plain ${open", &lookup).unwrap(), "plain ${open");
+        assert_eq!(expand("a ${NOPE} b", &lookup).unwrap_err(), "NOPE");
     }
 }

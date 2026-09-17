@@ -3,6 +3,7 @@
 //! the tool list and prompt prefix stay fixed however many servers there are. A server
 //! only a child identity allows starts on that child's first MCP call and is then shared.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -11,9 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::service::{Peer, RunningService};
-use rmcp::transport::TokioChildProcess;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
 
@@ -499,8 +502,41 @@ pub fn fake_server(name: &str, mode: &str) -> Option<Server> {
         command: "python3".to_string(),
         args: vec![fake.to_string(), mode.to_string()],
         env: std::collections::BTreeMap::new(),
+        url: None,
+        headers: crate::config::Headers::default(),
         skip: None,
     })
+}
+
+/// `fake_mcp.py http` on a free port, with the token it wants in a header.
+#[cfg(test)]
+pub fn fake_http_server(name: &str) -> Option<(Server, std::process::Child)> {
+    use std::io::BufRead as _;
+
+    let stdio = fake_server(name, "http")?;
+    let mut child = std::process::Command::new(&stdio.command)
+        .args(&stdio.args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("starting the http fake");
+    let mut line = String::new();
+    let stdout = child.stdout.take().expect("piped stdout");
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("reading the port");
+    let port = serde_json::from_str::<Value>(&line).expect("port line")["port"]
+        .as_u64()
+        .expect("port number");
+    let headers = std::collections::BTreeMap::from([(
+        "Authorization".to_string(),
+        "Bearer s3cret".to_string(),
+    )]);
+    let server = Server {
+        url: Some(format!("http://127.0.0.1:{port}/mcp")),
+        headers: crate::config::Headers(headers),
+        ..stdio
+    };
+    Some((server, child))
 }
 
 /// What `/mcp` prints for a session's hub.
@@ -601,22 +637,12 @@ or a server name to list its tools.",
     out.trim_end().to_string()
 }
 
-/// Spawn, initialize and list tools. Stderr goes to `<log_dir>/mcp-<name>.log`.
+/// Connect, initialize and list tools.
 async fn spawn(server: &Server, log_dir: &Path) -> Result<(Service, Vec<ToolInfo>)> {
-    std::fs::create_dir_all(log_dir).with_context(|| format!("creating {}", log_dir.display()))?;
-    let log_path = log_dir.join(format!("mcp-{}.log", file_safe(&server.name)));
-    let log = std::fs::File::create(&log_path)
-        .with_context(|| format!("creating {}", log_path.display()))?;
-    let mut command = tokio::process::Command::new(&server.command);
-    command
-        .args(&server.args)
-        .envs(&server.env)
-        .kill_on_drop(true);
-    let (transport, _) = TokioChildProcess::builder(command)
-        .stderr(Stdio::from(log))
-        .spawn()
-        .with_context(|| format!("starting `{}`", server.command))?;
-    let service = ().serve(transport).await.context("initialize failed")?;
+    let service = match &server.url {
+        Some(url) => http(server, url).await?,
+        None => stdio(server, log_dir).await?,
+    };
     let mut tools = service
         .list_all_tools()
         .await
@@ -632,6 +658,38 @@ async fn spawn(server: &Server, log_dir: &Path) -> Result<(Service, Vec<ToolInfo
     // Sorted so the prompt's tool lines do not depend on the server's listing order.
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((service, tools))
+}
+
+/// A stdio server as a child process. Its stderr goes to `<log_dir>/mcp-<name>.log`.
+async fn stdio(server: &Server, log_dir: &Path) -> Result<Service> {
+    std::fs::create_dir_all(log_dir).with_context(|| format!("creating {}", log_dir.display()))?;
+    let log_path = log_dir.join(format!("mcp-{}.log", file_safe(&server.name)));
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("creating {}", log_path.display()))?;
+    let mut command = tokio::process::Command::new(&server.command);
+    command
+        .args(&server.args)
+        .envs(&server.env)
+        .kill_on_drop(true);
+    let (transport, _) = TokioChildProcess::builder(command)
+        .stderr(Stdio::from(log))
+        .spawn()
+        .with_context(|| format!("starting `{}`", server.command))?;
+    ().serve(transport).await.context("initialize failed")
+}
+
+/// A streamable HTTP server. Header values are never named in an error: they carry tokens.
+async fn http(server: &Server, url: &str) -> Result<Service> {
+    let mut headers = HashMap::new();
+    for (name, value) in &server.headers.0 {
+        let name = HeaderName::try_from(name).with_context(|| format!("bad header `{name}`"))?;
+        let value = HeaderValue::from_str(value)
+            .with_context(|| format!("bad value for header `{name}`"))?;
+        headers.insert(name, value);
+    }
+    let config = StreamableHttpClientTransportConfig::with_uri(url).custom_headers(headers);
+    let transport = StreamableHttpClientTransport::from_config(config);
+    ().serve(transport).await.context("initialize failed")
 }
 
 /// Higher for a closer match: whole-name hits beat name substrings beat descriptions,
@@ -761,13 +819,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_round_trips_through_a_streamable_http_server() {
+        let Some((server, mut child)) = fake_http_server("web") else {
+            return;
+        };
+        let dir = temp_dir();
+        let wrong = Server {
+            name: "wrong".to_string(),
+            headers: crate::config::Headers(std::collections::BTreeMap::from([(
+                "Authorization".to_string(),
+                "Bearer nope".to_string(),
+            )])),
+            ..server.clone()
+        };
+        let hub = Hub::connect(
+            vec![server, wrong],
+            &Identity::default(),
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
+        let names: Vec<_> = hub.tools().map(ToolInfo::full_name).collect();
+        assert_eq!(names, ["mcp__web__echo", "mcp__web__fail"]);
+        let args = serde_json::json!({"message": "hi"});
+        let (out, ok) = hub.call("mcp__web__echo", args).await;
+        assert_eq!((out.as_str(), ok), ("echo: hi", true));
+
+        // A rejected header must not be named in the failure.
+        let State::Failed(why) = &hub.servers[1].state else {
+            panic!("{:?}", hub.servers[1]);
+        };
+        assert!(!why.contains("nope"), "{why}");
+        hub.shutdown().await;
+        child.kill().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn failed_servers_are_marked_and_skipped() {
         if !python() {
             return;
         }
         let dir = temp_dir();
         let mut skipped = fake("skipped", "");
-        skipped.skip = Some("http servers are not supported yet".to_string());
+        skipped.skip = Some("legacy sse transport not supported".to_string());
         let missing = Server {
             command: "/nonexistent/bhai-mcp".to_string(),
             ..fake("missing", "")
@@ -810,7 +906,7 @@ mod tests {
             "{}",
             state("missing")
         );
-        assert!(state("skipped").contains("http"));
+        assert!(state("skipped").contains("legacy sse"));
         assert!(state("hidden").contains("identity general"));
         let names: Vec<_> = hub.tools().map(ToolInfo::full_name).collect();
         assert_eq!(names, ["mcp__good__echo"]);
