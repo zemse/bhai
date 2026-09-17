@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
@@ -15,7 +16,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::permissions::Mode;
+use crate::permissions::{Answer, Mode, Remember};
 use crate::session::{Session, SubmitError};
 
 /// Port `--serve` listens on when none is given.
@@ -105,16 +106,40 @@ async fn prompt(State(session): State<Arc<Session>>, Json(body): Json<Prompt>) -
     }
 }
 
-async fn approve(State(session): State<Arc<Session>>) -> Response {
-    answer(&session, true)
+#[derive(Debug, Default, Deserialize)]
+struct Approve {
+    /// Which offered rule to remember.
+    remember: Option<Remember>,
+}
+
+/// The body is optional: `{"remember": "exact" | "prefix"}`.
+async fn approve(State(session): State<Arc<Session>>, body: Bytes) -> Response {
+    let approve: Approve = if body.iter().all(u8::is_ascii_whitespace) {
+        Approve::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(approve) => approve,
+            Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad body: {e}")),
+        }
+    };
+    let Some(pending) = session.state().pending else {
+        return error(StatusCode::CONFLICT, "no approval is pending");
+    };
+    if let Some(remember) = approve.remember
+        && pending.offers.get(remember).is_none()
+    {
+        let message = format!("this approval offers no {} rule", remember.as_str());
+        return error(StatusCode::BAD_REQUEST, &message);
+    }
+    answer(&session, Answer::Accept(approve.remember), Some(pending.id))
 }
 
 async fn reject(State(session): State<Arc<Session>>) -> Response {
-    answer(&session, false)
+    answer(&session, Answer::Reject, None)
 }
 
-fn answer(session: &Session, accept: bool) -> Response {
-    match session.answer(accept, None) {
+fn answer(session: &Session, answer: Answer, id: Option<u64>) -> Response {
+    match session.answer(answer, id) {
         Some(id) => Json(json!({ "ok": true, "id": id })).into_response(),
         None => error(StatusCode::CONFLICT, "no approval is pending"),
     }
@@ -161,7 +186,7 @@ mod tests {
     use super::*;
     use crate::agent::{AgentEvent, Control};
     use crate::client::Usage;
-    use crate::permissions::Policy;
+    use crate::permissions::{Offers, Policy};
     use crate::prompt::SystemPrompt;
     use crate::{profile, session};
 
@@ -169,7 +194,7 @@ mod tests {
 
     /// Start a server on an ephemeral port in front of a fake agent that says hi, asks
     /// to run one command, and reports the decision on the returned channel.
-    async fn start() -> (String, oneshot::Receiver<bool>) {
+    async fn start() -> (String, oneshot::Receiver<Answer>) {
         let (tx_user, mut rx_user) = mpsc::channel::<String>(1);
         let (tx_control, mut rx_control) = mpsc::channel::<Control>(1);
         let (tx_agent, rx_agent) = mpsc::unbounded_channel();
@@ -202,9 +227,13 @@ mod tests {
             let _ = tx_agent.send(AgentEvent::Approval {
                 tool: "bash".to_string(),
                 command: "ls".to_string(),
+                offers: Offers {
+                    exact: Some("Bash(ls)".to_string()),
+                    prefix: None,
+                },
                 reply,
             });
-            let accepted = wait.await.unwrap_or(false);
+            let accepted = wait.await.unwrap_or(Answer::Reject);
             let _ = tx_decision.send(accepted);
             let _ = tx_agent.send(AgentEvent::Usage(Usage {
                 input: 5,
@@ -258,10 +287,8 @@ mod tests {
         let events = http.get(format!("{base}/events")).send().await.unwrap();
         assert_eq!(events.status().as_u16(), 200);
 
-        assert_eq!(
-            post(&http, format!("{base}/approve"), json!({})).await,
-            StatusCode::CONFLICT
-        );
+        let empty = http.post(format!("{base}/approve")).send().await.unwrap();
+        assert_eq!(empty.status(), StatusCode::CONFLICT);
         assert_eq!(
             post(&http, format!("{base}/prompt"), json!({"text": "go"})).await,
             StatusCode::OK
@@ -273,10 +300,29 @@ mod tests {
 
         wait_state(&http, &base, |s| s["pending"]["command"] == "ls").await;
         assert_eq!(
-            post(&http, format!("{base}/approve"), json!({})).await,
+            get_json(&http, format!("{base}/state")).await["pending"]["exact"],
+            "Bash(ls)"
+        );
+        // Only an offered rule can be remembered, and the body must parse.
+        for body in [json!({"remember": "prefix"}), json!({"remember": "all"})] {
+            assert_eq!(
+                post(&http, format!("{base}/approve"), body).await,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            post(
+                &http,
+                format!("{base}/approve"),
+                json!({"remember": "exact"})
+            )
+            .await,
             StatusCode::OK
         );
-        assert!(timeout(WAIT, rx_decision).await.unwrap().unwrap());
+        assert_eq!(
+            timeout(WAIT, rx_decision).await.unwrap().unwrap(),
+            Answer::Accept(Some(Remember::Exact))
+        );
 
         wait_state(&http, &base, |s| s["working"] == false).await;
         let state = get_json(&http, format!("{base}/state")).await;
@@ -300,8 +346,8 @@ mod tests {
         for want in [
             r#"{"type":"user","data":"go"}"#,
             r#"{"type":"text","data":"hi"}"#,
-            r#"{"type":"approval","data":{"id":1,"tool":"bash","command":"ls"}}"#,
-            r#"{"type":"resolved","data":{"id":1,"accepted":true}}"#,
+            r#"{"type":"approval","data":{"id":1,"tool":"bash","command":"ls","exact":"Bash(ls)"}}"#,
+            r#"{"type":"resolved","data":{"id":1,"accepted":true,"remember":"exact"}}"#,
         ] {
             assert!(body.contains(want), "missing {want} in {body}");
         }

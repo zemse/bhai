@@ -131,13 +131,27 @@ fn load(flags: Flags) -> Result<(SystemPrompt, Policy)> {
     let loaded = instructions::load(&config, &roots);
     let mut prompt = prompt::system_prompt(&loaded.files, skills);
     prompt.skipped = loaded.skipped;
-    let policy = Policy::new(
-        config.permission_mode,
-        config.permissions,
-        roots.home,
-        roots.cwd,
-    );
+    let (policy, notices) = permissions(config, roots.home, roots.cwd);
+    prompt.skipped.extend(notices);
     Ok((prompt, policy))
+}
+
+/// The policy from the config, Claude Code's settings and remembered approvals, plus
+/// notices about rules that were skipped.
+fn permissions(config: Config, home: Option<PathBuf>, cwd: PathBuf) -> (Policy, Vec<String>) {
+    let mut rules = config.permissions;
+    let mut notices = Vec::new();
+    if config.import_claude_permissions {
+        let (claude, skipped) = permissions::settings::claude(home.as_deref(), &cwd);
+        rules.extend(claude);
+        notices.extend(skipped);
+    }
+    let store = cwd.join(permissions::settings::LOCAL);
+    let (remembered, skipped) = permissions::settings::load_local(&store);
+    rules.allow.extend(remembered);
+    notices.extend(skipped);
+    let policy = Policy::new(config.permission_mode, rules, home, cwd).with_store(store);
+    (policy, notices)
 }
 
 fn parse_args(args: &[String]) -> Result<Args> {
@@ -233,7 +247,7 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
             AgentEvent::Reasoning(_) => {}
             AgentEvent::Approval { command, reply, .. } => {
                 println!("\n[would run] {command}\n[probe rejects it]");
-                let _ = reply.send(false);
+                let _ = reply.send(permissions::Answer::Reject);
             }
             AgentEvent::ToolStart(command) => println!("\n$ {command}"),
             AgentEvent::ToolOutput(output) => println!("{output}"),

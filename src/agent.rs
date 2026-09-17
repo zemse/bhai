@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::client::{Client, Delta, Usage};
-use crate::permissions::{Decision, Policy};
+use crate::permissions::{Answer, Decision, Mode, Offers, Policy};
 use crate::profile::{self, Measured, Profile};
 use crate::prompt::SystemPrompt;
 use crate::tools::{self, Registry};
@@ -29,7 +29,8 @@ pub enum AgentEvent {
         tool: String,
         /// The command, or a one-line summary of the call.
         command: String,
-        reply: oneshot::Sender<bool>,
+        offers: Offers,
+        reply: oneshot::Sender<Answer>,
     },
     ToolStart(String),
     ToolOutput(String),
@@ -277,7 +278,8 @@ not retry it. Try a different approach, or ask the user."
             );
         }
         Decision::Ask => {
-            if let Some(result) = ask(name, &summary, tx).await {
+            let offers = policy.offers(name, &args);
+            if let Some(result) = ask(name, &summary, &offers, policy, tx).await {
                 return result;
             }
         }
@@ -293,6 +295,8 @@ not retry it. Try a different approach, or ask the user."
 async fn ask(
     name: &str,
     summary: &str,
+    offers: &Offers,
+    policy: &Policy,
     tx: &mpsc::UnboundedSender<AgentEvent>,
 ) -> Option<(String, bool)> {
     let (reply, wait) = oneshot::channel();
@@ -300,6 +304,7 @@ async fn ask(
         .send(AgentEvent::Approval {
             tool: name.to_string(),
             command: summary.to_string(),
+            offers: offers.clone(),
             reply,
         })
         .is_err()
@@ -310,7 +315,11 @@ async fn ask(
         ));
     }
 
-    if wait.await.unwrap_or(false) {
+    let answer = wait.await.unwrap_or(Answer::Reject);
+    if answer.accepted() {
+        if let Some(rule) = answer.remember().and_then(|r| offers.get(r)) {
+            let _ = tx.send(remembered(policy, rule));
+        }
         return None;
     }
     let _ = tx.send(AgentEvent::ToolRejected(summary.to_string()));
@@ -320,6 +329,21 @@ want instead, or try a different approach."
             .to_string(),
         false,
     ))
+}
+
+/// Remember `rule` and say where it went.
+fn remembered(policy: &Policy, rule: &str) -> AgentEvent {
+    let note = match policy.mode() {
+        Mode::Ask => " (allow rules apply in auto mode)",
+        _ => "",
+    };
+    match policy.remember(rule) {
+        Ok(Some(path)) => {
+            AgentEvent::Info(format!("remembered {rule} in {}{note}", path.display()))
+        }
+        Ok(None) => AgentEvent::Info(format!("remembered {rule} for this session{note}")),
+        Err(e) => AgentEvent::Error(format!("could not save {rule}: {e:#}")),
+    }
 }
 
 #[cfg(test)]

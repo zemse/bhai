@@ -10,6 +10,8 @@ use super::bash;
 pub struct Rule {
     /// As written in the config, for messages.
     pub text: String,
+    /// The file the rule came from, for `/permissions`.
+    pub source: String,
     /// Lowercase tool name.
     tool: String,
     pattern: Pattern,
@@ -58,9 +60,17 @@ impl Rule {
         };
         Ok(Self {
             text: trimmed.to_string(),
+            source: String::new(),
             tool,
             pattern,
         })
+    }
+
+    pub fn with_source(self, source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            ..self
+        }
     }
 
     /// `Edit` rules cover every tool that changes files, as in Claude Code.
@@ -120,6 +130,97 @@ impl Rule {
             Pattern::Command { .. } => false,
         }
     }
+}
+
+/// Tools whose second word picks the subcommand, so a prefix rule keeps both words.
+const MULTI_VERB: &[&str] = &[
+    "git", "cargo", "npm", "pnpm", "yarn", "docker", "kubectl", "gh", "go",
+];
+
+/// `Bash(<command>)` for exactly this simple command, if the rule reads back as such.
+pub fn exact_command(command: &str) -> Option<Rule> {
+    let words = single(command)?.words;
+    let rule = Rule::parse(&format!("Bash({})", command.trim())).ok()?;
+    let want = Pattern::Command {
+        words,
+        prefix: false,
+    };
+    (rule.pattern == want).then_some(rule)
+}
+
+/// `Bash(ls:*)`, or `Bash(git log:*)` for multi-verb tools. Never behind a wrapper,
+/// where the prefix would be the wrapper itself.
+pub fn prefix_command(command: &str) -> Option<Rule> {
+    let command = single(command)?;
+    if command.unwrapped().len() < command.words.len() {
+        return None;
+    }
+    let program = command.words.first()?;
+    let len = if MULTI_VERB.contains(&program.as_str()) {
+        2
+    } else {
+        1
+    };
+    let words = command.words.get(..len)?.to_vec();
+    let plain = |w: &String| {
+        !w.starts_with('-')
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./+@".contains(c))
+    };
+    if !words.iter().all(plain) {
+        return None;
+    }
+    let rule = Rule::parse(&format!("Bash({}:*)", words.join(" "))).ok()?;
+    let want = Pattern::Command {
+        words,
+        prefix: true,
+    };
+    (rule.pattern == want).then_some(rule)
+}
+
+/// The one simple command in `command`, unless it may reach a protected path.
+fn single(command: &str) -> Option<bash::Command> {
+    let mut commands = bash::parse(command)?;
+    if commands.len() != 1 {
+        return None;
+    }
+    let command = commands.remove(0);
+    (!command.words.is_empty() && !bash::mentions_protected(&command)).then_some(command)
+}
+
+/// `Edit(/src/main.rs)` for one file: `/` anchors at the working directory, `//` at root.
+pub fn exact_path(tool: &str, path: &Path, base: Base) -> Option<Rule> {
+    let name = if tool == "write" { "Write" } else { "Edit" };
+    let pattern = path_pattern(&components(path), base)?;
+    let rule = Rule::parse(&format!("{name}({pattern})")).ok()?;
+    rule.matches_path(path, base, false).then_some(rule)
+}
+
+/// `Edit(/src/**)`: every change under the file's directory.
+pub fn dir_path(path: &Path, base: Base) -> Option<Rule> {
+    let parts = components(path);
+    let dir = parts.get(..parts.len().checked_sub(1)?)?;
+    if dir.is_empty() {
+        return None;
+    }
+    let pattern = path_pattern(dir, base)?;
+    let pattern = match pattern.ends_with('/') {
+        true => format!("{pattern}**"),
+        false => format!("{pattern}/**"),
+    };
+    let rule = Rule::parse(&format!("Edit({pattern})")).ok()?;
+    rule.matches_path(path, base, false).then_some(rule)
+}
+
+fn path_pattern(parts: &[String], base: Base) -> Option<String> {
+    if parts.iter().any(|p| p.contains(['*', '?', '[', '(', ')'])) {
+        return None;
+    }
+    let cwd = components(base.cwd);
+    Some(match parts.strip_prefix(cwd.as_slice()) {
+        Some(rest) => format!("/{}", rest.join("/")),
+        None => format!("//{}", parts.join("/")),
+    })
 }
 
 /// `git log:*` and `npm run test *` are prefixes; anything else is an exact word list.
@@ -230,6 +331,7 @@ pub fn is_protected(path: &Path, home: Option<&Path>) -> bool {
     if parts.iter().any(|p| p == ".git")
         || name.starts_with(".env")
         || parts.ends_with(&[".bhai".to_string(), "config.toml".to_string()])
+        || parts.ends_with(&[".bhai".to_string(), "settings.local.json".to_string()])
         || (parent == Some(".claude") && name.starts_with("settings") && name.ends_with(".json"))
     {
         return true;
@@ -320,6 +422,78 @@ mod tests {
     }
 
     #[test]
+    fn offered_command_rules() {
+        let text = |rule: Option<Rule>| rule.map(|r| r.text);
+        let cases = [
+            ("ls -la", Some("Bash(ls -la)"), Some("Bash(ls:*)")),
+            (
+                "git log --oneline",
+                Some("Bash(git log --oneline)"),
+                Some("Bash(git log:*)"),
+            ),
+            (
+                "cargo test -p x",
+                Some("Bash(cargo test -p x)"),
+                Some("Bash(cargo test:*)"),
+            ),
+            ("git -C x log", Some("Bash(git -C x log)"), None),
+            ("cargo", Some("Bash(cargo)"), None),
+            (
+                "timeout 5 cargo test",
+                Some("Bash(timeout 5 cargo test)"),
+                None,
+            ),
+            ("echo 'a b'", Some("Bash(echo 'a b')"), Some("Bash(echo:*)")),
+            ("'my tool' x", Some("Bash('my tool' x)"), None),
+            ("ls && pwd", None, None),
+            ("ls $(pwd)", None, None),
+            ("ls *.rs", None, Some("Bash(ls:*)")),
+            ("cat .env", None, None),
+            ("echo a:*", None, Some("Bash(echo:*)")),
+        ];
+        for (command, exact, prefix) in cases {
+            assert_eq!(text(exact_command(command)).as_deref(), exact, "{command}");
+            assert_eq!(
+                text(prefix_command(command)).as_deref(),
+                prefix,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn offered_path_rules() {
+        let offer = |tool, path: &str| {
+            let path = Path::new(path);
+            (
+                exact_path(tool, path, base()).map(|r| r.text),
+                dir_path(path, base()).map(|r| r.text),
+            )
+        };
+        let some = |a: &str, b: &str| (Some(a.to_string()), Some(b.to_string()));
+        assert_eq!(
+            offer("edit", "/home/u/repo/src/main.rs"),
+            some("Edit(/src/main.rs)", "Edit(/src/**)")
+        );
+        assert_eq!(
+            offer("write", "/home/u/repo/README.md"),
+            some("Write(/README.md)", "Edit(/**)")
+        );
+        assert_eq!(
+            offer("write", "/tmp/x/y.txt"),
+            some("Write(//tmp/x/y.txt)", "Edit(//tmp/x/**)")
+        );
+        assert_eq!(
+            offer("write", "/y.txt"),
+            (Some("Write(//y.txt)".into()), None)
+        );
+        assert_eq!(
+            offer("edit", "/home/u/repo/a*b"),
+            (None, Some("Edit(/**)".into()))
+        );
+    }
+
+    #[test]
     fn path_globs() {
         let cases = [
             ("Edit(src/**)", "/home/u/repo/src/a/b.rs", true),
@@ -371,6 +545,7 @@ mod tests {
             "/home/u/.claude/CLAUDE.md",
             "/home/u/.config/bhai/config.toml",
             "/home/u/repo/.bhai/config.toml",
+            "/home/u/repo/.bhai/settings.local.json",
             "/home/u/repo/.claude/settings.local.json",
             "/home/u/repo/src/../.git/HEAD",
         ] {

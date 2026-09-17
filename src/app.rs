@@ -10,7 +10,7 @@ use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::client::Usage;
-use crate::permissions::Mode;
+use crate::permissions::{Answer, Mode, Remember};
 use crate::profile;
 use crate::session::{Approval, Event, Session};
 use crate::skills::Skill;
@@ -88,8 +88,12 @@ impl App {
         // An approval is modal: nothing else happens until it is answered.
         if self.pending.is_some() {
             match key.code {
-                KeyCode::Char('a') | KeyCode::Char('y') => self.answer(true),
-                KeyCode::Char('r') | KeyCode::Char('n') | KeyCode::Esc => self.answer(false),
+                KeyCode::Char('y') => self.answer(Answer::Accept(None)),
+                KeyCode::Char('a') => self.answer(Answer::Accept(Some(Remember::Exact))),
+                KeyCode::Char('p') => self.answer(Answer::Accept(Some(Remember::Prefix))),
+                KeyCode::Char('r') | KeyCode::Char('n') | KeyCode::Esc => {
+                    self.answer(Answer::Reject)
+                }
                 KeyCode::Char('c') if ctrl => self.interrupt(),
                 _ => {}
             }
@@ -139,8 +143,18 @@ impl App {
             }
             Event::Text(delta) => self.append(delta, Stream::Assistant),
             Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
-            Event::Approval { id, tool, command } => {
-                self.pending = Some(Approval { id, tool, command });
+            Event::Approval {
+                id,
+                tool,
+                command,
+                offers,
+            } => {
+                self.pending = Some(Approval {
+                    id,
+                    tool,
+                    command,
+                    offers,
+                });
             }
             Event::Resolved { id, .. } => {
                 if self.pending.as_ref().is_some_and(|p| p.id == id) {
@@ -184,6 +198,11 @@ impl App {
             self.export_context();
             return;
         }
+        if message.starts_with("/permissions") {
+            self.follow = true;
+            self.entries.push(Entry::Info(self.session.permissions()));
+            return;
+        }
         if message.starts_with("/skills") {
             self.follow = true;
             self.entries.push(Entry::Info(skills_report(&self.skills)));
@@ -211,10 +230,20 @@ impl App {
         });
     }
 
-    fn answer(&mut self, accept: bool) {
-        if let Some(pending) = self.pending.take() {
-            self.session.answer(accept, Some(pending.id));
+    /// A remember key does nothing unless the prompt offers that rule.
+    fn answer(&mut self, answer: Answer) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        if answer
+            .remember()
+            .is_some_and(|r| pending.offers.get(r).is_none())
+        {
+            return;
         }
+        let id = pending.id;
+        self.pending = None;
+        self.session.answer(answer, Some(id));
     }
 
     fn interrupt(&mut self) {

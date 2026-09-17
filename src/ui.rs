@@ -18,7 +18,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .map(|pending| {
             let width = frame.area().width.saturating_sub(4).max(10) as usize;
             let lines = wrap(&pending.command, width).len() as u16;
-            (lines + 4).min(frame.area().height / 2).max(5)
+            let offers = [&pending.offers.exact, &pending.offers.prefix]
+                .iter()
+                .filter(|o| o.is_some())
+                .count() as u16;
+            (lines + offers + 4).min(frame.area().height / 2).max(5)
         })
         .unwrap_or(3);
 
@@ -179,18 +183,41 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let key = |k: &'static str, color| Span::styled(k, Style::new().fg(color).bold());
+    let mut options = Vec::new();
+    let bash = pending.tool == "bash";
+    if let Some(rule) = &pending.offers.exact {
+        let what = if bash { "command" } else { "file" };
+        options.push(Line::from(vec![
+            key("[a]", Color::Cyan),
+            Span::raw(format!(" always allow this exact {what}: {rule}")),
+        ]));
+    }
+    if let Some(rule) = &pending.offers.prefix {
+        let what = if bash {
+            "always allow this prefix"
+        } else {
+            "always allow edits under this directory"
+        };
+        options.push(Line::from(vec![
+            key("[p]", Color::Cyan),
+            Span::raw(format!(" {what}: {rule}")),
+        ]));
+    }
+
     let mut lines: Vec<Line> = wrap(&pending.command, inner.width.max(4) as usize)
         .into_iter()
         .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Yellow))))
         .collect();
-    lines.truncate(inner.height.saturating_sub(2) as usize);
+    lines.truncate(inner.height.saturating_sub(2 + options.len() as u16) as usize);
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("[a]", Style::new().fg(Color::Green).bold()),
-        Span::raw("ccept   "),
-        Span::styled("[r]", Style::new().fg(Color::Red).bold()),
-        Span::raw("eject"),
+        key("[y]", Color::Green),
+        Span::raw("es   "),
+        key("[n]", Color::Red),
+        Span::raw("o"),
     ]));
+    lines.extend(options);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 

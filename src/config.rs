@@ -22,6 +22,8 @@ pub struct Config {
     pub mcp: bool,
     pub permission_mode: Mode,
     pub permissions: Rules,
+    /// Rules from Claude Code's `settings.json` files.
+    pub import_claude_permissions: bool,
 }
 
 impl Default for Config {
@@ -34,6 +36,7 @@ impl Default for Config {
             mcp: false,
             permission_mode: Mode::Ask,
             permissions: Rules::default(),
+            import_claude_permissions: true,
         }
     }
 }
@@ -47,6 +50,7 @@ struct Layer {
     skills: Option<bool>,
     mcp: Option<bool>,
     permission_mode: Option<Mode>,
+    import_claude_permissions: Option<bool>,
     #[serde(default)]
     permissions: RulesLayer,
 }
@@ -84,7 +88,8 @@ impl Config {
         Ok(config)
     }
 
-    /// `--bare` turns off everything that adds context; permissions stay as configured.
+    /// `--bare` turns off everything that adds context, and the Claude Code rule import;
+    /// the rest of the permissions stay as configured.
     pub fn with_flags(mut self, flags: Flags) -> Self {
         if let Some(mode) = flags.mode {
             self.permission_mode = mode;
@@ -96,6 +101,7 @@ impl Config {
                 load_project_instructions: false,
                 skills: false,
                 mcp: false,
+                import_claude_permissions: false,
                 ..self
             };
         }
@@ -110,7 +116,7 @@ impl Config {
     }
 
     /// A missing file changes nothing; a malformed one is an error. Only a `trusted`
-    /// file may set the mode or add allow rules.
+    /// file may set the mode, add allow rules or turn the Claude Code import on.
     fn apply_file(&mut self, path: &Path, trusted: bool) -> Result<()> {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Ok(());
@@ -121,7 +127,7 @@ impl Config {
         let parse = |rules: &[String]| {
             rules
                 .iter()
-                .map(|r| Rule::parse(r))
+                .map(|r| Rule::parse(r).map(|r| r.with_source(path.display().to_string())))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(bad)
         };
@@ -136,6 +142,11 @@ impl Config {
             if let Some(mode) = layer.permission_mode {
                 self.permission_mode = mode;
             }
+        }
+        if let Some(import) = layer.import_claude_permissions
+            && (trusted || !import)
+        {
+            self.import_claude_permissions = import;
         }
         self.apply(layer);
         Ok(())
@@ -228,6 +239,25 @@ mod tests {
         assert_eq!(texts(&config.permissions.allow), ["Bash(ls)"]);
         assert_eq!(texts(&config.permissions.deny), ["Read(a)", "Read(b)"]);
         assert_eq!(texts(&config.permissions.ask), ["Edit"]);
+        let project = cwd.join(".bhai/config.toml").display().to_string();
+        assert_eq!(config.permissions.ask[0].source, project);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_project_can_only_turn_the_claude_import_off() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        let global = home.join(".config/bhai/config.toml");
+        let project = cwd.join(".bhai/config.toml");
+        write(&global, "import_claude_permissions = false\n");
+        write(&project, "import_claude_permissions = true\n");
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(!config.import_claude_permissions);
+        write(&global, "import_claude_permissions = true\n");
+        write(&project, "import_claude_permissions = false\n");
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(!config.import_claude_permissions);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -283,6 +313,7 @@ mod tests {
                 && !bare.load_project_instructions
                 && !bare.skills
                 && !bare.mcp
+                && !bare.import_claude_permissions
         );
     }
 }

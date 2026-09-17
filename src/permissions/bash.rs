@@ -258,9 +258,14 @@ pub fn mentions_protected(command: &Command) -> bool {
             let parts: Vec<&str> = lower.split(['/', '=', ':', ',']).collect();
             parts.iter().any(|p| {
                 matches!(*p, ".git" | ".ssh" | ".codex" | ".claude") || p.starts_with(".env")
-            }) || parts
-                .windows(2)
-                .any(|w| matches!(w, [".config", "bhai"] | [".bhai", "config.toml"]))
+            }) || parts.windows(2).any(|w| {
+                matches!(
+                    w,
+                    [".config", "bhai"]
+                        | [".bhai", "config.toml"]
+                        | [".bhai", "settings.local.json"]
+                )
+            })
         })
 }
 
@@ -403,6 +408,7 @@ mod tests {
             "grep x --file=.env",
             "ls ~/.config/bhai",
             "cat .bhai/config.toml",
+            "cp x .bhai/settings.local.json",
             "ls .claude",
             "cat .e*",
             "ls ~/.s?h",

@@ -10,7 +10,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::agent::{AgentEvent, Control};
 use crate::client::Usage;
-use crate::permissions::{Mode, Policy};
+use crate::permissions::{Answer, Mode, Offers, Policy, Remember};
 use crate::profile::Profile;
 
 /// Events a slow consumer can fall behind by before it starts missing them.
@@ -28,11 +28,15 @@ pub enum Event {
         id: u64,
         tool: String,
         command: String,
+        #[serde(flatten)]
+        offers: Offers,
     },
     /// A pending approval was answered, by whichever consumer got there first.
     Resolved {
         id: u64,
         accepted: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        remember: Option<Remember>,
     },
     ToolStart(String),
     ToolOutput(String),
@@ -53,6 +57,9 @@ pub struct Approval {
     pub id: u64,
     pub tool: String,
     pub command: String,
+    /// Rules the user may choose to remember.
+    #[serde(flatten)]
+    pub offers: Offers,
 }
 
 /// A snapshot of the session, as `GET /state` reports it.
@@ -92,7 +99,7 @@ struct Inner {
     total: Usage,
     last_usage: Option<Usage>,
     next_id: u64,
-    pending: Option<(Approval, oneshot::Sender<bool>)>,
+    pending: Option<(Approval, oneshot::Sender<Answer>)>,
 }
 
 pub struct Session {
@@ -160,18 +167,25 @@ impl Session {
         Ok(())
     }
 
-    /// Answer the pending approval, only if it is `id` when one is given. Returns the id
-    /// answered, or `None` if there was nothing (or something else) to answer.
-    pub fn answer(&self, accept: bool, id: Option<u64>) -> Option<u64> {
+    /// Answer the pending approval, only if it is `id` when one is given, and only with
+    /// a rule it offered. Returns the id answered, or `None` if there was nothing (or
+    /// something else) to answer.
+    pub fn answer(&self, answer: Answer, id: Option<u64>) -> Option<u64> {
         let mut inner = self.lock();
-        if id.is_some_and(|id| inner.pending.as_ref().map(|(a, _)| a.id) != Some(id)) {
+        let (approval, _) = inner.pending.as_ref()?;
+        if id.is_some_and(|id| approval.id != id)
+            || answer
+                .remember()
+                .is_some_and(|r| approval.offers.get(r).is_none())
+        {
             return None;
         }
         let (approval, reply) = inner.pending.take()?;
-        let _ = reply.send(accept);
+        let _ = reply.send(answer);
         self.publish(Event::Resolved {
             id: approval.id,
-            accepted: accept,
+            accepted: answer.accepted(),
+            remember: answer.remember(),
         });
         Some(approval.id)
     }
@@ -183,7 +197,7 @@ impl Session {
         }
         // Cancel first so the agent does not move on to the next call once rejected.
         self.cancel.store(true, Ordering::Relaxed);
-        self.answer(false, None);
+        self.answer(Answer::Reject, None);
         self.publish(Event::Interrupted);
         true
     }
@@ -204,6 +218,11 @@ impl Session {
         mode
     }
 
+    /// What `/permissions` prints.
+    pub fn permissions(&self) -> String {
+        self.policy.describe()
+    }
+
     /// Ask the agent for a token breakdown of its context; `None` if it has gone away.
     pub async fn context(&self) -> Option<Profile> {
         let (reply, wait) = oneshot::channel();
@@ -219,6 +238,7 @@ impl Session {
             AgentEvent::Approval {
                 tool,
                 command,
+                offers,
                 reply,
             } => {
                 inner.next_id += 1;
@@ -226,12 +246,14 @@ impl Session {
                     id: inner.next_id,
                     tool: tool.clone(),
                     command: command.clone(),
+                    offers: offers.clone(),
                 };
                 inner.pending = Some((approval, reply));
                 Event::Approval {
                     id: inner.next_id,
                     tool,
                     command,
+                    offers,
                 }
             }
             AgentEvent::ToolStart(s) => Event::ToolStart(s),
@@ -288,11 +310,15 @@ mod tests {
         )
     }
 
-    fn approval(session: &Session) -> oneshot::Receiver<bool> {
+    fn approval(session: &Session) -> oneshot::Receiver<Answer> {
         let (reply, wait) = oneshot::channel();
         session.on_agent(AgentEvent::Approval {
             tool: "bash".to_string(),
             command: "ls".to_string(),
+            offers: Offers {
+                exact: Some("Bash(ls)".to_string()),
+                prefix: None,
+            },
             reply,
         });
         wait
@@ -332,19 +358,27 @@ mod tests {
             Event::Approval {
                 id: 1,
                 tool: "bash".to_string(),
-                command: "ls".to_string()
+                command: "ls".to_string(),
+                offers: Offers {
+                    exact: Some("Bash(ls)".to_string()),
+                    prefix: None,
+                },
             }
         );
-        // A stale id from another consumer does nothing.
-        assert_eq!(session.answer(false, Some(7)), None);
-        assert_eq!(session.answer(true, Some(1)), Some(1));
-        assert_eq!(session.answer(false, None), None);
-        assert_eq!(wait.try_recv(), Ok(true));
+        // A stale id from another consumer does nothing, nor does a rule not offered.
+        assert_eq!(session.answer(Answer::Reject, Some(7)), None);
+        let prefix = Answer::Accept(Some(Remember::Prefix));
+        assert_eq!(session.answer(prefix, Some(1)), None);
+        let exact = Answer::Accept(Some(Remember::Exact));
+        assert_eq!(session.answer(exact, Some(1)), Some(1));
+        assert_eq!(session.answer(Answer::Reject, None), None);
+        assert_eq!(wait.try_recv(), Ok(exact));
         assert_eq!(
             events.try_recv().unwrap(),
             Event::Resolved {
                 id: 1,
-                accepted: true
+                accepted: true,
+                remember: Some(Remember::Exact),
             }
         );
         assert!(session.state().pending.is_none());
@@ -368,7 +402,7 @@ mod tests {
         let mut wait = approval(&session);
         assert!(session.interrupt());
         assert!(session.cancel.load(Ordering::Relaxed));
-        assert_eq!(wait.try_recv(), Ok(false));
+        assert_eq!(wait.try_recv(), Ok(Answer::Reject));
     }
 
     #[test]

@@ -5,12 +5,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{RwLock, RwLockReadGuard};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod bash;
 pub mod rules;
+pub mod settings;
 
 use rules::Base;
 pub use rules::Rule;
@@ -69,6 +71,14 @@ pub struct Rules {
     pub ask: Vec<Rule>,
 }
 
+impl Rules {
+    pub fn extend(&mut self, other: Rules) {
+        self.allow.extend(other.allow);
+        self.deny.extend(other.deny);
+        self.ask.extend(other.ask);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     /// Run without prompting; the reason is shown in the transcript.
@@ -78,21 +88,87 @@ pub enum Decision {
     Ask,
 }
 
+/// Which offered rule an approval should remember.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Remember {
+    Exact,
+    Prefix,
+}
+
+impl Remember {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Remember::Exact => "exact",
+            Remember::Prefix => "prefix",
+        }
+    }
+}
+
+/// The user's answer to an approval prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Reject,
+    Accept(Option<Remember>),
+}
+
+impl Answer {
+    pub fn accepted(self) -> bool {
+        self != Answer::Reject
+    }
+
+    pub fn remember(self) -> Option<Remember> {
+        match self {
+            Answer::Accept(remember) => remember,
+            Answer::Reject => None,
+        }
+    }
+}
+
+/// Allow rules an approval prompt may offer to remember, as rule text.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Offers {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+impl Offers {
+    pub fn get(&self, remember: Remember) -> Option<&str> {
+        match remember {
+            Remember::Exact => self.exact.as_deref(),
+            Remember::Prefix => self.prefix.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Policy {
     mode: AtomicU8,
-    rules: Rules,
+    /// Allow rules grow as approvals are remembered.
+    rules: RwLock<Rules>,
     home: Option<PathBuf>,
     cwd: PathBuf,
+    /// Where remembered rules are saved; `None` keeps them for this session only.
+    store: Option<PathBuf>,
 }
 
 impl Policy {
     pub fn new(mode: Mode, rules: Rules, home: Option<PathBuf>, cwd: PathBuf) -> Self {
         Self {
             mode: AtomicU8::new(mode as u8),
-            rules,
+            rules: RwLock::new(rules),
             home,
             cwd,
+            store: None,
+        }
+    }
+
+    pub fn with_store(self, store: PathBuf) -> Self {
+        Self {
+            store: Some(store),
+            ..self
         }
     }
 
@@ -107,6 +183,125 @@ impl Policy {
     /// Decide a call to `tool`. Tools that skip approval only answer to deny and ask
     /// rules; their `Allow` carries no reason and needs no notice.
     pub fn check(&self, tool: &str, args: &Value, needs_approval: bool) -> Decision {
+        let rules = self.rules();
+        self.checker(&rules, self.mode())
+            .check(tool, args, needs_approval)
+    }
+
+    /// The rules the approval prompt for this call may offer: each one is offered only
+    /// if, once added, it would let this very call run in `auto` mode.
+    pub fn offers(&self, tool: &str, args: &Value) -> Offers {
+        let base = self.base();
+        let (exact, prefix) = match (tool, args.get("command"), args.get("path")) {
+            ("bash", Some(Value::String(command)), _) => (
+                rules::exact_command(command),
+                rules::prefix_command(command),
+            ),
+            ("write" | "edit", _, Some(Value::String(path))) => {
+                let path = Path::new(path);
+                if rules::is_protected(path, base.home) {
+                    (None, None)
+                } else {
+                    (
+                        rules::exact_path(tool, path, base),
+                        rules::dir_path(path, base),
+                    )
+                }
+            }
+            _ => (None, None),
+        };
+        let works = |rule: Option<Rule>| {
+            let rule = rule?;
+            let mut rules = self.rules().clone();
+            rules.allow.insert(0, rule.clone());
+            let decision = self.checker(&rules, Mode::Auto).check(tool, args, true);
+            matches!(decision, Decision::Allow(_)).then_some(rule.text)
+        };
+        Offers {
+            exact: works(exact),
+            prefix: works(prefix),
+        }
+    }
+
+    /// Allow `text` for the rest of the session, then save it if there is a store.
+    /// Returns where it was saved.
+    pub fn remember(&self, text: &str) -> anyhow::Result<Option<&Path>> {
+        let source = match &self.store {
+            Some(store) => store.display().to_string(),
+            None => "this session".to_string(),
+        };
+        let rule = Rule::parse(text)
+            .map_err(anyhow::Error::msg)?
+            .with_source(source);
+        {
+            let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
+            if !rules.allow.iter().any(|r| r.text == rule.text) {
+                rules.allow.push(rule);
+            }
+        }
+        if let Some(store) = &self.store {
+            settings::remember(store, text)?;
+        }
+        Ok(self.store.as_deref())
+    }
+
+    /// What `/permissions` prints: the mode, then each rule and where it came from.
+    pub fn describe(&self) -> String {
+        let rules = self.rules();
+        let mut out = format!("permission mode: {}", self.mode());
+        if self.mode() == Mode::Ask {
+            out.push_str(" (allow rules apply in auto mode)");
+        }
+        for (name, list) in [
+            ("deny", &rules.deny),
+            ("ask", &rules.ask),
+            ("allow", &rules.allow),
+        ] {
+            if list.is_empty() {
+                out.push_str(&format!("\n{name}: none"));
+                continue;
+            }
+            out.push_str(&format!("\n{name}:"));
+            for rule in list {
+                let source = match rule.source.as_str() {
+                    "" => "built in",
+                    source => source,
+                };
+                out.push_str(&format!("\n  {}  ({source})", rule.text));
+            }
+        }
+        out
+    }
+
+    fn rules(&self) -> RwLockReadGuard<'_, Rules> {
+        self.rules.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn checker<'a>(&'a self, rules: &'a Rules, mode: Mode) -> Checker<'a> {
+        Checker {
+            rules,
+            mode,
+            base: self.base(),
+        }
+    }
+
+    fn base(&self) -> Base<'_> {
+        Base {
+            home: self.home.as_deref(),
+            cwd: &self.cwd,
+        }
+    }
+}
+
+/// One decision against a fixed set of rules and a mode.
+struct Checker<'a> {
+    rules: &'a Rules,
+    mode: Mode,
+    base: Base<'a>,
+}
+
+impl Checker<'_> {
+    fn check(&self, tool: &str, args: &Value, needs_approval: bool) -> Decision {
         let text = |key| args.get(key).and_then(Value::as_str);
         match tool {
             "bash" => self.check_bash(text("command").unwrap_or_default()),
@@ -133,7 +328,7 @@ impl Policy {
     }
 
     fn check_path(&self, tool: &str, path: &Path, needs_approval: bool) -> Decision {
-        let base = self.base();
+        let base = self.base;
         let find = |rules: &[Rule], fold: bool| {
             rules
                 .iter()
@@ -149,7 +344,7 @@ impl Policy {
         if !needs_approval {
             return Decision::Allow(String::new());
         }
-        if rules::is_protected(path, self.home.as_deref()) {
+        if rules::is_protected(path, base.home) {
             return Decision::Ask;
         }
         self.fallback(find(&self.rules.allow, false).map(|r| rule_reason(&r)))
@@ -212,18 +407,11 @@ impl Policy {
 
     /// What the mode makes of a call no deny, ask or protected check stopped.
     fn fallback(&self, allowed: Option<String>) -> Decision {
-        match (self.mode(), allowed) {
+        match (self.mode, allowed) {
             (Mode::Ask, _) => Decision::Ask,
             (_, Some(reason)) => Decision::Allow(reason),
             (Mode::Bypass, None) => Decision::Allow("bypass mode".to_string()),
             (Mode::Auto, None) => Decision::Ask,
-        }
-    }
-
-    fn base(&self) -> Base<'_> {
-        Base {
-            home: self.home.as_deref(),
-            cwd: &self.cwd,
         }
     }
 }
@@ -438,5 +626,82 @@ mod tests {
         let ask = policy(Mode::Bypass, &[], &[], &["Skill"]);
         assert_eq!(ask.check("skill", &args, false), Decision::Ask);
         assert_eq!(Policy::default().check("skill", &args, false), allowed(""));
+    }
+
+    #[test]
+    fn offers_only_rules_that_would_let_the_call_run() {
+        let policy = policy(
+            Mode::Ask,
+            &[],
+            &["Bash(git push:*)"],
+            &["Bash(git log -p:*)"],
+        );
+        let offers = |tool, args: Value| policy.offers(tool, &args);
+        let both = |exact: &str, prefix: &str| Offers {
+            exact: Some(exact.to_string()),
+            prefix: Some(prefix.to_string()),
+        };
+        assert_eq!(
+            offers("bash", json!({"command": "git log --oneline"})),
+            both("Bash(git log --oneline)", "Bash(git log:*)")
+        );
+        // The prefix would still hit the ask rule; a deny rule wins over both.
+        assert_eq!(
+            offers("bash", json!({"command": "git log -p"})),
+            Offers::default()
+        );
+        assert_eq!(
+            offers("bash", json!({"command": "git push"})),
+            Offers::default()
+        );
+        assert_eq!(
+            offers("bash", json!({"command": "ls | wc -l"})),
+            Offers::default()
+        );
+        assert_eq!(
+            offers("edit", json!({"path": "/home/u/repo/src/a.rs"})),
+            both("Edit(/src/a.rs)", "Edit(/src/**)")
+        );
+        assert_eq!(
+            offers("write", json!({"path": "/home/u/repo/.env"})),
+            Offers::default()
+        );
+        assert_eq!(offers("skill", json!({"name": "x"})), Offers::default());
+    }
+
+    #[test]
+    fn a_remembered_rule_applies_to_later_calls_and_is_saved() {
+        let dir = std::env::temp_dir().join(format!("bhai-policy-{}", uuid::Uuid::new_v4()));
+        let store = dir.join(settings::LOCAL);
+        let policy =
+            Policy::new(Mode::Auto, Rules::default(), None, dir.clone()).with_store(store.clone());
+        assert_eq!(bash(&policy, "cargo test --all"), Decision::Ask);
+        let rule = policy
+            .offers("bash", &json!({"command": "cargo test"}))
+            .prefix;
+        assert_eq!(rule.as_deref(), Some("Bash(cargo test:*)"));
+        assert_eq!(
+            policy.remember("Bash(cargo test:*)").unwrap(),
+            Some(store.as_path())
+        );
+        policy.remember("Bash(cargo test:*)").unwrap();
+        assert_eq!(
+            bash(&policy, "cargo test --all"),
+            allowed("rule Bash(cargo test:*)")
+        );
+        let (saved, _) = settings::load_local(&store);
+        assert_eq!(saved.len(), 1);
+        let described = policy.describe();
+        assert_eq!(described.matches("Bash(cargo test:*)").count(), 1);
+        assert!(
+            described.contains(&store.display().to_string()),
+            "{described}"
+        );
+        assert!(policy.remember("Bash(ls").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let memory = Policy::default();
+        assert_eq!(memory.remember("Bash(ls)").unwrap(), None);
+        assert!(memory.describe().contains("Bash(ls)  (this session)"));
     }
 }
