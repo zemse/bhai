@@ -6,6 +6,8 @@ mod app;
 mod auth;
 mod client;
 mod config;
+mod frontmatter;
+mod identity;
 mod instructions;
 mod permissions;
 mod profile;
@@ -48,32 +50,49 @@ enum Event {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "identities") {
+        return identities();
+    }
+
     // Fail before taking over the terminal if there is nothing to authenticate with.
     let http = reqwest::Client::new();
     if let Err(e) = auth::load(&http).await {
         eprintln!("bhai: {e:#}");
         std::process::exit(1);
     }
-    let model = client::Client::new()?.model().to_string();
 
     // `bhai --probe [prompt]` does one non-interactive model call, for checking that
     // auth and the wire format still work without entering the TUI.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "--probe") {
-        let (prompt, _) = load(Flags::default())?;
+        let (prompt, _) = load(Flags::default(), identity::DEFAULT)?;
         return probe(prompt, args.get(1).cloned()).await;
     }
     let args = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [--probe [prompt]] [--serve [port] [--headless]] [--profile] [--mode ask|auto|bypass] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [--probe [prompt]] [--as <identity>] [--serve [port] [--headless]] [--profile] [--mode ask|auto|bypass] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
     };
-    let (prompt, policy) = load(args.flags)?;
-    let notices = prompt.notices();
+    let (prompt, policy) = load(
+        args.flags,
+        args.identity.as_deref().unwrap_or(identity::DEFAULT),
+    )?;
+    let identity = prompt.identity.clone();
+    let model = client::Client::new()?
+        .with_overrides(identity.model.clone(), identity.effort.clone())
+        .model()
+        .to_string();
+    let mut notices = prompt.notices();
+    if identity.name != identity::DEFAULT {
+        notices.insert(
+            0,
+            format!("identity: {} ({})", identity.name, identity.source),
+        );
+    }
     let skills = prompt.skills.clone();
 
     // Bind before taking over the terminal so a busy port is a plain error.
@@ -114,23 +133,19 @@ struct Args {
     headless: bool,
     /// Log every model call's usage to `.bhai/debug/usage.jsonl`.
     profile: bool,
+    /// `--as`: the identity to run as.
+    identity: Option<String>,
     flags: Flags,
 }
 
-/// Config and instruction files for the working directory, as the system prompt and
-/// the permission policy.
-fn load(flags: Flags) -> Result<(SystemPrompt, Policy)> {
+/// Config and instruction files for the working directory, as the system prompt for
+/// the identity called `name` and the permission policy.
+fn load(flags: Flags, name: &str) -> Result<(SystemPrompt, Policy)> {
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
-    let skills = if config.skills {
-        skills::discover(&roots)
-    } else {
-        Vec::new()
-    };
-    let loaded = instructions::load(&config, &roots);
-    let mut prompt = prompt::system_prompt(&loaded.files, skills);
-    prompt.skipped = loaded.skipped;
+    let identity = identity::find(&identity::discover(&roots), name)?;
+    let mut prompt = identity::build(&config, &roots, &identity);
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
     Ok((prompt, policy))
@@ -154,6 +169,17 @@ fn permissions(config: Config, home: Option<PathBuf>, cwd: PathBuf) -> (Policy, 
     (policy, notices)
 }
 
+/// `bhai identities`: every identity with its baseline context cost.
+fn identities() -> Result<()> {
+    let roots = instructions::Roots::from_env(std::env::current_dir()?);
+    let config = Config::load(roots.home.as_deref(), &roots.cwd)?;
+    print!(
+        "{}",
+        identity::report(&identity::discover(&roots), &config, &roots)
+    );
+    Ok(())
+}
+
 fn parse_args(args: &[String]) -> Result<Args> {
     let mut parsed = Args::default();
     let mut args = args.iter().peekable();
@@ -175,6 +201,12 @@ fn parse_args(args: &[String]) -> Result<Args> {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--mode needs a value"))?;
                 parsed.flags.mode = Some(mode.parse().map_err(anyhow::Error::msg)?);
+            }
+            "--as" => {
+                let name = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--as needs an identity name"))?;
+                parsed.identity = Some(name.clone());
             }
             "--no-global" => parsed.flags.no_global = true,
             "--no-project" => parsed.flags.no_project = true,
@@ -203,6 +235,7 @@ fn start(
     let policy = Arc::new(policy);
     let session = Session::new(
         model,
+        prompt.identity.name.clone(),
         tx_user,
         tx_control,
         Arc::clone(&cancel),
@@ -387,6 +420,20 @@ mod tests {
         );
         assert!(mode(&["--mode"]).is_err());
         assert!(mode(&["--mode", "yolo"]).is_err());
+    }
+
+    #[test]
+    fn as_flag() {
+        let identity = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse_args(&args).map(|a| a.identity)
+        };
+        assert_eq!(identity(&[]).unwrap(), None);
+        assert_eq!(
+            identity(&["--as", "router"]).unwrap().as_deref(),
+            Some("router")
+        );
+        assert!(identity(&["--as"]).is_err());
     }
 
     #[test]

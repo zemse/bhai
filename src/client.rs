@@ -87,6 +87,13 @@ impl Client {
         })
     }
 
+    /// An identity's model and effort, where set, in place of the configured ones.
+    pub fn with_overrides(mut self, model: Option<String>, effort: Option<String>) -> Self {
+        self.model = model.unwrap_or(self.model);
+        self.effort = effort.unwrap_or(self.effort);
+        self
+    }
+
     pub fn model(&self) -> &str {
         &self.model
     }

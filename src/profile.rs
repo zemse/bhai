@@ -26,6 +26,8 @@ pub struct Measured {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Profile {
+    /// The session's identity.
+    pub identity: String,
     pub total_bytes: usize,
     pub estimated_tokens: u64,
     pub calibration: Option<Calibration>,
@@ -153,6 +155,7 @@ pub fn build(
     items.sort_by_key(|i| std::cmp::Reverse(i.bytes));
     categories.sort_by_key(|c| std::cmp::Reverse(c.bytes));
     Profile {
+        identity: prompt.identity.name.clone(),
         total_bytes,
         estimated_tokens,
         calibration,
@@ -167,7 +170,8 @@ impl Profile {
         let mut out = String::from("# bhai context\n\n");
         let _ = writeln!(
             out,
-            "{} items, {} bytes, about {} tokens (bytes/4).",
+            "Identity `{}`: {} items, {} bytes, about {} tokens (bytes/4).",
+            self.identity,
             self.items.len(),
             self.total_bytes,
             self.estimated_tokens
@@ -220,7 +224,8 @@ impl Profile {
     /// What `/context` prints: where the export went and the largest items.
     pub fn summary(&self, path: &Path) -> String {
         let mut out = format!(
-            "context: about {} tokens, written to {} and .md",
+            "context ({}): about {} tokens, written to {} and .md",
+            self.identity,
             self.estimated_tokens,
             path.display()
         );
@@ -432,7 +437,10 @@ mod tests {
             items: 5,
         };
         let md = build(&plain("be brief"), &[], &history(), Some(measured)).markdown();
-        assert!(md.starts_with("# bhai context\n"));
+        assert!(
+            md.starts_with("# bhai context\n\nIdentity `general`: "),
+            "{md}"
+        );
         assert!(md.contains("Last call: 900 real input tokens"));
         assert!(md.contains("## By category"));
         assert!(md.contains("| function_call_output | 1 | "));

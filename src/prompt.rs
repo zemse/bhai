@@ -5,6 +5,7 @@
 
 use std::fmt::Write as _;
 
+use crate::identity::Identity;
 use crate::instructions::File;
 use crate::skills::Skill;
 
@@ -19,6 +20,8 @@ pub struct SystemPrompt {
     pub skills_bytes: usize,
     /// Imports refused while loading the instruction files.
     pub skipped: Vec<String>,
+    /// The identity the prompt was built for.
+    pub identity: Identity,
 }
 
 /// One appended instruction file.
@@ -92,6 +95,7 @@ pub fn system_prompt(files: &[File], skills: Vec<Skill>) -> SystemPrompt {
         sources,
         skills,
         skipped: Vec::new(),
+        identity: Identity::default(),
     }
 }
 

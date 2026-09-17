@@ -12,6 +12,9 @@ pub mod read;
 pub mod skill;
 pub mod write;
 
+/// Every tool name, as identities refer to them.
+pub const NAMES: [&str; 5] = [bash::NAME, read::NAME, write::NAME, edit::NAME, skill::NAME];
+
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
 const MAX_OUTPUT: usize = 20_000;
 
@@ -45,6 +48,15 @@ impl Registry {
             tools.push(Box::new(skill::Skill { skills }));
         }
         Self { tools }
+    }
+
+    /// The tools a session's prompt allows: its skills, narrowed to its identity's tools.
+    pub fn for_prompt(prompt: &crate::prompt::SystemPrompt) -> Self {
+        let mut registry = Self::new(prompt.skills.clone());
+        registry
+            .tools
+            .retain(|t| prompt.identity.allows_tool(t.name()));
+        registry
     }
 
     pub fn schemas(&self) -> Vec<Value> {

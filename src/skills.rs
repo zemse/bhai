@@ -4,10 +4,16 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::config::Source;
+use crate::frontmatter;
 use crate::instructions::{self, Roots};
 
-/// Skill roots under the home directory and the project root, lowest precedence first.
-const SKILL_DIRS: [&str; 2] = [".claude/skills", ".agents/skills"];
+/// Skill roots under the home directory and the project root, lowest precedence first,
+/// with the source that turns each on under the home directory.
+const SKILL_DIRS: [(&str, Source); 2] = [
+    (".claude/skills", Source::GlobalClaude),
+    (".agents/skills", Source::GlobalAgents),
+];
 
 /// Descriptions longer than this are cut in the listing.
 const MAX_DESCRIPTION: usize = 250;
@@ -45,17 +51,24 @@ impl Skill {
     }
 }
 
-/// Every skill found, sorted by name; project skills replace global ones of the same name.
-pub fn discover(roots: &Roots) -> Vec<Skill> {
+/// Every skill found in the enabled sources, sorted by name; project skills replace
+/// global ones of the same name.
+pub fn discover(roots: &Roots, sources: &[Source]) -> Vec<Skill> {
     let mut bases = Vec::new();
     if let Some(home) = &roots.home {
-        bases.push(home.clone());
+        bases.push((home.clone(), None));
     }
-    bases.push(instructions::project_root(&roots.cwd).to_path_buf());
+    if sources.contains(&Source::Project) {
+        let project = instructions::project_root(&roots.cwd).to_path_buf();
+        bases.push((project, Some(Source::Project)));
+    }
 
     let mut found = BTreeMap::new();
-    for base in bases {
-        for dir in SKILL_DIRS {
+    for (base, project) in bases {
+        for (dir, global) in SKILL_DIRS {
+            if !sources.contains(&project.unwrap_or(global)) {
+                continue;
+            }
             let root = base.join(dir);
             for skill in scan(&root, &instructions::label(&root, roots)) {
                 found.insert(skill.name.clone(), skill);
@@ -94,64 +107,10 @@ pub struct Frontmatter {
 
 /// Split `SKILL.md` into its frontmatter and body. `None` without a frontmatter `name`.
 pub fn parse(text: &str) -> Option<(Frontmatter, &str)> {
-    let rest = text.strip_prefix("---")?;
-    let rest = rest
-        .strip_prefix("\r\n")
-        .or_else(|| rest.strip_prefix('\n'))?;
-    let mut front = Vec::new();
-    let mut body = None;
-    let mut offset = text.len() - rest.len();
-    for line in rest.split_inclusive('\n') {
-        offset += line.len();
-        if line.trim_end() == "---" {
-            body = Some(&text[offset..]);
-            break;
-        }
-        front.push(line.trim_end_matches(['\n', '\r']));
-    }
-    let body = body?.trim_start_matches(['\n', '\r']);
-
-    let name = value(&front, "name").filter(|n| !n.is_empty())?;
-    let description = value(&front, "description").unwrap_or_default();
+    let (front, body) = frontmatter::split(text)?;
+    let name = frontmatter::value(&front, "name").filter(|n| !n.is_empty())?;
+    let description = frontmatter::value(&front, "description").unwrap_or_default();
     Some((Frontmatter { name, description }, body))
-}
-
-/// A top-level key's value: plain, quoted, a `|`/`>` block, or continued on indented lines.
-fn value(lines: &[&str], key: &str) -> Option<String> {
-    let index = lines.iter().position(|line| {
-        line.strip_prefix(key)
-            .is_some_and(|rest| rest.trim_start().starts_with(':'))
-    })?;
-    let first = lines[index][key.len()..].trim_start()[1..].trim();
-    let more: Vec<&str> = lines[index + 1..]
-        .iter()
-        .take_while(|line| line.trim().is_empty() || line.starts_with([' ', '\t']))
-        .map(|line| line.trim())
-        .collect();
-
-    if first.starts_with(['|', '>']) {
-        let separator = if first.starts_with('|') { "\n" } else { " " };
-        let lines: Vec<&str> = more.into_iter().filter(|l| !l.is_empty()).collect();
-        return Some(lines.join(separator));
-    }
-    if let Some(quoted) = unquote(first) {
-        return Some(quoted);
-    }
-    let mut words = vec![first];
-    words.extend(more.into_iter().filter(|l| !l.is_empty()));
-    Some(words.join(" ").trim().to_string())
-}
-
-/// The contents of a `"..."` or `'...'` scalar on one line.
-fn unquote(value: &str) -> Option<String> {
-    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-        let inner = &value[1..value.len() - 1];
-        return Some(inner.replace("\\\"", "\"").replace("\\\\", "\\"));
-    }
-    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
-        return Some(value[1..value.len() - 1].replace("''", "'"));
-    }
-    None
 }
 
 #[cfg(test)]
@@ -258,7 +217,7 @@ mod tests {
         f.skill("home/.claude/skills/nameless", "", "skipped");
         std::fs::create_dir_all(f.dir.join("home/.claude/skills/no-file")).unwrap();
 
-        let skills = discover(&f.roots);
+        let skills = discover(&f.roots, &Source::ALL);
         let found: Vec<_> = skills
             .iter()
             .map(|s| (s.name.as_str(), s.description.as_str(), s.source.as_str()))
@@ -288,7 +247,7 @@ mod tests {
             f.dir.join("home/.claude/skills/linked"),
         )
         .unwrap();
-        let skills = discover(&f.roots);
+        let skills = discover(&f.roots, &Source::ALL);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "linked");
         assert_eq!(
@@ -298,13 +257,30 @@ mod tests {
     }
 
     #[test]
+    fn disabled_sources_are_not_scanned() {
+        let f = Fixture::new();
+        f.skill("home/.claude/skills/a", "a", "");
+        f.skill("home/.agents/skills/b", "b", "");
+        f.skill("home/repo/.agents/skills/c", "c", "");
+        let names = |sources: &[Source]| -> Vec<String> {
+            discover(&f.roots, sources)
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        assert_eq!(names(&[Source::GlobalAgents]), ["b"]);
+        assert_eq!(names(&[Source::GlobalClaude, Source::Project]), ["a", "c"]);
+        assert!(names(&[]).is_empty());
+    }
+
+    #[test]
     fn missing_roots_find_nothing() {
         let roots = Roots {
             home: None,
             codex_home: None,
             cwd: std::env::temp_dir().join(format!("bhai-none-{}", uuid::Uuid::new_v4())),
         };
-        assert!(discover(&roots).is_empty());
+        assert!(discover(&roots, &Source::ALL).is_empty());
     }
 
     #[test]

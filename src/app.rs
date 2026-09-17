@@ -43,6 +43,7 @@ pub struct App {
     pub follow: bool,
     pub spinner: usize,
     pub model: String,
+    pub identity: String,
     pub mode: Mode,
     pub tokens_in: u64,
     pub tokens_out: u64,
@@ -69,6 +70,7 @@ impl App {
             follow: true,
             spinner: 0,
             model: session.state().model,
+            identity: session.state().identity,
             mode: session.state().mode,
             tokens_in: 0,
             tokens_out: 0,
@@ -203,6 +205,14 @@ impl App {
             self.entries.push(Entry::Info(self.session.permissions()));
             return;
         }
+        if let Some(rest) = message.strip_prefix("/as")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            self.entries
+                .push(Entry::Info(switch_notice(&self.identity, rest.trim())));
+            return;
+        }
         if message.starts_with("/skills") {
             self.follow = true;
             self.entries.push(Entry::Info(skills_report(&self.skills)));
@@ -283,6 +293,16 @@ impl App {
             Stream::Reasoning => Entry::Reasoning(text),
         });
     }
+}
+
+/// What `/as` prints. The identity is fixed for the session, so switching needs a new one.
+fn switch_notice(current: &str, name: &str) -> String {
+    if name.is_empty() {
+        return format!("identity: {current}. Usage: /as <name>");
+    }
+    format!(
+        "identity: {current}. The identity is fixed for the session; to switch, quit and run: bhai --as {name}"
+    )
 }
 
 /// What `/skills` prints: each skill, where it came from and its listing cost.
@@ -381,6 +401,15 @@ mod tests {
             input_request(key(KeyCode::Left, KeyModifiers::CONTROL)),
             Some(InputRequest::GoToPrevWord)
         );
+    }
+
+    #[test]
+    fn switch_notice_shows_the_command() {
+        assert_eq!(
+            switch_notice("general", ""),
+            "identity: general. Usage: /as <name>"
+        );
+        assert!(switch_notice("general", "router").ends_with("run: bhai --as router"));
     }
 
     #[test]

@@ -201,6 +201,7 @@ mod tests {
         let (tx_decision, rx_decision) = oneshot::channel();
         let session = Session::new(
             "test-model".to_string(),
+            "router".to_string(),
             tx_user,
             tx_control,
             Arc::new(AtomicBool::new(false)),
@@ -281,6 +282,7 @@ mod tests {
 
         let state = get_json(&http, format!("{base}/state")).await;
         assert_eq!(state["model"], "test-model");
+        assert_eq!(state["identity"], "router");
         assert_eq!(state["working"], false);
         assert!(state["pending"].is_null());
 

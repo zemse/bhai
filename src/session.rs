@@ -66,6 +66,7 @@ pub struct Approval {
 #[derive(Debug, Clone, Serialize)]
 pub struct State {
     pub model: String,
+    pub identity: String,
     pub mode: Mode,
     pub working: bool,
     pub input_tokens: u64,
@@ -104,6 +105,7 @@ struct Inner {
 
 pub struct Session {
     model: String,
+    identity: String,
     events: broadcast::Sender<Event>,
     inner: Mutex<Inner>,
     tx_user: mpsc::Sender<String>,
@@ -115,6 +117,7 @@ pub struct Session {
 impl Session {
     pub fn new(
         model: String,
+        identity: String,
         tx_user: mpsc::Sender<String>,
         tx_control: mpsc::Sender<Control>,
         cancel: Arc<AtomicBool>,
@@ -122,6 +125,7 @@ impl Session {
     ) -> Arc<Self> {
         Arc::new(Self {
             model,
+            identity,
             events: broadcast::channel(EVENT_BUFFER).0,
             inner: Mutex::default(),
             tx_user,
@@ -139,6 +143,7 @@ impl Session {
         let inner = self.lock();
         State {
             model: self.model.clone(),
+            identity: self.identity.clone(),
             mode: self.policy.mode(),
             working: inner.working,
             input_tokens: inner.total.input,
@@ -305,7 +310,14 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let policy = Arc::new(Policy::default());
         (
-            Session::new("m".to_string(), tx_user, tx_control, cancel, policy),
+            Session::new(
+                "m".to_string(),
+                "general".to_string(),
+                tx_user,
+                tx_control,
+                cancel,
+                policy,
+            ),
             rx_user,
         )
     }

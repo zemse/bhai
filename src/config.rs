@@ -19,6 +19,8 @@ pub struct Config {
     /// Instruction files from the repo root down to the working directory.
     pub load_project_instructions: bool,
     pub skills: bool,
+    /// Where skills are discovered from.
+    pub skill_sources: Vec<Source>,
     pub mcp: bool,
     pub permission_mode: Mode,
     pub permissions: Rules,
@@ -33,10 +35,36 @@ impl Default for Config {
             load_global_agents: true,
             load_project_instructions: true,
             skills: true,
+            skill_sources: Source::ALL.to_vec(),
             mcp: false,
             permission_mode: Mode::Ask,
             permissions: Rules::default(),
             import_claude_permissions: true,
+        }
+    }
+}
+
+/// A place context comes from: the global Claude dir, the global agents dir, or the project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    GlobalClaude,
+    GlobalAgents,
+    Project,
+}
+
+impl Source {
+    pub const ALL: [Source; 3] = [Source::GlobalClaude, Source::GlobalAgents, Source::Project];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Source::GlobalClaude => "global_claude",
+            Source::GlobalAgents => "global_agents",
+            Source::Project => "project",
         }
     }
 }
@@ -47,12 +75,23 @@ struct Layer {
     load_global_claude: Option<bool>,
     load_global_agents: Option<bool>,
     load_project_instructions: Option<bool>,
-    skills: Option<bool>,
+    skills: Option<SkillsLayer>,
     mcp: Option<bool>,
     permission_mode: Option<Mode>,
     import_claude_permissions: Option<bool>,
     #[serde(default)]
     permissions: RulesLayer,
+}
+
+/// `skills = false`, or a `[skills]` table.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SkillsLayer {
+    Enabled(bool),
+    Table {
+        enabled: Option<bool>,
+        sources: Option<Vec<Source>>,
+    },
 }
 
 /// `[permissions]`: rule lists add up across files.
@@ -164,7 +203,16 @@ impl Config {
             &mut self.load_project_instructions,
             layer.load_project_instructions,
         );
-        set(&mut self.skills, layer.skills);
+        match layer.skills {
+            Some(SkillsLayer::Enabled(enabled)) => self.skills = enabled,
+            Some(SkillsLayer::Table { enabled, sources }) => {
+                set(&mut self.skills, enabled);
+                if let Some(sources) = sources {
+                    self.skill_sources = sources;
+                }
+            }
+            None => {}
+        }
         set(&mut self.mcp, layer.mcp);
     }
 }
@@ -272,6 +320,35 @@ mod tests {
             assert!(Config::load(None, &dir).is_err(), "{text}");
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn skill_sources_come_from_a_skills_table() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &home.join(".config/bhai/config.toml"),
+            "[skills]\nsources = [\"project\", \"global_agents\"]\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(config.skills);
+        assert_eq!(
+            config.skill_sources,
+            [Source::Project, Source::GlobalAgents]
+        );
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[skills]\nenabled = false\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(!config.skills);
+        assert_eq!(config.skill_sources.len(), 2);
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[skills]\nsources = [\"x\"]\n",
+        );
+        assert!(Config::load(Some(&home), &cwd).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -62,14 +62,15 @@ pub async fn run(
     cancel: Arc<AtomicBool>,
     usage_log: Option<PathBuf>,
 ) {
+    let identity = &prompt.identity;
     let client = match Client::new() {
-        Ok(client) => client,
+        Ok(client) => client.with_overrides(identity.model.clone(), identity.effort.clone()),
         Err(e) => {
             let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
             return;
         }
     };
-    let registry = Registry::new(prompt.skills.clone());
+    let registry = Registry::for_prompt(&prompt);
     let tools = registry.schemas();
     let mut history: Vec<Value> = Vec::new();
     let mut measured: Option<Measured> = None;
