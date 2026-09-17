@@ -12,6 +12,7 @@ mod frontmatter;
 mod identity;
 mod input;
 mod instructions;
+mod markdown;
 mod mcp;
 mod permissions;
 mod profile;

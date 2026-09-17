@@ -10,6 +10,7 @@ use std::ops::Range;
 
 use crate::app::{App, Entry};
 use crate::client::Usage;
+use crate::markdown;
 use crate::permissions::Mode;
 use crate::profile::{Method, Tokens};
 
@@ -245,6 +246,14 @@ fn usage_badge(usage: Usage) -> String {
 /// An entry's rows plus a blank separator; long tool output shows only its head
 /// unless `expanded`.
 fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>> {
+    if let Entry::Assistant(text) = entry {
+        let mut lines = markdown::render(text, width);
+        if lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(""));
+        return lines;
+    }
     let (prefix, text, style) = match entry {
         Entry::User(t) => ("› ", t, Style::new().fg(Color::Cyan).bold()),
         Entry::Assistant(t) => ("", t, Style::new()),
@@ -526,6 +535,36 @@ mod tests {
             row_text(&terminal, rows.end - 1)
         );
         assert!(row_text(&terminal, rows.start).starts_with("› hello"));
+    }
+
+    #[test]
+    fn assistant_markdown_rows_line_up_with_the_row_map() {
+        let mut app = App::detached();
+        let raw = "# Plan\n\n- first step that wraps around\n- second\n\n```sh\nls";
+        app.entries.push(Entry::Assistant(raw.to_string()));
+        app.tokens.insert(
+            1,
+            Tokens {
+                input: Some(5),
+                method: Method::Tokenized,
+                ..Tokens::default()
+            },
+        );
+        app.all_badges = true;
+        let mut terminal = Terminal::new(TestBackend::new(24, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
+        let screen = screen(&terminal);
+        let lines: Vec<&str> = screen.lines().collect();
+        let entry: Vec<&str> = lines[rows.start as usize..rows.end as usize]
+            .iter()
+            .map(|l| l.trim_end())
+            .collect();
+        assert_eq!(entry[0], "Plan");
+        assert!(entry.contains(&"  around"), "{entry:?}");
+        assert!(entry[entry.len() - 1].starts_with("  ls"), "{entry:?}");
+        assert!(entry[entry.len() - 1].ends_with("(tokenized)"), "{entry:?}");
+        assert!(matches!(&app.entries[1], Entry::Assistant(t) if t == raw));
     }
 
     fn left(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
