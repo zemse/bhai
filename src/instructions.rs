@@ -47,7 +47,7 @@ pub struct File {
 #[derive(Debug, Default)]
 pub struct Loaded {
     pub files: Vec<File>,
-    /// Imports refused for leaving their root, like `skipped import ~/.ssh/id_rsa (outside project)`.
+    /// Files and imports refused for leaving their root, like `skipped ./CLAUDE.md (outside project)`.
     pub skipped: Vec<String>,
 }
 
@@ -60,7 +60,7 @@ struct Candidate {
 }
 
 /// Every enabled instruction file that exists, with `@path` imports one level deep.
-/// Imports that resolve outside the importing file's root are skipped.
+/// Project files and imports that resolve outside their root are skipped.
 pub fn load(config: &Config, roots: &Roots) -> Loaded {
     let mut candidates = Vec::new();
     let global = |path: PathBuf| Candidate {
@@ -95,6 +95,13 @@ pub fn load(config: &Config, roots: &Roots) -> Loaded {
     let mut seen = HashSet::new();
     let mut loaded = Loaded::default();
     for candidate in candidates {
+        if !candidate.global && leaves_root(&candidate) {
+            let label = label(&candidate.path, roots);
+            loaded
+                .skipped
+                .push(format!("skipped {label} (outside project)"));
+            continue;
+        }
         let Some(file) = read(&candidate.path, roots, &mut seen) else {
             continue;
         };
@@ -129,6 +136,14 @@ pub fn load(config: &Config, roots: &Roots) -> Loaded {
         );
     }
     loaded
+}
+
+/// True when an existing candidate file really lives outside its root (a symlink out).
+fn leaves_root(candidate: &Candidate) -> bool {
+    match (candidate.path.canonicalize(), candidate.root.canonicalize()) {
+        (Ok(real), Ok(root)) => real.is_file() && !real.starts_with(root),
+        _ => false,
+    }
 }
 
 /// Where a candidate's imports may resolve to. A global file may also be a symlink into
@@ -416,6 +431,19 @@ mod tests {
         let loaded = load(&project_only(), &f.roots);
         assert_eq!(loaded.files.len(), 1);
         assert_eq!(loaded.skipped, ["skipped import link.md (outside project)"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_files_linked_out_of_the_project_are_skipped() {
+        let f = Fixture::new();
+        let outside = f.write("secret.txt", "secret");
+        std::os::unix::fs::symlink(&outside, f.dir.join("home/repo/sub/CLAUDE.md")).unwrap();
+        f.write("home/repo/AGENTS.md", "repo rules");
+        let loaded = load(&project_only(), &f.roots);
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(loaded.files[0].content, "repo rules");
+        assert_eq!(loaded.skipped, ["skipped ./CLAUDE.md (outside project)"]);
     }
 
     #[test]
