@@ -295,17 +295,20 @@ pub fn report(found: &Found) -> String {
     for workflow in &found.workflows {
         let _ = writeln!(
             out,
-            "{} ({}): {} step(s), budget {} tokens, {} at a time{}",
+            "{} ({}): {} step(s), budget {} tokens, {} at a time",
             workflow.name,
             workflow.source,
             workflow.steps.len(),
             workflow.budget_tokens,
-            workflow.max_parallel,
-            match workflow.description.is_empty() {
-                true => String::new(),
-                false => format!("\n  {}", workflow.description),
-            }
+            workflow.max_parallel
         );
+        // The description and the file's prose, indented under the definition.
+        for line in workflow.description.lines().chain(workflow.body.lines()) {
+            let _ = match line.is_empty() {
+                true => writeln!(out),
+                false => writeln!(out, "  {line}"),
+            };
+        }
     }
     for error in &found.errors {
         let _ = writeln!(out, "{error}");
@@ -878,6 +881,7 @@ needs: [a]\n    prompt: two\n---\n",
             "{report}"
         );
         assert!(report.contains("Look it over"), "{report}");
+        assert!(report.contains("  prose here"), "{report}");
         assert!(
             report.contains("skipped ./.bhai/workflows/bad.md"),
             "{report}"

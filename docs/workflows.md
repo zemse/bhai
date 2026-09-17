@@ -9,7 +9,8 @@ Only you start a workflow. It is not a model tool, so the agent cannot start one
 - `/workflows` in the TUI lists the definitions
 - `/workflow <name> [input]` runs one
 - `bhai --workflow <name> [input]` runs one without the TUI; add `--workflow-yes` to
-  answer the confirmation, or the plan is only printed
+  answer the confirmation, or the plan is only printed. Any other approval is rejected,
+  since nothing is there to answer it
 
 Before anything runs, the confirmation prompt shows the step count, the identity of each
 step and the budget. While it runs, child usage is summed: once the budget is spent no
