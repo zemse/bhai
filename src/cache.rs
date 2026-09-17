@@ -6,7 +6,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -31,6 +31,23 @@ pub struct CacheBreak {
     /// The first differing field, or `input[i]` for a history item.
     pub field: String,
     pub detail: String,
+}
+
+/// A request `--strict-cache` refused, carrying the break so the UI can still show it.
+#[derive(Debug)]
+pub struct Refused(pub CacheBreak);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cache break: {} ({})", self.0.field, self.0.detail)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The break behind a strict-mode refusal, if that is what `e` is.
+pub fn refused(e: &anyhow::Error) -> Option<&CacheBreak> {
+    e.downcast_ref::<Refused>().map(|r| &r.0)
 }
 
 /// A request body, serialized piecewise so the next one can be compared cheaply.
@@ -74,7 +91,7 @@ impl CacheGuard {
                 eprintln!("bhai: cache log: {e:#}");
             }
             if self.strict {
-                bail!("cache break: {} ({})", found.field, found.detail);
+                return Err(Refused(found.clone()).into());
             }
         }
         self.previous = Some(next);
@@ -375,6 +392,11 @@ mod tests {
         assert!(
             err.to_string().contains("cache break: instructions"),
             "{err}"
+        );
+        // The break survives the error, so the status bar can show it too.
+        assert_eq!(
+            refused(&err).map(|f| f.field.as_str()),
+            Some("instructions")
         );
         assert_eq!(guard.check(&body("i", tools(), &[])).unwrap(), None);
     }

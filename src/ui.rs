@@ -498,6 +498,7 @@ fn char_index(s: &str, chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::CacheBreak;
     use crate::permissions::Offers;
     use crate::session::{Approval, Event};
     use ratatui::Terminal;
@@ -919,6 +920,33 @@ mod tests {
             assert_eq!(status_cell(&terminal, "5h ").fg, colour);
             assert_eq!(status_cell(&terminal, "wk ").fg, Color::DarkGray);
         }
+    }
+
+    #[test]
+    fn status_bar_shows_a_cache_break_until_the_next_clean_call() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("cache break"));
+
+        app.on_event(Event::Cache(Some(CacheBreak {
+            field: "input[3]".to_string(),
+            detail: "shrank from 5 to 3 items".to_string(),
+        })));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let top = screen(&terminal);
+        assert!(
+            top.lines()
+                .next()
+                .unwrap()
+                .contains("cache break: input[3] "),
+            "{top}"
+        );
+        assert_eq!(status_cell(&terminal, "cache break").fg, Color::Red);
+
+        app.on_event(Event::Cache(None));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("cache break"));
     }
 
     #[test]

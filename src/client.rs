@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::auth::{self, Auth};
-use crate::cache::{CacheBreak, CacheGuard};
+use crate::cache::{self, CacheBreak, CacheGuard};
 use crate::limits::{self, RateLimits};
 
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -205,11 +205,21 @@ impl Client {
             input,
         );
         // Checked once per call, so retries of the same body are not compared.
-        let found = self
+        let checked = self
             .guard
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .check(&body)?;
+            .check(&body);
+        let found = match checked {
+            Ok(found) => found,
+            // Strict mode refuses the call, but the break still belongs in the status bar.
+            Err(e) => {
+                if let Some(found) = cache::refused(&e) {
+                    on_delta(Delta::Cache(Some(found.clone())));
+                }
+                return Err(e);
+            }
+        };
         on_delta(Delta::Cache(found));
 
         let mut backoff = Duration::from_millis(500);
