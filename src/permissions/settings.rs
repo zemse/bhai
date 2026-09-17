@@ -252,7 +252,7 @@ mod tests {
             &home.join(".claude/settings.json"),
             json!({"permissions": {
                 "allow": ["Bash(git log:*)", "WebFetch(domain:x.com)", "mcp__github__get", "MultiEdit(src/**)"],
-                "deny": ["Read(*.pem)", "Bash(npm run *:*)"],
+                "deny": ["Read(*.pem)", "Bash(npm run test?)"],
             }}),
         );
         write(

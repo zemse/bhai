@@ -799,6 +799,26 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_rules_match_each_command_of_a_chain() {
+        let rule = "Bash(git -C * push origin main)";
+        let deny_policy = policy(Mode::Bypass, &["Bash(echo:*)"], &[rule], &[]);
+        let deny = Decision::Deny(format!("deny rule {rule}"));
+        for command in [
+            "echo hi && git -C x push origin main",
+            "echo hi; /usr/bin/GIT -C x push origin main",
+            "timeout 5 git -C x push origin main | cat",
+        ] {
+            assert_eq!(bash(&deny_policy, command), deny, "{command}");
+        }
+        let allow = policy(Mode::Auto, &["Bash(git -C * status)"], &[], &[]);
+        assert_eq!(
+            bash(&allow, "git -C x status"),
+            allowed("rule Bash(git -C * status)")
+        );
+        assert_eq!(bash(&allow, "git -C x status && rm y"), Decision::Ask);
+    }
+
+    #[test]
     fn file_decisions() {
         let allow = ["Edit(src/**)", "Write(//tmp/**)", "Write(.git/**)"];
         let deny = ["Edit(secrets/**)", "Read(*.pem)"];

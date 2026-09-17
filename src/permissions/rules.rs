@@ -29,6 +29,8 @@ enum Pattern {
         words: Vec<String>,
         prefix: bool,
     },
+    /// Words joined by spaces, where each `*` matches any text.
+    Glob(String),
     Path(String),
 }
 
@@ -128,6 +130,19 @@ impl Rule {
                         }
                     })
             }
+            Pattern::Glob(want) => {
+                let (want, text) = match fold {
+                    true => (
+                        want.to_ascii_lowercase(),
+                        words.join(" ").to_ascii_lowercase(),
+                    ),
+                    false => (want.clone(), words.join(" ")),
+                };
+                wildcard(&want, &text, false)
+                    || want
+                        .strip_suffix(" *")
+                        .is_some_and(|bare| wildcard(bare, &text, false))
+            }
             Pattern::Path(_) => false,
         }
     }
@@ -151,7 +166,7 @@ impl Rule {
                 let path = fold_all(components(path));
                 glob(&pattern, &path)
             }
-            Pattern::Command { .. } => false,
+            Pattern::Command { .. } | Pattern::Glob(_) => false,
         }
     }
 }
@@ -261,7 +276,8 @@ fn path_pattern(parts: &[String], base: Base) -> Option<String> {
     })
 }
 
-/// `git log:*` and `npm run test *` are prefixes; anything else is an exact word list.
+/// `git log:*` and `npm run test *` are prefixes, `git -C * push` a glob, and anything
+/// else an exact word list.
 fn command_pattern(content: &str) -> Result<Pattern, &'static str> {
     let (rest, prefix) = match content.strip_suffix(":*") {
         Some(rest) => (rest, true),
@@ -270,16 +286,33 @@ fn command_pattern(content: &str) -> Result<Pattern, &'static str> {
             None => (content, false),
         },
     };
+    if rest.contains('*') {
+        let words = command_words(rest, false)?;
+        let glob = words.join(" ");
+        return Ok(Pattern::Glob(match prefix {
+            true => format!("{glob} *"),
+            false => glob,
+        }));
+    }
+    let words = command_words(rest, prefix)?;
+    if words.is_empty() {
+        return Ok(Pattern::Any);
+    }
+    Ok(Pattern::Command { words, prefix })
+}
+
+/// The words of the one simple command in `rest`, empty only when `empty_ok`.
+fn command_words(rest: &str, empty_ok: bool) -> Result<Vec<String>, &'static str> {
     let mut commands = bash::parse(rest).ok_or("the command does not parse")?;
     let words = match commands.len() {
-        0 if prefix => return Ok(Pattern::Any),
+        0 if empty_ok => Vec::new(),
         1 => commands.remove(0).words,
         _ => return Err("expected one simple command"),
     };
-    if words.iter().any(|w| w.contains(['*', '?', '['])) {
-        return Err("only a trailing `:*` or ` *` wildcard is supported");
+    if words.iter().any(|w| w.contains(['?', '['])) {
+        return Err("only the `*` wildcard is supported");
     }
-    Ok(Pattern::Command { words, prefix })
+    Ok(words)
 }
 
 /// A path pattern as absolute components: `//x` is absolute, `~/x` under home, and the
@@ -335,16 +368,17 @@ fn glob(pattern: &[String], path: &[String]) -> bool {
         }
         Some((first, rest)) => path
             .split_first()
-            .is_some_and(|(part, tail)| wildcard(first, part) && glob(rest, tail)),
+            .is_some_and(|(part, tail)| wildcard(first, part, true) && glob(rest, tail)),
     }
 }
 
-fn wildcard(pattern: &str, text: &str) -> bool {
+/// `*` matches any text, and `?` one character when `question` is set.
+fn wildcard(pattern: &str, text: &str, question: bool) -> bool {
     let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
     let (mut pi, mut ti) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+        if pi < p.len() && ((question && p[pi] == '?') || p[pi] == t[ti]) {
             pi += 1;
             ti += 1;
         } else if pi < p.len() && p[pi] == '*' {
@@ -423,7 +457,7 @@ mod tests {
             "",
             "Bash(ls; rm x)",
             "Bash(ls $(x))",
-            "Bash(git log*)",
+            "Bash(git log?)",
             "Skill(x)",
             "Ba sh",
             "mcp__",
@@ -473,6 +507,32 @@ mod tests {
             ("Bash(git status)", "git status", true),
             ("Bash(git status)", "git status -s", false),
             ("Bash('a b' c)", "a b c", false),
+            (
+                "Bash(git -C * push origin main)",
+                "git -C /x push origin main",
+                true,
+            ),
+            (
+                "Bash(git -C * push origin main)",
+                "git -C /x push origin dev",
+                false,
+            ),
+            (
+                "Bash(git -C * push origin main)",
+                "git -C a b push origin main",
+                true,
+            ),
+            ("Bash(mkdir -p .research/*)", "mkdir -p .research/a/b", true),
+            ("Bash(mkdir -p .research/*)", "mkdir -p .other/a", false),
+            ("Bash(ls *)", "ls -la", true),
+            ("Bash(ls *)", "ls", true),
+            ("Bash(ls *)", "lsof", false),
+            ("Bash(ls*)", "lsof", true),
+            ("Bash(git * push *)", "git -C x push", true),
+            ("Bash(git * push *)", "git -C x pushy", false),
+            ("Bash(git -C * log:*)", "git -C x log -p", true),
+            ("Bash(git -C * log:*)", "git -C x logx", false),
+            ("Bash(* --version)", "cargo --version", true),
         ];
         for (rule, command, want) in cases {
             let rule = Rule::parse(rule).unwrap();
