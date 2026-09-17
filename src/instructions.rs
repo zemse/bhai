@@ -43,47 +43,131 @@ pub struct File {
     pub content: String,
 }
 
+/// What `load` found.
+#[derive(Debug, Default)]
+pub struct Loaded {
+    pub files: Vec<File>,
+    /// Imports refused for leaving their root, like `skipped import ~/.ssh/id_rsa (outside project)`.
+    pub skipped: Vec<String>,
+}
+
+/// A candidate file and the directory its imports must stay under.
+struct Candidate {
+    path: PathBuf,
+    root: PathBuf,
+    /// Global files live in their own config dir; project files in the project.
+    global: bool,
+}
+
 /// Every enabled instruction file that exists, with `@path` imports one level deep.
-pub fn load(config: &Config, roots: &Roots) -> Vec<File> {
+/// Imports that resolve outside the importing file's root are skipped.
+pub fn load(config: &Config, roots: &Roots) -> Loaded {
     let mut candidates = Vec::new();
+    let global = |path: PathBuf| Candidate {
+        root: path.parent().unwrap_or(&path).to_path_buf(),
+        path,
+        global: true,
+    };
     if config.load_global_claude
         && let Some(home) = &roots.home
     {
-        candidates.push(home.join(".claude/CLAUDE.md"));
+        candidates.push(global(home.join(".claude/CLAUDE.md")));
     }
     if config.load_global_agents {
         if let Some(home) = &roots.home {
-            candidates.push(home.join(".agents/AGENTS.md"));
+            candidates.push(global(home.join(".agents/AGENTS.md")));
         }
         if let Some(codex) = &roots.codex_home {
-            candidates.push(codex.join("AGENTS.md"));
+            candidates.push(global(codex.join("AGENTS.md")));
         }
     }
     if config.load_project_instructions {
+        let root = project_root(&roots.cwd);
         for dir in project_dirs(&roots.cwd) {
-            candidates.extend(PROJECT_FILES.iter().map(|name| dir.join(name)));
+            candidates.extend(PROJECT_FILES.iter().map(|name| Candidate {
+                path: dir.join(name),
+                root: root.to_path_buf(),
+                global: false,
+            }));
         }
     }
 
     let mut seen = HashSet::new();
-    let mut files = Vec::new();
-    for path in candidates {
-        let Some(file) = read(&path, roots, &mut seen) else {
+    let mut loaded = Loaded::default();
+    for candidate in candidates {
+        let Some(file) = read(&candidate.path, roots, &mut seen) else {
             continue;
         };
-        let imports: Vec<PathBuf> = file
-            .content
-            .lines()
-            .filter_map(|line| import(line, &path, roots.home.as_deref()))
-            .collect();
-        files.push(file);
-        files.extend(
+        let allowed = allowed_roots(&candidate);
+        let reason = if candidate.global {
+            format!("outside {}", label(&candidate.root, roots))
+        } else {
+            "outside project".to_string()
+        };
+        let mut imports = Vec::new();
+        for line in unfenced(&file.content) {
+            let Some(target) = import(line, &candidate.path, roots.home.as_deref()) else {
+                continue;
+            };
+            let Ok(real) = target.canonicalize() else {
+                continue;
+            };
+            if allowed.iter().any(|root| real.starts_with(root)) {
+                imports.push(real);
+            } else {
+                let written = line.trim().trim_start_matches('@');
+                loaded
+                    .skipped
+                    .push(format!("skipped import {written} ({reason})"));
+            }
+        }
+        loaded.files.push(file);
+        loaded.files.extend(
             imports
                 .iter()
                 .filter_map(|import| read(import, roots, &mut seen)),
         );
     }
-    files
+    loaded
+}
+
+/// Where a candidate's imports may resolve to. A global file may also be a symlink into
+/// a dotfiles checkout, so the directory it really lives in counts too.
+fn allowed_roots(candidate: &Candidate) -> Vec<PathBuf> {
+    let mut allowed: Vec<PathBuf> = candidate.root.canonicalize().into_iter().collect();
+    if candidate.global
+        && let Some(dir) = candidate
+            .path
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        allowed.push(dir);
+    }
+    allowed
+}
+
+/// The lines of `content` outside fenced code blocks (``` or ~~~).
+fn unfenced(content: &str) -> impl Iterator<Item = &str> {
+    let mut fence: Option<char> = None;
+    content.lines().filter(move |line| {
+        let trimmed = line.trim_start();
+        let marker = ['`', '~']
+            .into_iter()
+            .find(|c| trimmed.starts_with(&c.to_string().repeat(3)));
+        match (fence, marker) {
+            (None, Some(c)) => {
+                fence = Some(c);
+                false
+            }
+            (Some(open), Some(c)) if open == c => {
+                fence = None;
+                false
+            }
+            (None, None) => true,
+            (Some(_), _) => false,
+        }
+    })
 }
 
 /// The git repo root, or `cwd` outside a repo.
@@ -186,6 +270,7 @@ mod tests {
 
         fn labels(&self, config: &Config) -> Vec<String> {
             load(config, &self.roots)
+                .files
                 .into_iter()
                 .map(|f| f.label)
                 .collect()
@@ -214,7 +299,7 @@ mod tests {
         let f = Fixture::new();
         write_all(&f);
         f.write("home/CLAUDE.md", "above the repo root, ignored");
-        let files = load(&Config::default(), &f.roots);
+        let files = load(&Config::default(), &f.roots).files;
         let labels: Vec<_> = files.iter().map(|f| f.label.as_str()).collect();
         let codex = f.dir.join("codex/AGENTS.md").display().to_string();
         assert_eq!(
@@ -274,26 +359,95 @@ mod tests {
         assert_eq!(f.labels(&project), ["./CLAUDE.md"]);
     }
 
+    fn project_only() -> Config {
+        Config {
+            load_global_claude: false,
+            load_global_agents: false,
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn imports_resolve_one_level_deep() {
         let f = Fixture::new();
         f.write(
             "home/repo/sub/CLAUDE.md",
-            "intro\n@docs/style.md\n  @~/notes.md  \n@missing.md\nsee @inline.md here\n",
+            "intro\n@docs/style.md\n  @../top.md  \n@missing.md\nsee @inline.md here\n",
         );
         f.write("home/repo/sub/docs/style.md", "style\n@deeper.md\n");
         f.write("home/repo/sub/docs/deeper.md", "too deep");
-        f.write("home/notes.md", "notes");
+        f.write("home/repo/top.md", "top");
         f.write("home/repo/sub/inline.md", "not a whole-line import");
-        let project = Config {
-            load_global_claude: false,
+        let loaded = load(&project_only(), &f.roots);
+        let labels: Vec<_> = loaded.files.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, ["./CLAUDE.md", "./docs/style.md", "~/repo/top.md"]);
+        assert!(loaded.skipped.is_empty());
+    }
+
+    #[test]
+    fn project_imports_cannot_leave_the_project() {
+        let f = Fixture::new();
+        let outside = f.write("secret.txt", "secret");
+        f.write("home/.ssh/id_rsa", "key");
+        f.write("home/.env", "env");
+        f.write(
+            "home/repo/sub/CLAUDE.md",
+            &format!("@~/.ssh/id_rsa\n@../../.env\n@{}\n", outside.display()),
+        );
+        let loaded = load(&project_only(), &f.roots);
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(
+            loaded.skipped,
+            [
+                "skipped import ~/.ssh/id_rsa (outside project)".to_string(),
+                "skipped import ../../.env (outside project)".to_string(),
+                format!("skipped import {} (outside project)", outside.display()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_out_of_the_project_are_skipped() {
+        let f = Fixture::new();
+        let outside = f.write("secret.txt", "secret");
+        std::os::unix::fs::symlink(&outside, f.dir.join("home/repo/sub/link.md")).unwrap();
+        f.write("home/repo/sub/CLAUDE.md", "@link.md\n");
+        let loaded = load(&project_only(), &f.roots);
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(loaded.skipped, ["skipped import link.md (outside project)"]);
+    }
+
+    #[test]
+    fn global_imports_stay_in_their_config_dir() {
+        let f = Fixture::new();
+        f.write("home/.claude/CLAUDE.md", "@guides/rust.md\n@~/notes.md\n");
+        f.write("home/.claude/guides/rust.md", "rust");
+        f.write("home/notes.md", "notes");
+        let only_claude = Config {
             load_global_agents: false,
+            load_project_instructions: false,
             ..Config::default()
         };
+        let loaded = load(&only_claude, &f.roots);
+        let labels: Vec<_> = loaded.files.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, ["~/.claude/CLAUDE.md", "~/.claude/guides/rust.md"]);
         assert_eq!(
-            f.labels(&project),
-            ["./CLAUDE.md", "./docs/style.md", "~/notes.md"]
+            loaded.skipped,
+            ["skipped import ~/notes.md (outside ~/.claude)"]
         );
+    }
+
+    #[test]
+    fn imports_inside_code_fences_are_ignored() {
+        let f = Fixture::new();
+        f.write("home/repo/sub/MainActor", "not an import");
+        f.write("home/repo/sub/x.md", "x");
+        f.write(
+            "home/repo/sub/CLAUDE.md",
+            "```swift\n@MainActor\n~~~\n@x.md\n```\n~~~\n@MainActor\n~~~\n@x.md\n",
+        );
+        assert_eq!(f.labels(&project_only()), ["./CLAUDE.md", "./x.md"]);
     }
 
     #[cfg(unix)]
@@ -322,7 +476,8 @@ mod tests {
             codex_home: None,
             cwd: std::env::temp_dir().join(format!("bhai-none-{}", uuid::Uuid::new_v4())),
         };
-        assert!(load(&Config::default(), &roots).is_empty());
+        let loaded = load(&Config::default(), &roots);
+        assert!(loaded.files.is_empty() && loaded.skipped.is_empty());
     }
 
     #[test]

@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         }
     };
     let prompt = load_prompt(args.flags)?;
-    let loaded = prompt.loaded();
+    let notices = prompt.notices();
     let skills = prompt.skills.clone();
 
     // Bind before taking over the terminal so a busy port is a plain error.
@@ -85,8 +85,8 @@ async fn main() -> Result<()> {
     let (session, events) = start(model, prompt, usage_log);
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
-        if let Some(loaded) = loaded {
-            eprintln!("bhai: {loaded}");
+        for notice in &notices {
+            eprintln!("bhai: {notice}");
         }
         eprintln!("bhai: debug server on http://{}", listener.local_addr()?);
         return server::serve(listener, session).await;
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     // Mouse capture is what turns the wheel into scroll events. It also takes over
     // click-drag, so terminals need shift (or option) held to select text while bhai runs.
     let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(terminal, session, events, listener, loaded, skills).await;
+    let result = run(terminal, session, events, listener, notices, skills).await;
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -125,10 +125,10 @@ fn load_prompt(flags: Flags) -> Result<SystemPrompt> {
     } else {
         Vec::new()
     };
-    Ok(prompt::system_prompt(
-        &instructions::load(&config, &roots),
-        skills,
-    ))
+    let loaded = instructions::load(&config, &roots);
+    let mut prompt = prompt::system_prompt(&loaded.files, skills);
+    prompt.skipped = loaded.skipped;
+    Ok(prompt)
 }
 
 fn parse_args(args: &[String]) -> Result<Args> {
@@ -229,7 +229,7 @@ async fn run(
     session: Arc<Session>,
     mut events: broadcast::Receiver<session::Event>,
     listener: Option<TcpListener>,
-    loaded: Option<String>,
+    notices: Vec<String>,
     skills: Vec<skills::Skill>,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
@@ -270,9 +270,8 @@ async fn run(
 
     let mut app = App::new(Arc::clone(&session));
     app.skills = skills;
-    if let Some(loaded) = loaded {
-        app.entries.push(app::Entry::Info(loaded));
-    }
+    app.entries
+        .extend(notices.into_iter().map(app::Entry::Info));
     if let Some(listener) = listener {
         let addr = listener.local_addr()?;
         app.entries

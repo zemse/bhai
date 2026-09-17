@@ -17,6 +17,8 @@ pub struct SystemPrompt {
     pub skills: Vec<Skill>,
     /// Bytes the skills listing adds to the prompt.
     pub skills_bytes: usize,
+    /// Imports refused while loading the instruction files.
+    pub skipped: Vec<String>,
 }
 
 /// One appended instruction file.
@@ -28,17 +30,33 @@ pub struct Source {
 }
 
 impl SystemPrompt {
-    /// The startup line, like `loaded: ~/.claude/CLAUDE.md (3.1k), ./CLAUDE.md (0.4k)`.
-    pub fn loaded(&self) -> Option<String> {
-        if self.sources.is_empty() {
-            return None;
-        }
-        let list: Vec<String> = self
+    /// The startup lines: `loaded: ~/.claude/CLAUDE.md (~0.8k tok), skills (~52 tok)`,
+    /// then one per skipped import.
+    pub fn notices(&self) -> Vec<String> {
+        let mut list: Vec<String> = self
             .sources
             .iter()
-            .map(|s| format!("{} ({:.1}k)", s.label, s.bytes as f64 / 1000.0))
+            .map(|s| format!("{} ({})", s.label, tokens(s.bytes)))
             .collect();
-        Some(format!("loaded: {}", list.join(", ")))
+        if self.skills_bytes > 0 {
+            list.push(format!("skills ({})", tokens(self.skills_bytes)));
+        }
+        let mut lines = Vec::new();
+        if !list.is_empty() {
+            lines.push(format!("loaded: {}", list.join(", ")));
+        }
+        lines.extend(self.skipped.iter().cloned());
+        lines
+    }
+}
+
+/// Approximate tokens (bytes/4), like `~52 tok` or `~2.1k tok`.
+fn tokens(bytes: usize) -> String {
+    let tokens = bytes.div_ceil(4);
+    if tokens < 1000 {
+        format!("~{tokens} tok")
+    } else {
+        format!("~{:.1}k tok", tokens as f64 / 1000.0)
     }
 }
 
@@ -73,6 +91,7 @@ pub fn system_prompt(files: &[File], skills: Vec<Skill>) -> SystemPrompt {
         text,
         sources,
         skills,
+        skipped: Vec::new(),
     }
 }
 
@@ -129,11 +148,11 @@ mod tests {
         let bare = system_prompt(&[], Vec::new());
         assert_eq!(bare.text, base());
         assert!(bare.sources.is_empty());
-        assert_eq!(bare.loaded(), None);
+        assert!(bare.notices().is_empty());
 
         let files = [
             file("~/.claude/CLAUDE.md", "be terse\n"),
-            file("./CLAUDE.md", &"x".repeat(420)),
+            file("./CLAUDE.md", &"x".repeat(4200)),
         ];
         let prompt = system_prompt(&files, Vec::new());
         assert!(prompt.text.starts_with(&bare.text));
@@ -142,12 +161,12 @@ mod tests {
                 .text
                 .contains("# Instructions from ~/.claude/CLAUDE.md\n\nbe terse\n\n#")
         );
-        assert!(prompt.text.ends_with(&"x".repeat(420)));
+        assert!(prompt.text.ends_with(&"x".repeat(4200)));
         let added: usize = prompt.sources.iter().map(|s| s.bytes).sum();
         assert_eq!(bare.text.len() + added, prompt.text.len());
         assert_eq!(
-            prompt.loaded().unwrap(),
-            "loaded: ~/.claude/CLAUDE.md (0.1k), ./CLAUDE.md (0.5k)"
+            prompt.notices(),
+            ["loaded: ~/.claude/CLAUDE.md (~13 tok), ./CLAUDE.md (~1.1k tok)"]
         );
         assert_eq!(prompt.skills_bytes, 0);
     }
@@ -169,5 +188,23 @@ mod tests {
         ));
         assert_eq!(without.text.len() + prompt.skills_bytes, prompt.text.len());
         assert_eq!(prompt.skills.len(), 1);
+        assert_eq!(
+            prompt.notices()[0],
+            format!(
+                "loaded: ./CLAUDE.md ({}), skills (~{} tok)",
+                tokens(without.sources[0].bytes),
+                prompt.skills_bytes.div_ceil(4)
+            )
+        );
+    }
+
+    #[test]
+    fn skipped_imports_follow_the_loaded_line() {
+        let mut prompt = system_prompt(&[], Vec::new());
+        prompt.skipped = vec!["skipped import ~/.ssh/id_rsa (outside project)".to_string()];
+        assert_eq!(
+            prompt.notices(),
+            ["skipped import ~/.ssh/id_rsa (outside project)"]
+        );
     }
 }
