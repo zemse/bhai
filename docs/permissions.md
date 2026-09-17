@@ -31,7 +31,8 @@ does not understand gets no rule match and prompts.
 Rules come from, lowest precedence first:
 
 - `[permissions]` in `~/.config/bhai/config.toml`
-- Claude Code's `~/.claude/settings.json`, `<project>/.claude/settings.json` and
+- Claude Code's `~/.claude/settings.json`, `<project>/.claude/settings.json` (checked
+  into the repo, so its `allow` rules are ignored) and
   `<project>/.claude/settings.local.json`, unless `import_claude_permissions = false`
 - `<project>/.bhai/settings.local.json`, where approvals bhai remembers are written
 - `[permissions]` in `<project>/.bhai/config.toml`, whose `allow` list and

@@ -41,7 +41,8 @@ shows `cache miss N%` in the status bar.
 - `--cache-check` is a non-interactive check: it builds the same prefix a session would,
   pads it past the backend's cache minimum, sends a few calls on it and reports whether
   each was served from cache. It exits non-zero if not
-- `--profile` logs the response headers of every call to `.bhai/debug/headers.jsonl`
+- `--profile` logs every call's usage to `.bhai/debug/usage.jsonl` and its response
+  headers to `headers.jsonl`
 
 The cache key is the session id, and `<session>-<identity>` for children, so children of
 one identity share a prefix with each other and not with the parent.

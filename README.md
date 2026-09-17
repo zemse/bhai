@@ -49,7 +49,7 @@ bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--as <identity>
      [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]
 ```
 
-`identities` and `sessions` print what is available and exit. `--probe` does one non-interactive model call to check auth and the wire format. `--profile` logs the response headers of every call to `.bhai/debug/headers.jsonl`. `--trust` trusts the repo's allow rules at startup. `--no-global`, `--no-project` and `--bare` drop instruction files and skills, `--bare` all of them.
+`identities` and `sessions` print what is available and exit. `--probe` does one non-interactive model call to check auth and the wire format. `--profile` logs every call's usage and response headers under `.bhai/debug/`. `--trust` trusts the repo's allow rules at startup. `--no-global`, `--no-project` and `--bare` drop instruction files and skills, `--bare` all of them.
 
 ## not built yet
 

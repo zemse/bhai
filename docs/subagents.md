@@ -6,8 +6,8 @@ call takes an `identity` (`general` by default), a short `description` and the c
 `prompt`.
 
 A child has no `agent` tool of its own, so the tree is one level deep, and at most three
-children run at once. Each one writes its own transcript to
-`.bhai/sessions/child-<id>.jsonl`.
+children run at once. Each one writes its own transcript beside the parent's, in
+`.bhai/sessions/<session id>/child-<id>.jsonl`.
 
 ## Permissions and tokens
 
