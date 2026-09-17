@@ -17,6 +17,8 @@ use ratatui::widgets::{Block, Paragraph};
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// Untracked files larger than this are not shown.
 const MAX_UNTRACKED_BYTES: u64 = 1 << 20;
+/// Tabs are expanded, since the terminal buffer drops them.
+const TAB: &str = "    ";
 /// Width of the file list column.
 const LIST_WIDTH: u16 = 36;
 
@@ -228,7 +230,7 @@ impl DiffView {
             .iter()
             .skip(self.scroll)
             .take(diff_area.height as usize)
-            .map(|(kind, text)| Line::styled(text.clone(), style(*kind)))
+            .map(|(kind, text)| Line::styled(text.replace('\t', TAB), style(*kind)))
             .collect();
         let block = Block::bordered()
             .title(format!(" {} ", path.unwrap_or("")))
@@ -504,7 +506,7 @@ mod tests {
             message: None,
             files: vec![first, second],
             selected: 0,
-            lines: classify("@@ -1 +1 @@\n-old\n+new\n"),
+            lines: classify("@@ -1 +1 @@\n-old\n+\tnew\n"),
             scroll: 0,
             focus: Focus::Files,
             list_area: Rect::default(),
@@ -531,6 +533,7 @@ mod tests {
         assert!(row(3).contains("-old"), "{:?}", row(3));
         // The diff column starts at 30, its text one cell in.
         assert_eq!(buffer[(31, 4)].symbol(), "+");
+        assert_eq!(buffer[(36, 4)].symbol(), "n");
         assert_eq!(buffer[(31, 4)].fg, Color::Green);
         assert_eq!(buffer[(31, 3)].fg, Color::Red);
         assert_eq!(buffer[(31, 2)].fg, Color::Cyan);
