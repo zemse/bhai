@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{self, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -37,7 +38,26 @@ fn router(session: Arc<Session>) -> Router {
         .route("/reject", post(reject))
         .route("/interrupt", post(interrupt))
         .route("/context", get(context))
+        .layer(middleware::from_fn(local_only))
         .with_state(session)
+}
+
+/// Refuse browsers: any web page could otherwise POST `/approve` to localhost, and a
+/// rebound DNS name could drive the whole session.
+async fn local_only(request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    if headers.contains_key(header::ORIGIN) || !matches!(name, "127.0.0.1" | "localhost") {
+        return error(
+            StatusCode::FORBIDDEN,
+            "only local, non-browser clients are allowed",
+        );
+    }
+    next.run(request).await
 }
 
 #[derive(Deserialize)]
@@ -256,6 +276,26 @@ mod tests {
         let (base, _) = start().await;
         let response = reqwest::get(format!("{base}/context")).await.unwrap();
         assert_eq!(response.status().as_u16(), 501);
+    }
+
+    #[tokio::test]
+    async fn browser_and_foreign_host_requests_are_refused() {
+        let (base, _) = start().await;
+        let http = reqwest::Client::new();
+        let from_page = http
+            .post(format!("{base}/approve"))
+            .header("origin", "https://example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(from_page.status().as_u16(), 403);
+        let rebound = http
+            .get(format!("{base}/state"))
+            .header("host", "evil.example:7878")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebound.status().as_u16(), 403);
     }
 
     #[tokio::test]
