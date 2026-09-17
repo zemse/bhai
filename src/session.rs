@@ -11,8 +11,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::agent::{AgentEvent, Control};
 use crate::cache::{CacheBreak, Hit};
 use crate::client::Usage;
+use crate::entries::Entries;
 use crate::permissions::{Answer, Mode, Offers, Policy, Remember};
-use crate::profile::{CallTokens, Profile};
+use crate::profile::{CallTokens, EntryTokens, Profile};
 
 /// Events a slow consumer can fall behind by before it starts missing them.
 const EVENT_BUFFER: usize = 4096;
@@ -95,6 +96,8 @@ pub struct State {
     /// The most recent prompt cache break, if there has been one.
     pub last_cache_break: Option<CacheBreak>,
     pub pending: Option<Approval>,
+    /// Transcript entries with token attribution, as the hover badges show them.
+    pub entries: Vec<EntryTokens>,
 }
 
 /// Why a message was not submitted.
@@ -130,6 +133,7 @@ pub struct Session {
     identity: String,
     events: broadcast::Sender<Event>,
     inner: Mutex<Inner>,
+    entries: Mutex<Entries>,
     tx_user: mpsc::Sender<String>,
     tx_control: mpsc::Sender<Control>,
     cancel: Arc<AtomicBool>,
@@ -150,6 +154,7 @@ impl Session {
             identity,
             events: broadcast::channel(EVENT_BUFFER).0,
             inner: Mutex::default(),
+            entries: Mutex::default(),
             tx_user,
             tx_control,
             cancel,
@@ -177,6 +182,7 @@ impl Session {
             children: inner.children,
             last_cache_break: inner.last_cache_break.clone(),
             pending: inner.pending.as_ref().map(|(approval, _)| approval.clone()),
+            entries: self.entries().attributed(),
         }
     }
 
@@ -348,8 +354,14 @@ impl Session {
     }
 
     pub fn publish(&self, event: Event) {
+        self.entries().apply(&event);
         // No subscribers is fine; the event is simply dropped.
         let _ = self.events.send(event);
+    }
+
+    /// The transcript. Never lock the session state while holding it.
+    pub fn entries(&self) -> MutexGuard<'_, Entries> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {

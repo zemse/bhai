@@ -9,6 +9,7 @@ mod client;
 mod compact;
 mod config;
 mod diff;
+mod entries;
 mod frontmatter;
 mod identity;
 mod input;
@@ -201,6 +202,7 @@ async fn main() -> Result<()> {
     let (session, events) = start(client, prompt, policy, usage_log, delegation, saved, limits);
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
+        session.entries().restore(&history);
         for notice in &notices {
             eprintln!("bhai: {notice}");
         }
@@ -711,12 +713,16 @@ async fn run(
     app.skills = skills;
     app.mcp = hub;
     app.history = prompts;
-    app.restore(history);
-    app.entries
-        .extend(notices.into_iter().map(app::Entry::Info));
+    {
+        let mut entries = app.entries();
+        entries.restore(history);
+        entries
+            .list
+            .extend(notices.into_iter().map(app::Entry::Info));
+    }
     if let Some(listener) = listener {
         let addr = listener.local_addr()?;
-        app.entries
+        app.entries()
             .push(app::Entry::Info(format!("debug server on http://{addr}")));
         tokio::spawn(server::serve(listener, session));
     }

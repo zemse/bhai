@@ -362,6 +362,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_lists_the_attributed_entries() {
+        use crate::agent::fake::{Fake, say};
+
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx_agent, rx_agent) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let policy = Arc::new(Policy::default());
+        let session = Session::new(
+            "fake".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            Arc::clone(&cancel),
+            Arc::clone(&policy),
+        );
+        tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
+        tokio::spawn(crate::agent::run_with(
+            Arc::new(Fake::new(vec![vec![say("one")], vec![say("two")]])),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            policy,
+            rx_user,
+            rx_control,
+            tx_agent,
+            cancel,
+            None,
+            None,
+            None,
+            crate::compact::Limits::default(),
+        ));
+        let listener = bind(0).await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(serve(listener, session));
+        let http = reqwest::Client::new();
+
+        for text in ["first", "second"] {
+            assert_eq!(
+                post(&http, format!("{base}/prompt"), json!({"text": text})).await,
+                StatusCode::OK
+            );
+            wait_state(&http, &base, |s| s["working"] == false).await;
+        }
+        let state = get_json(&http, format!("{base}/state")).await;
+        let entries = state["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        let first = &entries[0];
+        assert_eq!(
+            (&first["index"], &first["kind"], &first["label"]),
+            (&json!(0), &json!("user"), &json!("first"))
+        );
+        assert_eq!(first["method"], "estimated");
+        assert!(first["input"].as_u64().unwrap() > 0);
+        // The second call sent the first message again.
+        assert_eq!(first["resends"], 1);
+        assert_eq!(entries[1]["label"], "second");
+        assert_eq!(entries[1]["resends"], 0);
+    }
+
+    #[tokio::test]
     async fn context_returns_the_breakdown() {
         let (base, _) = start().await;
         let context = get_json(&reqwest::Client::new(), format!("{base}/context")).await;

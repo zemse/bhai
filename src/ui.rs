@@ -140,13 +140,15 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     let width = text_area.width.max(10) as usize;
     let mut lines: Vec<Line> = Vec::new();
-    let mut spans = Vec::with_capacity(app.entries.len());
-    for (index, entry) in app.entries.iter().enumerate() {
+    let entries = app.entries();
+    let mut spans = Vec::with_capacity(entries.list.len());
+    for (index, entry) in entries.list.iter().enumerate() {
         let start = lines.len();
         lines.extend(entry_lines(entry, width, app.expanded.contains(&index)));
         // The blank separator line belongs to no entry.
         spans.push((start..lines.len() - 1, index));
     }
+    drop(entries);
 
     let height = area.height as usize;
     app.page = height.saturating_sub(1).max(1);
@@ -196,9 +198,10 @@ fn row_map(spans: &[(Range<usize>, usize)], scroll: usize, area: Rect) -> Vec<(R
 /// Badges of hovered, pinned or (with ctrl+t) all entries, right-aligned on each
 /// entry's last visible row.
 fn render_badges(frame: &mut Frame, area: Rect, app: &App) {
+    let entries = app.entries();
     for (rows, entry) in &app.rows {
         let shown = app.all_badges || app.hover == Some(*entry) || app.pinned.contains(entry);
-        let Some(text) = app.tokens.get(entry).filter(|_| shown).and_then(badge) else {
+        let Some(text) = entries.tokens.get(entry).filter(|_| shown).and_then(badge) else {
             continue;
         };
         let line = Line::from(Span::styled(
@@ -509,9 +512,9 @@ mod tests {
     #[test]
     fn hovering_draws_the_badge_on_the_entry_last_row() {
         let mut app = App::detached();
-        app.entries
+        app.entries()
             .push(Entry::User("hello there, a message that wraps".to_string()));
-        app.tokens.insert(
+        app.entries().tokens.insert(
             1,
             Tokens {
                 input: Some(5),
@@ -557,8 +560,8 @@ mod tests {
     fn assistant_markdown_rows_line_up_with_the_row_map() {
         let mut app = App::detached();
         let raw = "# Plan\n\n- first step that wraps around\n- second\n\n```sh\nls";
-        app.entries.push(Entry::Assistant(raw.to_string()));
-        app.tokens.insert(
+        app.entries().push(Entry::Assistant(raw.to_string()));
+        app.entries().tokens.insert(
             1,
             Tokens {
                 input: Some(5),
@@ -580,7 +583,7 @@ mod tests {
         assert!(entry.contains(&"  around"), "{entry:?}");
         assert!(entry[entry.len() - 1].starts_with("  ls"), "{entry:?}");
         assert!(entry[entry.len() - 1].ends_with("(tokenized)"), "{entry:?}");
-        assert!(matches!(&app.entries[1], Entry::Assistant(t) if t == raw));
+        assert!(matches!(&app.entries().list[1], Entry::Assistant(t) if t == raw));
     }
 
     fn left(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -670,9 +673,9 @@ mod tests {
     #[test]
     fn long_tool_output_collapses_until_clicked() {
         let mut app = App::detached();
-        app.entries
+        app.entries()
             .push(Entry::Output("one\ntwo\nthree\nfour\nfive".to_string()));
-        app.entries.push(Entry::Output("short".to_string()));
+        app.entries().push(Entry::Output("short".to_string()));
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
@@ -698,7 +701,7 @@ mod tests {
     fn dragging_the_scrollbar_scrolls_in_proportion() {
         let mut app = App::detached();
         for i in 0..40 {
-            app.entries.push(Entry::User(format!("message {i}")));
+            app.entries().push(Entry::User(format!("message {i}")));
         }
         let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();

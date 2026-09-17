@@ -5,58 +5,26 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
-use serde_json::Value;
 use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::client::Usage;
 use crate::diff::DiffView;
+use crate::entries::Entries;
+pub use crate::entries::Entry;
 use crate::input::{Editor, History};
 use crate::permissions::{Answer, Mode, Remember};
-use crate::profile::{self, CallTokens, EntryTokens, Tokens, Transcript};
+use crate::profile::{self, Transcript};
 use crate::session::{Approval, Event, Session};
 use crate::skills::Skill;
 
 /// Lines a mouse wheel notch moves the transcript.
 const WHEEL_LINES: usize = 3;
-/// Characters of an entry the `/context` transcript table shows.
-const LABEL_CHARS: usize = 40;
-
-#[derive(Debug)]
-pub enum Entry {
-    User(String),
-    Assistant(String),
-    Reasoning(String),
-    Command(String),
-    Output(String),
-    Rejected(String),
-    Error(String),
-    Info(String),
-}
-
-/// Ties history items and calls to the entries that show them.
-#[derive(Default)]
-struct Attribution {
-    /// History index to entry, for user messages and tool results.
-    items: BTreeMap<usize, usize>,
-    /// Entries from here on are not yet tied to a call or item.
-    mark: usize,
-    /// Output tokens of each function call still waiting for its result.
-    calls: VecDeque<u64>,
-    /// Totals of a call that wrote no text, for its first function call entry.
-    totals: Option<Usage>,
-    /// Child agent usage since the last tool result.
-    child: Option<Usage>,
-}
-
 pub struct App {
-    pub entries: Vec<Entry>,
-    /// Token attribution by entry index.
-    pub tokens: HashMap<usize, Tokens>,
     /// Screen rows of each visible entry, filled in by the renderer.
     pub rows: Vec<(Range<u16>, usize)>,
     /// The entry under the mouse.
@@ -75,7 +43,6 @@ pub struct App {
     pub scrollbar: Option<Rect>,
     /// A left drag that started on the scrollbar is in progress.
     dragging: bool,
-    attribution: Attribution,
     pub input: Editor,
     /// Submitted prompts, for `ctrl+p` and `ctrl+n`.
     pub history: History,
@@ -110,12 +77,11 @@ pub struct App {
 
 impl App {
     pub fn new(session: Arc<Session>) -> Self {
+        session.entries().push(Entry::Info(
+            "bhai · bash, read, write and edit; every change needs your approval. Type a task and hit enter."
+                .to_string(),
+        ));
         Self {
-            entries: vec![Entry::Info(
-                "bhai · bash, read, write and edit; every change needs your approval. Type a task and hit enter."
-                    .to_string(),
-            )],
-            tokens: HashMap::new(),
             rows: Vec::new(),
             hover: None,
             mouse_row: None,
@@ -126,7 +92,6 @@ impl App {
             input_area: None,
             scrollbar: None,
             dragging: false,
-            attribution: Attribution::default(),
             input: Editor::default(),
             history: History::default(),
             working: false,
@@ -288,7 +253,7 @@ impl App {
         let Some(entry) = self.entry_at(y) else {
             return false;
         };
-        let set = if matches!(self.entries.get(entry), Some(Entry::Output(_))) {
+        let set = if matches!(self.entries().list.get(entry), Some(Entry::Output(_))) {
             &mut self.expanded
         } else {
             &mut self.pinned
@@ -324,56 +289,14 @@ impl App {
         std::mem::replace(&mut self.hover, hover) != hover
     }
 
-    /// Show a history resumed from disk. Encrypted reasoning without a summary is skipped.
-    pub fn restore(&mut self, history: &[Value]) {
-        for (index, item) in history.iter().enumerate() {
-            let text = |key: &str| {
-                item[key]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|part| part["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            let entry = match item["type"].as_str() {
-                Some("message") if item["role"] == "user" => Entry::User(text("content")),
-                Some("message") => Entry::Assistant(text("content")),
-                Some("reasoning") if !text("summary").is_empty() => {
-                    Entry::Reasoning(text("summary"))
-                }
-                Some("function_call") => Entry::Command(format!(
-                    "{} {}",
-                    item["name"].as_str().unwrap_or_default(),
-                    item["arguments"].as_str().unwrap_or_default()
-                )),
-                Some("function_call_output") => Entry::Output(
-                    item["output"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .trim_end()
-                        .to_string(),
-                ),
-                _ => continue,
-            };
-            if matches!(entry, Entry::User(_) | Entry::Output(_)) {
-                self.attribution.items.insert(index, self.entries.len());
-            }
-            self.entries.push(entry);
-        }
-        self.attribution.mark = self.entries.len();
-    }
-
+    /// UI state for a published event; the session has already updated the entries.
     pub fn on_event(&mut self, event: Event) {
         match event {
             // Messages from any consumer (this TUI or the debug server) land here.
-            Event::User(message) => {
-                self.entries.push(Entry::User(message));
+            Event::User(_) => {
                 self.follow = true;
                 self.working = true;
             }
-            Event::Text(delta) => self.append(delta, Stream::Assistant),
-            Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
             Event::Approval {
                 id,
                 tool,
@@ -387,19 +310,8 @@ impl App {
                     offers,
                 });
             }
-            Event::Resolved { id, .. } => {
-                if self.pending.as_ref().is_some_and(|p| p.id == id) {
-                    self.pending = None;
-                }
-            }
-            Event::ToolStart(command) => self.entries.push(Entry::Command(command)),
-            Event::ToolOutput(output) => {
-                self.entries
-                    .push(Entry::Output(output.trim_end().to_string()));
-            }
-            Event::ToolRejected(command) => {
-                self.entries
-                    .push(Entry::Rejected(format!("rejected: {command}")));
+            Event::Resolved { id, .. } if self.pending.as_ref().is_some_and(|p| p.id == id) => {
+                self.pending = None;
             }
             Event::Usage(usage) => {
                 self.tokens_in += usage.input;
@@ -410,38 +322,17 @@ impl App {
             Event::ChildUsage(usage) => {
                 self.tokens_in += usage.input;
                 self.tokens_out += usage.output;
-                let child = self.attribution.child.get_or_insert_default();
-                child.input += usage.input;
-                child.cached += usage.cached;
-                child.output += usage.output;
-                child.reasoning += usage.reasoning;
             }
-            Event::Call(call) => self.on_call(call),
-            Event::Item(index) => self.on_item(index),
-            Event::Cache(found) => {
-                if let Some(found) = &found {
-                    self.entries.push(Entry::Error(format!(
-                        "cache break: {}: {}",
-                        found.field, found.detail
-                    )));
-                }
-                self.cache_break = found.map(|f| f.field);
-            }
+            Event::Cache(found) => self.cache_break = found.map(|f| f.field),
             Event::CacheHit(hit) => {
                 self.cache_miss = hit
                     .hit_ratio
                     .filter(|_| hit.miss())
                     .map(|ratio| ratio * 100.0);
             }
-            Event::Info(message) => self.entries.push(Entry::Info(message)),
-            Event::Compacted(message) => {
-                self.attribution.items.clear();
-                self.entries.push(Entry::Info(message));
-            }
             Event::Mode(mode) => self.mode = mode,
-            Event::Error(message) => self.entries.push(Entry::Error(message)),
-            Event::Interrupted => self.entries.push(Entry::Info("interrupted".to_string())),
             Event::TurnEnd => self.working = false,
+            _ => {}
         }
     }
 
@@ -457,8 +348,7 @@ impl App {
         }
         let message = self.input.take().trim().to_string();
         if let Err(e) = self.history.push(&message) {
-            self.entries
-                .push(Entry::Error(format!("could not save prompt history: {e}")));
+            self.note(Entry::Error(format!("could not save prompt history: {e}")));
         }
         if message == "/diff" {
             let dir = std::env::current_dir().unwrap_or_default();
@@ -473,13 +363,13 @@ impl App {
             self.follow = true;
             match self.session.compact() {
                 Ok(()) => self.working = true,
-                Err(e) => self.entries.push(Entry::Error(e.to_string())),
+                Err(e) => self.note(Entry::Error(e.to_string())),
             }
             return;
         }
         if message.starts_with("/permissions") {
             self.follow = true;
-            self.entries.push(Entry::Info(self.session.permissions()));
+            self.note(Entry::Info(self.session.permissions()));
             return;
         }
         if message == "/trust" || message == "/untrust" {
@@ -488,7 +378,7 @@ impl App {
                 "/trust" => self.session.trust(),
                 _ => self.session.untrust(),
             };
-            self.entries.push(match result {
+            self.note(match result {
                 Ok(text) => Entry::Info(text),
                 Err(e) => Entry::Error(format!("{e:#}")),
             });
@@ -498,24 +388,22 @@ impl App {
             && (rest.is_empty() || rest.starts_with(' '))
         {
             self.follow = true;
-            self.entries
-                .push(Entry::Info(switch_notice(&self.identity, rest.trim())));
+            self.note(Entry::Info(switch_notice(&self.identity, rest.trim())));
             return;
         }
         if message.starts_with("/mcp") {
             self.follow = true;
-            self.entries
-                .push(Entry::Info(crate::mcp::report(self.mcp.as_deref())));
+            self.note(Entry::Info(crate::mcp::report(self.mcp.as_deref())));
             return;
         }
         if message.starts_with("/skills") {
             self.follow = true;
-            self.entries.push(Entry::Info(skills_report(&self.skills)));
+            self.note(Entry::Info(skills_report(&self.skills)));
             return;
         }
         // The transcript entry arrives back as `Event::User` once the session accepts it.
         if let Err(e) = self.session.submit(message) {
-            self.entries.push(Entry::Error(e.to_string()));
+            self.note(Entry::Error(e.to_string()));
         }
     }
 
@@ -541,23 +429,9 @@ impl App {
 
     /// The badge numbers of every attributed entry, with the session totals.
     fn transcript(&self) -> Transcript {
-        let mut entries: Vec<EntryTokens> = self
-            .tokens
-            .iter()
-            .map(|(&index, &tokens)| {
-                let entry = &self.entries[index];
-                EntryTokens {
-                    index,
-                    kind: entry.kind(),
-                    label: entry.label(),
-                    tokens,
-                }
-            })
-            .collect();
-        entries.sort_by_key(|e| e.index);
         let state = self.session.state();
         Transcript {
-            entries,
+            entries: state.entries,
             totals: Usage {
                 input: state.input_tokens,
                 cached: state.cached_tokens,
@@ -566,6 +440,16 @@ impl App {
             },
             calls: state.calls,
         }
+    }
+
+    /// The transcript, shared with the session.
+    pub fn entries(&self) -> MutexGuard<'_, Entries> {
+        self.session.entries()
+    }
+
+    /// Show a notice that only this TUI produced.
+    fn note(&self, entry: Entry) {
+        self.session.entries().push(entry);
     }
 
     /// A remember key does nothing unless the prompt offers that rule.
@@ -594,164 +478,7 @@ impl App {
         self.scroll = target.clamp(0, self.max_scroll as isize) as usize;
         self.follow = self.scroll >= self.max_scroll;
     }
-
-    /// Tie a finished call to the entries it read and wrote.
-    fn on_call(&mut self, call: CallTokens) {
-        let first = call.sent - call.inputs.len();
-        for (offset, &input) in call.inputs.iter().enumerate() {
-            if let Some(&entry) = self.attribution.items.get(&(first + offset)) {
-                let tokens = self.tokens.entry(entry).or_default();
-                tokens.input = Some(input);
-                tokens.method = call.method;
-            }
-        }
-        // The usage only says how much of the whole call was cached, so each resent
-        // entry takes the call's cached ratio: the per-entry split is proportional, not
-        // exact.
-        let ratio = match call.usage.input {
-            0 => 0.0,
-            input => call.usage.cached as f64 / input as f64,
-        };
-        for entry in self.attribution.items.range(..first).map(|(_, e)| *e) {
-            let tokens = self.tokens.entry(entry).or_default();
-            if let Some(input) = tokens.input {
-                tokens.resends += 1;
-                tokens.cached += (input as f64 * ratio).round() as u64;
-            }
-        }
-
-        let fresh = self.attribution.mark..self.entries.len();
-        let of = |want: fn(&Entry) -> bool| -> Vec<usize> {
-            fresh.clone().filter(|&i| want(&self.entries[i])).collect()
-        };
-        let text = of(|e| matches!(e, Entry::Assistant(_)));
-        let thinking = of(|e| matches!(e, Entry::Reasoning(_)));
-        self.share(&text, call.text, |tokens, part| tokens.output = Some(part));
-        self.share(&thinking, call.usage.reasoning, |tokens, part| {
-            tokens.reasoning = Some(part)
-        });
-        match (text.last(), thinking.last()) {
-            (Some(&entry), _) => self.tokens.entry(entry).or_default().call = Some(call.usage),
-            _ if !call.calls.is_empty() => self.attribution.totals = Some(call.usage),
-            (None, Some(&entry)) => self.tokens.entry(entry).or_default().call = Some(call.usage),
-            (None, None) => {}
-        }
-        self.attribution.calls.extend(call.calls);
-        self.attribution.mark = self.entries.len();
-    }
-
-    /// Split `total` over `entries` by their text length.
-    fn share(&mut self, entries: &[usize], total: u64, set: impl Fn(&mut Tokens, u64)) {
-        let weights: Vec<u64> = entries
-            .iter()
-            .map(|&i| self.entries[i].text().len() as u64)
-            .collect();
-        for (&entry, part) in entries.iter().zip(profile::split(total, &weights)) {
-            set(self.tokens.entry(entry).or_default(), part);
-        }
-    }
-
-    /// Tie history item `index` to the entry just shown: a tool result when a function
-    /// call is waiting for one, else the user message.
-    fn on_item(&mut self, index: usize) {
-        let fresh = self.attribution.mark..self.entries.len();
-        let last = |want: fn(&Entry) -> bool| fresh.clone().rev().find(|&i| want(&self.entries[i]));
-        match self.attribution.calls.pop_front() {
-            Some(output) => {
-                // A child's commands come after the parent's own, and its results before.
-                let command = fresh
-                    .clone()
-                    .find(|&i| matches!(self.entries[i], Entry::Command(_)));
-                let result = last(|e| matches!(e, Entry::Output(_) | Entry::Rejected(_)));
-                if let Some(entry) = command.or(result) {
-                    let tokens = self.tokens.entry(entry).or_default();
-                    tokens.output = Some(output);
-                    tokens.call = self.attribution.totals.take().or(tokens.call);
-                }
-                let child = self.attribution.child.take();
-                if let Some(entry) = result {
-                    self.attribution.items.insert(index, entry);
-                    if child.is_some() {
-                        self.tokens.entry(entry).or_default().child = child;
-                    }
-                }
-            }
-            None => {
-                if let Some(entry) = last(|e| matches!(e, Entry::User(_))) {
-                    self.attribution.items.insert(index, entry);
-                }
-            }
-        }
-        self.attribution.mark = self.entries.len();
-    }
-
-    /// Append a streaming delta to the last entry of the same kind, or start a new one.
-    /// Entries of a call already accounted for are never extended.
-    fn append(&mut self, delta: String, kind: Stream) {
-        let open = self.entries.len() > self.attribution.mark;
-        let appended = match (self.entries.last_mut().filter(|_| open), kind) {
-            (Some(Entry::Assistant(text)), Stream::Assistant) => {
-                text.push_str(&delta);
-                true
-            }
-            (Some(Entry::Reasoning(text)), Stream::Reasoning) => {
-                text.push_str(&delta);
-                true
-            }
-            _ => false,
-        };
-        if appended {
-            return;
-        }
-        // Drop the leading whitespace a new block often starts with.
-        let text = delta.trim_start().to_string();
-        if text.is_empty() {
-            return;
-        }
-        self.entries.push(match kind {
-            Stream::Assistant => Entry::Assistant(text),
-            Stream::Reasoning => Entry::Reasoning(text),
-        });
-    }
 }
-
-impl Entry {
-    pub fn text(&self) -> &str {
-        match self {
-            Entry::User(t)
-            | Entry::Assistant(t)
-            | Entry::Reasoning(t)
-            | Entry::Command(t)
-            | Entry::Output(t)
-            | Entry::Rejected(t)
-            | Entry::Error(t)
-            | Entry::Info(t) => t,
-        }
-    }
-
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Entry::User(_) => "user",
-            Entry::Assistant(_) => "assistant",
-            Entry::Reasoning(_) => "thinking",
-            Entry::Command(_) => "command",
-            Entry::Output(_) => "output",
-            Entry::Rejected(_) => "rejected",
-            Entry::Error(_) => "error",
-            Entry::Info(_) => "info",
-        }
-    }
-
-    /// The first line, cut to `LABEL_CHARS`.
-    pub fn label(&self) -> String {
-        let line = self.text().trim().lines().next().unwrap_or_default();
-        match line.char_indices().nth(LABEL_CHARS) {
-            Some((end, _)) => format!("{}...", &line[..end]),
-            None => line.to_string(),
-        }
-    }
-}
-
 /// What `/as` prints. The identity is fixed for the session, so switching needs a new one.
 fn switch_notice(current: &str, name: &str) -> String {
     if name.is_empty() {
@@ -792,12 +519,6 @@ fn diff_mouse(diff: &mut DiffView, mouse: MouseEvent) -> bool {
         _ => return false,
     }
     true
-}
-
-#[derive(Clone, Copy)]
-enum Stream {
-    Assistant,
-    Reasoning,
 }
 
 /// tui-input's crossterm mapping covers readline keys and `ctrl+arrow`, but not the
@@ -843,16 +564,6 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::Method;
-
-    fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
-        Usage {
-            input,
-            cached,
-            output,
-            reasoning,
-        }
-    }
 
     fn moved(row: u16) -> MouseEvent {
         MouseEvent {
@@ -861,93 +572,6 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
-    }
-
-    #[test]
-    fn calls_are_attributed_to_their_entries() {
-        let mut app = App::detached();
-        let text = |s: &str| s.to_string();
-        app.on_event(Event::User(text("hi")));
-        app.on_event(Event::Item(0));
-        app.on_event(Event::Reasoning(text("think")));
-        app.on_event(Event::Text(text("hello")));
-        app.on_event(Event::Call(CallTokens {
-            usage: usage(100, 0, 30, 10),
-            sent: 1,
-            outputs: 3,
-            inputs: vec![5],
-            method: Method::Tokenized,
-            text: 12,
-            calls: vec![8],
-        }));
-        app.on_event(Event::ToolStart(text("agent worker: go")));
-        app.on_event(Event::ChildUsage(usage(7, 2, 1, 0)));
-        app.on_event(Event::ToolStart(text("[child a worker] ls")));
-        app.on_event(Event::ToolOutput(text("[child a worker] x")));
-        app.on_event(Event::ToolOutput(text("child done")));
-        app.on_event(Event::Item(4));
-        // The next call's text starts an entry of its own.
-        app.on_event(Event::Reasoning(text("more")));
-        app.on_event(Event::Text(text("done")));
-        app.on_event(Event::Call(CallTokens {
-            usage: usage(150, 100, 5, 1),
-            sent: 5,
-            outputs: 2,
-            inputs: vec![20],
-            method: Method::Exact,
-            text: 4,
-            calls: vec![],
-        }));
-        assert_eq!(app.entries.len(), 10);
-
-        let get = |i: usize| app.tokens.get(&i).copied().unwrap_or_default();
-        // The user message was tokenized, then resent once at the call's cached ratio.
-        assert_eq!(
-            get(1),
-            Tokens {
-                input: Some(5),
-                method: Method::Tokenized,
-                resends: 1,
-                cached: 3,
-                ..Tokens::default()
-            }
-        );
-        assert_eq!(get(2).reasoning, Some(10));
-        assert_eq!(get(3).output, Some(12));
-        assert_eq!(get(3).call, Some(usage(100, 0, 30, 10)));
-        assert_eq!(get(4).output, Some(8));
-        assert_eq!(
-            get(5),
-            Tokens::default(),
-            "child entries are not the parent's"
-        );
-        let result = get(7);
-        assert_eq!((result.input, result.method), (Some(20), Method::Exact));
-        assert_eq!(result.resends, 0);
-        assert_eq!(result.child, Some(usage(7, 2, 1, 0)));
-        assert_eq!(get(8).reasoning, Some(1));
-        assert_eq!(get(9).output, Some(4));
-        assert_eq!(get(9).call, Some(usage(150, 100, 5, 1)));
-    }
-
-    #[test]
-    fn a_call_without_text_puts_its_totals_on_the_command() {
-        let mut app = App::detached();
-        app.on_event(Event::User("hi".to_string()));
-        app.on_event(Event::Item(0));
-        app.on_event(Event::Call(CallTokens {
-            usage: usage(10, 0, 3, 0),
-            sent: 1,
-            outputs: 1,
-            inputs: vec![1],
-            calls: vec![3],
-            ..CallTokens::default()
-        }));
-        app.on_event(Event::ToolRejected("ls".to_string()));
-        app.on_event(Event::Item(2));
-        let rejected = app.tokens[&2];
-        assert_eq!(rejected.output, Some(3));
-        assert_eq!(rejected.call, Some(usage(10, 0, 3, 0)));
     }
 
     #[test]
@@ -1020,23 +644,6 @@ mod tests {
             input_request(key(KeyCode::Left, KeyModifiers::CONTROL)),
             Some(InputRequest::GoToPrevWord)
         );
-    }
-
-    #[test]
-    fn a_restored_history_shows_as_entries() {
-        let mut app = App::detached();
-        let history = [
-            serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}),
-            serde_json::json!({"type": "reasoning", "encrypted_content": "x", "summary": []}),
-            serde_json::json!({"type": "function_call", "call_id": "c", "name": "bash", "arguments": "{}"}),
-            serde_json::json!({"type": "function_call_output", "call_id": "c", "output": "ok\n"}),
-            serde_json::json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}),
-        ];
-        app.restore(&history);
-        let kinds: Vec<_> = app.entries[1..].iter().map(Entry::kind).collect();
-        assert_eq!(kinds, ["user", "command", "output", "assistant"]);
-        assert_eq!(app.entries[3].text(), "ok");
-        assert_eq!(app.attribution.items.get(&3), Some(&3));
     }
 
     #[test]

@@ -202,7 +202,7 @@ pub async fn run(
 
 /// `run` with the model given.
 #[allow(clippy::too_many_arguments)]
-async fn run_with(
+pub(crate) async fn run_with(
     model: Arc<dyn Model>,
     session_id: String,
     prompt: SystemPrompt,
