@@ -278,9 +278,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_model_error_reports_the_steps_taken_and_the_reason() {
-        let mut script = vec![vec![call("read", json!({"path": "/etc/hosts"}))]];
-        script.push(fake::step(fake::FAIL));
-        let fake = Fake::new(script);
+        let fake = Fake::new(vec![
+            vec![call("read", json!({"path": "/etc/hosts"}))],
+            fake::step(fake::FAIL),
+        ]);
         let (agent, _rx) = tool(&fake, false);
         let args = json!({"description": "read hosts", "prompt": "go"});
         let (out, ok) = agent.execute(&args).await;
