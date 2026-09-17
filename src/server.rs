@@ -1,0 +1,270 @@
+//! A localhost debug server: inspect and drive a running session over HTTP.
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::sse::{self, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use futures_util::Stream;
+use serde::Deserialize;
+use serde_json::json;
+use tokio::net::TcpListener;
+use tokio::sync::broadcast::error::RecvError;
+
+use crate::session::{Session, SubmitError};
+
+/// Port `--serve` listens on when none is given.
+pub const DEFAULT_PORT: u16 = 7878;
+
+/// Bind to 127.0.0.1 only; the server can run commands, so it never faces the network.
+pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
+    Ok(TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?)
+}
+
+pub async fn serve(listener: TcpListener, session: Arc<Session>) -> anyhow::Result<()> {
+    Ok(axum::serve(listener, router(session)).await?)
+}
+
+fn router(session: Arc<Session>) -> Router {
+    Router::new()
+        .route("/state", get(state))
+        .route("/events", get(events))
+        .route("/prompt", post(prompt))
+        .route("/approve", post(approve))
+        .route("/reject", post(reject))
+        .route("/interrupt", post(interrupt))
+        .route("/context", get(context))
+        .with_state(session)
+}
+
+#[derive(Deserialize)]
+struct Prompt {
+    text: String,
+}
+
+async fn state(State(session): State<Arc<Session>>) -> Response {
+    Json(session.state()).into_response()
+}
+
+async fn events(
+    State(session): State<Arc<Session>>,
+) -> Sse<impl Stream<Item = Result<sse::Event, axum::Error>>> {
+    let rx = session.subscribe();
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => return Some((sse::Event::default().json_data(&event), rx)),
+                // A slow client just misses events; the stream keeps going.
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn prompt(State(session): State<Arc<Session>>, Json(body): Json<Prompt>) -> Response {
+    let text = body.text.trim().to_string();
+    if text.is_empty() {
+        return error(StatusCode::BAD_REQUEST, "text is empty");
+    }
+    match session.submit(text) {
+        Ok(()) => ok(),
+        Err(e @ SubmitError::Busy) => error(StatusCode::CONFLICT, &e.to_string()),
+        Err(e @ SubmitError::Closed) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
+}
+
+async fn approve(State(session): State<Arc<Session>>) -> Response {
+    answer(&session, true)
+}
+
+async fn reject(State(session): State<Arc<Session>>) -> Response {
+    answer(&session, false)
+}
+
+fn answer(session: &Session, accept: bool) -> Response {
+    match session.answer(accept, None) {
+        Some(id) => Json(json!({ "ok": true, "id": id })).into_response(),
+        None => error(StatusCode::CONFLICT, "no approval is pending"),
+    }
+}
+
+async fn interrupt(State(session): State<Arc<Session>>) -> Response {
+    if session.interrupt() {
+        ok()
+    } else {
+        error(StatusCode::CONFLICT, "no turn is running")
+    }
+}
+
+async fn context() -> Response {
+    error(
+        StatusCode::NOT_IMPLEMENTED,
+        "context export is not built yet; the token profiler will fill this in",
+    )
+}
+
+fn ok() -> Response {
+    Json(json!({ "ok": true })).into_response()
+}
+
+fn error(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({ "error": message }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use futures_util::StreamExt;
+    use serde_json::Value;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::agent::AgentEvent;
+    use crate::session;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// Start a server on an ephemeral port in front of a fake agent that says hi, asks
+    /// to run one command, and reports the decision on the returned channel.
+    async fn start() -> (String, oneshot::Receiver<bool>) {
+        let (tx_user, mut rx_user) = mpsc::channel::<String>(1);
+        let (tx_agent, rx_agent) = mpsc::unbounded_channel();
+        let (tx_decision, rx_decision) = oneshot::channel();
+        let session = Session::new(
+            "test-model".to_string(),
+            tx_user,
+            Arc::new(AtomicBool::new(false)),
+        );
+        tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
+        tokio::spawn(async move {
+            let _prompt = rx_user.recv().await;
+            let _ = tx_agent.send(AgentEvent::Text("hi".to_string()));
+            let (reply, wait) = oneshot::channel();
+            let _ = tx_agent.send(AgentEvent::Approval {
+                command: "ls".to_string(),
+                reply,
+            });
+            let accepted = wait.await.unwrap_or(false);
+            let _ = tx_decision.send(accepted);
+            let _ = tx_agent.send(AgentEvent::Usage {
+                input: 5,
+                output: 2,
+            });
+            let _ = tx_agent.send(AgentEvent::TurnEnd);
+            // Stay alive so the session keeps accepting messages.
+            let _ = rx_user.recv().await;
+        });
+        let listener = bind(0).await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(serve(listener, session));
+        (base, rx_decision)
+    }
+
+    async fn get_json(http: &reqwest::Client, url: String) -> Value {
+        http.get(url).send().await.unwrap().json().await.unwrap()
+    }
+
+    async fn post(http: &reqwest::Client, url: String, body: Value) -> StatusCode {
+        let status = http.post(url).json(&body).send().await.unwrap().status();
+        StatusCode::from_u16(status.as_u16()).unwrap()
+    }
+
+    /// Poll `/state` until `check` passes.
+    async fn wait_state(http: &reqwest::Client, base: &str, check: impl Fn(&Value) -> bool) {
+        timeout(WAIT, async {
+            loop {
+                if check(&get_json(http, format!("{base}/state")).await) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("state never matched");
+    }
+
+    #[tokio::test]
+    async fn drives_a_turn_over_http() {
+        let (base, rx_decision) = start().await;
+        let http = reqwest::Client::new();
+
+        let state = get_json(&http, format!("{base}/state")).await;
+        assert_eq!(state["model"], "test-model");
+        assert_eq!(state["working"], false);
+        assert!(state["pending"].is_null());
+
+        let events = http.get(format!("{base}/events")).send().await.unwrap();
+        assert_eq!(events.status().as_u16(), 200);
+
+        assert_eq!(
+            post(&http, format!("{base}/approve"), json!({})).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post(&http, format!("{base}/prompt"), json!({"text": "go"})).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post(&http, format!("{base}/prompt"), json!({"text": "again"})).await,
+            StatusCode::CONFLICT
+        );
+
+        wait_state(&http, &base, |s| s["pending"]["command"] == "ls").await;
+        assert_eq!(
+            post(&http, format!("{base}/approve"), json!({})).await,
+            StatusCode::OK
+        );
+        assert!(timeout(WAIT, rx_decision).await.unwrap().unwrap());
+
+        wait_state(&http, &base, |s| s["working"] == false).await;
+        let state = get_json(&http, format!("{base}/state")).await;
+        assert_eq!(state["input_tokens"], 5);
+        assert_eq!(state["output_tokens"], 2);
+        assert!(state["pending"].is_null());
+
+        // The stream saw the whole turn, approval id included.
+        let mut body = String::new();
+        let mut stream = events.bytes_stream();
+        timeout(WAIT, async {
+            while !body.contains("turn_end") {
+                let chunk = stream.next().await.unwrap().unwrap();
+                body.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await
+        .expect("no turn_end on /events");
+        for want in [
+            r#"{"type":"user","data":"go"}"#,
+            r#"{"type":"text","data":"hi"}"#,
+            r#"{"type":"approval","data":{"id":1,"command":"ls"}}"#,
+            r#"{"type":"resolved","data":{"id":1,"accepted":true}}"#,
+        ] {
+            assert!(body.contains(want), "missing {want} in {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn context_is_not_implemented_yet() {
+        let (base, _) = start().await;
+        let response = reqwest::get(format!("{base}/context")).await.unwrap();
+        assert_eq!(response.status().as_u16(), 501);
+    }
+
+    #[tokio::test]
+    async fn interrupt_needs_a_running_turn() {
+        let (base, _) = start().await;
+        let http = reqwest::Client::new();
+        assert_eq!(
+            post(&http, format!("{base}/interrupt"), json!({})).await,
+            StatusCode::CONFLICT
+        );
+    }
+}

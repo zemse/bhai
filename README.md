@@ -6,6 +6,8 @@
 cargo install bhai
 ```
 
+`bhai --serve [port]` also starts a localhost debug server (default 7878) with `/state`, `/events` (SSE), `/prompt`, `/approve`, `/reject` and `/interrupt`. add `--headless` to run it without the tui.
+
 > wip - most of the features mentioned are not built yet. at this point this is just a hobby project.
 
 ## feature set

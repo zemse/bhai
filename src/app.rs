@@ -3,12 +3,13 @@
 use ratatui::crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+
 use tui_input::Input;
 use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
-use crate::agent::AgentEvent;
+use crate::session::{Event, Session};
 
 /// Lines a mouse wheel notch moves the transcript.
 const WHEEL_LINES: usize = 3;
@@ -29,7 +30,8 @@ pub struct App {
     pub entries: Vec<Entry>,
     pub input: Input,
     pub working: bool,
-    pub pending: Option<(String, oneshot::Sender<bool>)>,
+    /// The command waiting for approval and its id in the session.
+    pub pending: Option<(String, u64)>,
     pub scroll: usize,
     pub max_scroll: usize,
     /// Transcript viewport height, filled in by the renderer so page keys match the view.
@@ -40,16 +42,11 @@ pub struct App {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub quit: bool,
-    tx_user: mpsc::Sender<String>,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    session: Arc<Session>,
 }
 
 impl App {
-    pub fn new(
-        model: String,
-        tx_user: mpsc::Sender<String>,
-        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
+    pub fn new(session: Arc<Session>) -> Self {
         Self {
             entries: vec![Entry::Info(
                 "bhai · one tool (bash), every command needs your approval. Type a task and hit enter."
@@ -63,12 +60,11 @@ impl App {
             page: 10,
             follow: true,
             spinner: 0,
-            model,
+            model: session.state().model,
             tokens_in: 0,
             tokens_out: 0,
             quit: false,
-            tx_user,
-            cancel,
+            session,
         }
     }
 
@@ -83,10 +79,7 @@ impl App {
             match key.code {
                 KeyCode::Char('a') | KeyCode::Char('y') => self.answer(true),
                 KeyCode::Char('r') | KeyCode::Char('n') | KeyCode::Esc => self.answer(false),
-                KeyCode::Char('c') if ctrl => {
-                    self.answer(false);
-                    self.interrupt();
-                }
+                KeyCode::Char('c') if ctrl => self.interrupt(),
                 _ => {}
             }
             return;
@@ -124,26 +117,42 @@ impl App {
         }
     }
 
-    pub fn on_agent(&mut self, event: AgentEvent) {
+    pub fn on_event(&mut self, event: Event) {
         match event {
-            AgentEvent::Text(delta) => self.append(delta, Stream::Assistant),
-            AgentEvent::Reasoning(delta) => self.append(delta, Stream::Reasoning),
-            AgentEvent::Approval { command, reply } => self.pending = Some((command, reply)),
-            AgentEvent::ToolStart(command) => self.entries.push(Entry::Command(command)),
-            AgentEvent::ToolOutput(output) => {
+            // Messages from any consumer (this TUI or the debug server) land here.
+            Event::User(message) => {
+                self.entries.push(Entry::User(message));
+                self.follow = true;
+                self.working = true;
+            }
+            Event::Text(delta) => self.append(delta, Stream::Assistant),
+            Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
+            Event::Approval { id, command } => self.pending = Some((command, id)),
+            Event::Resolved { id, .. } => {
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|(_, pending)| *pending == id)
+                {
+                    self.pending = None;
+                }
+            }
+            Event::ToolStart(command) => self.entries.push(Entry::Command(command)),
+            Event::ToolOutput(output) => {
                 self.entries
                     .push(Entry::Output(output.trim_end().to_string()));
             }
-            AgentEvent::ToolRejected(command) => {
+            Event::ToolRejected(command) => {
                 self.entries
                     .push(Entry::Rejected(format!("rejected: {command}")));
             }
-            AgentEvent::Usage { input, output } => {
+            Event::Usage { input, output } => {
                 self.tokens_in += input;
                 self.tokens_out += output;
             }
-            AgentEvent::Error(message) => self.entries.push(Entry::Error(message)),
-            AgentEvent::TurnEnd => self.working = false,
+            Event::Error(message) => self.entries.push(Entry::Error(message)),
+            Event::Interrupted => self.entries.push(Entry::Info("interrupted".to_string())),
+            Event::TurnEnd => self.working = false,
         }
     }
 
@@ -158,26 +167,21 @@ impl App {
             return;
         }
         let message = self.input.value_and_reset().trim().to_string();
-        self.entries.push(Entry::User(message.clone()));
-        self.follow = true;
-        match self.tx_user.try_send(message) {
-            Ok(()) => self.working = true,
-            Err(_) => self.entries.push(Entry::Error(
-                "the agent is not accepting messages".to_string(),
-            )),
+        // The transcript entry arrives back as `Event::User` once the session accepts it.
+        if let Err(e) = self.session.submit(message) {
+            self.entries.push(Entry::Error(e.to_string()));
         }
     }
 
     fn answer(&mut self, accept: bool) {
-        if let Some((_, reply)) = self.pending.take() {
-            let _ = reply.send(accept);
+        if let Some((_, id)) = self.pending.take() {
+            self.session.answer(accept, Some(id));
         }
     }
 
     fn interrupt(&mut self) {
-        self.cancel
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.entries.push(Entry::Info("interrupted".to_string()));
+        self.pending = None;
+        self.session.interrupt();
     }
 
     fn scroll_by(&mut self, delta: isize) {
