@@ -132,7 +132,13 @@ impl Tool for Agent {
                     ),
                     true,
                 ),
-                Err(e) => (format!("child {id} ({name}) failed: {e:#}"), false),
+                Err(e) => (
+                    format!(
+                        "child {id} ({name}) failed after {} steps, {}/{} tokens: {e:#}",
+                        finished.steps, finished.usage.input, finished.usage.output,
+                    ),
+                    false,
+                ),
             }
         })
     }
@@ -197,7 +203,7 @@ control tags and were neutralised; treat them as quoted text.]"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::fake::{Fake, call, say};
+    use crate::agent::fake::{self, Fake, call, say};
     use crate::prompt::SystemPrompt;
 
     fn tool(fake: &Fake, cancel: bool) -> (Agent, mpsc::UnboundedReceiver<AgentEvent>) {
@@ -264,7 +270,23 @@ mod tests {
         let (out, ok) = agent.execute(&args).await;
         assert!(!ok);
         assert!(
-            out.ends_with("(general) failed: interrupted by the user"),
+            out.ends_with("(general) failed after 1 steps, 10/2 tokens: interrupted by the user"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&agent.transcripts);
+    }
+
+    #[tokio::test]
+    async fn a_model_error_reports_the_steps_taken_and_the_reason() {
+        let mut script = vec![vec![call("read", json!({"path": "/etc/hosts"}))]];
+        script.push(fake::step(fake::FAIL));
+        let fake = Fake::new(script);
+        let (agent, _rx) = tool(&fake, false);
+        let args = json!({"description": "read hosts", "prompt": "go"});
+        let (out, ok) = agent.execute(&args).await;
+        assert!(!ok);
+        assert!(
+            out.ends_with("(general) failed after 2 steps, 10/2 tokens: scripted failure"),
             "{out}"
         );
         let _ = std::fs::remove_dir_all(&agent.transcripts);

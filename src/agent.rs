@@ -341,7 +341,7 @@ pub(crate) async fn run_with(
                 }
             }
         };
-        if let Err(e) = result {
+        if let (_, Err(e)) = result {
             let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
         }
         // Between turns the history holds every call's output, so it can be rewritten.
@@ -368,7 +368,8 @@ pub(crate) async fn run_with(
     }
 }
 
-/// Returns the number of model calls made. `sink` gets every history item as it lands.
+/// Returns the number of model calls made and the failure, if there was one. `sink`
+/// gets every history item as it lands.
 #[allow(clippy::too_many_arguments)]
 async fn turn(
     model: &dyn Model,
@@ -383,7 +384,7 @@ async fn turn(
     monitor: &mut CacheMonitor,
     usage_log: Option<&Path>,
     sink: &mut Sink<'_>,
-) -> anyhow::Result<usize> {
+) -> (usize, anyhow::Result<()>) {
     let mut error_rounds = 0usize;
 
     for step in 1..=MAX_STEPS {
@@ -396,7 +397,7 @@ async fn turn(
                 .await
                 .is_some()
             {
-                return Ok(step - 1);
+                return (step - 1, Ok(()));
             }
             monitor.resume();
         }
@@ -436,8 +437,8 @@ async fn turn(
         {
             Ok(items) => items,
             // An interrupt is the user's decision, not an error worth reporting.
-            Err(_) if cancel.load(Ordering::Relaxed) => return Ok(step),
-            Err(e) => return Err(e),
+            Err(_) if cancel.load(Ordering::Relaxed) => return (step, Ok(())),
+            Err(e) => return (step, Err(e)),
         };
         if let Some(usage) = finished {
             let call = Call {
@@ -459,7 +460,7 @@ async fn turn(
         if calls.is_empty() {
             history.extend(items.iter().cloned());
             record(sink, &history[sent..], tx);
-            return Ok(step);
+            return (step, Ok(()));
         }
 
         let mut results = Vec::with_capacity(calls.len());
@@ -486,7 +487,7 @@ async fn turn(
         record(sink, &history[sent..], tx);
 
         if cancel.load(Ordering::Relaxed) {
-            return Ok(step);
+            return (step, Ok(()));
         }
 
         error_rounds = if all_failed { error_rounds + 1 } else { 0 };
@@ -494,14 +495,14 @@ async fn turn(
             let _ = tx.send(AgentEvent::Error(
                 "stopped: the last few tool calls all failed".to_string(),
             ));
-            return Ok(step);
+            return (step, Ok(()));
         }
     }
 
     let _ = tx.send(AgentEvent::Error(format!(
         "stopped after {MAX_STEPS} steps without finishing"
     )));
-    Ok(MAX_STEPS)
+    (MAX_STEPS, Ok(()))
 }
 
 /// One compaction of a conversation's history.
@@ -774,17 +775,13 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     };
     let ((result, history), (usage, failure)) = tokio::join!(work, forward);
 
-    let (steps, result) = match result {
-        Ok(steps) if child.cancel.load(Ordering::Relaxed) => {
-            (steps, Err(anyhow!("interrupted by the user")))
-        }
-        Ok(steps) => (
-            steps,
-            final_text(&history).ok_or_else(|| {
-                anyhow!(failure.unwrap_or_else(|| "ended without a final message".to_string()))
-            }),
-        ),
-        Err(e) => (0, Err(e)),
+    let (steps, result) = result;
+    let result = match result {
+        Ok(()) if child.cancel.load(Ordering::Relaxed) => Err(anyhow!("interrupted by the user")),
+        Ok(()) => final_text(&history).ok_or_else(|| {
+            anyhow!(failure.unwrap_or_else(|| "ended without a final message".to_string()))
+        }),
+        Err(e) => Err(e),
     };
     Finished {
         steps,
