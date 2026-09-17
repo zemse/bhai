@@ -974,6 +974,9 @@ pub mod fake {
         /// Every request body, with the conversation it belongs to.
         pub bodies: Arc<Mutex<Vec<(String, Value)>>>,
         pub breaks: Arc<Mutex<Vec<CacheBreak>>>,
+        /// Every intentional reset, as the conversation, the calls it had already made
+        /// and the reason.
+        pub resets: Arc<Mutex<Vec<(String, usize, String)>>>,
         conversation: String,
         key: String,
         guard: Arc<Mutex<CacheGuard>>,
@@ -988,6 +991,7 @@ pub mod fake {
                 offered: Arc::default(),
                 bodies: Arc::default(),
                 breaks: Arc::default(),
+                resets: Arc::default(),
                 conversation: "parent".to_string(),
                 key: "sess".to_string(),
                 guard: Arc::new(Mutex::new(CacheGuard::new("parent", None, false))),
@@ -999,6 +1003,14 @@ pub mod fake {
         /// Report `usage` for every call instead of `USAGE`.
         pub fn with_usage(self, usage: Usage) -> Self {
             Self { usage, ..self }
+        }
+
+        /// The same script and records with a fresh guard, as a resumed process starts.
+        pub fn restarted(&self) -> Self {
+            Self {
+                guard: Arc::new(Mutex::new(CacheGuard::new(&self.conversation, None, false))),
+                ..self.clone()
+            }
         }
     }
 
@@ -1119,6 +1131,17 @@ pub mod fake {
         }
 
         fn reset(&self, reason: &str) {
+            let at = self
+                .bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(c, _)| *c == self.conversation)
+                .count();
+            self.resets
+                .lock()
+                .unwrap()
+                .push((self.conversation.clone(), at, reason.to_string()));
             self.guard.lock().unwrap().reset(reason);
         }
     }
@@ -1345,9 +1368,17 @@ mod tests {
     async fn a_scripted_session_never_breaks_the_prompt_cache() {
         use crate::mcp::{Hub, ToolInfo};
         use crate::permissions::Rules;
+        use crate::sessions::{self, Header};
         use fake::{FAIL, Fake, HANG, call, say, step};
 
         let dir = tools::temp_dir();
+        let (bypassed, asked) = (dir.join("bypassed"), dir.join("asked"));
+        let touch = |path: &Path| {
+            call(
+                "bash",
+                json!({"command": format!("touch {}", path.display())}),
+            )
+        };
         let fake = Fake::new(vec![
             vec![say("hi")],
             vec![call("bash", json!({"command": "echo approved"}))],
@@ -1369,22 +1400,30 @@ mod tests {
                 json!({"name": "mcp__docs__lookup", "arguments": {"q": "x"}}),
             )],
             vec![say("mcp done")],
+            vec![touch(&bypassed)],
+            vec![say("bypassed")],
+            vec![touch(&asked)],
+            vec![say("asked")],
+            vec![say("the summary")],
+            vec![say("compacted")],
+            vec![say("resumed")],
         ]);
         let hub = Arc::new(Hub::offline(vec![(
             "docs",
             vec![ToolInfo::test("docs", "lookup", "Look things up.")],
         )]));
-        let prompt = SystemPrompt {
-            mcp: Some(hub),
-            ..crate::prompt::system_prompt(&[], Vec::new())
-        };
         let worker = Identity {
             name: "worker".to_string(),
             tools: Some(vec!["bash".to_string()]),
             ..Identity::default()
         };
-        let delegation = Delegation {
-            identities: vec![Identity::default(), worker],
+        // Rebuilt for the resumed run, so the prefix and the tool list stay the same.
+        let prompt = || SystemPrompt {
+            mcp: Some(Arc::clone(&hub)),
+            ..crate::prompt::system_prompt(&[], Vec::new())
+        };
+        let delegation = || Delegation {
+            identities: vec![Identity::default(), worker.clone()],
             prompt: Arc::new(|identity: &Identity| SystemPrompt {
                 identity: identity.clone(),
                 ..crate::prompt::system_prompt(&[], Vec::new())
@@ -1393,22 +1432,26 @@ mod tests {
         };
         let policy = Arc::new(Policy::new(Mode::Ask, Rules::default(), None, dir.clone()));
         let cancel = Arc::new(AtomicBool::new(false));
+        let saved = Saved {
+            writer: Writer::create(&dir, Header::new("sess", "general", "fake", "medium", &dir)),
+            history: Vec::new(),
+        };
 
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_with(
+        let running = tokio::spawn(run_with(
             Arc::new(fake.clone()),
             "sess".to_string(),
-            prompt,
+            prompt(),
             Arc::clone(&policy),
             rx_user,
             rx_control,
             tx,
             Arc::clone(&cancel),
             None,
-            Some(delegation),
-            None,
+            Some(delegation()),
+            Some(saved),
             Limits::default(),
         ));
         let accept = Answer::Accept(None);
@@ -1442,7 +1485,11 @@ mod tests {
         let (reply, wait) = oneshot::channel();
         tx_control.send(Control::Context(reply)).await.unwrap();
         assert!(!wait.await.unwrap().items.is_empty());
+
+        // The mode is not in the request, so cycling through all of them appends as usual.
+        assert_eq!(policy.mode(), Mode::Ask);
         policy.set_mode(policy.mode().next());
+        assert_eq!(policy.mode(), Mode::Auto);
 
         let events = turn("delegate", &[]).await;
         assert!(
@@ -1457,7 +1504,73 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("not connected")))
         );
 
+        policy.set_mode(policy.mode().next());
+        assert_eq!(policy.mode(), Mode::Bypass);
+        // `touch` is not read-only, so bypass runs it and ask prompts for it.
+        turn("write one", &[]).await;
+        assert!(bypassed.exists());
+        policy.set_mode(policy.mode().next());
+        assert_eq!(policy.mode(), Mode::Ask);
+        turn("write another", &[accept]).await;
+        assert!(asked.exists());
+
+        // A compaction rewrites history, which is a reset the guard is told about.
+        tx_control.send(Control::Compact).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::TurnEnd => break,
+                other => events.push(other),
+            }
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compacted(m) if m.contains("summarised")))
+        );
+        drive(&tx_user, &mut rx, &cancel, "carry on", &[]).await;
+
+        // Resuming the file seeds a fresh guard with the history as it was left.
+        drop(tx_user);
+        drop(tx_control);
+        running.await.unwrap();
+        let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
+        assert!(loaded.warnings.is_empty());
+        let resumed = Saved {
+            writer: Writer::resume(&dir, &loaded).unwrap(),
+            history: loaded.items.clone(),
+        };
+        let restarted = fake.restarted();
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(restarted),
+            "sess".to_string(),
+            prompt(),
+            Arc::clone(&policy),
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            Some(delegation()),
+            Some(resumed),
+            Limits::default(),
+        ));
+        // A changed prefix would be reported here as an error.
+        let events = drive(&tx_user, &mut rx, &cancel, "and back", &[]).await;
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+
         assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let resets = fake.resets.lock().unwrap().clone();
+        assert_eq!(
+            resets
+                .iter()
+                .map(|(c, at, reason)| (c.as_str(), *at, reason.as_str()))
+                .collect::<Vec<_>>(),
+            [("parent", 17, "compaction: summary")]
+        );
         let bodies = fake.bodies.lock().unwrap().clone();
         let conversation = |name: &str| -> Vec<Value> {
             bodies
@@ -1467,12 +1580,18 @@ mod tests {
                 .collect()
         };
         let (parent, child) = (conversation("parent"), conversation("child 1"));
-        assert_eq!(parent.len(), 12);
+        assert_eq!(parent.len(), 19);
         assert_eq!(child.len(), 2);
         assert_eq!(parent.len() + child.len(), bodies.len());
-        for (bodies, key) in [(&parent, "sess"), (&child, "sess-worker")] {
+        for (name, bodies, key) in [
+            ("parent", &parent, "sess"),
+            ("child 1", &child, "sess-worker"),
+        ] {
             let mut guard = crate::cache::CacheGuard::new("check", None, true);
-            for body in bodies {
+            for (i, body) in bodies.iter().enumerate() {
+                for (_, _, reason) in resets.iter().filter(|(c, at, _)| c == name && *at == i) {
+                    guard.reset(reason);
+                }
                 assert_eq!(body["prompt_cache_key"], key);
                 guard.check(body).unwrap();
             }
@@ -1484,6 +1603,17 @@ mod tests {
             &retried.as_array().unwrap()[..failed.len()],
             failed.as_slice()
         );
+        // The summary call appends to the history it summarises; the next one starts
+        // from the folded history, and the resumed one from the file.
+        let summarised = parent[16]["input"].as_array().unwrap();
+        let folded = parent[17]["input"].as_array().unwrap();
+        assert!(folded.len() < summarised.len());
+        assert_eq!(
+            folded[1],
+            compact::user_message("Summary of earlier conversation:\nthe summary")
+        );
+        let last = parent[18]["input"].as_array().unwrap();
+        assert_eq!(&last[..loaded.items.len()], loaded.items.as_slice());
         let _ = std::fs::remove_dir_all(dir);
     }
 
