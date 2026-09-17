@@ -609,4 +609,51 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         let reader = build(&config, &f.roots, &no_agent, &identities);
         assert!(!reader.text.contains("# Delegation"));
     }
+    #[test]
+    fn the_request_body_is_byte_identical_across_fresh_builds() {
+        let f = Fixture::new();
+        for name in ["web-search", "pdf", "ios-dev"] {
+            f.skill(name);
+        }
+        f.write("home/.claude/CLAUDE.md", "Global rules.\n");
+        f.write("home/repo/CLAUDE.md", "Project rules.\n");
+        f.write(
+            "home/.config/bhai/agents/rust.md",
+            "---\nname: rust-engineer\ndescription: Rust work\n---\nWrite Rust.\n",
+        );
+        f.write(
+            "home/.claude/agents/review.md",
+            "---\nname: reviewer\ndescription: Reviews code\n---\nReview.\n",
+        );
+        let body = || {
+            let identities = discover(&f.roots);
+            let hub = crate::mcp::Hub::offline(vec![(
+                "docs",
+                vec![
+                    crate::mcp::ToolInfo::test("docs", "search", "Search docs"),
+                    crate::mcp::ToolInfo::test("docs", "fetch", "Fetch a page"),
+                ],
+            )]);
+            let prompt = build(&Config::default(), &f.roots, &general(), &identities)
+                .with_mcp(Some(std::sync::Arc::new(hub)));
+            let tools = Registry::for_prompt(&prompt).schemas();
+            let input = [serde_json::json!({ "type": "message", "role": "user", "content": "hi" })];
+            let body =
+                crate::client::request_body("m", "medium", "key", &prompt.text, &tools, &input);
+            serde_json::to_string(&body).unwrap()
+        };
+        let first = body();
+        assert_eq!(first, body());
+        assert!(
+            first.contains("mcp__docs") || first.contains("mcp server docs"),
+            "{first}"
+        );
+        let skills: Vec<usize> = ["ios-dev", "pdf", "web-search"]
+            .iter()
+            .map(|name| first.find(&format!("- {name}: ")).unwrap())
+            .collect();
+        assert!(skills.is_sorted(), "{skills:?}");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(!first.contains(&today));
+    }
 }

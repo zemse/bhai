@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::cache::CacheBreak;
 use crate::client::{Client, Delta, Usage};
 use crate::identity::Identity;
 use crate::permissions::{Answer, Decision, Mode, Offers, Policy};
@@ -45,6 +46,8 @@ pub enum AgentEvent {
     Usage(Usage),
     /// Token counts for a model call a child agent just finished.
     ChildUsage(Usage),
+    /// The request just sent broke the prompt cache, or `None` when it was clean.
+    Cache(Option<CacheBreak>),
     Error(String),
     /// The agent is done with this turn and is waiting for input.
     TurnEnd,
@@ -119,6 +122,7 @@ pub type Children = Arc<Mutex<Vec<ChildUsage>>>;
 /// `usage_log` is the JSONL file each model call's usage is appended to, if any.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
+    client: Client,
     prompt: SystemPrompt,
     policy: Arc<Policy>,
     rx_user: mpsc::Receiver<String>,
@@ -128,14 +132,6 @@ pub async fn run(
     usage_log: Option<PathBuf>,
     delegation: Option<Delegation>,
 ) {
-    let identity = &prompt.identity;
-    let client = match Client::new() {
-        Ok(client) => client.with_overrides(identity.model.clone(), identity.effort.clone()),
-        Err(e) => {
-            let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
-            return;
-        }
-    };
     let session_id = client.session_id().to_string();
     let model: Arc<dyn Model> = Arc::new(client);
     run_with(
@@ -270,6 +266,7 @@ async fn turn(
                     }
                     AgentEvent::Usage(usage)
                 }
+                Delta::Cache(found) => AgentEvent::Cache(found),
             });
         };
 
@@ -438,6 +435,12 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     attribute(child.children, child.id, u);
                     AgentEvent::ChildUsage(u)
                 }
+                // A child's clean call must not clear a break the parent shows.
+                AgentEvent::Cache(None) => continue,
+                AgentEvent::Cache(Some(found)) => AgentEvent::Cache(Some(CacheBreak {
+                    detail: format!("{tag} {}", found.detail),
+                    ..found
+                })),
                 // The parent reads the final text; streaming it would interleave.
                 AgentEvent::Reasoning(_) | AgentEvent::Text(_) | AgentEvent::TurnEnd => continue,
                 AgentEvent::Approval {
@@ -730,6 +733,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
         tokio::spawn(run(
+            Client::new().unwrap(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(Policy::default()),
             rx_user,

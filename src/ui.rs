@@ -71,6 +71,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(rate) = app.last_usage.and_then(|u| u.cache_rate()) {
         spans.push(Span::styled(format!("cache {rate:.0}% "), dim));
     }
+    if let Some(field) = &app.cache_break {
+        spans.push(Span::styled(
+            format!("cache break: {field} "),
+            Style::new().fg(Color::Red).bold(),
+        ));
+    }
     spans.push(Span::styled(
         if app.pending.is_some() {
             "  a accept · r reject"

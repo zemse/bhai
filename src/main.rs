@@ -4,6 +4,7 @@
 mod agent;
 mod app;
 mod auth;
+mod cache;
 mod client;
 mod config;
 mod frontmatter;
@@ -76,7 +77,7 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [--probe [prompt]] [--as <identity>] [--serve [port] [--headless]] [--profile] [--mode ask|auto|bypass] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [--probe [prompt]] [--as <identity>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
@@ -88,10 +89,9 @@ async fn main() -> Result<()> {
     .await?;
     let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
-    let model = client::Client::new()?
+    let client = client::Client::new()?
         .with_overrides(identity.model.clone(), identity.effort.clone())
-        .model()
-        .to_string();
+        .strict_cache(args.strict_cache);
     let mut notices = prompt.notices();
     if identity.name != identity::DEFAULT {
         notices.insert(
@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
     let usage_log = args
         .profile
         .then(|| profile::debug_dir().join("usage.jsonl"));
-    let (session, events) = start(model, prompt, policy, usage_log, delegation);
+    let (session, events) = start(client, prompt, policy, usage_log, delegation);
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         for notice in &notices {
@@ -164,6 +164,8 @@ struct Args {
     headless: bool,
     /// Log every model call's usage to `.bhai/debug/usage.jsonl`.
     profile: bool,
+    /// Refuse to send a request that breaks the prompt cache.
+    strict_cache: bool,
     /// `--as`: the identity to run as.
     identity: Option<String>,
     flags: Flags,
@@ -242,6 +244,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
             }
             "--headless" => parsed.headless = true,
             "--profile" => parsed.profile = true,
+            "--strict-cache" => parsed.strict_cache = true,
             "--mode" => {
                 let mode = args
                     .next()
@@ -269,7 +272,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
 /// Spawn the agent behind a session. The returned receiver is subscribed before the
 /// agent starts, so the TUI sees every event.
 fn start(
-    model: String,
+    client: client::Client,
     prompt: SystemPrompt,
     policy: Policy,
     usage_log: Option<PathBuf>,
@@ -281,7 +284,7 @@ fn start(
     let cancel = Arc::new(AtomicBool::new(false));
     let policy = Arc::new(policy);
     let session = Session::new(
-        model,
+        client.model().to_string(),
         prompt.identity.name.clone(),
         tx_user,
         tx_control,
@@ -290,6 +293,7 @@ fn start(
     );
     let events = session.subscribe();
     tokio::spawn(agent::run(
+        client,
         prompt,
         policy,
         rx_user,
@@ -311,7 +315,12 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
     let (_tx_control, rx_control) = mpsc::channel::<Control>(1);
     let (tx_agent, mut rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
+    let client = client::Client::new()?.with_overrides(
+        system.identity.model.clone(),
+        system.identity.effort.clone(),
+    );
     tokio::spawn(agent::run(
+        client,
         system,
         Arc::new(Policy::default()),
         rx_user,
@@ -348,6 +357,10 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
             AgentEvent::ChildUsage(u) => {
                 println!("\n[child usage] input={} output={}", u.input, u.output)
             }
+            AgentEvent::Cache(Some(found)) => {
+                println!("\n[cache break] {}: {}", found.field, found.detail)
+            }
+            AgentEvent::Cache(None) => {}
             AgentEvent::Error(message) => println!("\n[error] {message}"),
             AgentEvent::TurnEnd => break,
         }
@@ -501,5 +514,12 @@ mod tests {
         let args = ["--profile"].map(String::from);
         assert!(parse_args(&args).unwrap().profile);
         assert!(!parse_args(&[]).unwrap().profile);
+    }
+
+    #[test]
+    fn strict_cache_flag() {
+        let args = ["--strict-cache"].map(String::from);
+        assert!(parse_args(&args).unwrap().strict_cache);
+        assert!(!parse_args(&[]).unwrap().strict_cache);
     }
 }

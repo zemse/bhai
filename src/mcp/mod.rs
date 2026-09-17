@@ -393,7 +393,7 @@ async fn spawn(server: &Server, log_dir: &Path) -> Result<(Service, Vec<ToolInfo
         .spawn()
         .with_context(|| format!("starting `{}`", server.command))?;
     let service = ().serve(transport).await.context("initialize failed")?;
-    let tools = service
+    let mut tools = service
         .list_all_tools()
         .await
         .context("tools/list failed")?
@@ -404,7 +404,9 @@ async fn spawn(server: &Server, log_dir: &Path) -> Result<(Service, Vec<ToolInfo
             description: t.description.as_deref().unwrap_or_default().to_string(),
             schema: Value::Object((*t.input_schema).clone()),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // Sorted so the prompt's tool lines do not depend on the server's listing order.
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((service, tools))
 }
 

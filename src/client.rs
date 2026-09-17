@@ -4,8 +4,8 @@
 //! and `codex-rs/model-provider-info`): `POST https://chatgpt.com/backend-api/codex/responses`
 //! with the ChatGPT access token as a bearer and the workspace id in `ChatGPT-Account-ID`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::auth::{self, Auth};
+use crate::cache::{CacheBreak, CacheGuard};
 
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const ORIGINATOR: &str = "codex_cli_rs";
@@ -29,6 +30,8 @@ pub enum Delta {
     Reasoning(String),
     Text(String),
     Usage(Usage),
+    /// The request about to be sent breaks the prompt cache, or `None` when it is clean.
+    Cache(Option<CacheBreak>),
 }
 
 /// Token counts for one model call, as `response.completed` reports them.
@@ -73,6 +76,8 @@ pub struct Client {
     cache_key: String,
     model: String,
     effort: String,
+    /// The conversation's cache guard; shared by clones, fresh for each child.
+    guard: Arc<Mutex<CacheGuard>>,
 }
 
 impl Client {
@@ -86,10 +91,17 @@ impl Client {
         Ok(Self {
             http,
             cache_key: session_id.clone(),
+            guard: guard(&session_id, false),
             session_id,
             model,
             effort,
         })
+    }
+
+    /// `--strict-cache`: refuse to send a request that breaks the prompt cache.
+    pub fn strict_cache(mut self, strict: bool) -> Self {
+        self.guard = guard(&self.session_id, strict);
+        self
     }
 
     /// An identity's model and effort, where set, in place of the configured ones.
@@ -114,6 +126,13 @@ impl Client {
             .clone()
             .with_overrides(identity.model.clone(), identity.effort.clone());
         child.cache_key = format!("{}-{}", self.session_id, identity.name);
+        let strict = self
+            .guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .strict();
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        child.guard = guard(&format!("{}/{}", child.cache_key, &id[..6]), strict);
         child
     }
 
@@ -127,19 +146,21 @@ impl Client {
         on_delta: &mut impl FnMut(Delta),
         cancel: &Arc<AtomicBool>,
     ) -> Result<Vec<Value>> {
-        let body = json!({
-            "model": self.model,
-            "instructions": instructions,
-            "input": input,
-            "tools": tools,
-            "tool_choice": "auto",
-            "parallel_tool_calls": false,
-            "reasoning": { "effort": self.effort, "summary": "auto" },
-            "store": false,
-            "stream": true,
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": self.cache_key,
-        });
+        let body = request_body(
+            &self.model,
+            &self.effort,
+            &self.cache_key,
+            instructions,
+            tools,
+            input,
+        );
+        // Checked once per call, so retries of the same body are not compared.
+        let found = self
+            .guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .check(&body)?;
+        on_delta(Delta::Cache(found));
 
         let mut backoff = Duration::from_millis(500);
         let mut last_err = None;
@@ -303,6 +324,36 @@ impl Client {
     }
 }
 
+/// A fresh guard for `conversation`, logging to `.bhai/debug/cache.jsonl`.
+fn guard(conversation: &str, strict: bool) -> Arc<Mutex<CacheGuard>> {
+    let log = crate::profile::debug_dir().join("cache.jsonl");
+    Arc::new(Mutex::new(CacheGuard::new(conversation, Some(log), strict)))
+}
+
+/// The Responses API request body for one model call.
+pub fn request_body(
+    model: &str,
+    effort: &str,
+    cache_key: &str,
+    instructions: &str,
+    tools: &[Value],
+    input: &[Value],
+) -> Value {
+    json!({
+        "model": model,
+        "instructions": instructions,
+        "input": input,
+        "tools": tools,
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "reasoning": { "effort": effort, "summary": "auto" },
+        "store": false,
+        "stream": true,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": cache_key,
+    })
+}
+
 enum Error {
     Retryable(anyhow::Error),
     Fatal(anyhow::Error),
@@ -393,6 +444,23 @@ mod tests {
             }
         );
         assert_eq!(usage.cache_rate(), Some(75.0));
+    }
+
+    #[test]
+    fn a_child_has_its_own_cache_key_and_guard() {
+        let parent = Client::new().unwrap().strict_cache(true);
+        let identity = crate::identity::Identity {
+            name: "reader".to_string(),
+            ..crate::identity::Identity::default()
+        };
+        let child = parent.for_child(&identity);
+        assert_ne!(child.cache_key, parent.cache_key);
+        assert!(!Arc::ptr_eq(&child.guard, &parent.guard));
+        assert!(child.guard.lock().unwrap().strict());
+        let body = request_body("m", "e", "k", "i", &[], &[]);
+        parent.guard.lock().unwrap().check(&body).unwrap();
+        let other = request_body("m", "e", "k", "changed", &[], &[]);
+        assert_eq!(child.guard.lock().unwrap().check(&other).unwrap(), None);
     }
 
     #[test]

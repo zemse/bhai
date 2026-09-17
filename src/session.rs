@@ -9,6 +9,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::agent::{AgentEvent, Control};
+use crate::cache::CacheBreak;
 use crate::client::Usage;
 use crate::permissions::{Answer, Mode, Offers, Policy, Remember};
 use crate::profile::Profile;
@@ -44,6 +45,8 @@ pub enum Event {
     Usage(Usage),
     /// Usage of a child agent's model call.
     ChildUsage(Usage),
+    /// A request broke the prompt cache, or `None` when the parent's last one was clean.
+    Cache(Option<CacheBreak>),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
     /// The permission mode changed.
@@ -79,6 +82,8 @@ pub struct State {
     pub last_usage: Option<Usage>,
     /// Usage of every child agent, summed; not in the counts above.
     pub children: Usage,
+    /// The most recent prompt cache break, if there has been one.
+    pub last_cache_break: Option<CacheBreak>,
     pub pending: Option<Approval>,
 }
 
@@ -104,6 +109,7 @@ struct Inner {
     total: Usage,
     children: Usage,
     last_usage: Option<Usage>,
+    last_cache_break: Option<CacheBreak>,
     next_id: u64,
     pending: Option<(Approval, oneshot::Sender<Answer>)>,
 }
@@ -157,6 +163,7 @@ impl Session {
             reasoning_tokens: inner.total.reasoning,
             last_usage: inner.last_usage,
             children: inner.children,
+            last_cache_break: inner.last_cache_break.clone(),
             pending: inner.pending.as_ref().map(|(approval, _)| approval.clone()),
         }
     }
@@ -278,6 +285,12 @@ impl Session {
             AgentEvent::ChildUsage(usage) => {
                 add(&mut inner.children, usage);
                 Event::ChildUsage(usage)
+            }
+            AgentEvent::Cache(found) => {
+                if let Some(found) = &found {
+                    inner.last_cache_break = Some(found.clone());
+                }
+                Event::Cache(found)
             }
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Error(s) => Event::Error(s),
@@ -443,6 +456,19 @@ mod tests {
         assert_eq!(session.state().mode, Mode::Ask);
         let json = serde_json::to_value(Event::Mode(Mode::Bypass)).unwrap();
         assert_eq!(json, serde_json::json!({"type": "mode", "data": "bypass"}));
+    }
+
+    #[test]
+    fn the_last_cache_break_outlives_clean_calls() {
+        let (session, _rx) = session();
+        let found = CacheBreak {
+            field: "tools".to_string(),
+            detail: "changed".to_string(),
+        };
+        assert_eq!(session.state().last_cache_break, None);
+        session.on_agent(AgentEvent::Cache(Some(found.clone())));
+        session.on_agent(AgentEvent::Cache(None));
+        assert_eq!(session.state().last_cache_break, Some(found));
     }
 
     #[test]

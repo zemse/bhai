@@ -48,6 +48,8 @@ pub struct App {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub last_usage: Option<Usage>,
+    /// The field that broke the prompt cache, until the next clean call.
+    pub cache_break: Option<String>,
     /// The skills in the system prompt, for `/skills`.
     pub skills: Vec<Skill>,
     /// The session's MCP servers, for `/mcp`.
@@ -77,6 +79,7 @@ impl App {
             tokens_in: 0,
             tokens_out: 0,
             last_usage: None,
+            cache_break: None,
             skills: Vec::new(),
             mcp: None,
             quit: false,
@@ -184,6 +187,15 @@ impl App {
             Event::ChildUsage(usage) => {
                 self.tokens_in += usage.input;
                 self.tokens_out += usage.output;
+            }
+            Event::Cache(found) => {
+                if let Some(found) = &found {
+                    self.entries.push(Entry::Error(format!(
+                        "cache break: {}: {}",
+                        found.field, found.detail
+                    )));
+                }
+                self.cache_break = found.map(|f| f.field);
             }
             Event::Info(message) => self.entries.push(Entry::Info(message)),
             Event::Mode(mode) => self.mode = mode,
