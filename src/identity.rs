@@ -609,6 +609,7 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         let reader = build(&config, &f.roots, &no_agent, &identities);
         assert!(!reader.text.contains("# Delegation"));
     }
+
     #[test]
     fn the_request_body_is_byte_identical_across_fresh_builds() {
         let f = Fixture::new();
