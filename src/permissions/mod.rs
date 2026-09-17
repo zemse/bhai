@@ -228,10 +228,17 @@ impl Policy {
     }
 }
 
-/// The words as written, and again from the real program with its path dropped.
+/// The words as written, and again from the real program with its path dropped. Behind a
+/// wrapper, every later word may be the program, since wrapper flags can take values.
 fn loose_forms(command: &bash::Command) -> Vec<Vec<String>> {
     let mut forms = vec![command.words.clone()];
-    for words in [&command.words[..], command.unwrapped()] {
+    let wrapped = command.unwrapped().len() < command.words.len();
+    let starts = if wrapped {
+        1..command.words.len()
+    } else {
+        0..1
+    };
+    for words in starts.map(|i| &command.words[i..]) {
         let mut words = words.to_vec();
         if let Some(first) = words.first_mut() {
             *first = bash::basename(first).to_string();
@@ -313,6 +320,9 @@ mod tests {
             (&auto, "git log | npm test", Decision::Ask),
             (&auto, "git status; rm -rf ~", deny_rm.clone()),
             (&auto, "timeout 5 /bin/RM x", deny_rm.clone()),
+            (&bypass, "env -u FOO rm x", deny_rm.clone()),
+            (&bypass, "timeout -s KILL 5 rm x", deny_rm.clone()),
+            (&bypass, "xargs -I X rm X", deny_rm.clone()),
             (
                 &auto,
                 "git push origin main",
