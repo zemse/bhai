@@ -16,8 +16,9 @@ use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
 use crate::client::{Client, Delta, Usage};
 use crate::identity::Identity;
 use crate::permissions::{Answer, Decision, Mode, Offers, Policy};
-use crate::profile::{self, Measured, Profile};
+use crate::profile::{self, Call, Profile};
 use crate::prompt::SystemPrompt;
+use crate::tokens;
 use crate::tools::{self, BoxFuture, Registry};
 
 /// Hard cap on model calls in a single turn, so a confused loop cannot run forever.
@@ -77,6 +78,9 @@ pub trait Model: Send + Sync {
 
     /// The model a child running as `identity` talks to.
     fn child(&self, identity: &Identity) -> Arc<dyn Model>;
+
+    /// The model's name, which picks its tokenizer.
+    fn name(&self) -> &str;
 }
 
 impl Model for Client {
@@ -95,6 +99,10 @@ impl Model for Client {
 
     fn child(&self, identity: &Identity) -> Arc<dyn Model> {
         Arc::new(self.for_child(identity))
+    }
+
+    fn name(&self) -> &str {
+        self.model()
     }
 }
 
@@ -174,19 +182,20 @@ async fn run_with(
         });
     }
     let tools = registry.schemas();
-    let report = |history: &[Value], measured| {
-        let mut profile = profile::build(&prompt, &tools, history, measured);
+    let tokenizer = tokens::for_model(model.name());
+    let report = |history: &[Value], calls: &[Call]| {
+        let mut profile = profile::build(&prompt, &tools, history, calls, tokenizer);
         profile.children = children.lock().unwrap_or_else(|e| e.into_inner()).clone();
         profile
     };
     let mut history: Vec<Value> = Vec::new();
-    let mut measured: Option<Measured> = None;
+    let mut calls: Vec<Call> = Vec::new();
     let mut monitor = CacheMonitor::default();
 
     loop {
         let message = tokio::select! {
             Some(Control::Context(reply)) = rx_control.recv() => {
-                let _ = reply.send(report(&history, measured));
+                let _ = reply.send(report(&history, &calls));
                 continue;
             }
             message = rx_user.recv() => match message {
@@ -202,7 +211,7 @@ async fn run_with(
         }));
 
         // The turn holds the history, so mid-turn requests see it as the turn started.
-        let (before, measured_before) = (history.clone(), measured);
+        let (before, calls_before) = (history.clone(), calls.clone());
         let result = {
             let turn = turn(
                 model.as_ref(),
@@ -213,7 +222,7 @@ async fn run_with(
                 &mut history,
                 &tx,
                 &cancel,
-                &mut measured,
+                &mut calls,
                 &mut monitor,
                 usage_log.as_deref(),
                 None,
@@ -223,7 +232,7 @@ async fn run_with(
                 tokio::select! {
                     result = &mut turn => break result,
                     Some(Control::Context(reply)) = rx_control.recv() => {
-                        let _ = reply.send(report(&before, measured_before));
+                        let _ = reply.send(report(&before, &calls_before));
                     }
                 }
             }
@@ -247,7 +256,7 @@ async fn turn(
     history: &mut Vec<Value>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     cancel: &Arc<AtomicBool>,
-    measured: &mut Option<Measured>,
+    ledger: &mut Vec<Call>,
     monitor: &mut CacheMonitor,
     usage_log: Option<&Path>,
     transcript: Option<&Path>,
@@ -269,15 +278,13 @@ async fn turn(
             monitor.resume();
         }
         let sent = history.len();
+        let mut finished = None;
         let mut on_delta = |delta: Delta| {
             let _ = tx.send(match delta {
                 Delta::Reasoning(s) => AgentEvent::Reasoning(s),
                 Delta::Text(s) => AgentEvent::Text(s),
                 Delta::Usage(usage) => {
-                    *measured = Some(Measured {
-                        input_tokens: usage.input,
-                        items: sent,
-                    });
+                    finished = Some(usage);
                     let hit = monitor.observe(&usage, Instant::now());
                     if let Some(path) = usage_log
                         && let Err(e) = profile::log_usage(path, &usage, &hit, sent)
@@ -308,6 +315,13 @@ async fn turn(
             Err(_) if cancel.load(Ordering::Relaxed) => return Ok(step),
             Err(e) => return Err(e),
         };
+        if let Some(usage) = finished {
+            ledger.push(Call {
+                usage,
+                sent,
+                outputs: items.len(),
+            });
+        }
 
         let calls: Vec<&Value> = items
             .iter()
@@ -434,7 +448,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             "content": [{ "type": "input_text", "text": child.task }],
         })];
         record(child.transcript, &history, &tx_child);
-        let mut measured = None;
+        let mut ledger = Vec::new();
         let mut monitor = CacheMonitor::default();
         let result = turn(
             child.model,
@@ -445,7 +459,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             &mut history,
             &tx_child,
             child.cancel,
-            &mut measured,
+            &mut ledger,
             &mut monitor,
             None,
             child.transcript,
@@ -828,6 +842,10 @@ pub mod fake {
                 conversation,
                 ..self.clone()
             })
+        }
+
+        fn name(&self) -> &str {
+            "fake"
         }
     }
 }

@@ -17,6 +17,7 @@ mod prompt;
 mod server;
 mod session;
 mod skills;
+mod tokens;
 mod tools;
 mod ui;
 
@@ -456,7 +457,7 @@ fn cache_check_prefix(
     system: &SystemPrompt,
     tools: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {
-    let estimated = profile::build(system, tools, &[], None).estimated_tokens;
+    let estimated = profile::build(system, tools, &[], &[], &tokens::ByteEstimate).estimated_tokens;
     let Some(missing) = CACHE_CHECK_PREFIX.checked_sub(estimated).filter(|m| *m > 0) else {
         return Vec::new();
     };
@@ -631,7 +632,8 @@ mod tests {
         };
         let input = cache_check_prefix(&short, &[]);
         assert_eq!(input.len(), 1);
-        let padded = profile::build(&short, &[], &input, None).estimated_tokens;
+        let padded =
+            profile::build(&short, &[], &input, &[], &tokens::ByteEstimate).estimated_tokens;
         assert!(padded >= CACHE_CHECK_PREFIX, "{padded}");
 
         let tools = tools::Registry::for_prompt(&short).schemas();

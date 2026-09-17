@@ -217,7 +217,8 @@ mod tests {
                     },
                     &[],
                     &[],
-                    None,
+                    &[],
+                    &crate::tokens::ByteEstimate,
                 ));
             }
         });
