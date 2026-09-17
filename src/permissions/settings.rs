@@ -16,8 +16,13 @@ pub const CLAUDE_LOCAL: &str = ".claude/settings.local.json";
 
 /// The allow rules bhai saved in `path`, which count as the user's, and a notice for each one that does not parse.
 pub fn load_local(path: &Path) -> (Vec<Rule>, Vec<String>) {
+    local_rules(path, read(path))
+}
+
+/// The allow rules in `settings`, read from `path`, as [`load_local`] loads them.
+pub(super) fn local_rules(path: &Path, settings: Result<Value>) -> (Vec<Rule>, Vec<String>) {
     let mut notices = Vec::new();
-    let settings = match read(path) {
+    let settings = match settings {
         Ok(settings) => settings,
         Err(e) => return (Vec::new(), vec![format!("{e:#}")]),
     };
@@ -63,12 +68,17 @@ pub fn remember(path: &Path, rule: &str) -> Result<()> {
     write_atomic(path, text.as_bytes())
 }
 
-/// The allow rules in `path` as written, parsed or not; none if it cannot be read.
-pub fn allow_texts(path: &Path) -> Vec<String> {
-    match read(path) {
-        Ok(settings) => strings(&settings, "allow").map(str::to_string).collect(),
-        Err(_) => Vec::new(),
-    }
+/// The allow rules in `settings` as written, parsed or not.
+pub(super) fn allow_texts(settings: &Value) -> Vec<String> {
+    strings(settings, "allow").map(str::to_string).collect()
+}
+
+/// The allow rules in `settings`, read from `path`, as [`claude`] loads a repo's local file.
+pub(super) fn claude_repo_allow(path: &Path, settings: &Value) -> Vec<Rule> {
+    strings(settings, "allow")
+        .filter_map(|text| claude_rule(text)?.ok())
+        .map(|rule| rule.with_source(path.display().to_string()).repo_supplied())
+        .collect()
 }
 
 /// Write to a temporary file next to `path`, then rename it over `path`.
@@ -149,13 +159,16 @@ fn claude_rule(text: &str) -> Option<Result<Rule, String>> {
 
 /// The settings object in `path`, or an empty one if there is no file.
 fn read(path: &Path) -> Result<Value> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            serde_json::from_str(&text).with_context(|| format!("bad settings {}", path.display()))
-        }
+    match std::fs::read(path) {
+        Ok(bytes) => parse(path, &bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
+}
+
+/// The settings object in `bytes`, read from `path`.
+pub(super) fn parse(path: &Path, bytes: &[u8]) -> Result<Value> {
+    serde_json::from_slice(bytes).with_context(|| format!("bad settings {}", path.display()))
 }
 
 /// The strings in `permissions.<key>`.

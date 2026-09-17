@@ -181,13 +181,14 @@ impl Policy {
     }
 
     pub fn with_trust(self, trust: Trust) -> Self {
-        let trusted = trust.is_trusted();
+        let snapshot = trust.snapshot();
+        let trusted = trust.matches(&snapshot);
         let policy = Self {
             trust: Some(trust),
             ..self
         };
         if trusted {
-            policy.set_trusted();
+            policy.set_trusted(&snapshot);
         }
         policy
     }
@@ -272,14 +273,13 @@ impl Policy {
         if let Some(store) = &self.store {
             // The user's own approvals keep a trusted project trusted, and make a
             // project with no repo-supplied allow rules trusted.
-            let keep = self
-                .trust
-                .as_ref()
-                .filter(|t| t.is_trusted() || t.allow_rules().is_empty());
+            let keep = self.trust.as_ref().filter(|t| {
+                let snapshot = t.snapshot();
+                t.matches(&snapshot) || snapshot.allow_rules().is_empty()
+            });
             settings::remember(store, text)?;
             if let Some(trust) = keep {
-                trust.trust()?;
-                self.set_trusted();
+                self.set_trusted(&trust.trust()?);
             }
         }
         Ok(self.store.as_deref())
@@ -288,9 +288,9 @@ impl Policy {
     /// Honour the repo-supplied allow rules as the files are now, for `/trust`.
     pub fn trust(&self) -> anyhow::Result<String> {
         let trust = self.trust.as_ref().context("no trust store")?;
-        trust.trust()?;
-        self.set_trusted();
-        let rules = trust.allow_rules();
+        let snapshot = trust.trust()?;
+        self.set_trusted(&snapshot);
+        let rules = snapshot.allow_rules();
         let mut out = format!("trusted {} repo-supplied allow rules", rules.len());
         for (source, rule) in rules {
             out.push_str(&format!("\n  {rule}  ({source})"));
@@ -311,16 +311,15 @@ impl Policy {
     /// The startup notice when the repo ships allow rules that are not trusted.
     pub fn trust_notice(&self) -> Option<String> {
         let trust = self.trust.as_ref()?;
-        let count = trust.allow_rules().len();
+        let count = trust.snapshot().allow_rules().len();
         (count > 0 && !self.trusted())
             .then(|| format!("this repo ships {count} allow rules; /trust to honour them"))
     }
 
-    /// Honour the repo-supplied allow rules, replacing the loaded ones with the files as
-    /// they are now, so the rules that apply are the ones trusted.
-    fn set_trusted(&self) {
-        let Some(trust) = &self.trust else { return };
-        let fresh = trust.load_allow();
+    /// Honour the repo-supplied allow rules, replacing the loaded ones with those in
+    /// `snapshot`, so the rules that apply are the ones trusted.
+    fn set_trusted(&self, snapshot: &trust::Snapshot) {
+        let fresh = snapshot.load_allow();
         let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
         rules.allow.retain(|r| !r.repo);
         let fresh: Vec<Rule> = fresh

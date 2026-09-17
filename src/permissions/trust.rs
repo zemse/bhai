@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{Rule, settings};
@@ -41,16 +42,17 @@ impl Trust {
         Self { claude, ..self }
     }
 
-    /// Whether the stored hash matches the files as they are now.
-    pub fn is_trusted(&self) -> bool {
-        read(&self.store).is_ok_and(|entries| entries.get(&self.root) == Some(&self.hash()))
+    /// Whether the stored hash matches `snapshot`.
+    pub fn matches(&self, snapshot: &Snapshot) -> bool {
+        read(&self.store).is_ok_and(|entries| entries.get(&self.root) == Some(&snapshot.hash()))
     }
 
-    /// Record the files as they are now.
-    pub fn trust(&self) -> Result<()> {
+    /// Record the files as they are now, and return what was recorded.
+    pub fn trust(&self) -> Result<Snapshot> {
+        let snapshot = self.snapshot();
         let mut entries = read(&self.store)?;
-        entries.insert(self.root.clone(), self.hash());
-        write(&self.store, &entries)
+        entries.insert(self.root.clone(), snapshot.hash());
+        write(&self.store, &entries).map(|()| snapshot)
     }
 
     /// Forget the project; false if it had no entry.
@@ -62,42 +64,72 @@ impl Trust {
         write(&self.store, &entries).map(|()| true)
     }
 
+    /// The files as they are now, each read once.
+    pub fn snapshot(&self) -> Snapshot {
+        let files = SOURCES.map(|source| std::fs::read(self.cwd.join(source)).ok());
+        Snapshot {
+            cwd: self.cwd.clone(),
+            claude: self.claude,
+            files,
+        }
+    }
+}
+
+/// The files' bytes from one read, so the hash, the rules and the listing agree.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    cwd: PathBuf,
+    claude: bool,
+    /// Each of [`SOURCES`]; `None` if it could not be read.
+    files: [Option<Vec<u8>>; 2],
+}
+
+impl Snapshot {
     /// Each allow rule the files hold, with the file it is in.
     pub fn allow_rules(&self) -> Vec<(&'static str, String)> {
         self.sources()
-            .flat_map(|source| {
-                settings::allow_texts(&self.cwd.join(source))
+            .flat_map(|(source, settings)| {
+                settings::allow_texts(&settings)
                     .into_iter()
                     .map(move |rule| (source, rule))
             })
             .collect()
     }
 
-    /// The allow rules the files hold now, parsed as startup loads them.
+    /// The allow rules the files hold, parsed as startup loads them.
     pub fn load_allow(&self) -> Vec<Rule> {
-        let mut rules = settings::load_local(&self.cwd.join(settings::LOCAL)).0;
-        if self.claude {
-            let (claude, _) = settings::claude(None, &self.cwd);
-            rules.extend(claude.allow.into_iter().filter(|r| r.repo));
+        let mut rules = Vec::new();
+        for (source, settings) in self.sources() {
+            let path = self.cwd.join(source);
+            if source == settings::LOCAL {
+                rules.extend(settings::local_rules(&path, Ok(settings)).0);
+            } else {
+                rules.extend(settings::claude_repo_allow(&path, &settings));
+            }
         }
         rules
     }
 
-    /// The files whose allow rules are imported.
-    fn sources(&self) -> impl Iterator<Item = &'static str> {
-        let claude = self.claude;
+    /// The imported files, parsed; one that cannot be read or parsed is empty.
+    fn sources(&self) -> impl Iterator<Item = (&'static str, Value)> {
         SOURCES
             .into_iter()
-            .filter(move |&source| claude || source != settings::CLAUDE_LOCAL)
+            .zip(&self.files)
+            .filter(|&(source, _)| self.claude || source != settings::CLAUDE_LOCAL)
+            .map(|(source, bytes)| {
+                let path = self.cwd.join(source);
+                let parsed = bytes.as_deref().map(|b| settings::parse(&path, b));
+                (source, parsed.and_then(Result::ok).unwrap_or_default())
+            })
     }
 
     /// sha256 of the files, each prefixed with its length; a missing file is empty.
     fn hash(&self) -> String {
         let mut hasher = Sha256::new();
-        for source in SOURCES {
-            let bytes = std::fs::read(self.cwd.join(source)).unwrap_or_default();
+        for bytes in &self.files {
+            let bytes = bytes.as_deref().unwrap_or_default();
             hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(&bytes);
+            hasher.update(bytes);
         }
         hasher
             .finalize()
@@ -133,21 +165,59 @@ mod tests {
         let (config, repo) = (dir.join("config"), dir.join("repo"));
         std::fs::create_dir_all(repo.join(".claude")).unwrap();
         let trust = Trust::new(&config, &repo);
-        assert!(!trust.is_trusted());
+        assert!(!trust.matches(&trust.snapshot()));
         assert!(!trust.untrust().unwrap());
         trust.trust().unwrap();
-        assert!(trust.is_trusted());
+        assert!(trust.matches(&trust.snapshot()));
         let local = repo.join(settings::CLAUDE_LOCAL);
         std::fs::write(&local, r#"{"permissions": {"allow": ["Bash"]}}"#).unwrap();
-        assert!(!trust.is_trusted());
+        assert!(!trust.matches(&trust.snapshot()));
         assert_eq!(
-            trust.allow_rules(),
+            trust.snapshot().allow_rules(),
             [(settings::CLAUDE_LOCAL, "Bash".to_string())]
         );
         trust.trust().unwrap();
-        assert!(trust.is_trusted());
+        assert!(trust.matches(&trust.snapshot()));
         assert!(trust.untrust().unwrap());
-        assert!(!trust.is_trusted());
+        assert!(!trust.matches(&trust.snapshot()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_bytes_it_read() {
+        let dir = std::env::temp_dir().join(format!("bhai-trust-{}", uuid::Uuid::new_v4()));
+        let (config, repo) = (dir.join("config"), dir.join("repo"));
+        let (local, claude) = (
+            repo.join(settings::LOCAL),
+            repo.join(settings::CLAUDE_LOCAL),
+        );
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        std::fs::write(&local, r#"{"permissions": {"allow": ["Bash(make:*)"]}}"#).unwrap();
+        std::fs::write(&claude, r#"{"permissions": {"allow": ["Bash(npm test)"]}}"#).unwrap();
+        let trust = Trust::new(&config, &repo);
+        let snapshot = trust.trust().unwrap();
+
+        // A write after the read changes neither the rules nor the recorded hash.
+        std::fs::write(&local, r#"{"permissions": {"allow": ["Bash(curl:*)"]}}"#).unwrap();
+        std::fs::write(&claude, "{}").unwrap();
+        assert_eq!(
+            snapshot.allow_rules(),
+            [
+                (settings::LOCAL, "Bash(make:*)".to_string()),
+                (settings::CLAUDE_LOCAL, "Bash(npm test)".to_string()),
+            ]
+        );
+        let loaded: Vec<_> = snapshot.load_allow().into_iter().map(|r| r.text).collect();
+        assert_eq!(loaded, ["Bash(make:*)", "Bash(npm test)"]);
+        assert!(snapshot.load_allow().iter().all(|r| r.repo));
+        assert!(trust.matches(&snapshot));
+        assert!(!trust.matches(&trust.snapshot()));
+        let without_claude = trust.with_claude(false).snapshot();
+        assert_eq!(
+            without_claude.allow_rules(),
+            [(settings::LOCAL, "Bash(curl:*)".to_string())]
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
