@@ -109,6 +109,26 @@ impl Writer {
 
     /// Append one history item, flushed before returning.
     pub fn append(&mut self, item: &Value) -> Result<()> {
+        let mut record = json!({ "type": "item", "item": item });
+        if let Some(sidechain) = self.sidechain(item) {
+            record["sidechain"] = json!(sidechain);
+        }
+        self.write(record)
+    }
+
+    /// Record a compaction: `items` replace the history so far on load.
+    pub fn compact(&mut self, stage: &str, before: u64, after: u64, items: &[Value]) -> Result<()> {
+        self.write(json!({
+            "type": "compaction",
+            "stage": stage,
+            "before": before,
+            "after": after,
+            "items": items,
+        }))
+    }
+
+    /// Append `record` with its id and parent, flushed before returning.
+    fn write(&mut self, mut record: Value) -> Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -124,15 +144,8 @@ impl Writer {
             self.started = true;
         }
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let mut record = json!({
-            "type": "item",
-            "id": id,
-            "parent_id": self.last,
-            "item": item,
-        });
-        if let Some(sidechain) = self.sidechain(item) {
-            record["sidechain"] = json!(sidechain);
-        }
+        record["id"] = json!(id);
+        record["parent_id"] = json!(self.last);
         writeln!(file, "{record}")?;
         file.flush()?;
         self.last = Some(id);
@@ -163,8 +176,9 @@ pub struct Loaded {
     pub warnings: Vec<String>,
 }
 
-/// Read a session file. A truncated last line is skipped, and so is a trailing
-/// function call whose output never landed, each with a warning.
+/// Read a session file, applying compactions as they come. A truncated last line is
+/// skipped, and so is a trailing function call whose output never landed, each with a
+/// warning.
 pub fn load(path: &Path) -> Result<Loaded> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("could not read {}", path.display()))?;
@@ -172,7 +186,9 @@ pub fn load(path: &Path) -> Result<Loaded> {
     let first = lines.next().unwrap_or_default();
     let header: Header =
         serde_json::from_str(first).with_context(|| format!("{}: bad header", path.display()))?;
-    let mut records: Vec<(String, Value, u64)> = Vec::new();
+    // Each record's id and where it ends; each item with the record it came from.
+    let mut records: Vec<(String, u64)> = Vec::new();
+    let mut items: Vec<(Value, usize)> = Vec::new();
     let mut len = first.len() as u64;
     let mut warnings = Vec::new();
     while let Some(line) = lines.next() {
@@ -188,34 +204,42 @@ pub fn load(path: &Path) -> Result<Loaded> {
         };
         let id = record.get("id").and_then(Value::as_str).unwrap_or_default();
         let parent = record.get("parent_id").and_then(Value::as_str);
-        if parent != records.last().map(|(id, _, _)| id.as_str()) {
+        if parent != records.last().map(|(id, _)| id.as_str()) {
             bail!(
                 "{}: record {id} does not follow the one before",
                 path.display()
             );
         }
-        let Some(item) = record.get("item") else {
-            bail!("{}: record {id} has no item", path.display());
-        };
+        let index = records.len();
+        if record.get("type").and_then(Value::as_str) == Some("compaction") {
+            let Some(compacted) = record.get("items").and_then(Value::as_array) else {
+                bail!("{}: compaction {id} has no items", path.display());
+            };
+            items = compacted.iter().map(|item| (item.clone(), index)).collect();
+        } else {
+            let Some(item) = record.get("item") else {
+                bail!("{}: record {id} has no item", path.display());
+            };
+            items.push((item.clone(), index));
+        }
         len += line.len() as u64;
-        records.push((id.to_string(), item.clone(), len));
+        records.push((id.to_string(), len));
     }
-    let keep = answered(records.iter().map(|(_, item, _)| item));
-    if keep < records.len() {
+    let keep = answered(items.iter().map(|(item, _)| item));
+    if keep < items.len() {
         warnings.push(format!(
             "{}: dropped {} trailing item(s) after a tool call with no result",
             path.display(),
-            records.len() - keep
+            items.len() - keep
         ));
-        records.truncate(keep);
-        len = records
-            .last()
-            .map_or(first.len() as u64, |(_, _, end)| *end);
+        records.truncate(items[keep].1);
+        items.truncate(keep);
+        len = records.last().map_or(first.len() as u64, |(_, end)| *end);
     }
     Ok(Loaded {
         header,
-        last: records.last().map(|(id, _, _)| id.clone()),
-        items: records.into_iter().map(|(_, item, _)| item).collect(),
+        last: records.last().map(|(id, _)| id.clone()),
+        items: items.into_iter().map(|(item, _)| item).collect(),
         len,
         warnings,
     })
@@ -405,6 +429,31 @@ mod tests {
             .unwrap();
         let reloaded = load(&path).unwrap();
         assert_eq!(reloaded.items.len(), 2);
+        assert!(reloaded.warnings.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_compaction_replaces_the_history_before_it() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+        let loaded = load(&path).unwrap();
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        let compacted = [items()[0].clone(), items()[4].clone()];
+        writer.compact("summary", 50, 10, &compacted).unwrap();
+        writer.append(&items()[0]).unwrap();
+        writer.append(&items()[2]).unwrap();
+
+        // The unanswered call after the compaction is dropped, and a resume cuts it off.
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.items, [&compacted[..], &items()[..1]].concat());
+        assert!(loaded.warnings[0].contains("dropped 1"));
+        Writer::resume(&dir, &loaded)
+            .unwrap()
+            .append(&items()[4])
+            .unwrap();
+        let reloaded = load(&path).unwrap();
+        assert_eq!(reloaded.items.len(), 4);
         assert!(reloaded.warnings.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }

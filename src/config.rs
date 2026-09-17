@@ -10,6 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::compact::Limits;
 use crate::permissions::{Mode, Rule, Rules};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +31,8 @@ pub struct Config {
     pub permissions: Rules,
     /// Rules from Claude Code's `settings.json` files.
     pub import_claude_permissions: bool,
+    /// When history is compacted: `context_window` and `compact_at`.
+    pub limits: Limits,
 }
 
 impl Default for Config {
@@ -45,6 +48,7 @@ impl Default for Config {
             permission_mode: Mode::Ask,
             permissions: Rules::default(),
             import_claude_permissions: true,
+            limits: Limits::default(),
         }
     }
 }
@@ -94,6 +98,8 @@ struct Layer {
     mcp: Option<McpLayer>,
     permission_mode: Option<Mode>,
     import_claude_permissions: Option<bool>,
+    context_window: Option<u64>,
+    compact_at: Option<f64>,
     #[serde(default)]
     permissions: RulesLayer,
 }
@@ -190,6 +196,11 @@ impl Config {
         let layer: Layer =
             toml::from_str(&text).with_context(|| format!("bad config {}", path.display()))?;
         let bad = |e| anyhow::anyhow!("bad config {}: {e}", path.display());
+        if let Some(at) = layer.compact_at
+            && !(at > 0.0 && at <= 1.0)
+        {
+            return Err(bad(format!("compact_at {at} is not in (0, 1]")));
+        }
         let parse = |rules: &[String]| {
             rules
                 .iter()
@@ -234,6 +245,12 @@ impl Config {
             &mut self.load_project_instructions,
             layer.load_project_instructions,
         );
+        if let Some(window) = layer.context_window {
+            self.limits.window = Some(window);
+        }
+        if let Some(at) = layer.compact_at {
+            self.limits.compact_at = at;
+        }
         match layer.skills {
             Some(SkillsLayer::Enabled(enabled)) => self.skills = enabled,
             Some(SkillsLayer::Table { enabled, sources }) => {
@@ -407,6 +424,38 @@ mod tests {
         assert!(config.mcp_servers["fs"].env.is_empty());
         write(&cwd.join(".bhai/config.toml"), "mcp = false\n");
         assert!(!Config::load(Some(&home), &cwd).unwrap().mcp);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compaction_limits_come_from_either_file() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &home.join(".config/bhai/config.toml"),
+            "context_window = 100000
+compact_at = 0.9
+",
+        );
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "compact_at = 0.7
+",
+        );
+        let limits = Config::load(Some(&home), &cwd).unwrap().limits;
+        assert_eq!(
+            limits,
+            Limits {
+                window: Some(100_000),
+                compact_at: 0.7
+            }
+        );
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "compact_at = 1.5
+",
+        );
+        assert!(Config::load(Some(&home), &cwd).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

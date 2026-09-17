@@ -55,6 +55,8 @@ pub enum Event {
     CacheHit(Hit),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
+    /// History was compacted; earlier history indexes no longer hold.
+    Compacted(String),
     /// The permission mode changed.
     Mode(Mode),
     Error(String),
@@ -261,6 +263,21 @@ impl Session {
         self.policy.untrust()
     }
 
+    /// Summarise the history now, as a turn of its own, unless one is already running.
+    pub fn compact(&self) -> Result<(), SubmitError> {
+        let mut inner = self.lock();
+        if inner.working {
+            return Err(SubmitError::Busy);
+        }
+        self.cancel.store(false, Ordering::Relaxed);
+        self.tx_control
+            .try_send(Control::Compact)
+            .map_err(|_| SubmitError::Closed)?;
+        inner.working = true;
+        self.publish(Event::Info("compacting history".to_string()));
+        Ok(())
+    }
+
     /// Ask the agent for a token breakdown of its context; `None` if it has gone away.
     pub async fn context(&self) -> Option<Profile> {
         let (reply, wait) = oneshot::channel();
@@ -319,6 +336,7 @@ impl Session {
             AgentEvent::Item(index) => Event::Item(index),
             AgentEvent::CacheHit(hit) => Event::CacheHit(hit),
             AgentEvent::Info(s) => Event::Info(s),
+            AgentEvent::Compacted(s) => Event::Compacted(s),
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnEnd => {
                 inner.working = false;

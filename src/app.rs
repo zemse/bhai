@@ -323,6 +323,10 @@ impl App {
                     .map(|ratio| ratio * 100.0);
             }
             Event::Info(message) => self.entries.push(Entry::Info(message)),
+            Event::Compacted(message) => {
+                self.attribution.items.clear();
+                self.entries.push(Entry::Info(message));
+            }
             Event::Mode(mode) => self.mode = mode,
             Event::Error(message) => self.entries.push(Entry::Error(message)),
             Event::Interrupted => self.entries.push(Entry::Info("interrupted".to_string())),
@@ -343,6 +347,14 @@ impl App {
         let message = self.input.value_and_reset().trim().to_string();
         if message.starts_with("/context") {
             self.export_context();
+            return;
+        }
+        if message == "/compact" {
+            self.follow = true;
+            match self.session.compact() {
+                Ok(()) => self.working = true,
+                Err(e) => self.entries.push(Entry::Error(e.to_string())),
+            }
             return;
         }
         if message.starts_with("/permissions") {

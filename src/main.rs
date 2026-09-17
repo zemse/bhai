@@ -6,6 +6,7 @@ mod app;
 mod auth;
 mod cache;
 mod client;
+mod compact;
 mod config;
 mod frontmatter;
 mod identity;
@@ -37,6 +38,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::{AgentEvent, Control, Delegation, Saved};
 use crate::app::App;
+use crate::compact::Limits;
 use crate::config::{Config, Flags};
 use crate::permissions::Policy;
 use crate::prompt::SystemPrompt;
@@ -74,7 +76,7 @@ async fn main() -> Result<()> {
     // `bhai --probe [prompt]` does one non-interactive model call, for checking that
     // auth and the wire format still work without entering the TUI.
     if args.first().is_some_and(|a| a == "--probe") {
-        let (prompt, _, _) = load(Flags::default(), identity::DEFAULT).await?;
+        let (prompt, _, _, _) = load(Flags::default(), identity::DEFAULT).await?;
         let hub = prompt.mcp.clone();
         let result = probe(prompt, args.get(1).cloned()).await;
         shutdown(hub).await;
@@ -82,7 +84,7 @@ async fn main() -> Result<()> {
     }
     // `bhai --cache-check` sends a few calls on one prefix and checks the cache served it.
     if args.first().is_some_and(|a| a == "--cache-check") {
-        let (prompt, policy, delegation) = load(Flags::default(), identity::DEFAULT).await?;
+        let (prompt, policy, delegation, _) = load(Flags::default(), identity::DEFAULT).await?;
         let hub = prompt.mcp.clone();
         let result = cache_check(prompt, policy, delegation).await;
         shutdown(hub).await;
@@ -114,7 +116,7 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| identity::DEFAULT.to_string()),
     };
-    let (prompt, policy, delegation) = load(args.flags, &name).await?;
+    let (prompt, policy, delegation, limits) = load(args.flags, &name).await?;
     let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
     let mut client =
@@ -190,7 +192,7 @@ async fn main() -> Result<()> {
         .profile
         .then(|| profile::debug_dir().join("usage.jsonl"));
     let history = saved.history.clone();
-    let (session, events) = start(client, prompt, policy, usage_log, delegation, saved);
+    let (session, events) = start(client, prompt, policy, usage_log, delegation, saved, limits);
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         for notice in &notices {
@@ -254,7 +256,7 @@ struct Args {
 /// Config and instruction files for the working directory, as the system prompt for
 /// the identity called `name`, the permission policy, and what child agents need.
 /// Starts the MCP servers.
-async fn load(flags: Flags, name: &str) -> Result<(SystemPrompt, Policy, Delegation)> {
+async fn load(flags: Flags, name: &str) -> Result<(SystemPrompt, Policy, Delegation, Limits)> {
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
@@ -274,9 +276,10 @@ async fn load(flags: Flags, name: &str) -> Result<(SystemPrompt, Policy, Delegat
             })
         },
     };
+    let limits = config.limits;
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
-    Ok((prompt, policy, delegation))
+    Ok((prompt, policy, delegation, limits))
 }
 
 /// The policy from the config, Claude Code's settings and remembered approvals, plus
@@ -393,6 +396,7 @@ fn start(
     usage_log: Option<PathBuf>,
     delegation: Delegation,
     saved: Saved,
+    limits: Limits,
 ) -> (Arc<Session>, broadcast::Receiver<session::Event>) {
     let (tx_user, rx_user) = mpsc::channel::<String>(16);
     let (tx_control, rx_control) = mpsc::channel::<Control>(16);
@@ -419,6 +423,7 @@ fn start(
         usage_log,
         Some(delegation),
         Some(saved),
+        limits,
     ));
     tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
     (session, events)
@@ -447,6 +452,7 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
         None,
         None,
         None,
+        Limits::default(),
     ));
 
     tx_user
@@ -467,7 +473,9 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
             AgentEvent::ToolStart(command) => println!("\n$ {command}"),
             AgentEvent::ToolOutput(output) => println!("{output}"),
             AgentEvent::ToolRejected(command) => println!("[rejected] {command}"),
-            AgentEvent::Info(message) => println!("[info] {message}"),
+            AgentEvent::Info(message) | AgentEvent::Compacted(message) => {
+                println!("[info] {message}")
+            }
             AgentEvent::Usage(u) => println!(
                 "\n[usage] input={} cached={} output={} reasoning={}",
                 u.input, u.cached, u.output, u.reasoning

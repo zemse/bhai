@@ -87,7 +87,6 @@ impl CacheGuard {
     }
 
     /// Forget the last request, for a break that is intended, such as a compaction.
-    #[allow(dead_code)] // no intended break exists yet
     pub fn reset(&mut self, reason: &str) {
         if self.previous.take().is_some()
             && let Some(path) = &self.log

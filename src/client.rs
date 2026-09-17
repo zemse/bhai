@@ -144,6 +144,14 @@ impl Client {
             .seed(&body);
     }
 
+    /// Forget the last request, for an intended break such as a compaction.
+    pub fn reset_cache(&self, reason: &str) {
+        self.guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset(reason);
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }

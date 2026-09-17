@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
 use crate::client::{Client, Delta, Usage};
+use crate::compact::{self, Limits};
 use crate::identity::Identity;
 use crate::permissions::{Answer, Decision, Offers, Policy};
 use crate::profile::{self, Call, CallTokens, Profile};
@@ -45,6 +46,8 @@ pub enum AgentEvent {
     ToolRejected(String),
     /// A notice for the transcript, such as a call the policy allowed.
     Info(String),
+    /// History was compacted, so earlier item indexes no longer hold; with a notice.
+    Compacted(String),
     /// Token counts for the model call that just finished.
     Usage(Usage),
     /// Token counts for a model call a child agent just finished.
@@ -67,6 +70,8 @@ pub enum AgentEvent {
 pub enum Control {
     /// A token breakdown of the context the next request would send.
     Context(oneshot::Sender<Profile>),
+    /// Summarise the history now, as a turn of its own.
+    Compact,
 }
 
 /// A model backend. `Client` is the real one; tests drive the loop with a fake.
@@ -89,6 +94,9 @@ pub trait Model: Send + Sync {
 
     /// Take `input` as already sent, for a conversation resumed from disk.
     fn seed(&self, _instructions: &str, _tools: &[Value], _input: &[Value]) {}
+
+    /// Forget the last request, for an intended break such as a compaction.
+    fn reset(&self, _reason: &str) {}
 }
 
 impl Model for Client {
@@ -115,6 +123,10 @@ impl Model for Client {
 
     fn seed(&self, instructions: &str, tools: &[Value], input: &[Value]) {
         Client::seed(self, instructions, tools, input);
+    }
+
+    fn reset(&self, reason: &str) {
+        self.reset_cache(reason);
     }
 }
 
@@ -163,7 +175,8 @@ impl<'a> From<Option<&'a Path>> for Sink<'a> {
 }
 
 /// `usage_log` is the JSONL file each model call's usage is appended to, if any.
-/// `saved` persists the session and holds the history it resumes from.
+/// `saved` persists the session and holds the history it resumes from. `limits` say
+/// when history is compacted.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: Client,
@@ -176,12 +189,13 @@ pub async fn run(
     usage_log: Option<PathBuf>,
     delegation: Option<Delegation>,
     saved: Option<Saved>,
+    limits: Limits,
 ) {
     let session_id = client.session_id().to_string();
     let model: Arc<dyn Model> = Arc::new(client);
     run_with(
         model, session_id, prompt, policy, rx_user, rx_control, tx, cancel, usage_log, delegation,
-        saved,
+        saved, limits,
     )
     .await;
 }
@@ -200,6 +214,7 @@ async fn run_with(
     usage_log: Option<PathBuf>,
     delegation: Option<Delegation>,
     saved: Option<Saved>,
+    limits: Limits,
 ) {
     let children = Children::default();
     let mut registry = Registry::for_prompt(&prompt);
@@ -245,16 +260,40 @@ async fn run_with(
     let mut calls: Vec<Call> = Vec::new();
     let mut monitor = CacheMonitor::default();
 
+    let mut compact_next = false;
+
     loop {
         let message = tokio::select! {
-            Some(Control::Context(reply)) = rx_control.recv() => {
-                let _ = reply.send(report(&history, &calls));
-                continue;
+            Some(control) = rx_control.recv() => {
+                match control {
+                    Control::Context(reply) => {
+                        let _ = reply.send(report(&history, &calls));
+                        continue;
+                    }
+                    Control::Compact => None,
+                }
             }
             message = rx_user.recv() => match message {
-                Some(message) => message,
+                Some(message) => Some(message),
                 None => break,
             },
+        };
+        let Some(message) = message else {
+            let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
+            let pass = Compaction {
+                model: model.as_ref(),
+                tools: &tools,
+                instructions: &prompt.text,
+                limits,
+                tx: &tx,
+                cancel: &cancel,
+            };
+            if let Err(e) = pass.run(&mut history, None, &mut sink).await {
+                let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
+            }
+            (calls, monitor) = (Vec::new(), CacheMonitor::default());
+            let _ = tx.send(AgentEvent::TurnEnd);
+            continue;
         };
         // `Session::submit` clears `cancel` before sending, so an early interrupt holds.
         history.push(json!({
@@ -287,14 +326,36 @@ async fn run_with(
             loop {
                 tokio::select! {
                     result = &mut turn => break result,
-                    Some(Control::Context(reply)) = rx_control.recv() => {
-                        let _ = reply.send(report(&before, &calls_before));
-                    }
+                    Some(control) = rx_control.recv() => match control {
+                        Control::Context(reply) => {
+                            let _ = reply.send(report(&before, &calls_before));
+                        }
+                        // Never while a tool call may be pending: once the turn is over.
+                        Control::Compact => compact_next = true,
+                    },
                 }
             }
         };
         if let Err(e) = result {
             let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
+        }
+        // Between turns the history holds every call's output, so it can be rewritten.
+        let size = calls.last().map(|call| call.usage.input);
+        if compact_next || size.is_some_and(|input| limits.over(model.name(), input)) {
+            let pass = Compaction {
+                model: model.as_ref(),
+                tools: &tools,
+                instructions: &prompt.text,
+                limits,
+                tx: &tx,
+                cancel: &cancel,
+            };
+            let size = if compact_next { None } else { size };
+            if let Err(e) = pass.run(&mut history, size, &mut sink).await {
+                let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
+            }
+            // Earlier calls index the old history and read the old prefix.
+            (calls, monitor, compact_next) = (Vec::new(), CacheMonitor::default(), false);
         }
         let _ = tx.send(AgentEvent::TurnEnd);
     }
@@ -435,6 +496,119 @@ async fn turn(
     Ok(MAX_STEPS)
 }
 
+/// One compaction of a conversation's history.
+struct Compaction<'a> {
+    model: &'a dyn Model,
+    tools: &'a [Value],
+    instructions: &'a str,
+    limits: Limits,
+    tx: &'a mpsc::UnboundedSender<AgentEvent>,
+    cancel: &'a Arc<AtomicBool>,
+}
+
+impl Compaction<'_> {
+    /// Bring `history` under the target: evict old tool outputs, then summarise if that
+    /// is not enough. `size` is the last call's input tokens; `None` forces a summary.
+    async fn run(
+        &self,
+        history: &mut Vec<Value>,
+        size: Option<u64>,
+        sink: &mut Sink<'_>,
+    ) -> anyhow::Result<()> {
+        let name = self.model.name();
+        let tokenizer = tokens::for_model(name);
+        let before = compact::estimate(history, tokenizer);
+        let mut next = history.clone();
+        if let (Some(size), Some(target)) = (size, self.limits.target(name)) {
+            let excess = size.saturating_sub(target);
+            if compact::evict(&mut next, excess, tokenizer) >= excess {
+                self.commit("evict", before, next, history, sink);
+                return Ok(());
+            }
+        }
+        if compact::fold(&next, "").is_none() {
+            if next != *history {
+                self.commit("evict", before, next, history, sink);
+            } else {
+                let _ = self.tx.send(AgentEvent::Info(
+                    "nothing to compact: there is no earlier turn to summarise".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        if next != *history {
+            // The summary call already sends the evicted outputs.
+            self.model.reset("compaction: evict before summary");
+        }
+        match self.summarize(&next).await {
+            Ok(summary) => {
+                let folded = compact::fold(&next, &summary).expect("checked above");
+                self.commit("summary", before, folded, history, sink);
+                Ok(())
+            }
+            Err(e) => {
+                if next != *history {
+                    self.commit("evict", before, next, history, sink);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// One model call on `history` with a request for a summary appended.
+    async fn summarize(&self, history: &[Value]) -> anyhow::Result<String> {
+        let mut input = history.to_vec();
+        input.push(compact::request());
+        let tx = self.tx;
+        let mut on_delta = |delta: Delta| {
+            if let Delta::Usage(usage) = delta {
+                let _ = tx.send(AgentEvent::Usage(usage));
+            }
+        };
+        let items = self
+            .model
+            .respond(
+                self.instructions,
+                self.tools,
+                &input,
+                &mut on_delta,
+                self.cancel,
+            )
+            .await?;
+        final_text(&items)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| anyhow!("the model wrote no summary"))
+    }
+
+    /// Replace `history` with `next`, reset the cache guard, record it and say so.
+    fn commit(
+        &self,
+        stage: &str,
+        before: u64,
+        next: Vec<Value>,
+        history: &mut Vec<Value>,
+        sink: &mut Sink<'_>,
+    ) {
+        let after = compact::estimate(&next, tokens::for_model(self.model.name()));
+        self.model.reset(&format!("compaction: {stage}"));
+        *history = next;
+        if let Sink::Session(writer) = sink
+            && let Err(e) = writer.compact(stage, before, after, history)
+        {
+            let _ = self
+                .tx
+                .send(AgentEvent::Error(format!("transcript: {e:#}")));
+        }
+        let what = match stage {
+            "evict" => "evicted old tool outputs",
+            _ => "summarised earlier turns",
+        };
+        let _ = self.tx.send(AgentEvent::Compacted(format!(
+            "compacted history ({what}): ~{before} -> ~{after} tokens"
+        )));
+    }
+}
+
 /// Write `items` to the sink.
 fn record(sink: &mut Sink<'_>, items: &[Value], tx: &mpsc::UnboundedSender<AgentEvent>) {
     let result = match sink {
@@ -555,7 +729,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::Text(_)
                 | AgentEvent::TurnEnd
                 | AgentEvent::Call(_)
-                | AgentEvent::Item(_) => continue,
+                | AgentEvent::Item(_)
+                | AgentEvent::Compacted(_) => continue,
                 AgentEvent::Approval {
                     tool,
                     command,
@@ -922,6 +1097,10 @@ pub mod fake {
             );
             self.guard.lock().unwrap().seed(&body);
         }
+
+        fn reset(&self, reason: &str) {
+            self.guard.lock().unwrap().reset(reason);
+        }
     }
 }
 
@@ -947,6 +1126,7 @@ mod tests {
             None,
             None,
             None,
+            Limits::default(),
         ));
 
         let (reply, wait) = oneshot::channel();
@@ -1008,6 +1188,7 @@ mod tests {
             None,
             Some(delegation),
             None,
+            Limits::default(),
         ));
         tx_user.send("go".to_string()).await.unwrap();
         let mut events = Vec::new();
@@ -1208,6 +1389,7 @@ mod tests {
             None,
             Some(delegation),
             None,
+            Limits::default(),
         ));
         let accept = Answer::Accept(None);
         let mut turn = async |message: &str, answers: &[Answer]| {
@@ -1308,6 +1490,7 @@ mod tests {
                 None,
                 None,
                 Some(saved),
+                Limits::default(),
             ));
             drive(&tx_user, &mut rx, &cancel, message, &[]).await
         };
@@ -1340,6 +1523,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_full_context_is_evicted_then_summarised_and_resumes_compacted() {
+        use crate::sessions::{self, Header};
+        use fake::{Fake, call, say};
+
+        let dir = tools::temp_dir();
+        let printf = || call("bash", json!({"command": "printf '%0400d' 0"}));
+        let fake = Fake::new(vec![
+            (0..9).map(|_| printf()).collect(),
+            vec![say("done")],
+            vec![say("two")],
+            vec![say("the summary")],
+            vec![say("three")],
+            vec![say("summary two")],
+        ])
+        .with_usage(Usage {
+            input: 850,
+            ..Usage::default()
+        });
+        // 850 is over 0.8 of 1000, so every turn compacts towards 600.
+        let limits = Limits {
+            window: Some(1000),
+            compact_at: 0.8,
+        };
+        let policy = Policy::new(Mode::Bypass, Default::default(), None, dir.clone());
+        let saved = Saved {
+            writer: Writer::create(&dir, Header::new("sess", "general", "fake", "medium", &dir)),
+            history: Vec::new(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(policy),
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            Some(saved),
+            limits,
+        ));
+        let compacted = |events: &[AgentEvent]| {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Compacted(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Evicting the three oldest of nine results is enough.
+        let events = drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        let notices = compacted(&events);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].starts_with("compacted history (evicted old tool outputs): ~"));
+        // Nothing left to evict, so the earlier turn is summarised.
+        let events = drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        assert!(compacted(&events)[0].contains("summarised earlier turns"));
+        drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let bodies: Vec<Value> = fake
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, body)| body["input"].clone())
+            .collect();
+        assert_eq!(bodies.len(), 6);
+        let input = bodies[2].as_array().unwrap();
+        let outputs: Vec<&str> = input
+            .iter()
+            .filter(|i| i["type"] == "function_call_output")
+            .map(|i| i["output"].as_str().unwrap())
+            .collect();
+        assert_eq!(outputs.len(), 9);
+        assert!(
+            outputs[..3]
+                .iter()
+                .all(|o| o.starts_with("[output removed"))
+        );
+        assert!(outputs[3..].iter().all(|o| o.contains(&"0".repeat(400))));
+        let calls = input.iter().filter(|i| i["type"] == "function_call");
+        for (call, output) in
+            calls.zip(input.iter().filter(|i| i["type"] == "function_call_output"))
+        {
+            assert_eq!(call["call_id"], output["call_id"]);
+        }
+        // The summary call appends its request to the history as the turn left it.
+        let asked = bodies[3].as_array().unwrap();
+        assert_eq!(asked.len(), input.len() + 2);
+        assert!(asked[..input.len()] == input[..]);
+        assert_eq!(asked[input.len()..], [say("two"), compact::request()]);
+        let summary = compact::user_message("Summary of earlier conversation:\nthe summary");
+        let text = |t: &str| compact::user_message(t);
+        assert_eq!(
+            bodies[4].as_array().unwrap(),
+            &[
+                input[0].clone(),
+                summary,
+                text("second"),
+                say("two"),
+                text("third")
+            ]
+        );
+
+        // A resume replays the compactions and continues without a break.
+        let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
+        let summary = compact::user_message("Summary of earlier conversation:\nsummary two");
+        assert_eq!(
+            loaded.items,
+            [input[0].clone(), summary, text("third"), say("three")]
+        );
+        assert!(loaded.warnings.is_empty());
+        let fake = Fake::new(vec![vec![say("four")]]);
+        let resumed = Saved {
+            writer: Writer::resume(&dir, &loaded).unwrap(),
+            history: loaded.items.clone(),
+        };
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            Some(resumed),
+            Limits::default(),
+        ));
+        drive(&tx_user, &mut rx, &cancel, "fourth", &[]).await;
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let input = fake.bodies.lock().unwrap()[0].1["input"].clone();
+        assert_eq!(&input.as_array().unwrap()[..4], loaded.items.as_slice());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn compact_forces_a_summary_between_turns() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![
+            vec![say("one")],
+            vec![say("two")],
+            vec![say("short")],
+            vec![say("three")],
+        ]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        let compact = async |rx: &mut mpsc::UnboundedReceiver<AgentEvent>| {
+            tx_control.send(Control::Compact).await.unwrap();
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                match event {
+                    AgentEvent::TurnEnd => break,
+                    other => events.push(other),
+                }
+            }
+            events
+        };
+
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        let events = compact(&mut rx).await;
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Info(m) if m.starts_with("nothing to compact"))));
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        let events = compact(&mut rx).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Compacted(_))));
+        drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let bodies = fake.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 4);
+        // The summary call itself only appends, so it reads the cached prefix.
+        let input = bodies[3].1["input"].as_array().unwrap();
+        assert_eq!(
+            input[1]["content"][0]["text"],
+            "Summary of earlier conversation:\nshort"
+        );
+        assert_eq!(input.len(), 5);
+    }
+
+    #[tokio::test]
     async fn repeated_cache_misses_pause_for_the_user() {
         use fake::{Fake, call, say};
 
@@ -1367,6 +1761,7 @@ mod tests {
             None,
             None,
             None,
+            Limits::default(),
         ));
 
         let events = drive(&tx_user, &mut rx, &cancel, "go", &[Answer::Reject]).await;
