@@ -27,6 +27,7 @@ mod skills;
 mod tokens;
 mod tools;
 mod ui;
+mod workflow;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -105,7 +106,7 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--as <identity>] [--resume [id]] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
@@ -187,6 +188,8 @@ async fn main() -> Result<()> {
         );
     }
     let skills = prompt.skills.clone();
+    let workflows = workflow::discover(&instructions::Roots::from_env(cwd.clone()));
+    notices.extend(workflows.errors.iter().cloned());
 
     // Bind before taking over the terminal so a busy port is a plain error.
     let listener = match args.serve {
@@ -204,6 +207,18 @@ async fn main() -> Result<()> {
         .then(|| profile::debug_dir().join("usage.jsonl"));
     let history = saved.history.clone();
     let (session, events) = start(client, prompt, policy, usage_log, delegation, saved, limits);
+    // `--workflow` is a run of its own: no TUI, no turn, just the steps and their report.
+    if let Some((name, input)) = args.workflow.clone() {
+        for notice in &notices {
+            eprintln!("bhai: {notice}");
+        }
+        let result = match workflow::find(&workflows.workflows, &name) {
+            Ok(found) => headless_workflow(&session, found, input, args.workflow_yes).await,
+            Err(e) => Err(e),
+        };
+        shutdown(hub).await;
+        return result;
+    }
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         session.entries().restore(&history);
@@ -247,6 +262,7 @@ async fn main() -> Result<()> {
         hub.clone(),
         &history,
         prompts,
+        workflows,
     )
     .await;
     release_modes(mouse, paste, keyboard);
@@ -291,6 +307,10 @@ struct Args {
     trust: bool,
     /// `--resume [id]`: continue a saved session, the latest when no id is given.
     resume: Option<Option<String>>,
+    /// `--workflow <name> [input]`: run one workflow without the TUI.
+    workflow: Option<(String, String)>,
+    /// Answer the workflow confirmation with yes; without it the plan is only printed.
+    workflow_yes: bool,
     flags: Flags,
 }
 
@@ -414,6 +434,14 @@ fn parse_args(args: &[String]) -> Result<Args> {
             "--resume" => {
                 parsed.resume = Some(args.next_if(|a| !a.starts_with("--")).cloned());
             }
+            "--workflow" => {
+                let name = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--workflow needs a workflow name"))?;
+                let input = args.next_if(|a| !a.starts_with("--")).cloned();
+                parsed.workflow = Some((name.clone(), input.unwrap_or_default()));
+            }
+            "--workflow-yes" => parsed.workflow_yes = true,
             "--no-global" => parsed.flags.no_global = true,
             "--no-project" => parsed.flags.no_project = true,
             "--bare" => parsed.flags.bare = true,
@@ -422,6 +450,9 @@ fn parse_args(args: &[String]) -> Result<Args> {
     }
     if parsed.headless && parsed.serve.is_none() {
         bail!("--headless needs --serve");
+    }
+    if parsed.workflow.is_some() && (parsed.serve.is_some() || parsed.headless) {
+        bail!("--workflow runs on its own, so it takes no --serve or --headless");
     }
     if parsed.resume.is_some() && parsed.identity.is_some() {
         bail!("--resume keeps the session's identity, so it takes no --as");
@@ -469,6 +500,56 @@ fn start(
     ));
     tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
     (session, events)
+}
+
+/// Run one workflow without the TUI: print the plan, then each step and the report.
+/// The confirmation is answered by `--workflow-yes`; any other approval is rejected,
+/// since nothing is there to answer it.
+async fn headless_workflow(
+    session: &Arc<Session>,
+    workflow: Arc<workflow::Workflow>,
+    input: String,
+    yes: bool,
+) -> Result<()> {
+    let mut events = session.subscribe();
+    session
+        .workflow(workflow, input)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    loop {
+        let event = match events.recv().await {
+            Ok(event) => event,
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        };
+        match event {
+            session::Event::Approval {
+                id, tool, command, ..
+            } => {
+                let confirmation = tool == workflow::TOOL;
+                let accept = yes && confirmation;
+                if !accept {
+                    println!("[rejected] {command}");
+                }
+                if confirmation && !yes {
+                    println!("bhai: pass --workflow-yes to run it");
+                }
+                session.answer(
+                    match accept {
+                        true => permissions::Answer::Accept(None),
+                        false => permissions::Answer::Reject,
+                    },
+                    Some(id),
+                );
+            }
+            session::Event::Info(message) => println!("{message}"),
+            session::Event::ToolStart(command) => println!("$ {command}"),
+            session::Event::ToolOutput(output) => println!("{output}"),
+            session::Event::Error(message) => eprintln!("[error] {message}"),
+            session::Event::TurnEnd => break,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Drive the real agent loop without the TUI, rejecting every command. Checks auth,
@@ -683,6 +764,7 @@ async fn run(
     hub: Option<Arc<mcp::Hub>>,
     history: &[serde_json::Value],
     prompts: input::History,
+    workflows: workflow::Found,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -724,6 +806,7 @@ async fn run(
     let mut app = App::new(Arc::clone(&session));
     app.skills = skills;
     app.mcp = hub;
+    app.workflows = workflows;
     app.history = prompts;
     {
         let mut entries = app.entries();

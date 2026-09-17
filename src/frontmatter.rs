@@ -53,6 +53,38 @@ pub fn list(lines: &[&str], key: &str) -> Option<Vec<String>> {
     Some(items.into_iter().filter(|i| !i.is_empty()).collect())
 }
 
+/// A top-level list of mappings: the lines of each `- key: value` block, dedented to
+/// the first item key so `value` and `list` read them as their own frontmatter.
+pub fn items<'a>(lines: &[&'a str], key: &str) -> Option<Vec<Vec<&'a str>>> {
+    let index = position(lines, key)?;
+    let mut blocks: Vec<Vec<&'a str>> = Vec::new();
+    let mut indent = 0;
+    for line in &lines[index + 1..] {
+        if line.trim().is_empty() {
+            if let Some(block) = blocks.last_mut() {
+                block.push("");
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let dash = line.len() - trimmed.len();
+        if trimmed.starts_with("- ") && (blocks.is_empty() || dash < indent) {
+            let rest = trimmed[1..].trim_start();
+            indent = line.len() - rest.len();
+            blocks.push(vec![rest]);
+        } else if line.starts_with([' ', '\t']) {
+            let Some(block) = blocks.last_mut() else {
+                continue;
+            };
+            let cut = indent.min(line.len() - trimmed.len());
+            block.push(&line[cut..]);
+        } else {
+            break;
+        }
+    }
+    Some(blocks)
+}
+
 /// One list item, unquoted.
 fn item(text: &str) -> String {
     let text = text.trim();
@@ -61,10 +93,7 @@ fn item(text: &str) -> String {
 
 /// The inline value after `key:` and the trimmed indented lines that follow it.
 fn entry<'a>(lines: &[&'a str], key: &str) -> Option<(&'a str, Vec<&'a str>)> {
-    let index = lines.iter().position(|line| {
-        line.strip_prefix(key)
-            .is_some_and(|rest| rest.trim_start().starts_with(':'))
-    })?;
+    let index = position(lines, key)?;
     let first = lines[index][key.len()..].trim_start()[1..].trim();
     let more = lines[index + 1..]
         .iter()
@@ -72,6 +101,14 @@ fn entry<'a>(lines: &[&'a str], key: &str) -> Option<(&'a str, Vec<&'a str>)> {
         .map(|line| line.trim())
         .collect();
     Some((first, more))
+}
+
+/// The line `key:` is on.
+fn position(lines: &[&str], key: &str) -> Option<usize> {
+    lines.iter().position(|line| {
+        line.strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+    })
 }
 
 /// The contents of a `"..."` or `'...'` scalar on one line.
@@ -106,5 +143,21 @@ mod tests {
         assert_eq!(split(text).unwrap().1, "body");
         let flush = "---\nskills:\n- '!*'\n- pdf\nname: x\n---\n";
         assert_eq!(lists(flush, "skills").unwrap(), ["!*", "pdf"]);
+    }
+
+    #[test]
+    fn items_split_a_list_of_mappings() {
+        let text = "---\nname: w\nsteps:\n  - id: a\n    prompt: |\n      one\n      two\n  \
+- id: b\n    needs:\n      - a\n    prompt: three\nbudget_tokens: 10\n---\nbody";
+        let (front, body) = split(text).unwrap();
+        let steps = items(&front, "steps").unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(value(&steps[0], "id").unwrap(), "a");
+        assert_eq!(value(&steps[0], "prompt").unwrap(), "one\ntwo");
+        assert_eq!(list(&steps[1], "needs").unwrap(), ["a"]);
+        assert_eq!(value(&steps[1], "prompt").unwrap(), "three");
+        assert_eq!(value(&front, "budget_tokens").unwrap(), "10");
+        assert_eq!(body, "body");
+        assert!(items(&front, "missing").is_none());
     }
 }

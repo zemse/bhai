@@ -15,6 +15,7 @@ use crate::entries::Entries;
 use crate::limits::RateLimits;
 use crate::permissions::{Answer, Mode, Offers, Policy, Remember};
 use crate::profile::{CallTokens, EntryTokens, Profile};
+use crate::workflow::Workflow;
 
 /// Events a slow consumer can fall behind by before it starts missing them.
 const EVENT_BUFFER: usize = 4096;
@@ -290,6 +291,21 @@ impl Session {
             .map_err(|_| SubmitError::Closed)?;
         inner.working = true;
         self.publish(Event::Info("compacting history".to_string()));
+        Ok(())
+    }
+
+    /// Run `workflow` now, as a turn of its own, unless one is already running. The
+    /// agent asks for confirmation before it launches anything.
+    pub fn workflow(&self, workflow: Arc<Workflow>, input: String) -> Result<(), SubmitError> {
+        let mut inner = self.lock();
+        if inner.working {
+            return Err(SubmitError::Busy);
+        }
+        self.cancel.store(false, Ordering::Relaxed);
+        self.tx_control
+            .try_send(Control::Workflow { workflow, input })
+            .map_err(|_| SubmitError::Closed)?;
+        inner.working = true;
         Ok(())
     }
 

@@ -1,0 +1,911 @@
+//! Workflows: a handful of child agent steps run in dependency order under one token
+//! budget. Definitions are markdown files with frontmatter, like identities. Only the
+//! user starts one, with `/workflow` or `--workflow`; the model is never offered a
+//! workflow tool, so it cannot spend the budget on its own.
+
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use anyhow::{Context, Result, bail};
+use futures_util::future::join_all;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::agent::{self, AgentEvent, Child, Children, Delegation};
+use crate::client::Usage;
+use crate::frontmatter;
+use crate::identity::{self, Identity};
+use crate::instructions::{self, Roots};
+use crate::permissions::{Offers, Policy};
+use crate::tools;
+
+/// The tool name the confirmation prompt carries.
+pub const TOOL: &str = "workflow";
+/// Tokens a workflow may spend before it stops launching steps.
+const DEFAULT_BUDGET: u64 = 200_000;
+/// Workflow files under the home directory.
+const HOME_DIR: &str = ".config/bhai/workflows";
+/// Workflow files under the project root; they replace a home one of the same name.
+const PROJECT_DIR: &str = ".bhai/workflows";
+
+/// What a step does when it fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnFail {
+    /// Launch no more steps.
+    Stop,
+    /// Carry on with the steps that do not need this one.
+    Continue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    pub id: String,
+    pub identity: String,
+    /// The task, with `{{input}}` and `{{steps.<id>}}` still in it.
+    pub prompt: String,
+    /// Step ids that must finish first.
+    pub needs: Vec<String>,
+    pub on_fail: OnFail,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Workflow {
+    pub name: String,
+    pub description: String,
+    /// Where it was defined, as shown to the user.
+    pub source: String,
+    pub budget_tokens: u64,
+    /// Steps launched at once, never more than the child agent fan-out cap.
+    pub max_parallel: usize,
+    pub steps: Vec<Step>,
+    /// Prose shown by `/workflows`.
+    pub body: String,
+}
+
+/// Every workflow file found, and the ones that would not load.
+#[derive(Debug, Default)]
+pub struct Found {
+    pub workflows: Vec<Arc<Workflow>>,
+    /// One line per file that failed to parse.
+    pub errors: Vec<String>,
+}
+
+/// The built-in workflows (there are none) and every workflow file; a later definition
+/// replaces an earlier one of the same name.
+pub fn discover(roots: &Roots) -> Found {
+    let mut dirs = Vec::new();
+    if let Some(home) = &roots.home {
+        dirs.push(home.join(HOME_DIR));
+    }
+    dirs.push(instructions::project_root(&roots.cwd).join(PROJECT_DIR));
+
+    let mut found = Found::default();
+    for dir in dirs {
+        let label = instructions::label(&dir, roots);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "md"))
+            .collect();
+        files.sort();
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            match parse(&text, &label) {
+                Ok(workflow) => {
+                    let workflow = Arc::new(workflow);
+                    match found.workflows.iter_mut().find(|w| w.name == workflow.name) {
+                        Some(slot) => *slot = workflow,
+                        None => found.workflows.push(workflow),
+                    }
+                }
+                Err(e) => found.errors.push(format!(
+                    "skipped {}: {e:#}",
+                    instructions::label(&path, roots)
+                )),
+            }
+        }
+    }
+    found
+}
+
+/// A workflow file. Everything that cannot be checked once it is running (a cycle, a
+/// placeholder with no value, a step that needs a step that is not there) fails here.
+pub fn parse(text: &str, source: &str) -> Result<Workflow> {
+    let (front, body) = frontmatter::split(text).context("no frontmatter")?;
+    let value = |key: &str| frontmatter::value(&front, key).filter(|v| !v.is_empty());
+    let name = value("name").context("no `name`")?;
+    let number = |key: &str, default: u64| -> Result<u64> {
+        match value(key) {
+            Some(text) => text
+                .parse()
+                .with_context(|| format!("bad `{key}` `{text}`")),
+            None => Ok(default),
+        }
+    };
+    let budget_tokens = number("budget_tokens", DEFAULT_BUDGET)?;
+    let max_parallel = number("max_parallel", 1)?.clamp(1, tools::agent::MAX_RUNNING as u64);
+
+    let mut steps = Vec::new();
+    for item in frontmatter::items(&front, "steps").unwrap_or_default() {
+        let value = |key: &str| frontmatter::value(&item, key).filter(|v| !v.is_empty());
+        let id = value("id").context("a step has no `id`")?;
+        let prompt = value("prompt").with_context(|| format!("step `{id}` has no `prompt`"))?;
+        let on_fail = match value("on_fail").as_deref() {
+            None | Some("stop") => OnFail::Stop,
+            Some("continue") => OnFail::Continue,
+            Some(other) => bail!("step `{id}` has a bad `on_fail` `{other}`"),
+        };
+        steps.push(Step {
+            id,
+            identity: value("identity").unwrap_or_else(|| identity::DEFAULT.to_string()),
+            prompt,
+            needs: frontmatter::list(&item, "needs").unwrap_or_default(),
+            on_fail,
+        });
+    }
+    if steps.is_empty() {
+        bail!("no `steps`");
+    }
+    check(&steps)?;
+    Ok(Workflow {
+        name,
+        description: value("description").unwrap_or_default(),
+        source: source.to_string(),
+        budget_tokens,
+        max_parallel: max_parallel as usize,
+        steps,
+        body: body.trim_end().to_string(),
+    })
+}
+
+/// Unique ids, dependencies that exist and are not circular, and placeholders that a
+/// value will be there for.
+fn check(steps: &[Step]) -> Result<()> {
+    for (index, step) in steps.iter().enumerate() {
+        if steps[..index].iter().any(|s| s.id == step.id) {
+            bail!("two steps are called `{}`", step.id);
+        }
+        for need in &step.needs {
+            if !steps.iter().any(|s| &s.id == need) {
+                bail!("step `{}` needs `{need}`, which is not a step", step.id);
+            }
+        }
+        for name in placeholders(&step.prompt) {
+            match name.strip_prefix("steps.") {
+                None if name == "input" => {}
+                Some(id) if step.needs.iter().any(|n| n == id) => {}
+                Some(id) if steps.iter().any(|s| s.id == id) => {
+                    bail!(
+                        "step `{}` uses `{{{{{name}}}}}` but does not need `{id}`",
+                        step.id
+                    )
+                }
+                _ => bail!("step `{}` uses unknown `{{{{{name}}}}}`", step.id),
+            }
+        }
+    }
+    order(steps)?;
+    Ok(())
+}
+
+/// Step indexes in dependency order; `Err` names the steps in a cycle.
+fn order(steps: &[Step]) -> Result<Vec<usize>> {
+    let mut done = vec![false; steps.len()];
+    let mut order = Vec::with_capacity(steps.len());
+    while order.len() < steps.len() {
+        let ready: Vec<usize> = steps
+            .iter()
+            .enumerate()
+            .filter(|(index, step)| {
+                !done[*index]
+                    && step.needs.iter().all(|need| {
+                        steps
+                            .iter()
+                            .position(|s| &s.id == need)
+                            .is_some_and(|i| done[i])
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if ready.is_empty() {
+            let stuck: Vec<&str> = steps
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !done[*index])
+                .map(|(_, step)| step.id.as_str())
+                .collect();
+            bail!("steps need each other in a cycle: {}", stuck.join(", "));
+        }
+        for index in ready {
+            done[index] = true;
+            order.push(index);
+        }
+    }
+    Ok(order)
+}
+
+/// The `{{...}}` names in `text`, in order.
+fn placeholders(text: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        found.push(after[..end].trim());
+        rest = &after[end + 2..];
+    }
+    found
+}
+
+/// `text` with `{{input}}` and `{{steps.<id>}}` filled in. A name with no value is left
+/// as it is; `check` already refused the ones that could not be filled.
+fn render(text: &str, input: &str, results: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let name = after[..end].trim();
+        let value = match name.strip_prefix("steps.") {
+            Some(id) => results.get(id).map(String::as_str),
+            None if name == "input" => Some(input),
+            None => None,
+        };
+        out.push_str(&rest[..start]);
+        match value {
+            Some(value) => out.push_str(value),
+            None => out.push_str(&rest[start..start + 4 + end]),
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The workflow called `name`, or an error listing the available ones.
+pub fn find(workflows: &[Arc<Workflow>], name: &str) -> Result<Arc<Workflow>> {
+    if let Some(workflow) = workflows.iter().find(|w| w.name == name) {
+        return Ok(Arc::clone(workflow));
+    }
+    let names: Vec<&str> = workflows.iter().map(|w| w.name.as_str()).collect();
+    if names.is_empty() {
+        bail!("unknown workflow `{name}`. No workflows are defined.");
+    }
+    bail!(
+        "unknown workflow `{name}`. Available workflows: {}",
+        names.join(", ")
+    )
+}
+
+/// What `/workflows` prints.
+pub fn report(found: &Found) -> String {
+    let mut out = String::new();
+    if found.workflows.is_empty() {
+        out.push_str(&format!(
+            "no workflows. Define them in ~/{HOME_DIR}/*.md or <project>/{PROJECT_DIR}/*.md.\n"
+        ));
+    }
+    for workflow in &found.workflows {
+        let _ = writeln!(
+            out,
+            "{} ({}): {} step(s), budget {} tokens, {} at a time{}",
+            workflow.name,
+            workflow.source,
+            workflow.steps.len(),
+            workflow.budget_tokens,
+            workflow.max_parallel,
+            match workflow.description.is_empty() {
+                true => String::new(),
+                false => format!("\n  {}", workflow.description),
+            }
+        );
+    }
+    for error in &found.errors {
+        let _ = writeln!(out, "{error}");
+    }
+    out
+}
+
+/// How one step ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Status {
+    Ok,
+    Failed(String),
+    /// Never launched, and why.
+    Skipped(String),
+}
+
+/// One step's line of the final report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepReport {
+    pub id: String,
+    pub identity: String,
+    pub status: Status,
+    pub usage: Usage,
+}
+
+/// What a finished run spent, step by step.
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub name: String,
+    pub steps: Vec<StepReport>,
+    pub usage: Usage,
+    pub budget: u64,
+    /// Set when the run never started, such as when the user said no.
+    pub refused: Option<String>,
+}
+
+impl Report {
+    /// The transcript line the run ends with.
+    pub fn text(&self) -> String {
+        if let Some(reason) = &self.refused {
+            return format!("workflow {}: {reason}", self.name);
+        }
+        let mut out = format!(
+            "workflow {} finished, {}/{} tokens of a {} budget",
+            self.name, self.usage.input, self.usage.output, self.budget
+        );
+        for step in &self.steps {
+            let status = match &step.status {
+                Status::Ok => "ok".to_string(),
+                Status::Failed(e) => format!("failed: {e}"),
+                Status::Skipped(reason) => format!("did not run: {reason}"),
+            };
+            let _ = write!(
+                out,
+                "\n  {} ({}) {status}, {}/{} tokens",
+                step.id, step.identity, step.usage.input, step.usage.output
+            );
+        }
+        out
+    }
+}
+
+/// One workflow run: the definition, its input, and everything a child agent needs.
+pub struct Run<'a> {
+    pub workflow: &'a Workflow,
+    pub input: &'a str,
+    pub delegation: &'a Delegation,
+    pub model: &'a dyn agent::Model,
+    pub policy: &'a Policy,
+    /// The session's events; every step's own events are forwarded into it.
+    pub tx: &'a mpsc::UnboundedSender<AgentEvent>,
+    pub cancel: &'a Arc<AtomicBool>,
+    pub children: &'a Children,
+    /// Where the step transcripts are written.
+    pub transcripts: PathBuf,
+}
+
+/// Run every step in dependency order, up to `max_parallel` at a time, until the steps
+/// run out, one fails with `on_fail: stop`, or the budget is spent.
+pub async fn run(run: Run<'_>) -> Report {
+    let workflow = run.workflow;
+    let mut report = Report {
+        name: workflow.name.clone(),
+        steps: Vec::new(),
+        usage: Usage::default(),
+        budget: workflow.budget_tokens,
+        refused: None,
+    };
+    let identities = match resolve(run.delegation, &workflow.steps) {
+        Ok(identities) => identities,
+        Err(e) => {
+            let _ = run.tx.send(AgentEvent::Error(format!("workflow: {e:#}")));
+            report.refused = Some(format!("not started: {e:#}"));
+            let _ = run.tx.send(AgentEvent::Info(report.text()));
+            return report;
+        }
+    };
+    let plan = plan(workflow);
+    let _ = run.tx.send(AgentEvent::Info(plan.clone()));
+    if !confirm(run.tx, plan).await {
+        report.refused = Some("not started".to_string());
+        let _ = run.tx.send(AgentEvent::Info(report.text()));
+        return report;
+    }
+
+    let mut status: Vec<Option<Status>> = vec![None; workflow.steps.len()];
+    let mut results: HashMap<String, String> = HashMap::new();
+    let mut usage = vec![Usage::default(); workflow.steps.len()];
+    // Set once no more steps are launched, with the reason the rest did not run.
+    let mut stopped: Option<String> = None;
+
+    while let Some(wave) = next_wave(&workflow.steps, &status) {
+        for (index, reason) in wave.blocked {
+            status[index] = Some(Status::Skipped(reason));
+        }
+        for chunk in wave.ready.chunks(workflow.max_parallel) {
+            if stopped.is_none() && run.cancel.load(Ordering::Relaxed) {
+                stopped = Some("the run was interrupted".to_string());
+            }
+            if stopped.is_none() && spent(&report.usage) >= workflow.budget_tokens {
+                stopped = Some(format!(
+                    "the {} token budget was spent",
+                    workflow.budget_tokens
+                ));
+            }
+            if let Some(reason) = &stopped {
+                for &index in chunk {
+                    status[index] = Some(Status::Skipped(reason.clone()));
+                }
+                continue;
+            }
+            let launched: Vec<(usize, String)> = chunk
+                .iter()
+                .map(|&index| {
+                    let step = &workflow.steps[index];
+                    (index, render(&step.prompt, run.input, &results))
+                })
+                .collect();
+            let finished = join_all(launched.iter().map(|(index, prompt)| {
+                step(&run, &workflow.steps[*index], &identities[*index], prompt)
+            }))
+            .await;
+            for ((index, _), done) in launched.iter().zip(finished) {
+                let step = &workflow.steps[*index];
+                usage[*index] = done.usage;
+                add(&mut report.usage, done.usage);
+                match done.result {
+                    Ok(text) => {
+                        results.insert(step.id.clone(), text);
+                        status[*index] = Some(Status::Ok);
+                    }
+                    Err(e) => {
+                        let reason = format!("{e:#}");
+                        status[*index] = Some(Status::Failed(reason.clone()));
+                        if step.on_fail == OnFail::Stop && stopped.is_none() {
+                            stopped = Some(format!("step `{}` failed", step.id));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    report.steps = workflow
+        .steps
+        .iter()
+        .zip(status)
+        .zip(usage)
+        .map(|((step, status), usage)| StepReport {
+            id: step.id.clone(),
+            identity: step.identity.clone(),
+            status: status.unwrap_or(Status::Skipped("not reached".to_string())),
+            usage,
+        })
+        .collect();
+    let _ = run.tx.send(AgentEvent::Info(report.text()));
+    report
+}
+
+/// The identity each step runs as; `Err` when a step names one that is not defined.
+fn resolve(delegation: &Delegation, steps: &[Step]) -> Result<Vec<Identity>> {
+    let choices: Vec<Identity> = delegation
+        .identities
+        .iter()
+        .filter(|i| i.name != identity::ROUTER)
+        .cloned()
+        .collect();
+    steps
+        .iter()
+        .map(|step| {
+            identity::find(&choices, &step.identity).with_context(|| format!("step `{}`", step.id))
+        })
+        .collect()
+}
+
+/// What the confirmation prompt shows before anything runs.
+fn plan(workflow: &Workflow) -> String {
+    let steps: Vec<String> = workflow
+        .steps
+        .iter()
+        .map(|s| format!("{} ({})", s.id, s.identity))
+        .collect();
+    format!(
+        "workflow {}: {} step(s) [{}], budget {} tokens, {} at a time",
+        workflow.name,
+        workflow.steps.len(),
+        steps.join(", "),
+        workflow.budget_tokens,
+        workflow.max_parallel
+    )
+}
+
+/// Ask the user through the session's approval path.
+async fn confirm(tx: &mpsc::UnboundedSender<AgentEvent>, plan: String) -> bool {
+    let (reply, wait) = oneshot::channel();
+    let sent = tx.send(AgentEvent::Approval {
+        tool: TOOL.to_string(),
+        command: plan,
+        offers: Offers::default(),
+        reply,
+    });
+    sent.is_ok() && wait.await.is_ok_and(|answer| answer.accepted())
+}
+
+/// Steps that can be launched now, and steps whose dependencies did not finish.
+struct Wave {
+    ready: Vec<usize>,
+    blocked: Vec<(usize, String)>,
+}
+
+/// The next wave, or `None` once every step has a status.
+fn next_wave(steps: &[Step], status: &[Option<Status>]) -> Option<Wave> {
+    let settled = |id: &str| {
+        steps
+            .iter()
+            .position(|s| s.id == id)
+            .and_then(|i| status[i].as_ref())
+    };
+    let mut wave = Wave {
+        ready: Vec::new(),
+        blocked: Vec::new(),
+    };
+    for (index, step) in steps.iter().enumerate() {
+        if status[index].is_some() {
+            continue;
+        }
+        let mut blocked = None;
+        let mut waiting = false;
+        for need in &step.needs {
+            match settled(need) {
+                Some(Status::Ok) => {}
+                Some(_) => blocked = Some(format!("`{need}` did not finish")),
+                None => waiting = true,
+            }
+        }
+        match (blocked, waiting) {
+            (Some(reason), _) => wave.blocked.push((index, reason)),
+            (None, true) => {}
+            (None, false) => wave.ready.push(index),
+        }
+    }
+    (!wave.ready.is_empty() || !wave.blocked.is_empty()).then_some(wave)
+}
+
+/// Run one step as a child agent, with its own transcript entry.
+async fn step(run: &Run<'_>, step: &Step, identity: &Identity, prompt: &str) -> agent::Finished {
+    let id = uuid::Uuid::new_v4().simple().to_string()[..6].to_string();
+    let _ = run.tx.send(AgentEvent::ToolStart(format!(
+        "workflow {} step {} ({})",
+        run.workflow.name, step.id, identity.name
+    )));
+    let model = run.model.child(identity);
+    let finished = agent::run_child(Child {
+        id: &id,
+        description: &step.id,
+        task: prompt,
+        prompt: (run.delegation.prompt)(identity),
+        model: model.as_ref(),
+        policy: run.policy,
+        tx: run.tx,
+        cancel: run.cancel,
+        transcript: Some(&run.transcripts.join(format!("child-{id}.jsonl"))),
+        children: run.children,
+    })
+    .await;
+    let output = match &finished.result {
+        Ok(text) => tools::truncate(&tools::agent::sanitize(text)),
+        Err(e) => format!("step {} failed: {e:#}", step.id),
+    };
+    let _ = run.tx.send(AgentEvent::ToolOutput(output));
+    finished
+}
+
+/// Tokens a run has spent: what was sent plus what came back.
+fn spent(usage: &Usage) -> u64 {
+    usage.input + usage.output
+}
+
+fn add(total: &mut Usage, usage: Usage) {
+    total.input += usage.input;
+    total.cached += usage.cached;
+    total.output += usage.output;
+    total.reasoning += usage.reasoning;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::fake::{self, Fake, say};
+    use crate::permissions::Answer;
+    use crate::prompt::SystemPrompt;
+
+    fn workflow(steps: &str) -> Workflow {
+        parse(&format!("---\nname: w\n{steps}---\nprose"), "./test").unwrap()
+    }
+
+    fn delegation() -> Delegation {
+        Delegation {
+            identities: vec![Identity::default()],
+            prompt: Arc::new(|identity: &Identity| SystemPrompt {
+                identity: identity.clone(),
+                ..SystemPrompt::default()
+            }),
+            sessions: PathBuf::new(),
+        }
+    }
+
+    /// Accept every approval and collect the transcript events.
+    async fn accept(mut rx: mpsc::UnboundedReceiver<AgentEvent>) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::Approval { command, reply, .. } => {
+                    seen.push(format!("approval: {command}"));
+                    let _ = reply.send(Answer::Accept(None));
+                }
+                AgentEvent::ToolStart(s) => seen.push(format!("start: {s}")),
+                AgentEvent::ToolOutput(s) => seen.push(format!("output: {s}")),
+                AgentEvent::Info(s) => seen.push(format!("info: {s}")),
+                _ => {}
+            }
+        }
+        seen
+    }
+
+    async fn go(workflow: &Workflow, input: &str, fake: &Fake) -> (Report, Vec<String>, PathBuf) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let seen = tokio::spawn(accept(rx));
+        let transcripts = tools::temp_dir();
+        let report = run(Run {
+            workflow,
+            input,
+            delegation: &delegation(),
+            model: fake,
+            policy: &Policy::default(),
+            tx: &tx,
+            cancel: &Arc::new(AtomicBool::new(false)),
+            children: &Children::default(),
+            transcripts: transcripts.clone(),
+        })
+        .await;
+        drop(tx);
+        (report, seen.await.unwrap(), transcripts)
+    }
+
+    fn statuses(report: &Report) -> Vec<(&str, &Status)> {
+        report
+            .steps
+            .iter()
+            .map(|s| (s.id.as_str(), &s.status))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_later_step_gets_the_earlier_step_output() {
+        let workflow = workflow(
+            "steps:\n  - id: a\n    prompt: look at {{input}}\n  - id: b\n    needs: [a]\n    \
+prompt: review {{steps.a}}\n",
+        );
+        let fake = Fake::new(vec![vec![say("a said this")], vec![say("b done")]]);
+        let (report, seen, dir) = go(&workflow, "the repo", &fake).await;
+        assert_eq!(statuses(&report), [("a", &Status::Ok), ("b", &Status::Ok)]);
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let inputs: Vec<String> = bodies.iter().map(|(_, b)| b["input"].to_string()).collect();
+        assert!(inputs[0].contains("look at the repo"), "{inputs:?}");
+        assert!(inputs[1].contains("review a said this"), "{inputs:?}");
+        // Each step is its own pair of transcript entries, under one confirmation.
+        assert_eq!(
+            seen.iter().filter(|s| s.starts_with("approval: ")).count(),
+            1
+        );
+        assert!(seen.contains(&"start: workflow w step b (general)".to_string()));
+        assert!(seen.iter().any(|s| s == "output: a said this"));
+        assert!(
+            report.text().contains("a (general) ok"),
+            "{}",
+            report.text()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn independent_steps_run_together() {
+        let workflow = workflow(
+            "max_parallel: 2\nsteps:\n  - id: a\n    prompt: one\n  - id: b\n    prompt: two\n",
+        );
+        assert_eq!(workflow.max_parallel, 2);
+        let fake = Fake::new(vec![vec![say("first")], vec![say("second")]]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(statuses(&report), [("a", &Status::Ok), ("b", &Status::Ok)]);
+        // Two children, each on its own conversation and cache key.
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let mut keys: Vec<String> = bodies
+            .iter()
+            .map(|(c, b)| format!("{c} {}", b["prompt_cache_key"]))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_failing_step_stops_the_run_unless_it_says_continue() {
+        let steps = |on_fail: &str| {
+            format!(
+                "steps:\n  - id: a\n    prompt: one\n    on_fail: {on_fail}\n  - id: b\n    prompt: two\n"
+            )
+        };
+        let stop = workflow(&steps("stop"));
+        let fake = Fake::new(vec![fake::step(fake::FAIL), vec![say("second")]]);
+        let (report, _, dir) = go(&stop, "", &fake).await;
+        assert_eq!(
+            report.steps[0].status,
+            Status::Failed("scripted failure".to_string())
+        );
+        assert_eq!(
+            report.steps[1].status,
+            Status::Skipped("step `a` failed".to_string())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+
+        let carry_on = workflow(&steps("continue"));
+        let fake = Fake::new(vec![fake::step(fake::FAIL), vec![say("second")]]);
+        let (report, _, dir) = go(&carry_on, "", &fake).await;
+        assert!(matches!(report.steps[0].status, Status::Failed(_)));
+        assert_eq!(report.steps[1].status, Status::Ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_step_that_needs_a_failed_step_never_runs() {
+        let workflow = workflow(
+            "steps:\n  - id: a\n    prompt: one\n    on_fail: continue\n  - id: b\n    \
+needs: [a]\n    prompt: two {{steps.a}}\n",
+        );
+        let fake = Fake::new(vec![fake::step(fake::FAIL)]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(
+            report.steps[1].status,
+            Status::Skipped("`a` did not finish".to_string())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_budget_stops_launching_steps() {
+        // One step costs 12 tokens, so the second one is over the budget.
+        let workflow = workflow(
+            "budget_tokens: 11\nsteps:\n  - id: a\n    prompt: one\n  - id: b\n    prompt: two\n",
+        );
+        let fake = Fake::new(vec![vec![say("first")], vec![say("second")]]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(report.steps[0].status, Status::Ok);
+        assert_eq!(
+            report.steps[1].status,
+            Status::Skipped("the 11 token budget was spent".to_string())
+        );
+        assert_eq!(spent(&report.usage), 12);
+        assert!(report.text().contains("10/2 tokens of a 11 budget"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_refused_confirmation_runs_nothing() {
+        let workflow = workflow("steps:\n  - id: a\n    prompt: one\n");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let answer = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let AgentEvent::Approval { reply, .. } = event {
+                    let _ = reply.send(Answer::Reject);
+                }
+            }
+        });
+        let fake = Fake::default();
+        let report = run(Run {
+            workflow: &workflow,
+            input: "",
+            delegation: &delegation(),
+            model: &fake,
+            policy: &Policy::default(),
+            tx: &tx,
+            cancel: &Arc::new(AtomicBool::new(false)),
+            children: &Children::default(),
+            transcripts: PathBuf::new(),
+        })
+        .await;
+        drop(tx);
+        answer.await.unwrap();
+        assert_eq!(report.refused.as_deref(), Some("not started"));
+        assert!(report.steps.is_empty());
+        assert!(fake.bodies.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_cycle_and_an_unknown_placeholder_are_load_errors() {
+        let cycle = parse(
+            "---\nname: w\nsteps:\n  - id: a\n    needs: [b]\n    prompt: one\n  - id: b\n    \
+needs: [a]\n    prompt: two\n---\n",
+            "./test",
+        )
+        .unwrap_err();
+        assert!(format!("{cycle:#}").contains("cycle: a, b"), "{cycle:#}");
+
+        let unknown = parse(
+            "---\nname: w\nsteps:\n  - id: a\n    prompt: one {{nope}}\n---\n",
+            "./test",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{unknown:#}").contains("step `a` uses unknown `{{nope}}`"),
+            "{unknown:#}"
+        );
+
+        let undeclared = parse(
+            "---\nname: w\nsteps:\n  - id: a\n    prompt: one\n  - id: b\n    prompt: {{steps.a}}\n---\n",
+            "./test",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{undeclared:#}").contains("does not need `a`"),
+            "{undeclared:#}"
+        );
+
+        let missing = parse("---\nname: w\n---\n", "./test").unwrap_err();
+        assert!(format!("{missing:#}").contains("no `steps`"), "{missing:#}");
+    }
+
+    #[test]
+    fn a_definition_takes_the_defaults_and_the_fan_out_cap() {
+        let workflow = parse(
+            "---\nname: review\ndescription: Look it over\nmax_parallel: 9\nsteps:\n  - id: a\n \
+   identity: router\n    prompt: |\n      read {{input}}\n      then stop\n---\nprose here\n",
+            "~/.config/bhai/workflows",
+        )
+        .unwrap();
+        assert_eq!(workflow.budget_tokens, DEFAULT_BUDGET);
+        assert_eq!(workflow.max_parallel, tools::agent::MAX_RUNNING);
+        assert_eq!(workflow.steps[0].identity, "router");
+        assert_eq!(workflow.steps[0].prompt, "read {{input}}\nthen stop");
+        assert_eq!(workflow.steps[0].on_fail, OnFail::Stop);
+        assert_eq!(workflow.body, "prose here");
+        let found = Found {
+            workflows: vec![Arc::new(workflow)],
+            errors: vec!["skipped ./.bhai/workflows/bad.md: no `name`".to_string()],
+        };
+        let report = report(&found);
+        assert!(
+            report.contains("review (~/.config/bhai/workflows): 1 step(s)"),
+            "{report}"
+        );
+        assert!(report.contains("Look it over"), "{report}");
+        assert!(
+            report.contains("skipped ./.bhai/workflows/bad.md"),
+            "{report}"
+        );
+        assert!(find(&found.workflows, "nope").is_err());
+        assert_eq!(find(&found.workflows, "review").unwrap().name, "review");
+    }
+
+    #[test]
+    fn the_shipped_example_loads() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/workflows/review.md");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let workflow = parse(&text, "./docs/workflows").unwrap();
+        assert_eq!(workflow.name, "review");
+        assert_eq!(workflow.max_parallel, 2);
+        assert_eq!(workflow.steps[1].on_fail, OnFail::Continue);
+        assert!(workflow.steps[2].prompt.contains("{{steps.diff}}"));
+    }
+
+    #[test]
+    fn a_step_that_names_an_unknown_identity_stops_the_run() {
+        let workflow = workflow("steps:\n  - id: a\n    identity: nope\n    prompt: one\n");
+        let error = resolve(&delegation(), &workflow.steps).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("step `a`: unknown identity `nope`"),
+            "{error:#}"
+        );
+    }
+}

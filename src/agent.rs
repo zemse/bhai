@@ -23,6 +23,7 @@ use crate::prompt::SystemPrompt;
 use crate::sessions::{self, Writer};
 use crate::tokens;
 use crate::tools::{self, BoxFuture, Registry};
+use crate::workflow::{self, Workflow};
 
 /// Hard cap on model calls in a single turn, so a confused loop cannot run forever.
 const MAX_STEPS: usize = 40;
@@ -77,6 +78,11 @@ pub enum Control {
     Context(oneshot::Sender<Profile>),
     /// Summarise the history now, as a turn of its own.
     Compact,
+    /// Run a workflow now, as a turn of its own. Only the user starts one.
+    Workflow {
+        workflow: Arc<Workflow>,
+        input: String,
+    },
 }
 
 /// A model backend. `Client` is the real one; tests drive the loop with a fake.
@@ -223,11 +229,16 @@ pub(crate) async fn run_with(
 ) {
     let children = Children::default();
     let mut registry = Registry::for_prompt(&prompt);
-    if let Some(delegation) = delegation
+    // Kept past the `agent` tool: workflows run children whatever the identity's tools are.
+    let transcripts = delegation
+        .as_ref()
+        .map(|d| d.sessions.join(&session_id))
+        .unwrap_or_default();
+    if let Some(delegation) = delegation.clone()
         && prompt.identity.allows_tool(tools::agent::NAME)
     {
         registry = registry.with_agent(tools::agent::Agent {
-            transcripts: delegation.sessions.join(&session_id),
+            transcripts: transcripts.clone(),
             delegation,
             model: Arc::clone(&model),
             policy: Arc::clone(&policy),
@@ -273,6 +284,31 @@ pub(crate) async fn run_with(
                 match control {
                     Control::Context(reply) => {
                         let _ = reply.send(report(&history, &calls));
+                        continue;
+                    }
+                    Control::Workflow { workflow, input } => {
+                        match &delegation {
+                            Some(delegation) => {
+                                workflow::run(workflow::Run {
+                                    workflow: &workflow,
+                                    input: &input,
+                                    delegation,
+                                    model: model.as_ref(),
+                                    policy: &policy,
+                                    tx: &tx,
+                                    cancel: &cancel,
+                                    children: &children,
+                                    transcripts: transcripts.clone(),
+                                })
+                                .await;
+                            }
+                            None => {
+                                let _ = tx.send(AgentEvent::Error(
+                                    "this session cannot run child agents, so it cannot run a workflow".to_string(),
+                                ));
+                            }
+                        }
+                        let _ = tx.send(AgentEvent::TurnEnd);
                         continue;
                     }
                     Control::Compact => None,
@@ -337,6 +373,12 @@ pub(crate) async fn run_with(
                         }
                         // Never while a tool call may be pending: once the turn is over.
                         Control::Compact => compact_next = true,
+                        // The session refuses one while a turn runs, so this cannot happen.
+                        Control::Workflow { .. } => {
+                            let _ = tx.send(AgentEvent::Error(
+                                "a workflow cannot start while a turn is running".to_string(),
+                            ));
+                        }
                     },
                 }
             }

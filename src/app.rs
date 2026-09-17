@@ -22,6 +22,7 @@ use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
 use crate::session::{Approval, Event, Session};
 use crate::skills::Skill;
+use crate::workflow::{self, Found};
 
 /// Lines a mouse wheel notch moves the transcript.
 const WHEEL_LINES: usize = 3;
@@ -75,6 +76,8 @@ pub struct App {
     pub skills: Vec<Skill>,
     /// The session's MCP servers, for `/mcp`.
     pub mcp: Option<Arc<crate::mcp::Hub>>,
+    /// The workflow definitions, for `/workflows` and `/workflow`.
+    pub workflows: Found,
     /// The `/diff` pane, shown instead of the transcript while open.
     pub diff: Option<DiffView>,
     pub quit: bool,
@@ -120,6 +123,7 @@ impl App {
             limits_hover: false,
             skills: Vec::new(),
             mcp: None,
+            workflows: Found::default(),
             diff: None,
             quit: false,
             session,
@@ -412,6 +416,18 @@ impl App {
             self.note(Entry::Info(crate::mcp::report(self.mcp.as_deref())));
             return;
         }
+        if message.starts_with("/workflows") {
+            self.follow = true;
+            self.note(Entry::Info(workflow::report(&self.workflows)));
+            return;
+        }
+        if let Some(rest) = message.strip_prefix("/workflow")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            self.start_workflow(rest.trim());
+            return;
+        }
         if message.starts_with("/skills") {
             self.follow = true;
             self.note(Entry::Info(skills_report(&self.skills)));
@@ -420,6 +436,27 @@ impl App {
         // The transcript entry arrives back as `Event::User` once the session accepts it.
         if let Err(e) = self.session.submit(message) {
             self.note(Entry::Error(e.to_string()));
+        }
+    }
+
+    /// `/workflow <name> [input]`: the agent asks for confirmation before it launches
+    /// anything, so this only hands the definition over.
+    fn start_workflow(&mut self, rest: &str) {
+        let (name, input) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        if name.is_empty() {
+            self.note(Entry::Info(workflow::report(&self.workflows)));
+            return;
+        }
+        let started = workflow::find(&self.workflows.workflows, name)
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|found| {
+                self.session
+                    .workflow(found, input.trim().to_string())
+                    .map_err(|e| e.to_string())
+            });
+        match started {
+            Ok(()) => self.working = true,
+            Err(e) => self.note(Entry::Error(e)),
         }
     }
 
