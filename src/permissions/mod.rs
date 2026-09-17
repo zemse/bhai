@@ -815,6 +815,13 @@ mod tests {
         let allow = policy(Mode::Auto, &["Bash(git push:*)"], &[], &[]);
         assert_eq!(bash(&allow, r"find . -exec git push \;"), Decision::Ask);
         assert_eq!(bash(&allow, "xargs -n1 git push"), Decision::Ask);
+        // A refused program behind `-exec` is not granted by an allow rule on `find`.
+        let allow = policy(Mode::Auto, &["Bash(find:*)"], &[], &[]);
+        assert!(matches!(bash(&allow, "find . -name x"), Decision::Allow(_)));
+        assert_eq!(
+            bash(&allow, r"find . -exec sudo rm -rf / \;"),
+            Decision::Ask
+        );
     }
 
     #[test]

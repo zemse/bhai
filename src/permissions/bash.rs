@@ -86,6 +86,10 @@ fn allowed(command: &Command) -> bool {
     if is_assignment(first) || REFUSED.contains(&basename(first)) {
         return false;
     }
+    // A refused program behind `find -exec` is refused too.
+    if !command.nested().iter().all(allowed) {
+        return false;
+    }
     // `sh -c`, also behind wrappers such as `xargs sh -c`.
     !command.words.iter().enumerate().any(|(i, word)| {
         SHELLS.contains(&basename(word))
@@ -381,6 +385,8 @@ mod tests {
             "(rm x)",
             "{ rm x; }",
             "ls; command eval x",
+            r"find . -exec sudo rm -rf / \;",
+            r"find . -execdir eval x \;",
         ] {
             assert_eq!(parse(input), None, "{input}");
         }
