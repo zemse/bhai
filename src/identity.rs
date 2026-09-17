@@ -284,7 +284,8 @@ pub fn build(
             content: identity.prompt.clone(),
         });
     }
-    let mut prompt = prompt::system_prompt(&files, skills);
+    let tools = Registry::for_identity(skills.clone(), identity);
+    let mut prompt = prompt::system_prompt_for(&tools.names(), &files, skills);
     if identity.allows_tool(tools::agent::NAME) {
         prompt = prompt.with_agents(identities);
     }
@@ -501,6 +502,12 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         assert_eq!(prompt.skills.len(), 1);
         assert!(prompt.text.contains("- ios-dev:") && !prompt.text.contains("- pdf:"));
         assert!(prompt.text.contains("Apple only.\n\n# Skills"));
+        assert!(
+            prompt
+                .text
+                .contains("Your tools are `read`. Use `read` to view files.")
+        );
+        assert!(!prompt.text.contains("`bash`"));
 
         let registry = Registry::for_prompt(&prompt);
         let names: Vec<_> = registry

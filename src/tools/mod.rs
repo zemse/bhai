@@ -77,14 +77,25 @@ impl Registry {
         self
     }
 
+    /// The built-in tools and `skill`, narrowed to an identity's tools.
+    pub fn for_identity(
+        skills: Vec<crate::skills::Skill>,
+        identity: &crate::identity::Identity,
+    ) -> Self {
+        let mut registry = Self::new(skills);
+        registry.tools.retain(|t| identity.allows_tool(t.name()));
+        registry
+    }
+
     /// The tools a session's prompt allows: its skills, narrowed to its identity's tools,
     /// and the MCP tools, which its identity's `mcp` globs already narrowed.
     pub fn for_prompt(prompt: &crate::prompt::SystemPrompt) -> Self {
-        let mut registry = Self::new(prompt.skills.clone());
-        registry
-            .tools
-            .retain(|t| prompt.identity.allows_tool(t.name()));
-        registry.with_mcp(prompt.mcp.clone())
+        Self::for_identity(prompt.skills.clone(), &prompt.identity).with_mcp(prompt.mcp.clone())
+    }
+
+    /// Tool names in registration order.
+    pub fn names(&self) -> Vec<&str> {
+        self.tools.iter().map(|t| t.name()).collect()
     }
 
     pub fn schemas(&self) -> Vec<Value> {

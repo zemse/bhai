@@ -10,6 +10,7 @@ use crate::identity::Identity;
 use crate::instructions::File;
 use crate::mcp::Hub;
 use crate::skills::Skill;
+use crate::tools::{bash, edit, read, write};
 
 /// The system prompt and the instruction files and skills appended to it.
 #[derive(Debug, Clone, Default)]
@@ -108,8 +109,15 @@ fn tokens(bytes: usize) -> String {
     }
 }
 
+/// The prompt with every built-in tool.
+#[cfg(test)]
 pub fn system_prompt(files: &[File], skills: Vec<Skill>) -> SystemPrompt {
-    let mut text = base();
+    system_prompt_for(&crate::tools::NAMES, files, skills)
+}
+
+/// The prompt for a session whose registry holds the tools named `tools`.
+pub fn system_prompt_for(tools: &[&str], files: &[File], skills: Vec<Skill>) -> SystemPrompt {
+    let mut text = base(tools);
     let mut sources = Vec::new();
     for file in files {
         let start = text.len();
@@ -147,11 +155,60 @@ pub fn system_prompt(files: &[File], skills: Vec<Skill>) -> SystemPrompt {
     }
 }
 
-fn base() -> String {
+/// What the static text says about the file and shell tools present, names sorted.
+fn tools_paragraph(tools: &[&str]) -> String {
+    let mut names: Vec<&str> = [bash::NAME, read::NAME, write::NAME, edit::NAME]
+        .into_iter()
+        .filter(|name| tools.contains(name))
+        .collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    names.sort_unstable();
+    let quoted: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+    let files: Vec<String> = [
+        (read::NAME, "to view files"),
+        (edit::NAME, "for targeted changes"),
+        (write::NAME, "for new files"),
+    ]
+    .into_iter()
+    .filter(|(name, _)| names.contains(name))
+    .map(|(name, what)| format!("`{name}` {what}"))
+    .collect();
+    let mut uses = and_list(&files);
+    if names.contains(&bash::NAME) {
+        let (sep, rest) = if uses.is_empty() {
+            ("", "")
+        } else {
+            ("; use ", " else")
+        };
+        let _ = write!(
+            uses,
+            "{sep}`bash` for everything{rest} (searching with `rg`, building, testing)"
+        );
+    }
+    format!(
+        "Your tools are {}. Use {uses}. Do not describe an edit you have not actually \
+applied.\n\n",
+        and_list(&quoted)
+    )
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn and_list(items: &[String]) -> String {
+    match items.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, init)) => format!("{} and {last}", init.join(", ")),
+    }
+}
+
+fn base(tools: &[&str]) -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     let os = std::env::consts::OS;
+    let tools = tools_paragraph(tools);
 
     format!(
         "You are bhai, a coding agent running in a terminal on the user's machine.
@@ -161,11 +218,7 @@ Environment:
 - Operating system: {os}
 - Shell: bash
 
-Your tools are `bash`, `read`, `write` and `edit`. Use `read` to view files, `edit` for \
-targeted changes and `write` for new files; use `bash` for everything else (searching with \
-`rg`, building, testing). Do not describe an edit you have not actually applied.
-
-Rules:
+{tools}Rules:
 - Every command, write and edit is shown to the user, who accepts or rejects it before it \
 runs. A rejected call did not execute; take the rejection as direction and change course \
 rather than retrying the same thing.
@@ -198,7 +251,7 @@ mod tests {
     #[test]
     fn files_are_appended_after_the_static_text() {
         let bare = system_prompt(&[], Vec::new());
-        assert_eq!(bare.text, base());
+        assert_eq!(bare.text, base(&crate::tools::NAMES));
         assert!(bare.sources.is_empty());
         assert!(bare.notices().is_empty());
 
@@ -258,5 +311,28 @@ mod tests {
             prompt.notices(),
             ["skipped import ~/.ssh/id_rsa (outside project)"]
         );
+    }
+
+    #[test]
+    fn the_tools_paragraph_names_only_the_tools_present() {
+        assert_eq!(
+            tools_paragraph(&crate::tools::NAMES),
+            "Your tools are `bash`, `edit`, `read` and `write`. Use `read` to view files, \
+`edit` for targeted changes and `write` for new files; use `bash` for everything else \
+(searching with `rg`, building, testing). Do not describe an edit you have not actually \
+applied.\n\n"
+        );
+        assert!(
+            tools_paragraph(&["read", "agent"])
+                .starts_with("Your tools are `read`. Use `read` to view files. Do not")
+        );
+        assert!(
+            tools_paragraph(&["bash"]).starts_with(
+                "Your tools are `bash`. Use `bash` for everything (searching with `rg`"
+            )
+        );
+        assert_eq!(tools_paragraph(&["skill", "agent"]), "");
+        let bare = base(&[]);
+        assert!(bare.contains("- Shell: bash\n\nRules:"), "{bare}");
     }
 }
