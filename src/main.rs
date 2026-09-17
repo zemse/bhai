@@ -220,6 +220,12 @@ async fn main() -> Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )
         .is_ok();
+    // ratatui's own panic hook only leaves raw mode and the alternate screen.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        release_modes(mouse, paste, keyboard);
+        hook(info);
+    }));
     let prompts = input::History::load(
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/bhai/history.jsonl")),
     );
@@ -235,6 +241,14 @@ async fn main() -> Result<()> {
         prompts,
     )
     .await;
+    release_modes(mouse, paste, keyboard);
+    ratatui::restore();
+    shutdown(hub).await;
+    result
+}
+
+/// Turn off the terminal modes the TUI turned on.
+fn release_modes(mouse: bool, paste: bool, keyboard: bool) {
     if keyboard {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -244,9 +258,6 @@ async fn main() -> Result<()> {
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
-    ratatui::restore();
-    shutdown(hub).await;
-    result
 }
 
 /// Stop the MCP servers, if any were started.
