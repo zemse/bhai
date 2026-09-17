@@ -1,12 +1,16 @@
 //! Prompt cache guard: every request of a conversation must be an append-only
-//! extension of the one before it, or the cached prefix is lost.
+//! extension of the one before it, or the cached prefix is lost. The monitor then
+//! checks that the server actually served the prefix from its cache.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
+
+use crate::client::Usage;
 
 /// The request fields that must stay byte-identical for the life of a conversation.
 const FIXED: [&str; 9] = [
@@ -108,6 +112,89 @@ impl CacheGuard {
             .with_context(|| format!("could not open {}", path.display()))?;
         writeln!(file, "{line}")?;
         Ok(())
+    }
+}
+
+/// Prompts shorter than this many tokens are never cached.
+pub const MIN_CACHED: u64 = 1024;
+/// Cached prefixes grow in steps of this many tokens.
+const CACHE_STEP: u64 = 128;
+/// A call this long after the previous one may find its prefix evicted.
+const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// A hit ratio below this is a miss.
+const MISS_RATIO: f64 = 0.5;
+/// Consecutive misses that pause the session.
+pub const MAX_MISSES: usize = 3;
+
+/// How much of one call's input the cache was expected to serve, and how much it did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Hit {
+    /// `None` when the call was not judged.
+    pub expected_cached: Option<u64>,
+    /// Cached over expected tokens, when judged.
+    pub hit_ratio: Option<f64>,
+}
+
+impl Hit {
+    pub fn miss(&self) -> bool {
+        self.hit_ratio.is_some_and(|r| r < MISS_RATIO)
+    }
+}
+
+/// The tokens a call can expect from the cache when the previous call sent `input`.
+pub fn expected_cached(input: u64) -> u64 {
+    if input < MIN_CACHED {
+        return 0;
+    }
+    input / CACHE_STEP * CACHE_STEP
+}
+
+/// Judges each call of one conversation against the cache the previous call left.
+#[derive(Debug, Default)]
+pub struct CacheMonitor {
+    /// The previous call's input tokens and when it finished.
+    previous: Option<(u64, Instant)>,
+    /// When the current call was sent, and whether its request broke the cache.
+    sent: Option<(Instant, bool)>,
+    misses: usize,
+}
+
+impl CacheMonitor {
+    /// Note a request going out, with the guard's verdict on it.
+    pub fn sent(&mut self, found: Option<&CacheBreak>, now: Instant) {
+        self.sent = Some((now, found.is_some()));
+    }
+
+    /// Judge a finished call. Only a call sent within the cache lifetime of the previous
+    /// one, with a clean request and an expected prefix, is judged.
+    pub fn observe(&mut self, usage: &Usage, now: Instant) -> Hit {
+        let (at, broke) = self.sent.take().unwrap_or((now, false));
+        let expected = self
+            .previous
+            .filter(|(_, done)| !broke && at.saturating_duration_since(*done) < CACHE_TTL)
+            .map(|(input, _)| expected_cached(input))
+            .filter(|expected| *expected > 0);
+        self.previous = Some((usage.input, now));
+        let hit = Hit {
+            expected_cached: expected,
+            hit_ratio: expected.map(|e| usage.cached as f64 / e as f64),
+        };
+        if hit.miss() {
+            self.misses += 1;
+        } else if hit.hit_ratio.is_some() {
+            self.misses = 0;
+        }
+        hit
+    }
+
+    /// Whether enough calls missed in a row that the user should be asked to go on.
+    pub fn tripped(&self) -> bool {
+        self.misses >= MAX_MISSES
+    }
+
+    /// The user chose to go on; count misses afresh.
+    pub fn resume(&mut self) {
+        self.misses = 0;
     }
 }
 
@@ -286,6 +373,89 @@ mod tests {
             "{err}"
         );
         assert_eq!(guard.check(&body("i", tools(), &[])).unwrap(), None);
+    }
+
+    fn usage(input: u64, cached: u64) -> Usage {
+        Usage {
+            input,
+            cached,
+            ..Usage::default()
+        }
+    }
+
+    /// Send and finish one call a second after `at`; returns the call's end.
+    fn call(monitor: &mut CacheMonitor, at: Instant, u: Usage, broke: bool) -> (Hit, Instant) {
+        let found = broke.then(|| CacheBreak {
+            field: "tools".to_string(),
+            detail: String::new(),
+        });
+        monitor.sent(found.as_ref(), at);
+        let done = at + Duration::from_secs(1);
+        (monitor.observe(&u, done), done)
+    }
+
+    #[test]
+    fn expected_cache_rounds_down_to_whole_steps() {
+        assert_eq!(expected_cached(1023), 0);
+        assert_eq!(expected_cached(1024), 1024);
+        assert_eq!(expected_cached(1300), 1280);
+        assert_eq!(expected_cached(6672), 6656);
+    }
+
+    #[test]
+    fn a_hit_is_judged_and_the_first_call_is_not() {
+        let mut monitor = CacheMonitor::default();
+        let (first, t) = call(&mut monitor, Instant::now(), usage(2000, 0), false);
+        assert_eq!(first, Hit::default());
+        let (hit, _) = call(&mut monitor, t, usage(2100, 1920), false);
+        assert_eq!(hit.expected_cached, Some(1920));
+        assert_eq!(hit.hit_ratio, Some(1.0));
+        assert!(!hit.miss());
+    }
+
+    #[test]
+    fn a_miss_is_below_half() {
+        let mut monitor = CacheMonitor::default();
+        let (_, t) = call(&mut monitor, Instant::now(), usage(2000, 0), false);
+        let (hit, _) = call(&mut monitor, t, usage(2100, 128), false);
+        assert!(hit.miss(), "{hit:?}");
+        assert!(!monitor.tripped());
+    }
+
+    #[test]
+    fn an_idle_gap_a_break_or_a_small_prompt_is_not_judged() {
+        let mut monitor = CacheMonitor::default();
+        let (_, t) = call(&mut monitor, Instant::now(), usage(2000, 0), false);
+        let (idle, t) = call(&mut monitor, t + CACHE_TTL, usage(2000, 0), false);
+        assert_eq!(idle, Hit::default());
+        let (broke, t) = call(&mut monitor, t, usage(2000, 0), true);
+        assert_eq!(broke, Hit::default());
+        let (_, t) = call(&mut monitor, t, usage(1000, 0), false);
+        let (small, _) = call(&mut monitor, t, usage(1100, 0), false);
+        assert_eq!(small, Hit::default());
+    }
+
+    #[test]
+    fn three_misses_trip_the_breaker_and_a_hit_resets_it() {
+        let mut monitor = CacheMonitor::default();
+        let (_, mut t) = call(&mut monitor, Instant::now(), usage(2000, 0), false);
+        for _ in 0..2 {
+            t = call(&mut monitor, t, usage(2000, 0), false).1;
+        }
+        // An unjudged call neither counts nor resets.
+        t = call(&mut monitor, t, usage(2000, 0), true).1;
+        assert!(!monitor.tripped());
+        t = call(&mut monitor, t, usage(2000, 0), false).1;
+        assert!(monitor.tripped());
+        t = call(&mut monitor, t, usage(2000, 1920), false).1;
+        assert!(!monitor.tripped());
+
+        for _ in 0..3 {
+            t = call(&mut monitor, t, usage(2000, 0), false).1;
+        }
+        assert!(monitor.tripped());
+        monitor.resume();
+        assert!(!monitor.tripped());
     }
 
     #[test]

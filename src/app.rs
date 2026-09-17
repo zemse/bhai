@@ -50,6 +50,8 @@ pub struct App {
     pub last_usage: Option<Usage>,
     /// The field that broke the prompt cache, until the next clean call.
     pub cache_break: Option<String>,
+    /// The hit percent of the last judged call, when it missed.
+    pub cache_miss: Option<f64>,
     /// The skills in the system prompt, for `/skills`.
     pub skills: Vec<Skill>,
     /// The session's MCP servers, for `/mcp`.
@@ -80,6 +82,7 @@ impl App {
             tokens_out: 0,
             last_usage: None,
             cache_break: None,
+            cache_miss: None,
             skills: Vec::new(),
             mcp: None,
             quit: false,
@@ -196,6 +199,12 @@ impl App {
                     )));
                 }
                 self.cache_break = found.map(|f| f.field);
+            }
+            Event::CacheHit(hit) => {
+                self.cache_miss = hit
+                    .hit_ratio
+                    .filter(|_| hit.miss())
+                    .map(|ratio| ratio * 100.0);
             }
             Event::Info(message) => self.entries.push(Entry::Info(message)),
             Event::Mode(mode) => self.mode = mode,

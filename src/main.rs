@@ -73,11 +73,22 @@ async fn main() -> Result<()> {
         shutdown(hub).await;
         return result;
     }
+    // `bhai --cache-check` sends a few calls on one prefix and checks the cache served it.
+    if args.first().is_some_and(|a| a == "--cache-check") {
+        let (prompt, _, _) = load(Flags::default(), identity::DEFAULT).await?;
+        let hub = prompt.mcp.clone();
+        let result = cache_check(prompt).await;
+        shutdown(hub).await;
+        if !result? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let args = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [--probe [prompt]] [--as <identity>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [--probe [prompt]] [--cache-check] [--as <identity>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
@@ -156,7 +167,7 @@ async fn shutdown(hub: Option<Arc<mcp::Hub>>) {
     }
 }
 
-/// Command-line flags, apart from `--probe`.
+/// Command-line flags, apart from `--probe` and `--cache-check`.
 #[derive(Debug, Default, PartialEq)]
 struct Args {
     /// Port for the debug server, when `--serve` is given.
@@ -361,11 +372,125 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
                 println!("\n[cache break] {}: {}", found.field, found.detail)
             }
             AgentEvent::Cache(None) => {}
+            AgentEvent::CacheHit(hit) => {
+                if let (Some(expected), Some(ratio)) = (hit.expected_cached, hit.hit_ratio) {
+                    println!("[cache] expected={expected} hit={:.0}%", ratio * 100.0);
+                }
+            }
             AgentEvent::Error(message) => println!("\n[error] {message}"),
             AgentEvent::TurnEnd => break,
         }
     }
     Ok(())
+}
+
+/// Calls `--cache-check` makes on one prefix.
+const CACHE_CHECK_CALLS: usize = 3;
+/// The estimated prefix `--cache-check` pads up to, with a margin over the cache minimum.
+const CACHE_CHECK_PREFIX: u64 = cache::MIN_CACHED * 3 / 2;
+const FILLER: &str = "This line only pads the prompt past the prompt cache minimum.\n";
+
+/// One `--cache-check` call's result.
+struct CacheRow {
+    usage: client::Usage,
+    hit: cache::Hit,
+}
+
+/// Send a few tiny calls with the session's real instructions and tools through the
+/// real client, and report how much of each the cache served. `false` when call 2 or
+/// later got nothing from the cache.
+async fn cache_check(system: SystemPrompt) -> Result<bool> {
+    let client = client::Client::new()?.with_overrides(
+        system.identity.model.clone(),
+        system.identity.effort.clone(),
+    );
+    let tools = tools::Registry::for_prompt(&system).schemas();
+    let mut input = cache_check_prefix(&system, &tools);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut monitor = cache::CacheMonitor::default();
+    let mut rows = Vec::new();
+    for call in 1..=CACHE_CHECK_CALLS {
+        input.push(user_message(&format!(
+            "Call {call} of {CACHE_CHECK_CALLS}. Reply with just: ok"
+        )));
+        let mut usage = None;
+        let mut on_delta = |delta: client::Delta| match delta {
+            client::Delta::Cache(found) => {
+                if let Some(found) = &found {
+                    println!("[cache break] {}: {}", found.field, found.detail);
+                }
+                monitor.sent(found.as_ref(), std::time::Instant::now());
+            }
+            client::Delta::Usage(u) => usage = Some(u),
+            _ => {}
+        };
+        let items = client
+            .respond(&system.text, &tools, &input, &mut on_delta, &cancel)
+            .await?;
+        let usage = usage.ok_or_else(|| anyhow::anyhow!("call {call} reported no usage"))?;
+        let hit = monitor.observe(&usage, std::time::Instant::now());
+        rows.push(CacheRow { usage, hit });
+        input.extend(items);
+    }
+    print!("{}", cache_table(&rows));
+    Ok(cache_check_passed(&rows))
+}
+
+/// The input `--cache-check` starts from: empty, or one filler message when the
+/// instructions and tools are estimated under `CACHE_CHECK_PREFIX` tokens.
+fn cache_check_prefix(
+    system: &SystemPrompt,
+    tools: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let estimated = profile::build(system, tools, &[], None).estimated_tokens;
+    let Some(missing) = CACHE_CHECK_PREFIX.checked_sub(estimated).filter(|m| *m > 0) else {
+        return Vec::new();
+    };
+    let lines = (missing * 4).div_ceil(FILLER.len() as u64) as usize;
+    vec![user_message(&FILLER.repeat(lines))]
+}
+
+fn user_message(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": text }],
+    })
+}
+
+fn cache_table(rows: &[CacheRow]) -> String {
+    let mut table = format!(
+        "{:>4} {:>8} {:>8} {:>8} {:>6}  verdict\n",
+        "call", "input", "cached", "expected", "ratio"
+    );
+    for (i, row) in rows.iter().enumerate() {
+        let (expected, ratio) = match (row.hit.expected_cached, row.hit.hit_ratio) {
+            (Some(e), Some(r)) => (e.to_string(), format!("{:.0}%", r * 100.0)),
+            _ => ("-".to_string(), "-".to_string()),
+        };
+        let verdict = if i == 0 {
+            "first"
+        } else if row.hit.hit_ratio.is_none() {
+            "not judged"
+        } else if row.hit.miss() {
+            "MISS"
+        } else {
+            "hit"
+        };
+        table.push_str(&format!(
+            "{:>4} {:>8} {:>8} {:>8} {:>6}  {verdict}\n",
+            i + 1,
+            row.usage.input,
+            row.usage.cached,
+            expected,
+            ratio
+        ));
+    }
+    table
+}
+
+fn cache_check_passed(rows: &[CacheRow]) -> bool {
+    rows.iter().skip(1).all(|row| row.usage.cached > 0)
 }
 
 async fn run(
@@ -447,6 +572,60 @@ mod tests {
     fn parse(args: &[&str]) -> Result<(Option<u16>, bool)> {
         parse_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
             .map(|a| (a.serve, a.headless))
+    }
+
+    fn row(input: u64, cached: u64, expected: Option<u64>) -> CacheRow {
+        CacheRow {
+            usage: client::Usage {
+                input,
+                cached,
+                ..client::Usage::default()
+            },
+            hit: cache::Hit {
+                expected_cached: expected,
+                hit_ratio: expected.map(|e| cached as f64 / e as f64),
+            },
+        }
+    }
+
+    #[test]
+    fn cache_check_table_and_verdict() {
+        let rows = [
+            row(1500, 0, None),
+            row(1520, 1408, Some(1408)),
+            row(1540, 128, Some(1408)),
+        ];
+        let table = cache_table(&rows);
+        let lines: Vec<_> = table.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].ends_with("  first"), "{table}");
+        assert!(lines[2].contains(" 100%  hit"), "{table}");
+        assert!(lines[3].contains("  9%  MISS"), "{table}");
+        assert!(cache_check_passed(&rows));
+        assert!(!cache_check_passed(&[
+            row(1500, 0, None),
+            row(1520, 0, Some(1408))
+        ]));
+    }
+
+    #[test]
+    fn cache_check_pads_a_short_prefix_past_the_minimum() {
+        let system = prompt::system_prompt(&[], Vec::new());
+        let short = SystemPrompt {
+            text: "Be brief.".to_string(),
+            ..system
+        };
+        let input = cache_check_prefix(&short, &[]);
+        assert_eq!(input.len(), 1);
+        let padded = profile::build(&short, &[], &input, None).estimated_tokens;
+        assert!(padded >= CACHE_CHECK_PREFIX, "{padded}");
+
+        let tools = tools::Registry::for_prompt(&short).schemas();
+        let long = SystemPrompt {
+            text: FILLER.repeat(200),
+            ..short
+        };
+        assert!(cache_check_prefix(&long, &tools).is_empty());
     }
 
     #[test]

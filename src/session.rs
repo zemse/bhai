@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::agent::{AgentEvent, Control};
-use crate::cache::CacheBreak;
+use crate::cache::{CacheBreak, Hit};
 use crate::client::Usage;
 use crate::permissions::{Answer, Mode, Offers, Policy, Remember};
 use crate::profile::Profile;
@@ -47,6 +47,8 @@ pub enum Event {
     ChildUsage(Usage),
     /// A request broke the prompt cache, or `None` when the parent's last one was clean.
     Cache(Option<CacheBreak>),
+    /// How well the cache served a judged call.
+    CacheHit(Hit),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
     /// The permission mode changed.
@@ -292,6 +294,7 @@ impl Session {
                 }
                 Event::Cache(found)
             }
+            AgentEvent::CacheHit(hit) => Event::CacheHit(hit),
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnEnd => {

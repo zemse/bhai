@@ -5,13 +5,14 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::cache::CacheBreak;
+use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
 use crate::client::{Client, Delta, Usage};
 use crate::identity::Identity;
 use crate::permissions::{Answer, Decision, Mode, Offers, Policy};
@@ -48,6 +49,8 @@ pub enum AgentEvent {
     ChildUsage(Usage),
     /// The request just sent broke the prompt cache, or `None` when it was clean.
     Cache(Option<CacheBreak>),
+    /// How well the cache served a call that was judged; a child's only when it missed.
+    CacheHit(Hit),
     Error(String),
     /// The agent is done with this turn and is waiting for input.
     TurnEnd,
@@ -178,6 +181,7 @@ async fn run_with(
     };
     let mut history: Vec<Value> = Vec::new();
     let mut measured: Option<Measured> = None;
+    let mut monitor = CacheMonitor::default();
 
     loop {
         let message = tokio::select! {
@@ -210,6 +214,7 @@ async fn run_with(
                 &tx,
                 &cancel,
                 &mut measured,
+                &mut monitor,
                 usage_log.as_deref(),
                 None,
             );
@@ -243,12 +248,26 @@ async fn turn(
     tx: &mpsc::UnboundedSender<AgentEvent>,
     cancel: &Arc<AtomicBool>,
     measured: &mut Option<Measured>,
+    monitor: &mut CacheMonitor,
     usage_log: Option<&Path>,
     transcript: Option<&Path>,
 ) -> anyhow::Result<usize> {
     let mut error_rounds = 0usize;
 
     for step in 1..=MAX_STEPS {
+        if monitor.tripped() {
+            let prompt = format!(
+                "cache missed {} calls in a row; continue?",
+                cache::MAX_MISSES
+            );
+            if ask("cache", &prompt, &Offers::default(), policy, tx)
+                .await
+                .is_some()
+            {
+                return Ok(step - 1);
+            }
+            monitor.resume();
+        }
         let sent = history.len();
         let mut on_delta = |delta: Delta| {
             let _ = tx.send(match delta {
@@ -259,14 +278,22 @@ async fn turn(
                         input_tokens: usage.input,
                         items: sent,
                     });
+                    let hit = monitor.observe(&usage, Instant::now());
                     if let Some(path) = usage_log
-                        && let Err(e) = profile::log_usage(path, &usage, sent)
+                        && let Err(e) = profile::log_usage(path, &usage, &hit, sent)
                     {
                         let _ = tx.send(AgentEvent::Error(format!("usage log: {e:#}")));
                     }
-                    AgentEvent::Usage(usage)
+                    let _ = tx.send(AgentEvent::Usage(usage));
+                    if hit.hit_ratio.is_none() {
+                        return;
+                    }
+                    AgentEvent::CacheHit(hit)
                 }
-                Delta::Cache(found) => AgentEvent::Cache(found),
+                Delta::Cache(found) => {
+                    monitor.sent(found.as_ref(), Instant::now());
+                    AgentEvent::Cache(found)
+                }
             });
         };
 
@@ -408,6 +435,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
         })];
         record(child.transcript, &history, &tx_child);
         let mut measured = None;
+        let mut monitor = CacheMonitor::default();
         let result = turn(
             child.model,
             &registry,
@@ -418,6 +446,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             &tx_child,
             child.cancel,
             &mut measured,
+            &mut monitor,
             None,
             child.transcript,
         )
@@ -435,8 +464,9 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     attribute(child.children, child.id, u);
                     AgentEvent::ChildUsage(u)
                 }
-                // A child's clean call must not clear a break the parent shows.
+                // A child's clean call must not clear a break or miss the parent shows.
                 AgentEvent::Cache(None) => continue,
+                AgentEvent::CacheHit(hit) if !hit.miss() => continue,
                 AgentEvent::Cache(Some(found)) => AgentEvent::Cache(Some(CacheBreak {
                     detail: format!("{tag} {}", found.detail),
                     ..found
@@ -462,7 +492,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     failure = Some(s.clone());
                     AgentEvent::Error(format!("{tag} {s}"))
                 }
-                other @ AgentEvent::ChildUsage(_) => other,
+                other @ (AgentEvent::ChildUsage(_) | AgentEvent::CacheHit(_)) => other,
             };
             let _ = child.tx.send(event);
         }
@@ -650,15 +680,33 @@ fn remembered(policy: &Policy, rule: &str) -> AgentEvent {
 #[cfg(test)]
 pub mod fake {
     use std::collections::VecDeque;
+    use std::time::Duration;
+
+    use anyhow::bail;
 
     use super::*;
+    use crate::cache::CacheGuard;
+
+    /// A script step that fails the call.
+    pub const FAIL: &str = "fake.fail";
+    /// A script step that streams a little, then waits for an interrupt.
+    pub const HANG: &str = "fake.hang";
 
     /// Answers each call with the next scripted output and remembers the tool names
-    /// every call was offered. Children share the script.
-    #[derive(Clone, Default)]
+    /// every call was offered. Each call's request body is built and checked as the
+    /// real client does, per conversation. Children share the script and the records.
+    #[derive(Clone)]
     pub struct Fake {
         script: Arc<Mutex<VecDeque<Vec<Value>>>>,
         pub offered: Arc<Mutex<Vec<Vec<String>>>>,
+        /// Every request body, with the conversation it belongs to.
+        pub bodies: Arc<Mutex<Vec<(String, Value)>>>,
+        pub breaks: Arc<Mutex<Vec<CacheBreak>>>,
+        conversation: String,
+        key: String,
+        guard: Arc<Mutex<CacheGuard>>,
+        children: Arc<Mutex<usize>>,
+        usage: Usage,
     }
 
     impl Fake {
@@ -666,7 +714,25 @@ pub mod fake {
             Self {
                 script: Arc::new(Mutex::new(script.into())),
                 offered: Arc::default(),
+                bodies: Arc::default(),
+                breaks: Arc::default(),
+                conversation: "parent".to_string(),
+                key: "sess".to_string(),
+                guard: Arc::new(Mutex::new(CacheGuard::new("parent", None, false))),
+                children: Arc::default(),
+                usage: USAGE,
             }
+        }
+
+        /// Report `usage` for every call instead of `USAGE`.
+        pub fn with_usage(self, usage: Usage) -> Self {
+            Self { usage, ..self }
+        }
+    }
+
+    impl Default for Fake {
+        fn default() -> Self {
+            Self::new(Vec::new())
         }
     }
 
@@ -695,14 +761,19 @@ pub mod fake {
         })
     }
 
+    /// A script step of the given kind, such as `FAIL`.
+    pub fn step(kind: &str) -> Vec<Value> {
+        vec![json!({ "type": kind })]
+    }
+
     impl Model for Fake {
         fn respond<'a>(
             &'a self,
-            _instructions: &'a str,
+            instructions: &'a str,
             tools: &'a [Value],
-            _input: &'a [Value],
+            input: &'a [Value],
             on_delta: &'a mut (dyn FnMut(Delta) + Send),
-            _cancel: &'a Arc<AtomicBool>,
+            cancel: &'a Arc<AtomicBool>,
         ) -> BoxFuture<'a, anyhow::Result<Vec<Value>>> {
             Box::pin(async move {
                 let names = tools
@@ -710,14 +781,53 @@ pub mod fake {
                     .filter_map(|t| t["name"].as_str().map(str::to_string))
                     .collect();
                 self.offered.lock().unwrap().push(names);
-                on_delta(Delta::Usage(USAGE));
+                let body = crate::client::request_body(
+                    "fake",
+                    "medium",
+                    &self.key,
+                    instructions,
+                    tools,
+                    input,
+                );
+                let found = self.guard.lock().unwrap().check(&body)?;
+                self.breaks.lock().unwrap().extend(found.clone());
+                self.bodies
+                    .lock()
+                    .unwrap()
+                    .push((self.conversation.clone(), body));
+                on_delta(Delta::Cache(found));
+
                 let next = self.script.lock().unwrap().pop_front();
-                next.ok_or_else(|| anyhow!("the script ran out"))
+                let next = next.ok_or_else(|| anyhow!("the script ran out"))?;
+                match next.first().and_then(|item| item["type"].as_str()) {
+                    Some(FAIL) => bail!("scripted failure"),
+                    Some(HANG) => {
+                        on_delta(Delta::Text("partial".to_string()));
+                        while !cancel.load(Ordering::Relaxed) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        bail!("interrupted")
+                    }
+                    _ => {}
+                }
+                on_delta(Delta::Usage(self.usage));
+                Ok(next)
             })
         }
 
-        fn child(&self, _identity: &Identity) -> Arc<dyn Model> {
-            Arc::new(self.clone())
+        fn child(&self, identity: &Identity) -> Arc<dyn Model> {
+            let n = {
+                let mut children = self.children.lock().unwrap();
+                *children += 1;
+                *children
+            };
+            let conversation = format!("child {n}");
+            Arc::new(Self {
+                key: format!("{}-{}", self.key, identity.name),
+                guard: Arc::new(Mutex::new(CacheGuard::new(&conversation, None, false))),
+                conversation,
+                ..self.clone()
+            })
         }
     }
 }
@@ -881,6 +991,224 @@ mod tests {
                 output_tokens: 4,
             }
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Send `message` and collect the turn's events, answering approvals in order and
+    /// interrupting once the model starts streaming text.
+    async fn drive(
+        tx_user: &mpsc::Sender<String>,
+        rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+        cancel: &AtomicBool,
+        message: &str,
+        answers: &[Answer],
+    ) -> Vec<AgentEvent> {
+        // As `Session::submit` does.
+        cancel.store(false, Ordering::Relaxed);
+        tx_user.send(message.to_string()).await.unwrap();
+        let mut answers = answers.iter();
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::TurnEnd => break,
+                AgentEvent::Approval { reply, command, .. } => {
+                    let answer = answers.next().copied().expect("an answer for the approval");
+                    let _ = reply.send(answer);
+                    events.push(AgentEvent::Info(format!("asked: {command}")));
+                }
+                AgentEvent::Text(text) => {
+                    cancel.store(true, Ordering::Relaxed);
+                    events.push(AgentEvent::Text(text));
+                }
+                other => events.push(other),
+            }
+        }
+        assert!(answers.next().is_none(), "unused answers for {message}");
+        events
+    }
+
+    #[tokio::test]
+    async fn a_scripted_session_never_breaks_the_prompt_cache() {
+        use crate::mcp::{Hub, ToolInfo};
+        use crate::permissions::Rules;
+        use fake::{FAIL, Fake, HANG, call, say, step};
+
+        let dir = tools::temp_dir();
+        let fake = Fake::new(vec![
+            vec![say("hi")],
+            vec![call("bash", json!({"command": "echo approved"}))],
+            vec![say("ran it")],
+            vec![call("bash", json!({"command": "echo rejected"}))],
+            vec![say("fine")],
+            step(HANG),
+            step(FAIL),
+            vec![say("retried")],
+            vec![call(
+                "agent",
+                json!({"identity": "worker", "description": "look", "prompt": "echo"}),
+            )],
+            vec![call("bash", json!({"command": "echo child"}))],
+            vec![say("child done")],
+            vec![say("delegated")],
+            vec![call(
+                "mcp_call",
+                json!({"name": "mcp__docs__lookup", "arguments": {"q": "x"}}),
+            )],
+            vec![say("mcp done")],
+        ]);
+        let hub = Arc::new(Hub::offline(vec![(
+            "docs",
+            vec![ToolInfo::test("docs", "lookup", "Look things up.")],
+        )]));
+        let prompt = SystemPrompt {
+            mcp: Some(hub),
+            ..crate::prompt::system_prompt(&[], Vec::new())
+        };
+        let worker = Identity {
+            name: "worker".to_string(),
+            tools: Some(vec!["bash".to_string()]),
+            ..Identity::default()
+        };
+        let delegation = Delegation {
+            identities: vec![Identity::default(), worker],
+            prompt: Arc::new(|identity: &Identity| SystemPrompt {
+                identity: identity.clone(),
+                ..crate::prompt::system_prompt(&[], Vec::new())
+            }),
+            sessions: dir.clone(),
+        };
+        let policy = Arc::new(Policy::new(Mode::Ask, Rules::default(), None, dir.clone()));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            prompt,
+            Arc::clone(&policy),
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            Some(delegation),
+        ));
+        let accept = Answer::Accept(None);
+        let mut turn = async |message: &str, answers: &[Answer]| {
+            drive(&tx_user, &mut rx, &cancel, message, answers).await
+        };
+
+        turn("hello", &[]).await;
+        let events = turn("run it", &[accept]).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("approved")))
+        );
+        let events = turn("try this", &[Answer::Reject]).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolRejected(_)))
+        );
+        let events = turn("take long", &[]).await;
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+        let events = turn("fail", &[]).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(m) if m.contains("scripted failure")))
+        );
+        turn("again", &[]).await;
+
+        let (reply, wait) = oneshot::channel();
+        tx_control.send(Control::Context(reply)).await.unwrap();
+        assert!(!wait.await.unwrap().items.is_empty());
+        policy.set_mode(policy.mode().next());
+
+        let events = turn("delegate", &[]).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("child done")))
+        );
+        let events = turn("look it up", &[accept]).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("not connected")))
+        );
+
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let conversation = |name: &str| -> Vec<Value> {
+            bodies
+                .iter()
+                .filter(|(c, _)| c == name)
+                .map(|(_, b)| b.clone())
+                .collect()
+        };
+        let (parent, child) = (conversation("parent"), conversation("child 1"));
+        assert_eq!(parent.len(), 12);
+        assert_eq!(child.len(), 2);
+        assert_eq!(parent.len() + child.len(), bodies.len());
+        for (bodies, key) in [(&parent, "sess"), (&child, "sess-worker")] {
+            let mut guard = crate::cache::CacheGuard::new("check", None, true);
+            for body in bodies {
+                assert_eq!(body["prompt_cache_key"], key);
+                guard.check(body).unwrap();
+            }
+        }
+        // The failed call and its retry share the prefix; the retry only appends.
+        let (failed, retried) = (&parent[6]["input"], &parent[7]["input"]);
+        let failed = failed.as_array().unwrap();
+        assert_eq!(
+            &retried.as_array().unwrap()[..failed.len()],
+            failed.as_slice()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn repeated_cache_misses_pause_for_the_user() {
+        use fake::{Fake, call, say};
+
+        let echo = || vec![call("bash", json!({"command": "echo x"}))];
+        let fake =
+            Fake::new(vec![echo(), echo(), echo(), echo(), vec![say("never")]]).with_usage(Usage {
+                input: 2000,
+                ..Usage::default()
+            });
+        let dir = tools::temp_dir();
+        let policy = Policy::new(Mode::Bypass, Default::default(), None, dir.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(policy),
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+        ));
+
+        let events = drive(&tx_user, &mut rx, &cancel, "go", &[Answer::Reject]).await;
+        let misses = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::CacheHit(hit) if hit.miss()))
+            .count();
+        assert_eq!(misses, 3);
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Info(m) if m == "asked: cache missed 3 calls in a row; continue?")));
+        assert_eq!(fake.bodies.lock().unwrap().len(), 4);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

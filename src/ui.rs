@@ -77,6 +77,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Red).bold(),
         ));
     }
+    if let Some(percent) = app.cache_miss {
+        spans.push(Span::styled(
+            format!("cache miss {percent:.0}% "),
+            Style::new().fg(Color::Yellow).bold(),
+        ));
+    }
     spans.push(Span::styled(
         if app.pending.is_some() {
             "  a accept · r reject"

@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::agent::ChildUsage;
+use crate::cache::Hit;
 use crate::client::Usage;
 use crate::prompt::SystemPrompt;
 
@@ -309,7 +310,7 @@ pub fn export(profile: &Profile, dir: &Path) -> Result<PathBuf> {
 }
 
 /// Append one JSONL line for a finished model call.
-pub fn log_usage(path: &Path, usage: &Usage, items: usize) -> Result<()> {
+pub fn log_usage(path: &Path, usage: &Usage, hit: &Hit, items: usize) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -320,6 +321,8 @@ pub fn log_usage(path: &Path, usage: &Usage, items: usize) -> Result<()> {
         "output": usage.output,
         "reasoning": usage.reasoning,
         "history_items": items,
+        "expected_cached": hit.expected_cached,
+        "hit_ratio": hit.hit_ratio,
     });
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -534,8 +537,12 @@ mod tests {
             output: 3,
             reasoning: 1,
         };
-        log_usage(&log, &usage, 4).unwrap();
-        log_usage(&log, &usage, 6).unwrap();
+        log_usage(&log, &usage, &Hit::default(), 4).unwrap();
+        let hit = Hit {
+            expected_cached: Some(8),
+            hit_ratio: Some(1.0),
+        };
+        log_usage(&log, &usage, &hit, 6).unwrap();
         let lines: Vec<Value> = std::fs::read_to_string(&log)
             .unwrap()
             .lines()
@@ -544,6 +551,9 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[1]["cached"], 8);
         assert_eq!(lines[1]["history_items"], 6);
+        assert!(lines[0]["expected_cached"].is_null());
+        assert_eq!(lines[1]["expected_cached"], 8);
+        assert_eq!(lines[1]["hit_ratio"], 1.0);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
