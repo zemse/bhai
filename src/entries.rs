@@ -479,7 +479,11 @@ mod tests {
         let Entry::Running { tail, lines } = &app.list[3] else {
             panic!("{:?}", app.list);
         };
-        assert!((LIVE_BYTES - 2..=LIVE_BYTES).contains(&tail.len()), "{}", tail.len());
+        assert!(
+            (LIVE_BYTES - 2..=LIVE_BYTES).contains(&tail.len()),
+            "{}",
+            tail.len()
+        );
         assert_eq!(*lines, LIVE_BYTES);
         assert_eq!(app.list.len(), 4);
 
