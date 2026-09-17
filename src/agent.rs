@@ -42,6 +42,8 @@ pub enum AgentEvent {
         reply: oneshot::Sender<Answer>,
     },
     ToolStart(String),
+    /// Output of the running call so far, for the UI only.
+    ToolProgress(String),
     ToolOutput(String),
     ToolRejected(String),
     /// A notice for the transcript, such as a call the policy allowed.
@@ -746,6 +748,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 },
                 AgentEvent::ToolStart(s) => AgentEvent::ToolStart(format!("{tag} {s}")),
                 AgentEvent::ToolOutput(s) => AgentEvent::ToolOutput(format!("{tag} {s}")),
+                // Untagged: it extends the child's own running command.
+                other @ AgentEvent::ToolProgress(_) => other,
                 AgentEvent::ToolRejected(s) => AgentEvent::ToolRejected(format!("{tag} {s}")),
                 AgentEvent::Info(s) => AgentEvent::Info(format!("{tag} {s}")),
                 AgentEvent::Error(s) => {
@@ -876,7 +880,14 @@ not retry it. Try a different approach, or ask the user."
     }
 
     let _ = tx.send(AgentEvent::ToolStart(summary));
-    let (output, ok) = tool.execute(&args).await;
+    let progress = |chunk: String| {
+        let _ = tx.send(AgentEvent::ToolProgress(chunk));
+    };
+    let live = tools::Live {
+        progress: &progress,
+        cancel,
+    };
+    let (output, ok) = tool.execute_live(&args, live).await;
     let _ = tx.send(AgentEvent::ToolOutput(output.clone()));
     (output, ok)
 }
@@ -1775,6 +1786,76 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e,
             AgentEvent::Info(m) if m == "asked: cache missed 3 calls in a row; continue?")));
         assert_eq!(fake.bodies.lock().unwrap().len(), 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_mid_stream_keeps_history_consistent() {
+        use crate::sessions::{self, Header};
+        use fake::{Fake, call, say};
+        use std::time::Duration;
+
+        let dir = tools::temp_dir();
+        let bash = call(
+            "bash",
+            json!({"command": "printf 'a\\n'; sleep 5; printf 'b\\n'"}),
+        );
+        let fake = Fake::new(vec![vec![bash.clone()], vec![say("next")]]);
+        let policy = Policy::new(Mode::Bypass, Default::default(), None, dir.clone());
+        let saved = Saved {
+            writer: Writer::create(&dir, Header::new("sess", "general", "fake", "medium", &dir)),
+            history: Vec::new(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(policy),
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            Some(saved),
+            Limits::default(),
+        ));
+
+        tx_user.send("run it".to_string()).await.unwrap();
+        let start = std::time::Instant::now();
+        let mut progress = Vec::new();
+        let mut output = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::ToolProgress(chunk) => {
+                    assert!(output.is_none(), "progress after the result");
+                    cancel.store(true, Ordering::Relaxed);
+                    progress.push(chunk);
+                }
+                AgentEvent::ToolOutput(out) => output = Some(out),
+                AgentEvent::TurnEnd => break,
+                _ => {}
+            }
+        }
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(progress, ["a\n"]);
+        let expected = "exit code: killed by signal\na\n";
+        assert_eq!(output.as_deref(), Some(expected));
+
+        drive(&tx_user, &mut rx, &cancel, "again", &[]).await;
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let input = fake.bodies.lock().unwrap()[1].1["input"].clone();
+        let input = input.as_array().unwrap();
+        assert_eq!(input[1], bash);
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], bash["call_id"]);
+        assert_eq!(input[2]["output"], expected);
+        let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
+        assert_eq!(&loaded.items[..3], &input[..3]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

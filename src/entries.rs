@@ -11,6 +11,8 @@ use crate::session::Event;
 
 /// Characters of an entry the `/context` transcript table shows.
 const LABEL_CHARS: usize = 40;
+/// Bytes of a running command's output kept for the transcript; older output is dropped.
+const LIVE_BYTES: usize = 16_000;
 
 #[derive(Debug)]
 pub enum Entry {
@@ -18,6 +20,11 @@ pub enum Entry {
     Assistant(String),
     Reasoning(String),
     Command(String),
+    /// Output of a command still running: its latest bytes and its complete lines so far.
+    Running {
+        tail: String,
+        lines: usize,
+    },
     Output(String),
     Rejected(String),
     Error(String),
@@ -60,7 +67,15 @@ impl Entries {
             Event::Text(delta) => self.append(delta, Stream::Assistant),
             Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
             Event::ToolStart(command) => self.push(Entry::Command(command.clone())),
-            Event::ToolOutput(output) => self.push(Entry::Output(output.trim_end().to_string())),
+            Event::ToolProgress(chunk) => self.progress(chunk),
+            Event::ToolOutput(output) => {
+                let entry = Entry::Output(output.trim_end().to_string());
+                // The result takes the running entry's place.
+                match self.running() {
+                    Some(index) => self.list[index] = entry,
+                    None => self.push(entry),
+                }
+            }
             Event::ToolRejected(command) => {
                 self.push(Entry::Rejected(format!("rejected: {command}")))
             }
@@ -237,6 +252,36 @@ impl Entries {
         self.attribution.mark = self.list.len();
     }
 
+    /// The running command entry, if a call is still in flight.
+    fn running(&self) -> Option<usize> {
+        (self.attribution.mark..self.list.len())
+            .rev()
+            .find(|&i| matches!(self.list[i], Entry::Running { .. }))
+    }
+
+    /// Add live output to the running entry, starting one on the first chunk.
+    fn progress(&mut self, chunk: &str) {
+        let index = self.running().unwrap_or_else(|| {
+            self.list.push(Entry::Running {
+                tail: String::new(),
+                lines: 0,
+            });
+            self.list.len() - 1
+        });
+        let Entry::Running { tail, lines } = &mut self.list[index] else {
+            return;
+        };
+        *lines += chunk.matches('\n').count();
+        tail.push_str(chunk);
+        if tail.len() > LIVE_BYTES {
+            let mut cut = tail.len() - LIVE_BYTES;
+            while !tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            tail.drain(..cut);
+        }
+    }
+
     /// Append a streaming delta to the last entry of the same kind, or start a new one.
     /// Entries of a call already accounted for are never extended.
     fn append(&mut self, delta: &str, kind: Stream) {
@@ -268,6 +313,7 @@ impl Entry {
             | Entry::Assistant(t)
             | Entry::Reasoning(t)
             | Entry::Command(t)
+            | Entry::Running { tail: t, .. }
             | Entry::Output(t)
             | Entry::Rejected(t)
             | Entry::Error(t)
@@ -281,6 +327,7 @@ impl Entry {
             Entry::Assistant(_) => "assistant",
             Entry::Reasoning(_) => "thinking",
             Entry::Command(_) => "command",
+            Entry::Running { .. } => "running",
             Entry::Output(_) => "output",
             Entry::Rejected(_) => "rejected",
             Entry::Error(_) => "error",
@@ -410,6 +457,38 @@ mod tests {
         let rejected = app.tokens[&2];
         assert_eq!(rejected.output, Some(3));
         assert_eq!(rejected.call, Some(usage(10, 0, 3, 0)));
+    }
+
+    #[test]
+    fn live_output_is_capped_and_gives_way_to_the_result() {
+        let mut app = intro();
+        app.apply(&Event::User("hi".to_string()));
+        app.apply(&Event::Item(0));
+        app.apply(&Event::Call(CallTokens {
+            usage: usage(10, 0, 3, 0),
+            sent: 1,
+            outputs: 1,
+            inputs: vec![1],
+            calls: vec![3],
+            ..CallTokens::default()
+        }));
+        app.apply(&Event::ToolStart("yes".to_string()));
+        for _ in 0..LIVE_BYTES {
+            app.apply(&Event::ToolProgress("é\n".to_string()));
+        }
+        let Entry::Running { tail, lines } = &app.list[3] else {
+            panic!("{:?}", app.list);
+        };
+        assert!((LIVE_BYTES - 2..=LIVE_BYTES).contains(&tail.len()), "{}", tail.len());
+        assert_eq!(*lines, LIVE_BYTES);
+        assert_eq!(app.list.len(), 4);
+
+        app.apply(&Event::ToolOutput("exit code: 0\n".to_string()));
+        app.apply(&Event::Item(2));
+        assert_eq!(app.list.len(), 4);
+        assert_eq!(app.list[3].text(), "exit code: 0");
+        assert_eq!(app.attribution.items[&2], 3);
+        assert_eq!(app.tokens[&2].output, Some(3));
     }
 
     #[test]

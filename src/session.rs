@@ -41,6 +41,8 @@ pub enum Event {
         remember: Option<Remember>,
     },
     ToolStart(String),
+    /// Output of the running call so far; never part of history.
+    ToolProgress(String),
     ToolOutput(String),
     ToolRejected(String),
     Usage(Usage),
@@ -318,6 +320,7 @@ impl Session {
                 }
             }
             AgentEvent::ToolStart(s) => Event::ToolStart(s),
+            AgentEvent::ToolProgress(s) => Event::ToolProgress(s),
             AgentEvent::ToolOutput(s) => Event::ToolOutput(s),
             AgentEvent::ToolRejected(s) => Event::ToolRejected(s),
             AgentEvent::Usage(usage) => {

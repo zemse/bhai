@@ -162,6 +162,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures-util",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "reqwest",

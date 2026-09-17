@@ -273,12 +273,13 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>
         lines.push(Line::from(""));
         return lines;
     }
-    let (prefix, text, style) = match entry {
+    let (prefix, text, style): (&str, &str, Style) = match entry {
         Entry::User(t) => ("› ", t, Style::new().fg(Color::Cyan).bold()),
         Entry::Assistant(t) => ("", t, Style::new()),
         Entry::Reasoning(t) => ("", t, Style::new().fg(Color::DarkGray).italic()),
         Entry::Command(t) => ("$ ", t, Style::new().fg(Color::Yellow)),
         Entry::Output(t) => ("", t, Style::new().fg(Color::Gray)),
+        Entry::Running { tail, .. } => ("", tail.trim_end(), Style::new().fg(Color::Gray)),
         Entry::Rejected(t) => ("✗ ", t, Style::new().fg(Color::Red)),
         Entry::Error(t) => ("! ", t, Style::new().fg(Color::Red).bold()),
         Entry::Info(t) => ("", t, Style::new().fg(Color::DarkGray)),
@@ -292,6 +293,13 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>
         _ => 0,
     };
     wrapped_lines.truncate(wrapped_lines.len() - hidden);
+    // A running command shows its latest lines instead.
+    if let Entry::Running { .. } = entry
+        && !expanded
+    {
+        let skip = wrapped_lines.len().saturating_sub(COLLAPSED_LINES);
+        wrapped_lines.drain(..skip);
+    }
     for (i, wrapped) in wrapped_lines.into_iter().enumerate() {
         let lead = if i == 0 {
             prefix.to_string()
@@ -303,6 +311,13 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>
     if hidden > 0 {
         lines.push(Line::from(Span::styled(
             format!("[+{hidden} lines]"),
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    if let Entry::Running { tail, lines: done } = entry {
+        let total = done + usize::from(!tail.is_empty() && !tail.ends_with('\n'));
+        lines.push(Line::from(Span::styled(
+            format!("[running, {total} lines]"),
             Style::new().fg(Color::DarkGray),
         )));
     }
@@ -450,7 +465,7 @@ fn char_index(s: &str, chars: usize) -> usize {
 mod tests {
     use super::*;
     use crate::permissions::Offers;
-    use crate::session::Approval;
+    use crate::session::{Approval, Event};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -668,6 +683,31 @@ mod tests {
         assert!(app.buttons.is_empty());
         app.on_mouse(down(always.x, always.y));
         assert_eq!(app.input.value(), "", "a stale button types nothing");
+    }
+
+    #[test]
+    fn a_running_command_shows_its_latest_lines() {
+        let mut app = App::detached();
+        app.entries().apply(&Event::ToolStart("seq 5".to_string()));
+        app.entries()
+            .apply(&Event::ToolProgress("one\ntwo\nthree\n".to_string()));
+        app.entries()
+            .apply(&Event::ToolProgress("four\nfi".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("three\nfour\nfi\n[running, 5 lines]\n"),
+            "{text}"
+        );
+        assert!(!text.contains("two"), "{text}");
+
+        app.entries()
+            .apply(&Event::ToolOutput("exit code: 0\n1".to_string()));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("$ seq 5\n\nexit code: 0\n1\n"), "{text}");
+        assert!(!text.contains("running"), "{text}");
     }
 
     #[test]

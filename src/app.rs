@@ -253,7 +253,10 @@ impl App {
         let Some(entry) = self.entry_at(y) else {
             return false;
         };
-        let set = if matches!(self.entries().list.get(entry), Some(Entry::Output(_))) {
+        let set = if matches!(
+            self.entries().list.get(entry),
+            Some(Entry::Output(_) | Entry::Running { .. })
+        ) {
             &mut self.expanded
         } else {
             &mut self.pinned

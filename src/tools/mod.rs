@@ -4,6 +4,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::Value;
 
@@ -39,6 +40,23 @@ pub trait Tool: Send + Sync {
     fn describe(&self, args: &Value) -> Result<String, String>;
     /// Run the call; returns the output and whether it counts as a success.
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)>;
+    /// Run the call while reporting output as it arrives; only `bash` streams.
+    fn execute_live<'a>(
+        &'a self,
+        args: &'a Value,
+        _live: Live<'a>,
+    ) -> BoxFuture<'a, (String, bool)> {
+        self.execute(args)
+    }
+}
+
+/// What a running call reports to and hears from the agent.
+#[derive(Clone, Copy)]
+pub struct Live<'a> {
+    /// Takes output as it arrives, for the UI only; it never reaches history.
+    pub progress: &'a (dyn Fn(String) + Send + Sync),
+    /// Set when the user interrupts the turn.
+    pub cancel: &'a AtomicBool,
 }
 
 pub struct Registry {
