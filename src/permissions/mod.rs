@@ -261,7 +261,7 @@ impl Policy {
             .by_user();
         {
             let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
-            if !rules.allow.iter().any(|r| r.text == rule.text) {
+            if !rules.allow.iter().any(|r| r.text == rule.text && !r.repo) {
                 rules.allow.push(rule);
             }
         }
@@ -1020,6 +1020,9 @@ mod tests {
         assert!(!repo_policy(&dir, &repo).trusted());
         assert_eq!(bash(&policy, "cargo fmt"), allowed("rule Bash(cargo fmt)"));
         assert_eq!(bash(&policy, "make all"), Decision::Ask);
+        // Approving a rule the repo also ships applies it as the user's own.
+        policy.remember("Bash(make:*)").unwrap();
+        assert!(matches!(bash(&policy, "make all"), Decision::Allow(_)));
 
         // Untrusted with no allow rules: the resulting file is the user's own.
         let fresh = dir.join("fresh");
