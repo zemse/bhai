@@ -18,6 +18,8 @@ use crate::tools::{self, Registry};
 pub const DEFAULT: &str = "general";
 /// The built-in identity that only delegates; never offered as a child.
 pub const ROUTER: &str = "router";
+/// The `tools` entry that allows both MCP tools.
+const MCP: &str = "mcp";
 
 /// Agent file roots under the home directory, lowest precedence first.
 const HOME_DIRS: [&str; 2] = [".claude/agents", ".config/bhai/agents"];
@@ -72,10 +74,12 @@ impl Identity {
         }
     }
 
+    /// A listed `mcp` stands for both `mcp_search` and `mcp_call`.
     pub fn allows_tool(&self, name: &str) -> bool {
+        let mcp = [tools::mcp::SEARCH, tools::mcp::CALL].contains(&name);
         self.tools
             .as_ref()
-            .is_none_or(|tools| tools.iter().any(|t| t == name))
+            .is_none_or(|tools| tools.iter().any(|t| t == name || (mcp && t == MCP)))
     }
 
     /// Included by some pattern (or there are none) and excluded by none.
@@ -89,9 +93,12 @@ impl Identity {
             && !excludes.iter().any(|p| glob(&p[1..], name))
     }
 
-    /// Whether to start `server`: a pattern names it or one of its tools, and no
-    /// server pattern excludes it.
+    /// Whether to start `server`: the MCP tools are allowed, a pattern names it or one
+    /// of its tools, and no server pattern excludes it.
     pub fn allows_mcp_server(&self, server: &str) -> bool {
+        if !self.allows_tool(tools::mcp::SEARCH) && !self.allows_tool(tools::mcp::CALL) {
+            return false;
+        }
         let (excludes, includes) = self.mcp_patterns();
         let server_part = |p: &str| p.split_once("__").map_or(p, |(s, _)| s).to_string();
         (includes.is_empty() || includes.iter().any(|p| glob(&server_part(p), server)))
@@ -176,7 +183,9 @@ pub fn parse(text: &str, path: &Path, source: &str) -> Option<Identity> {
 /// The bhai tool a bhai or Claude Code tool name refers to, like `Read` or `Bash(git:*)`.
 fn tool_name(name: &str) -> Option<String> {
     let name = name.split('(').next().unwrap_or(name).trim().to_lowercase();
-    tools::NAMES.contains(&name.as_str()).then_some(name)
+    let known = tools::NAMES.contains(&name.as_str())
+        || [MCP, tools::mcp::SEARCH, tools::mcp::CALL].contains(&name.as_str());
+    known.then_some(name)
 }
 
 /// `*` matches any run of characters and `?` any one.
@@ -402,10 +411,63 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         assert_eq!(claude.instructions, None);
         assert!(!claude.allows_tool("write"));
 
+        let mcp = identity("---\nname: m\ntools: read, mcp, mcp_call, mcp__x__y\n---\n");
+        assert_eq!(
+            mcp.tools,
+            Some(vec!["read".into(), "mcp".into(), "mcp_call".into()])
+        );
+
         let open = identity("---\nname: open\ntools:\n---\n");
         assert_eq!(open.tools, None);
         assert!(open.allows_tool("write"));
         assert!(parse("---\ndescription: x\n---\n", Path::new("/b.md"), "").is_none());
+    }
+
+    #[test]
+    fn the_tools_list_gates_the_mcp_tools() {
+        let hub = || {
+            Some(std::sync::Arc::new(crate::mcp::Hub::offline(vec![(
+                "docs",
+                vec![crate::mcp::ToolInfo::test("docs", "search", "Search docs")],
+            )])))
+        };
+        let names = |tools: Option<&[&str]>| {
+            let identity = Identity {
+                tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
+                ..general()
+            };
+            let prompt = SystemPrompt {
+                identity,
+                ..prompt::system_prompt(&[], Vec::new())
+            }
+            .with_mcp(hub());
+            let registry = Registry::for_prompt(&prompt);
+            registry
+                .names()
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+        };
+        let both = ["mcp_search", "mcp_call"];
+        assert!(names(None).ends_with(&both.map(String::from)));
+        assert_eq!(names(Some(&["read"])), ["read"]);
+        assert_eq!(
+            names(Some(&["read", "mcp"])),
+            ["read", "mcp_search", "mcp_call"]
+        );
+        assert_eq!(names(Some(&["mcp_call"])), ["mcp_call"]);
+
+        let only_read = Identity {
+            tools: Some(vec!["read".into()]),
+            ..general()
+        };
+        assert!(!only_read.allows_mcp_server("docs"));
+        let with_mcp = Identity {
+            tools: Some(vec!["mcp_search".into()]),
+            ..general()
+        };
+        assert!(with_mcp.allows_mcp_server("docs"));
+        assert!(!with_mcp.allows_tool("mcp_call"));
     }
 
     #[test]

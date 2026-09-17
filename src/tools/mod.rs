@@ -87,10 +87,14 @@ impl Registry {
         registry
     }
 
-    /// The tools a session's prompt allows: its skills, narrowed to its identity's tools,
-    /// and the MCP tools, which its identity's `mcp` globs already narrowed.
+    /// The tools a session's prompt allows: its skills and MCP tools, narrowed to its
+    /// identity's tools. Its identity's `mcp` globs already narrowed the MCP tools.
     pub fn for_prompt(prompt: &crate::prompt::SystemPrompt) -> Self {
-        Self::for_identity(prompt.skills.clone(), &prompt.identity).with_mcp(prompt.mcp.clone())
+        let mut registry = Self::new(prompt.skills.clone()).with_mcp(prompt.mcp.clone());
+        registry
+            .tools
+            .retain(|t| prompt.identity.allows_tool(t.name()));
+        registry
     }
 
     /// Tool names in registration order.

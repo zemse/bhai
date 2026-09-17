@@ -22,7 +22,8 @@ Keys:
 - `name`, `description`
 - `model`, `effort`: override the client settings
 - `tools`: tool names, comma list or YAML list; missing means all. Claude names
-  (`Read`, `Write`, `Edit`, `Bash`) map to bhai's, unknown ones are ignored
+  (`Read`, `Write`, `Edit`, `Bash`) map to bhai's, unknown ones are ignored. A list
+  gets MCP only if it names `mcp_search`, `mcp_call` or `mcp` (both)
 - `skills`: name globs, `!pat` excludes; missing means all
 - `mcp`: server globs, stored for when MCP lands
 - `instructions`: any of `global_claude`, `global_agents`, `project`; missing keeps the

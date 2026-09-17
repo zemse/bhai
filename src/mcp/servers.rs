@@ -74,7 +74,11 @@ pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
     found
 }
 
-fn add(found: &mut Vec<Server>, server: Server) {
+/// A name with `__` would make `mcp__server__tool` ambiguous, so it never starts.
+fn add(found: &mut Vec<Server>, mut server: Server) {
+    if server.name.contains("__") {
+        server.skip = Some("invalid name (contains __)".to_string());
+    }
     match found.iter_mut().find(|s| s.name == server.name) {
         Some(slot) => *slot = server,
         None => found.push(server),
@@ -199,16 +203,18 @@ mod tests {
                 "off": {"command": "off"},
                 "new": {"command": "new"},
                 "a": {"command": "a-repo"},
+                "x__y": {"command": "xy"},
             }}),
         );
-        let bhai = BTreeMap::from([(
-            "b".to_string(),
-            McpServer {
-                command: "b-bhai".to_string(),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-            },
-        )]);
+        let bhai_server = |command: &str| McpServer {
+            command: command.to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        };
+        let bhai = BTreeMap::from([
+            ("b".to_string(), bhai_server("b-bhai")),
+            ("p__q".to_string(), bhai_server("pq")),
+        ]);
         let roots = Roots {
             home: Some(home),
             codex_home: None,
@@ -218,7 +224,13 @@ mod tests {
         let get = |name: &str| servers.iter().find(|s| s.name == name).unwrap();
         let mut names: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
         names.sort();
-        assert_eq!(names, ["a", "b", "new", "off", "ok", "sse", "web"]);
+        assert_eq!(
+            names,
+            ["a", "b", "new", "off", "ok", "p__q", "sse", "web", "x__y"]
+        );
+        let invalid = Some("invalid name (contains __)".to_string());
+        assert_eq!(get("p__q").skip, invalid);
+        assert_eq!(get("x__y").skip, invalid);
         assert_eq!(get("b").command, "b-bhai");
         assert_eq!(get("b").source, "~/.config/bhai/config.toml");
         assert!(get("ok").skip.is_none());
