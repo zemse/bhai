@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
 use crate::client::{Client, Delta, Usage};
 use crate::identity::Identity;
-use crate::permissions::{Answer, Decision, Mode, Offers, Policy};
+use crate::permissions::{Answer, Decision, Offers, Policy};
 use crate::profile::{self, Call, CallTokens, Profile};
 use crate::prompt::SystemPrompt;
 use crate::tokens;
@@ -692,15 +692,9 @@ want instead, or try a different approach."
 
 /// Remember `rule` and say where it went.
 fn remembered(policy: &Policy, rule: &str) -> AgentEvent {
-    let note = match policy.mode() {
-        Mode::Ask => " (allow rules apply in auto mode)",
-        _ => "",
-    };
     match policy.remember(rule) {
-        Ok(Some(path)) => {
-            AgentEvent::Info(format!("remembered {rule} in {}{note}", path.display()))
-        }
-        Ok(None) => AgentEvent::Info(format!("remembered {rule} for this session{note}")),
+        Ok(Some(path)) => AgentEvent::Info(format!("remembered {rule} in {}", path.display())),
+        Ok(None) => AgentEvent::Info(format!("remembered {rule} for this session")),
         Err(e) => AgentEvent::Error(format!("could not save {rule}: {e:#}")),
     }
 }
@@ -868,6 +862,7 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::Mode;
 
     #[tokio::test]
     async fn context_is_answered_while_idle() {

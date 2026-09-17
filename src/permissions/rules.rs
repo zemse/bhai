@@ -12,6 +12,8 @@ pub struct Rule {
     pub text: String,
     /// The file the rule came from, for `/permissions`.
     pub source: String,
+    /// The user wrote or remembered it, so as an allow rule it also applies in `ask` mode.
+    pub user: bool,
     /// Lowercase tool name.
     tool: String,
     pattern: Pattern,
@@ -61,6 +63,7 @@ impl Rule {
         Ok(Self {
             text: trimmed.to_string(),
             source: String::new(),
+            user: false,
             tool,
             pattern,
         })
@@ -71,6 +74,10 @@ impl Rule {
             source: source.into(),
             ..self
         }
+    }
+
+    pub fn by_user(self) -> Self {
+        Self { user: true, ..self }
     }
 
     /// `Edit` rules cover every tool that changes files, as in Claude Code. `mcp__server`

@@ -11,7 +11,7 @@ use super::{Rule, Rules};
 /// Remembered approvals, under the project directory.
 pub const LOCAL: &str = ".bhai/settings.local.json";
 
-/// The allow rules saved in `path`, and a notice for each one that does not parse.
+/// The allow rules bhai saved in `path`, which count as the user's, and a notice for each one that does not parse.
 pub fn load_local(path: &Path) -> (Vec<Rule>, Vec<String>) {
     let mut notices = Vec::new();
     let settings = match read(path) {
@@ -20,7 +20,7 @@ pub fn load_local(path: &Path) -> (Vec<Rule>, Vec<String>) {
     };
     let rules = strings(&settings, "allow")
         .filter_map(|text| match Rule::parse(text) {
-            Ok(rule) => Some(rule.with_source(path.display().to_string())),
+            Ok(rule) => Some(rule.with_source(path.display().to_string()).by_user()),
             Err(e) => {
                 notices.push(format!("skipped in {}: {e}", path.display()));
                 None
@@ -71,18 +71,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Claude Code's rules for the tools bhai has, from the global and project settings.
 /// The shared project file is checked into the repo, so like `.bhai/config.toml` it may
-/// only add deny and ask rules.
+/// only add deny and ask rules. Only the global file's rules count as the user's.
 pub fn claude(home: Option<&Path>, cwd: &Path) -> (Rules, Vec<String>) {
     let global = home.map(|h| h.join(".claude/settings.json"));
     let shared = cwd.join(".claude/settings.json");
     let files = [
-        global.clone().map(|p| (p, true)),
-        (global.as_ref() != Some(&shared)).then_some((shared, false)),
-        Some((cwd.join(".claude/settings.local.json"), true)),
+        global.clone().map(|p| (p, true, true)),
+        (global.as_ref() != Some(&shared)).then_some((shared, false, false)),
+        Some((cwd.join(".claude/settings.local.json"), true, false)),
     ];
     let mut rules = Rules::default();
     let mut notices = Vec::new();
-    for (path, trusted) in files.into_iter().flatten() {
+    for (path, trusted, user) in files.into_iter().flatten() {
         let settings = match read(&path) {
             Ok(settings) => settings,
             Err(e) => {
@@ -93,7 +93,10 @@ pub fn claude(home: Option<&Path>, cwd: &Path) -> (Rules, Vec<String>) {
         let mut load = |key: &str, into: &mut Vec<Rule>| {
             for text in strings(&settings, key) {
                 match claude_rule(text) {
-                    Some(Ok(rule)) => into.push(rule.with_source(path.display().to_string())),
+                    Some(Ok(rule)) => {
+                        let rule = rule.with_source(path.display().to_string());
+                        into.push(if user { rule.by_user() } else { rule });
+                    }
                     Some(Err(e)) => notices.push(format!("skipped in {}: {e}", path.display())),
                     None => {}
                 }
@@ -177,6 +180,7 @@ mod tests {
         assert_eq!(texts(&rules), ["Bash(git log:*)", "Edit(/src/**)"]);
         assert!(notices.is_empty());
         assert_eq!(rules[0].source, path.display().to_string());
+        assert!(rules.iter().all(|r| r.user));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -249,6 +253,8 @@ mod tests {
                 "Read"
             ]
         );
+        let users: Vec<bool> = rules.allow.iter().map(|r| r.user).collect();
+        assert_eq!(users, [true, true, true, false]);
         assert_eq!(texts(&rules.deny), ["Read(*.pem)"]);
         assert_eq!(texts(&rules.ask), ["Write(docs/**)"]);
         assert_eq!(

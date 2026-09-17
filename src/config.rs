@@ -202,9 +202,10 @@ impl Config {
             .extend(parse(&layer.permissions.deny)?);
         self.permissions.ask.extend(parse(&layer.permissions.ask)?);
         if trusted {
+            let allow = parse(&layer.permissions.allow)?;
             self.permissions
                 .allow
-                .extend(parse(&layer.permissions.allow)?);
+                .extend(allow.into_iter().map(Rule::by_user));
             if let Some(mode) = layer.permission_mode {
                 self.permission_mode = mode;
             }
@@ -319,6 +320,7 @@ mod tests {
         assert_eq!(config.permission_mode, Mode::Auto);
         let texts = |rules: &[Rule]| rules.iter().map(|r| r.text.clone()).collect::<Vec<_>>();
         assert_eq!(texts(&config.permissions.allow), ["Bash(ls)"]);
+        assert!(config.permissions.allow[0].user);
         assert_eq!(texts(&config.permissions.deny), ["Read(a)", "Read(b)"]);
         assert_eq!(texts(&config.permissions.ask), ["Edit"]);
         let project = cwd.join(".bhai/config.toml").display().to_string();

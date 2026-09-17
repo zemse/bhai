@@ -241,7 +241,8 @@ impl Policy {
         };
         let rule = Rule::parse(text)
             .map_err(anyhow::Error::msg)?
-            .with_source(source);
+            .with_source(source)
+            .by_user();
         {
             let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
             if !rules.allow.iter().any(|r| r.text == rule.text) {
@@ -254,12 +255,16 @@ impl Policy {
         Ok(self.store.as_deref())
     }
 
-    /// What `/permissions` prints: the mode, then each rule and where it came from.
+    /// What `/permissions` prints: the mode, then each rule, where it came from and
+    /// whether the mode ignores it.
     pub fn describe(&self) -> String {
         let rules = self.rules();
-        let mut out = format!("permission mode: {}", self.mode());
-        if self.mode() == Mode::Ask {
-            out.push_str(" (allow rules apply in auto mode)");
+        let mode = self.mode();
+        let mut out = format!("permission mode: {mode}");
+        if mode == Mode::Ask {
+            out.push_str(
+                " (only your own and remembered allow rules apply; read-only commands still ask)",
+            );
         }
         for (name, list) in [
             ("deny", &rules.deny),
@@ -276,7 +281,12 @@ impl Policy {
                     "" => "built in",
                     source => source,
                 };
-                out.push_str(&format!("\n  {}  ({source})", rule.text));
+                let inactive = if name == "allow" && !allows_in(rule, mode) {
+                    format!(", inactive in {mode} mode")
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!("\n  {}  ({source}{inactive})", rule.text));
             }
         }
         out
@@ -300,6 +310,11 @@ impl Policy {
             cwd: &self.cwd,
         }
     }
+}
+
+/// Whether an allow rule counts in `mode`: `ask` only honours the user's own rules.
+fn allows_in(rule: &Rule, mode: Mode) -> bool {
+    mode != Mode::Ask || rule.user
 }
 
 /// The lowercase `mcp__server__tool` name an `mcp_call` runs, as rules name it.
@@ -343,7 +358,7 @@ impl Checker<'_> {
         if !needs_approval {
             return Decision::Allow(String::new());
         }
-        self.fallback(find(&self.rules.allow).map(|r| rule_reason(&r)))
+        self.fallback(find(&self.allow()).map(|r| rule_reason(&r)))
     }
 
     fn check_path(&self, tool: &str, path: &Path, needs_approval: bool) -> Decision {
@@ -366,7 +381,7 @@ impl Checker<'_> {
         if rules::is_protected(path, base.home) {
             return Decision::Ask;
         }
-        self.fallback(find(&self.rules.allow, false).map(|r| rule_reason(&r)))
+        self.fallback(find(&self.allow(), false).map(|r| rule_reason(&r)))
     }
 
     fn check_bash(&self, command: &str) -> Decision {
@@ -405,13 +420,13 @@ impl Checker<'_> {
 
         let mut reasons: Vec<String> = Vec::new();
         for c in &commands {
+            let read_only = self.mode != Mode::Ask && bash::is_read_only(&c.words);
             let reason = self
-                .rules
-                .allow
+                .allow()
                 .iter()
                 .find(|r| r.applies_to("bash") && r.matches_words(&c.words, false))
                 .map(rule_reason)
-                .or_else(|| bash::is_read_only(&c.words).then(|| "read-only".to_string()));
+                .or_else(|| read_only.then(|| "read-only".to_string()));
             match reason {
                 Some(reason) => {
                     if !reasons.contains(&reason) {
@@ -424,13 +439,22 @@ impl Checker<'_> {
         self.fallback(Some(reasons.join(", ")))
     }
 
+    /// The allow rules this mode honours.
+    fn allow(&self) -> Vec<Rule> {
+        self.rules
+            .allow
+            .iter()
+            .filter(|r| allows_in(r, self.mode))
+            .cloned()
+            .collect()
+    }
+
     /// What the mode makes of a call no deny, ask or protected check stopped.
     fn fallback(&self, allowed: Option<String>) -> Decision {
         match (self.mode, allowed) {
-            (Mode::Ask, _) => Decision::Ask,
             (_, Some(reason)) => Decision::Allow(reason),
             (Mode::Bypass, None) => Decision::Allow("bypass mode".to_string()),
-            (Mode::Auto, None) => Decision::Ask,
+            (Mode::Ask | Mode::Auto, None) => Decision::Ask,
         }
     }
 }
@@ -588,6 +612,94 @@ mod tests {
                 policy.mode()
             );
         }
+    }
+
+    #[test]
+    fn ask_mode_honours_only_the_users_allow_rules() {
+        let mut allow = rules(&["Bash(npm test)", "Write(docs/**)"]);
+        allow.extend(
+            rules(&["Bash(cargo build)", "Bash(git log:*)", "Write(src/**)"])
+                .into_iter()
+                .map(Rule::by_user),
+        );
+        let rules = Rules {
+            allow,
+            deny: rules(&["Bash(cargo build --release)"]),
+            ask: rules(&["Bash(git log -p:*)"]),
+        };
+        let at = |mode| {
+            Policy::new(
+                mode,
+                rules.clone(),
+                Some("/home/u".into()),
+                "/home/u/repo".into(),
+            )
+        };
+        let (ask, auto) = (at(Mode::Ask), at(Mode::Auto));
+        let user_rule = allowed("rule Bash(cargo build)");
+        let cases = [
+            (&ask, "cargo build", user_rule.clone()),
+            (&auto, "cargo build", user_rule),
+            (&ask, "npm test", Decision::Ask),
+            (&auto, "npm test", allowed("rule Bash(npm test)")),
+            (&ask, "ls", Decision::Ask),
+            (&auto, "ls", allowed("read-only")),
+            (&ask, "git log && ls", Decision::Ask),
+            (&ask, "git log -p", Decision::Ask),
+            (&ask, "git log .env", Decision::Ask),
+            (
+                &ask,
+                "cargo build --release",
+                Decision::Deny("deny rule Bash(cargo build --release)".to_string()),
+            ),
+        ];
+        for (policy, command, want) in cases {
+            assert_eq!(
+                bash(policy, command),
+                want,
+                "{command} in {}",
+                policy.mode()
+            );
+        }
+        let files = [
+            (&ask, "/home/u/repo/src/a.rs", allowed("rule Write(src/**)")),
+            (&ask, "/home/u/repo/docs/a.md", Decision::Ask),
+            (
+                &auto,
+                "/home/u/repo/docs/a.md",
+                allowed("rule Write(docs/**)"),
+            ),
+            (&ask, "/home/u/repo/src/.env", Decision::Ask),
+        ];
+        for (policy, path, want) in files {
+            assert_eq!(
+                file(policy, "write", path),
+                want,
+                "{path} in {}",
+                policy.mode()
+            );
+        }
+
+        ask.remember("Bash(npm test:*)").unwrap();
+        assert_eq!(bash(&ask, "npm test"), allowed("rule Bash(npm test:*)"));
+        let described = ask.describe();
+        assert!(
+            described.contains("only your own and remembered"),
+            "{described}"
+        );
+        assert!(
+            described.contains("Bash(npm test)  (built in, inactive in ask mode)"),
+            "{described}"
+        );
+        assert!(
+            described.contains("Bash(cargo build)  (built in)\n"),
+            "{described}"
+        );
+        assert!(
+            described.contains("Bash(npm test:*)  (this session)"),
+            "{described}"
+        );
+        assert!(!auto.describe().contains("inactive"));
     }
 
     #[test]
