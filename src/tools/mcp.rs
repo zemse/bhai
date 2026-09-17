@@ -60,7 +60,7 @@ impl Tool for Search {
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
         Box::pin(async move {
             match query(args) {
-                Ok(q) => (self.hub.search(q), true),
+                Ok(q) => (self.hub.search(q).await, true),
                 Err(e) => (e, false),
             }
         })
@@ -110,7 +110,7 @@ impl Tool for Call {
     fn describe(&self, args: &Value) -> Result<String, String> {
         let name = string_arg(args, "name")
             .ok_or_else(|| "missing required string field `name`.".to_string())?;
-        if self.hub.find(name).is_none() {
+        if !self.hub.may_call(name) {
             return Err(format!(
                 "no MCP tool named `{name}`. Use `mcp_search` to find the exact name."
             ));

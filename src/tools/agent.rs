@@ -270,6 +270,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&agent.transcripts);
     }
 
+    #[tokio::test]
+    async fn a_router_child_reaches_a_server_the_router_did_not_start() {
+        use crate::mcp::{self, Hub};
+        use crate::permissions::{Mode, Rules};
+
+        let Some(server) = mcp::fake_server("fake", "") else {
+            return;
+        };
+        let dir = super::super::temp_dir();
+        let roots = crate::instructions::Roots {
+            home: None,
+            codex_home: None,
+            cwd: dir.clone(),
+        };
+        let router = identity::find(&identity::discover(&roots), identity::ROUTER).unwrap();
+        let hub = Hub::connect(
+            vec![server],
+            &router,
+            &dir,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert!(!hub.has_tools());
+        let hub = Arc::new(hub);
+        let fake = Fake::new(vec![
+            vec![call("mcp_search", json!({"query": "echo"}))],
+            vec![call(
+                "mcp_call",
+                json!({"name": "mcp__fake__echo", "arguments": {"message": "hi"}}),
+            )],
+            vec![say("done")],
+        ]);
+        let (mut agent, _rx) = tool(&fake, false);
+        agent.policy = Arc::new(Policy::new(
+            Mode::Bypass,
+            Rules::default(),
+            None,
+            dir.clone(),
+        ));
+        agent.delegation.prompt = {
+            let hub = Arc::clone(&hub);
+            Arc::new(move |identity: &Identity| {
+                SystemPrompt {
+                    identity: identity.clone(),
+                    ..SystemPrompt::default()
+                }
+                .with_mcp(Some(Arc::new(hub.narrowed(identity))))
+            })
+        };
+        let (out, ok) = agent
+            .execute(&json!({"description": "echo", "prompt": "go"}))
+            .await;
+        assert!(ok, "{out}");
+        let offered = fake.offered.lock().unwrap().clone();
+        assert!(offered[0].contains(&"mcp_call".to_string()), "{offered:?}");
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let input = bodies.last().unwrap().1["input"].to_string();
+        assert!(input.contains("echo: hi"), "{input}");
+        hub.shutdown().await;
+        let _ = std::fs::remove_dir_all(&agent.transcripts);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn plain_output_is_untouched() {
         let text = "Found 3 files.\nuse a < b in the loop";
