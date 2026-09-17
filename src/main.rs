@@ -75,9 +75,9 @@ async fn main() -> Result<()> {
     }
     // `bhai --cache-check` sends a few calls on one prefix and checks the cache served it.
     if args.first().is_some_and(|a| a == "--cache-check") {
-        let (prompt, _, _) = load(Flags::default(), identity::DEFAULT).await?;
+        let (prompt, policy, delegation) = load(Flags::default(), identity::DEFAULT).await?;
         let hub = prompt.mcp.clone();
-        let result = cache_check(prompt).await;
+        let result = cache_check(prompt, policy, delegation).await;
         shutdown(hub).await;
         if !result? {
             std::process::exit(1);
@@ -399,14 +399,28 @@ struct CacheRow {
 /// Send a few tiny calls with the session's real instructions and tools through the
 /// real client, and report how much of each the cache served. `false` when call 2 or
 /// later got nothing from the cache.
-async fn cache_check(system: SystemPrompt) -> Result<bool> {
+async fn cache_check(system: SystemPrompt, policy: Policy, delegation: Delegation) -> Result<bool> {
     let client = client::Client::new()?.with_overrides(
         system.identity.model.clone(),
         system.identity.effort.clone(),
     );
-    let tools = tools::Registry::for_prompt(&system).schemas();
-    let mut input = cache_check_prefix(&system, &tools);
     let cancel = Arc::new(AtomicBool::new(false));
+    // The same tool list a session offers, the agent tool included; it is never run.
+    let mut registry = tools::Registry::for_prompt(&system);
+    if system.identity.allows_tool(tools::agent::NAME) {
+        registry = registry.with_agent(tools::agent::Agent {
+            transcripts: delegation.sessions.clone(),
+            delegation,
+            model: Arc::new(client.clone()),
+            policy: Arc::new(policy),
+            tx: mpsc::unbounded_channel().0,
+            cancel: Arc::clone(&cancel),
+            children: agent::Children::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
+        });
+    }
+    let tools = registry.schemas();
+    let mut input = cache_check_prefix(&system, &tools);
     let mut monitor = cache::CacheMonitor::default();
     let mut rows = Vec::new();
     for call in 1..=CACHE_CHECK_CALLS {
