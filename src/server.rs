@@ -149,6 +149,7 @@ mod tests {
     use super::*;
     use crate::agent::{AgentEvent, Control};
     use crate::client::Usage;
+    use crate::prompt::SystemPrompt;
     use crate::{profile, session};
 
     const WAIT: Duration = Duration::from_secs(5);
@@ -169,7 +170,15 @@ mod tests {
         tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
         tokio::spawn(async move {
             while let Some(Control::Context(reply)) = rx_control.recv().await {
-                let _ = reply.send(profile::build("sys", &[], &[], None));
+                let _ = reply.send(profile::build(
+                    &SystemPrompt {
+                        text: "sys".to_string(),
+                        sources: Vec::new(),
+                    },
+                    &[],
+                    &[],
+                    None,
+                ));
             }
         });
         tokio::spawn(async move {

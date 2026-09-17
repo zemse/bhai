@@ -1,7 +1,61 @@
 //! The system prompt. Kept short on purpose: the model is already trained to be a
 //! coding agent, so this only states what this particular harness can and cannot do.
+//! Instruction files go after the static text, so the cacheable prefix stays first.
 
-pub fn system_prompt() -> String {
+use std::fmt::Write as _;
+
+use crate::instructions::File;
+
+/// The system prompt and the instruction files appended to it.
+#[derive(Debug, Clone)]
+pub struct SystemPrompt {
+    pub text: String,
+    pub sources: Vec<Source>,
+}
+
+/// One appended instruction file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Source {
+    pub label: String,
+    /// Bytes its section adds to the prompt, heading included.
+    pub bytes: usize,
+}
+
+impl SystemPrompt {
+    /// The startup line, like `loaded: ~/.claude/CLAUDE.md (3.1k), ./CLAUDE.md (0.4k)`.
+    pub fn loaded(&self) -> Option<String> {
+        if self.sources.is_empty() {
+            return None;
+        }
+        let list: Vec<String> = self
+            .sources
+            .iter()
+            .map(|s| format!("{} ({:.1}k)", s.label, s.bytes as f64 / 1000.0))
+            .collect();
+        Some(format!("loaded: {}", list.join(", ")))
+    }
+}
+
+pub fn system_prompt(files: &[File]) -> SystemPrompt {
+    let mut text = base();
+    let mut sources = Vec::new();
+    for file in files {
+        let start = text.len();
+        let _ = write!(
+            text,
+            "\n\n# Instructions from {}\n\n{}",
+            file.label,
+            file.content.trim_end()
+        );
+        sources.push(Source {
+            label: file.label.clone(),
+            bytes: text.len() - start,
+        });
+    }
+    SystemPrompt { text, sources }
+}
+
+fn base() -> String {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
@@ -35,4 +89,45 @@ Answer in plain text for a terminal: short, specific, no markdown headers or bul
 padding. Say what you did and what you found. When a task is done, stop calling tools and \
 report the result."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn file(label: &str, content: &str) -> File {
+        File {
+            path: PathBuf::from(label),
+            label: label.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn files_are_appended_after_the_static_text() {
+        let bare = system_prompt(&[]);
+        assert_eq!(bare.text, base());
+        assert!(bare.sources.is_empty());
+        assert_eq!(bare.loaded(), None);
+
+        let files = [
+            file("~/.claude/CLAUDE.md", "be terse\n"),
+            file("./CLAUDE.md", &"x".repeat(420)),
+        ];
+        let prompt = system_prompt(&files);
+        assert!(prompt.text.starts_with(&bare.text));
+        assert!(
+            prompt
+                .text
+                .contains("# Instructions from ~/.claude/CLAUDE.md\n\nbe terse\n\n#")
+        );
+        assert!(prompt.text.ends_with(&"x".repeat(420)));
+        let added: usize = prompt.sources.iter().map(|s| s.bytes).sum();
+        assert_eq!(bare.text.len() + added, prompt.text.len());
+        assert_eq!(
+            prompt.loaded().unwrap(),
+            "loaded: ~/.claude/CLAUDE.md (0.1k), ./CLAUDE.md (0.5k)"
+        );
+    }
 }

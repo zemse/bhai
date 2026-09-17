@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::bash;
 use crate::client::{self, Client, Delta, Usage};
 use crate::profile::{self, Measured, Profile};
-use crate::prompt::system_prompt;
+use crate::prompt::SystemPrompt;
 
 /// Hard cap on model calls in a single turn, so a confused loop cannot run forever.
 const MAX_STEPS: usize = 40;
@@ -47,6 +47,7 @@ pub enum Control {
 
 /// `usage_log` is the JSONL file each model call's usage is appended to, if any.
 pub async fn run(
+    prompt: SystemPrompt,
     mut rx_user: mpsc::Receiver<String>,
     mut rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
@@ -60,7 +61,6 @@ pub async fn run(
             return;
         }
     };
-    let instructions = system_prompt();
     let tools = client::tools();
     let mut history: Vec<Value> = Vec::new();
     let mut measured: Option<Measured> = None;
@@ -68,7 +68,7 @@ pub async fn run(
     loop {
         let message = tokio::select! {
             Some(Control::Context(reply)) = rx_control.recv() => {
-                let _ = reply.send(profile::build(&instructions, &tools, &history, measured));
+                let _ = reply.send(profile::build(&prompt, &tools, &history, measured));
                 continue;
             }
             message = rx_user.recv() => match message {
@@ -88,7 +88,7 @@ pub async fn run(
         let result = {
             let turn = turn(
                 &client,
-                &instructions,
+                &prompt.text,
                 &mut history,
                 &tx,
                 &cancel,
@@ -101,7 +101,7 @@ pub async fn run(
                     result = &mut turn => break result,
                     Some(Control::Context(reply)) = rx_control.recv() => {
                         let _ = reply.send(profile::build(
-                            &instructions,
+                            &prompt,
                             &tools,
                             &before,
                             measured_before,
@@ -284,7 +284,14 @@ mod tests {
         let (tx_control, rx_control) = mpsc::channel(1);
         let (tx, _rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        tokio::spawn(run(rx_user, rx_control, tx, cancel, None));
+        tokio::spawn(run(
+            crate::prompt::system_prompt(&[]),
+            rx_user,
+            rx_control,
+            tx,
+            cancel,
+            None,
+        ));
 
         let (reply, wait) = oneshot::channel();
         tx_control.send(Control::Context(reply)).await.unwrap();

@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::client::Usage;
+use crate::prompt::SystemPrompt;
 
 /// Items `/context` prints into the transcript.
 const TOP_ITEMS: usize = 5;
@@ -67,16 +68,24 @@ pub struct Category {
 
 /// Break the context of the next request down into its components.
 pub fn build(
-    instructions: &str,
+    prompt: &SystemPrompt,
     tools: &[Value],
     history: &[Value],
     measured: Option<Measured>,
 ) -> Profile {
+    let appended: usize = prompt.sources.iter().map(|s| s.bytes).sum();
     let mut items = vec![item(
         "system prompt".to_string(),
         "system prompt",
-        instructions.len(),
+        prompt.text.len() - appended,
     )];
+    for source in &prompt.sources {
+        items.push(item(
+            format!("instructions: {}", source.label),
+            "instructions",
+            source.bytes,
+        ));
+    }
     for tool in tools {
         let name = tool.get("name").and_then(Value::as_str).unwrap_or("?");
         items.push(item(format!("tool: {name}"), "tool schema", json_len(tool)));
@@ -303,6 +312,13 @@ fn optional(n: Option<u64>) -> String {
 mod tests {
     use super::*;
 
+    fn plain(text: &str) -> SystemPrompt {
+        SystemPrompt {
+            text: text.to_string(),
+            sources: Vec::new(),
+        }
+    }
+
     fn history() -> Vec<Value> {
         vec![
             json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}),
@@ -316,7 +332,7 @@ mod tests {
     #[test]
     fn breakdown_is_sorted_categorised_and_sums_up() {
         let tools = [json!({"type": "function", "name": "bash"})];
-        let profile = build("be brief", &tools, &history(), None);
+        let profile = build(&plain("be brief"), &tools, &history(), None);
 
         assert_eq!(profile.items.len(), 7);
         assert!(profile.items.windows(2).all(|w| w[0].bytes >= w[1].bytes));
@@ -356,13 +372,30 @@ mod tests {
     }
 
     #[test]
+    fn instruction_files_are_items_of_their_own() {
+        let files = [crate::instructions::File {
+            path: "CLAUDE.md".into(),
+            label: "./CLAUDE.md".to_string(),
+            content: "z".repeat(300),
+        }];
+        let prompt = crate::prompt::system_prompt(&files);
+        let profile = build(&prompt, &[], &[], None);
+        assert_eq!(profile.items.len(), 2);
+        assert_eq!(profile.items[0].label, "system prompt");
+        assert_eq!(profile.items[1].label, "instructions: ./CLAUDE.md");
+        assert_eq!(profile.items[1].category, "instructions");
+        assert_eq!(profile.items[1].bytes, prompt.sources[0].bytes);
+        assert_eq!(profile.total_bytes, prompt.text.len());
+    }
+
+    #[test]
     fn calibration_uses_only_what_the_last_call_sent() {
         let history = history();
         let measured = Measured {
             input_tokens: 1000,
             items: 4,
         };
-        let profile = build("be brief", &[], &history, Some(measured));
+        let profile = build(&plain("be brief"), &[], &history, Some(measured));
         let c = profile.calibration.as_ref().unwrap();
         let unsent = profile
             .items
@@ -381,7 +414,7 @@ mod tests {
             input_tokens: 900,
             items: 5,
         };
-        let md = build("be brief", &[], &history(), Some(measured)).markdown();
+        let md = build(&plain("be brief"), &[], &history(), Some(measured)).markdown();
         assert!(md.starts_with("# bhai context\n"));
         assert!(md.contains("Last call: 900 real input tokens"));
         assert!(md.contains("## By category"));
@@ -396,7 +429,7 @@ mod tests {
     #[test]
     fn export_writes_json_and_markdown() {
         let dir = std::env::temp_dir().join(format!("bhai-profile-{}", uuid::Uuid::new_v4()));
-        let profile = build("x", &[], &history(), None);
+        let profile = build(&plain("x"), &[], &history(), None);
         let path = export(&profile, &dir).unwrap();
         let json: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(json["items"].as_array().unwrap().len(), 6);

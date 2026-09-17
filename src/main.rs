@@ -6,6 +6,8 @@ mod app;
 mod auth;
 mod bash;
 mod client;
+mod config;
+mod instructions;
 mod profile;
 mod prompt;
 mod server;
@@ -27,6 +29,8 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::{AgentEvent, Control};
 use crate::app::App;
+use crate::config::{Config, Flags};
+use crate::prompt::SystemPrompt;
 use crate::session::Session;
 
 /// How often the UI wakes up when nothing is happening (keeps the spinner moving).
@@ -53,17 +57,20 @@ async fn main() -> Result<()> {
     // auth and the wire format still work without entering the TUI.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "--probe") {
-        return probe(args.get(1).cloned()).await;
+        let prompt = load_prompt(Flags::default())?;
+        return probe(prompt, args.get(1).cloned()).await;
     }
     let args = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [--probe [prompt]] [--serve [port] [--headless]] [--profile]"
+                "bhai: {e:#}\nusage: bhai [--probe [prompt]] [--serve [port] [--headless]] [--profile] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
     };
+    let prompt = load_prompt(args.flags)?;
+    let loaded = prompt.loaded();
 
     // Bind before taking over the terminal so a busy port is a plain error.
     let listener = match args.serve {
@@ -73,9 +80,12 @@ async fn main() -> Result<()> {
     let usage_log = args
         .profile
         .then(|| profile::debug_dir().join("usage.jsonl"));
-    let (session, events) = start(model, usage_log);
+    let (session, events) = start(model, prompt, usage_log);
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
+        if let Some(loaded) = loaded {
+            eprintln!("bhai: {loaded}");
+        }
         eprintln!("bhai: debug server on http://{}", listener.local_addr()?);
         return server::serve(listener, session).await;
     }
@@ -84,7 +94,7 @@ async fn main() -> Result<()> {
     // Mouse capture is what turns the wheel into scroll events. It also takes over
     // click-drag, so terminals need shift (or option) held to select text while bhai runs.
     let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(terminal, session, events, listener).await;
+    let result = run(terminal, session, events, listener, loaded).await;
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -100,6 +110,15 @@ struct Args {
     headless: bool,
     /// Log every model call's usage to `.bhai/debug/usage.jsonl`.
     profile: bool,
+    flags: Flags,
+}
+
+/// Config and instruction files for the working directory, as the system prompt.
+fn load_prompt(flags: Flags) -> Result<SystemPrompt> {
+    let cwd = std::env::current_dir()?;
+    let roots = instructions::Roots::from_env(cwd);
+    let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
+    Ok(prompt::system_prompt(&instructions::load(&config, &roots)))
 }
 
 fn parse_args(args: &[String]) -> Result<Args> {
@@ -118,6 +137,9 @@ fn parse_args(args: &[String]) -> Result<Args> {
             }
             "--headless" => parsed.headless = true,
             "--profile" => parsed.profile = true,
+            "--no-global" => parsed.flags.no_global = true,
+            "--no-project" => parsed.flags.no_project = true,
+            "--bare" => parsed.flags.bare = true,
             other => bail!("unknown argument `{other}`"),
         }
     }
@@ -131,6 +153,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
 /// agent starts, so the TUI sees every event.
 fn start(
     model: String,
+    prompt: SystemPrompt,
     usage_log: Option<PathBuf>,
 ) -> (Arc<Session>, broadcast::Receiver<session::Event>) {
     let (tx_user, rx_user) = mpsc::channel::<String>(16);
@@ -139,19 +162,22 @@ fn start(
     let cancel = Arc::new(AtomicBool::new(false));
     let session = Session::new(model, tx_user, tx_control, Arc::clone(&cancel));
     let events = session.subscribe();
-    tokio::spawn(agent::run(rx_user, rx_control, tx_agent, cancel, usage_log));
+    tokio::spawn(agent::run(
+        prompt, rx_user, rx_control, tx_agent, cancel, usage_log,
+    ));
     tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
     (session, events)
 }
 
 /// Drive the real agent loop without the TUI, rejecting every command. Checks auth,
 /// the wire format and the tool-result replay path without executing anything.
-async fn probe(prompt: Option<String>) -> Result<()> {
+async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
     let (tx_user, rx_user) = mpsc::channel::<String>(1);
     let (_tx_control, rx_control) = mpsc::channel::<Control>(1);
     let (tx_agent, mut rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
     tokio::spawn(agent::run(
+        system,
         rx_user,
         rx_control,
         tx_agent,
@@ -193,6 +219,7 @@ async fn run(
     session: Arc<Session>,
     mut events: broadcast::Receiver<session::Event>,
     listener: Option<TcpListener>,
+    loaded: Option<String>,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -231,6 +258,9 @@ async fn run(
     });
 
     let mut app = App::new(Arc::clone(&session));
+    if let Some(loaded) = loaded {
+        app.entries.push(app::Entry::Info(loaded));
+    }
     if let Some(listener) = listener {
         let addr = listener.local_addr()?;
         app.entries
@@ -278,6 +308,19 @@ mod tests {
         assert!(parse(&["--headless"]).is_err());
         assert!(parse(&["--serve", "nope"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn instruction_flags() {
+        let flags = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse_args(&args).unwrap().flags
+        };
+        assert_eq!(flags(&[]), Flags::default());
+        assert!(flags(&["--no-global"]).no_global);
+        assert!(flags(&["--no-project"]).no_project);
+        let bare = flags(&["--bare", "--profile"]);
+        assert!(bare.bare && !bare.no_global);
     }
 
     #[test]
