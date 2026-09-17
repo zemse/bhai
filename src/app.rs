@@ -1,8 +1,11 @@
 //! UI state and the event handling that mutates it.
 
 use ratatui::crossterm::event::{
-    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 
 use tui_input::Input;
@@ -11,7 +14,7 @@ use tui_input::backend::crossterm::to_input_request;
 
 use crate::client::Usage;
 use crate::permissions::{Answer, Mode, Remember};
-use crate::profile;
+use crate::profile::{self, CallTokens};
 use crate::session::{Approval, Event, Session};
 use crate::skills::Skill;
 
@@ -30,8 +33,54 @@ pub enum Entry {
     Info(String),
 }
 
+/// What an entry cost, as far as the usage events pin it down.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Tokens {
+    /// Input tokens of the call that first sent this entry.
+    pub input: Option<u64>,
+    /// False when `input` is a tokenizer count.
+    pub exact: bool,
+    /// Later calls that sent this entry again.
+    pub resends: u64,
+    /// Tokens of those resends served from the cache.
+    pub cached: u64,
+    /// Output tokens, reasoning not included.
+    pub output: Option<u64>,
+    pub reasoning: Option<u64>,
+    /// Totals of the call this entry ended.
+    pub call: Option<Usage>,
+    /// The calls of the child agent this entry reports on.
+    pub child: Option<Usage>,
+}
+
+/// Ties history items and calls to the entries that show them.
+#[derive(Default)]
+struct Attribution {
+    /// History index to entry, for user messages and tool results.
+    items: BTreeMap<usize, usize>,
+    /// Entries from here on are not yet tied to a call or item.
+    mark: usize,
+    /// Output tokens of each function call still waiting for its result.
+    calls: VecDeque<u64>,
+    /// Totals of a call that wrote no text, for its first function call entry.
+    totals: Option<Usage>,
+    /// Child agent usage since the last tool result.
+    child: Option<Usage>,
+}
+
 pub struct App {
     pub entries: Vec<Entry>,
+    /// Token attribution by entry index.
+    pub tokens: HashMap<usize, Tokens>,
+    /// Screen rows of each visible entry, filled in by the renderer.
+    pub rows: Vec<(Range<u16>, usize)>,
+    /// The entry under the mouse.
+    pub hover: Option<usize>,
+    mouse_row: Option<u16>,
+    /// Entries whose badge stays up.
+    pub pinned: HashSet<usize>,
+    pub all_badges: bool,
+    attribution: Attribution,
     pub input: Input,
     pub working: bool,
     /// The tool call waiting for approval.
@@ -67,6 +116,13 @@ impl App {
                 "bhai · bash, read, write and edit; every change needs your approval. Type a task and hit enter."
                     .to_string(),
             )],
+            tokens: HashMap::new(),
+            rows: Vec::new(),
+            hover: None,
+            mouse_row: None,
+            pinned: HashSet::new(),
+            all_badges: false,
+            attribution: Attribution::default(),
             input: Input::default(),
             working: false,
             pending: None,
@@ -121,6 +177,7 @@ impl App {
             }
             KeyCode::Char('d') if ctrl && self.input.value().is_empty() => self.quit = true,
             KeyCode::Esc if self.working => self.interrupt(),
+            KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
             KeyCode::BackTab => self.mode = self.session.cycle_mode(),
             KeyCode::Enter => self.submit(),
             KeyCode::PageUp => self.scroll_by(-(self.page as isize)),
@@ -136,12 +193,41 @@ impl App {
         }
     }
 
-    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+    /// Returns whether the screen needs a redraw.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_by(-(WHEEL_LINES as isize)),
             MouseEventKind::ScrollDown => self.scroll_by(WHEEL_LINES as isize),
-            _ => {}
+            MouseEventKind::Moved => {
+                self.mouse_row = Some(mouse.row);
+                return self.rehover();
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_row = Some(mouse.row);
+                let Some(entry) = self.entry_at(mouse.row) else {
+                    return false;
+                };
+                if !self.pinned.remove(&entry) {
+                    self.pinned.insert(entry);
+                }
+            }
+            _ => return false,
         }
+        true
+    }
+
+    /// The entry drawn on screen row `y`.
+    pub fn entry_at(&self, y: u16) -> Option<usize> {
+        self.rows
+            .iter()
+            .find(|(rows, _)| rows.contains(&y))
+            .map(|(_, entry)| *entry)
+    }
+
+    /// Point the hover at the entry under the mouse; true when that changed.
+    pub fn rehover(&mut self) -> bool {
+        let hover = self.mouse_row.and_then(|y| self.entry_at(y));
+        std::mem::replace(&mut self.hover, hover) != hover
     }
 
     pub fn on_event(&mut self, event: Event) {
@@ -190,7 +276,14 @@ impl App {
             Event::ChildUsage(usage) => {
                 self.tokens_in += usage.input;
                 self.tokens_out += usage.output;
+                let child = self.attribution.child.get_or_insert_default();
+                child.input += usage.input;
+                child.cached += usage.cached;
+                child.output += usage.output;
+                child.reasoning += usage.reasoning;
             }
+            Event::Call(call) => self.on_call(call),
+            Event::Item(index) => self.on_item(index),
             Event::Cache(found) => {
                 if let Some(found) = &found {
                     self.entries.push(Entry::Error(format!(
@@ -302,9 +395,101 @@ impl App {
         self.follow = self.scroll >= self.max_scroll;
     }
 
+    /// Tie a finished call to the entries it read and wrote.
+    fn on_call(&mut self, call: CallTokens) {
+        let first = call.sent - call.inputs.len();
+        for (offset, &input) in call.inputs.iter().enumerate() {
+            if let Some(&entry) = self.attribution.items.get(&(first + offset)) {
+                let tokens = self.tokens.entry(entry).or_default();
+                tokens.input = Some(input);
+                tokens.exact = call.exact;
+            }
+        }
+        // The usage only says how much of the whole call was cached, so each resent
+        // entry takes the call's cached ratio: the per-entry split is proportional, not
+        // exact.
+        let ratio = match call.usage.input {
+            0 => 0.0,
+            input => call.usage.cached as f64 / input as f64,
+        };
+        for entry in self.attribution.items.range(..first).map(|(_, e)| *e) {
+            let tokens = self.tokens.entry(entry).or_default();
+            if let Some(input) = tokens.input {
+                tokens.resends += 1;
+                tokens.cached += (input as f64 * ratio).round() as u64;
+            }
+        }
+
+        let fresh = self.attribution.mark..self.entries.len();
+        let of = |want: fn(&Entry) -> bool| -> Vec<usize> {
+            fresh.clone().filter(|&i| want(&self.entries[i])).collect()
+        };
+        let text = of(|e| matches!(e, Entry::Assistant(_)));
+        let thinking = of(|e| matches!(e, Entry::Reasoning(_)));
+        self.share(&text, call.text, |tokens, part| tokens.output = Some(part));
+        self.share(&thinking, call.usage.reasoning, |tokens, part| {
+            tokens.reasoning = Some(part)
+        });
+        match (text.last(), thinking.last()) {
+            (Some(&entry), _) => self.tokens.entry(entry).or_default().call = Some(call.usage),
+            _ if !call.calls.is_empty() => self.attribution.totals = Some(call.usage),
+            (None, Some(&entry)) => self.tokens.entry(entry).or_default().call = Some(call.usage),
+            (None, None) => {}
+        }
+        self.attribution.calls.extend(call.calls);
+        self.attribution.mark = self.entries.len();
+    }
+
+    /// Split `total` over `entries` by their text length.
+    fn share(&mut self, entries: &[usize], total: u64, set: impl Fn(&mut Tokens, u64)) {
+        let weights: Vec<u64> = entries
+            .iter()
+            .map(|&i| self.entries[i].text().len() as u64)
+            .collect();
+        for (&entry, part) in entries.iter().zip(profile::split(total, &weights)) {
+            set(self.tokens.entry(entry).or_default(), part);
+        }
+    }
+
+    /// Tie history item `index` to the entry just shown: a tool result when a function
+    /// call is waiting for one, else the user message.
+    fn on_item(&mut self, index: usize) {
+        let fresh = self.attribution.mark..self.entries.len();
+        let last = |want: fn(&Entry) -> bool| fresh.clone().rev().find(|&i| want(&self.entries[i]));
+        match self.attribution.calls.pop_front() {
+            Some(output) => {
+                // A child's commands come after the parent's own, and its results before.
+                let command = fresh
+                    .clone()
+                    .find(|&i| matches!(self.entries[i], Entry::Command(_)));
+                let result = last(|e| matches!(e, Entry::Output(_) | Entry::Rejected(_)));
+                if let Some(entry) = command.or(result) {
+                    let tokens = self.tokens.entry(entry).or_default();
+                    tokens.output = Some(output);
+                    tokens.call = self.attribution.totals.take().or(tokens.call);
+                }
+                let child = self.attribution.child.take();
+                if let Some(entry) = result {
+                    self.attribution.items.insert(index, entry);
+                    if child.is_some() {
+                        self.tokens.entry(entry).or_default().child = child;
+                    }
+                }
+            }
+            None => {
+                if let Some(entry) = last(|e| matches!(e, Entry::User(_))) {
+                    self.attribution.items.insert(index, entry);
+                }
+            }
+        }
+        self.attribution.mark = self.entries.len();
+    }
+
     /// Append a streaming delta to the last entry of the same kind, or start a new one.
+    /// Entries of a call already accounted for are never extended.
     fn append(&mut self, delta: String, kind: Stream) {
-        let appended = match (self.entries.last_mut(), kind) {
+        let open = self.entries.len() > self.attribution.mark;
+        let appended = match (self.entries.last_mut().filter(|_| open), kind) {
             (Some(Entry::Assistant(text)), Stream::Assistant) => {
                 text.push_str(&delta);
                 true
@@ -327,6 +512,21 @@ impl App {
             Stream::Assistant => Entry::Assistant(text),
             Stream::Reasoning => Entry::Reasoning(text),
         });
+    }
+}
+
+impl Entry {
+    pub fn text(&self) -> &str {
+        match self {
+            Entry::User(t)
+            | Entry::Assistant(t)
+            | Entry::Reasoning(t)
+            | Entry::Command(t)
+            | Entry::Output(t)
+            | Entry::Rejected(t)
+            | Entry::Error(t)
+            | Entry::Info(t) => t,
+        }
     }
 }
 
@@ -391,8 +591,157 @@ fn input_request(key: KeyEvent) -> Option<InputRequest> {
 }
 
 #[cfg(test)]
+impl App {
+    /// An app on a session with no agent behind it.
+    pub fn detached() -> Self {
+        let (tx_user, _) = tokio::sync::mpsc::channel(1);
+        let (tx_control, _) = tokio::sync::mpsc::channel(1);
+        App::new(Session::new(
+            "m".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            Arc::default(),
+            Arc::default(),
+        ))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
+        Usage {
+            input,
+            cached,
+            output,
+            reasoning,
+        }
+    }
+
+    fn moved(row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 0,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn calls_are_attributed_to_their_entries() {
+        let mut app = App::detached();
+        let text = |s: &str| s.to_string();
+        app.on_event(Event::User(text("hi")));
+        app.on_event(Event::Item(0));
+        app.on_event(Event::Reasoning(text("think")));
+        app.on_event(Event::Text(text("hello")));
+        app.on_event(Event::Call(CallTokens {
+            usage: usage(100, 0, 30, 10),
+            sent: 1,
+            outputs: 3,
+            inputs: vec![5],
+            exact: false,
+            text: 12,
+            calls: vec![8],
+        }));
+        app.on_event(Event::ToolStart(text("agent worker: go")));
+        app.on_event(Event::ChildUsage(usage(7, 2, 1, 0)));
+        app.on_event(Event::ToolStart(text("[child a worker] ls")));
+        app.on_event(Event::ToolOutput(text("[child a worker] x")));
+        app.on_event(Event::ToolOutput(text("child done")));
+        app.on_event(Event::Item(4));
+        // The next call's text starts an entry of its own.
+        app.on_event(Event::Reasoning(text("more")));
+        app.on_event(Event::Text(text("done")));
+        app.on_event(Event::Call(CallTokens {
+            usage: usage(150, 100, 5, 1),
+            sent: 5,
+            outputs: 2,
+            inputs: vec![20],
+            exact: true,
+            text: 4,
+            calls: vec![],
+        }));
+        assert_eq!(app.entries.len(), 10);
+
+        let get = |i: usize| app.tokens.get(&i).copied().unwrap_or_default();
+        // The user message was tokenized, then resent once at the call's cached ratio.
+        assert_eq!(
+            get(1),
+            Tokens {
+                input: Some(5),
+                resends: 1,
+                cached: 3,
+                ..Tokens::default()
+            }
+        );
+        assert_eq!(get(2).reasoning, Some(10));
+        assert_eq!(get(3).output, Some(12));
+        assert_eq!(get(3).call, Some(usage(100, 0, 30, 10)));
+        assert_eq!(get(4).output, Some(8));
+        assert_eq!(
+            get(5),
+            Tokens::default(),
+            "child entries are not the parent's"
+        );
+        let result = get(7);
+        assert_eq!((result.input, result.exact), (Some(20), true));
+        assert_eq!(result.resends, 0);
+        assert_eq!(result.child, Some(usage(7, 2, 1, 0)));
+        assert_eq!(get(8).reasoning, Some(1));
+        assert_eq!(get(9).output, Some(4));
+        assert_eq!(get(9).call, Some(usage(150, 100, 5, 1)));
+    }
+
+    #[test]
+    fn a_call_without_text_puts_its_totals_on_the_command() {
+        let mut app = App::detached();
+        app.on_event(Event::User("hi".to_string()));
+        app.on_event(Event::Item(0));
+        app.on_event(Event::Call(CallTokens {
+            usage: usage(10, 0, 3, 0),
+            sent: 1,
+            outputs: 1,
+            inputs: vec![1],
+            calls: vec![3],
+            ..CallTokens::default()
+        }));
+        app.on_event(Event::ToolRejected("ls".to_string()));
+        app.on_event(Event::Item(2));
+        let rejected = app.tokens[&2];
+        assert_eq!(rejected.output, Some(3));
+        assert_eq!(rejected.call, Some(usage(10, 0, 3, 0)));
+    }
+
+    #[test]
+    fn hover_redraws_only_when_the_entry_changes() {
+        let mut app = App::detached();
+        app.rows = vec![(1..3, 0), (4..5, 1)];
+        assert!(app.on_mouse(moved(1)));
+        assert_eq!(app.hover, Some(0));
+        assert!(!app.on_mouse(moved(2)), "same entry");
+        assert!(app.on_mouse(moved(3)), "the blank line between entries");
+        assert_eq!(app.hover, None);
+        assert!(!app.on_mouse(moved(0)));
+        assert!(app.on_mouse(moved(4)));
+        assert_eq!(app.hover, Some(1));
+
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            ..moved(4)
+        };
+        assert!(app.on_mouse(click));
+        assert!(app.pinned.contains(&1));
+        assert!(app.on_mouse(click));
+        assert!(app.pinned.is_empty());
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            ..moved(4)
+        };
+        assert!(app.on_mouse(wheel), "the wheel still scrolls");
+    }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)

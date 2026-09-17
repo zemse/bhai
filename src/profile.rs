@@ -154,6 +154,64 @@ pub fn attribute(calls: &[Call]) -> Vec<Span> {
     spans
 }
 
+/// One finished call split for the transcript: what was new to it and what it wrote.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct CallTokens {
+    pub usage: Usage,
+    /// History items the call was sent.
+    pub sent: usize,
+    /// Output items it appended right after them.
+    pub outputs: usize,
+    /// Tokens of each item new to this call: history items `sent - inputs.len()..sent`.
+    pub inputs: Vec<u64>,
+    /// False when `inputs` are tokenizer counts rather than an exact usage delta.
+    pub exact: bool,
+    /// Output tokens minus reasoning that went to assistant text.
+    pub text: u64,
+    /// The same for each function call, in output order.
+    pub calls: Vec<u64>,
+}
+
+/// Split `call` for the transcript. `history` is what it was sent and `items` what it
+/// returned; `prev` is the call before it, whose usage makes the input split exact.
+pub fn call_tokens(
+    prev: Option<&Call>,
+    call: &Call,
+    history: &[Value],
+    items: &[Value],
+    tokenizer: &dyn Tokenizer,
+) -> CallTokens {
+    let weight =
+        |item: &Value| tokens::item_text(item).map_or(0, |text| tokenizer.count(&text) as u64);
+    let start = prev.map_or(0, |p| (p.sent + p.outputs).min(call.sent));
+    let new = &history[start..call.sent];
+    let weights: Vec<u64> = new.iter().map(weight).collect();
+    let span = prev.and_then(|p| {
+        attribute(&[*p, *call])
+            .into_iter()
+            .find(|s| s.reasoning.is_none() && !s.reasoning_dropped)
+    });
+    let (inputs, exact) = match span {
+        Some(span) => (split(span.tokens, &weights), true),
+        None => (weights, false),
+    };
+
+    let is = |item: &Value, kind: &str| item.get("type").and_then(Value::as_str) == Some(kind);
+    let mut weights = vec![items.iter().filter(|i| is(i, "message")).map(weight).sum()];
+    weights.extend(items.iter().filter(|i| is(i, "function_call")).map(weight));
+    let usage = call.usage;
+    let parts = split(usage.output - usage.reasoning.min(usage.output), &weights);
+    CallTokens {
+        usage,
+        sent: call.sent,
+        outputs: call.outputs,
+        inputs,
+        exact,
+        text: parts[0],
+        calls: parts[1..].to_vec(),
+    }
+}
+
 /// Break the context of the next request down into its components. `calls` are the
 /// model calls of this conversation so far, oldest first.
 pub fn build(
@@ -348,14 +406,23 @@ fn apply(rows: &mut [Item], span: &Span) {
     }
 }
 
-/// Split `total` over `rows` by `weight`, evenly when every weight is zero; the last
-/// row takes the rounding remainder.
+/// Split `total` over `rows` by `weight`.
 fn share(rows: &mut [&mut Item], total: u64, weight: impl Fn(&Item) -> u64) {
     let weights: Vec<u64> = rows.iter().map(|i| weight(i)).collect();
+    for (item, part) in rows.iter_mut().zip(split(total, &weights)) {
+        item.tokens = part;
+        item.method = Method::Exact;
+    }
+}
+
+/// Split `total` by `weights`, evenly when every weight is zero; the last part takes
+/// the rounding remainder.
+pub fn split(total: u64, weights: &[u64]) -> Vec<u64> {
     let sum: u64 = weights.iter().sum();
+    let count = weights.len();
     let mut left = total;
-    let count = rows.len();
-    for (index, (item, w)) in rows.iter_mut().zip(weights).enumerate() {
+    let mut parts = Vec::with_capacity(count);
+    for (index, &w) in weights.iter().enumerate() {
         let part = if index + 1 == count {
             left
         } else if sum == 0 {
@@ -364,9 +431,9 @@ fn share(rows: &mut [&mut Item], total: u64, weight: impl Fn(&Item) -> u64) {
             (total as u128 * w as u128 / sum as u128) as u64
         };
         left -= part;
-        item.tokens = part;
-        item.method = Method::Exact;
+        parts.push(part);
     }
+    parts
 }
 
 impl Profile {
@@ -654,6 +721,43 @@ mod tests {
         assert_eq!(profile.items[2].category, "skills");
         assert_eq!(profile.items[2].bytes, prompt.skills_bytes);
         assert_eq!(profile.total_bytes, prompt.text.len());
+    }
+
+    #[test]
+    fn call_tokens_split_new_inputs_and_output() {
+        let h = history();
+        let first = Call {
+            usage: usage(100, 30, 10),
+            sent: 1,
+            outputs: 2,
+        };
+        let tokens = call_tokens(None, &first, &h[..1], &h[1..3], &ByteEstimate);
+        assert_eq!((tokens.inputs, tokens.exact), (vec![1], false));
+        assert_eq!((tokens.text, tokens.calls), (0, vec![20]));
+
+        let second = Call {
+            usage: usage(700, 3, 0),
+            sent: 4,
+            outputs: 1,
+        };
+        let tokens = call_tokens(Some(&first), &second, &h[..4], &h[4..], &ByteEstimate);
+        assert_eq!((tokens.inputs, tokens.exact), (vec![570], true));
+        assert_eq!((tokens.text, tokens.calls), (3, vec![]));
+
+        // A negative delta is not usable, so the tokenizer answers instead.
+        let dropped = Call {
+            usage: usage(50, 3, 0),
+            ..second
+        };
+        let tokens = call_tokens(Some(&first), &dropped, &h[..4], &h[4..], &ByteEstimate);
+        assert_eq!((tokens.inputs, tokens.exact), (vec![500], false));
+    }
+
+    #[test]
+    fn split_gives_the_remainder_to_the_last_part() {
+        assert_eq!(split(10, &[1, 1, 1]), vec![3, 3, 4]);
+        assert_eq!(split(7, &[0, 0]), vec![3, 4]);
+        assert_eq!(split(5, &[]), Vec::<u64>::new());
     }
 
     #[test]

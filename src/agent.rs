@@ -16,7 +16,7 @@ use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
 use crate::client::{Client, Delta, Usage};
 use crate::identity::Identity;
 use crate::permissions::{Answer, Decision, Mode, Offers, Policy};
-use crate::profile::{self, Call, Profile};
+use crate::profile::{self, Call, CallTokens, Profile};
 use crate::prompt::SystemPrompt;
 use crate::tokens;
 use crate::tools::{self, BoxFuture, Registry};
@@ -48,6 +48,10 @@ pub enum AgentEvent {
     Usage(Usage),
     /// Token counts for a model call a child agent just finished.
     ChildUsage(Usage),
+    /// The model call that just finished, split for the transcript.
+    Call(CallTokens),
+    /// The user message or tool result just shown is history item `index`.
+    Item(usize),
     /// The request just sent broke the prompt cache, or `None` when it was clean.
     Cache(Option<CacheBreak>),
     /// How well the cache served a call that was judged; a child's only when it missed.
@@ -209,6 +213,7 @@ async fn run_with(
             "role": "user",
             "content": [{ "type": "input_text", "text": message }],
         }));
+        let _ = tx.send(AgentEvent::Item(history.len() - 1));
 
         // The turn holds the history, so mid-turn requests see it as the turn started.
         let (before, calls_before) = (history.clone(), calls.clone());
@@ -316,11 +321,15 @@ async fn turn(
             Err(e) => return Err(e),
         };
         if let Some(usage) = finished {
-            ledger.push(Call {
+            let call = Call {
                 usage,
                 sent,
                 outputs: items.len(),
-            });
+            };
+            let tokenizer = tokens::for_model(model.name());
+            let split = profile::call_tokens(ledger.last(), &call, history, &items, tokenizer);
+            let _ = tx.send(AgentEvent::Call(split));
+            ledger.push(call);
         }
 
         let calls: Vec<&Value> = items
@@ -336,7 +345,7 @@ async fn turn(
 
         let mut results = Vec::with_capacity(calls.len());
         let mut all_failed = true;
-        for call in &calls {
+        for (index, call) in calls.iter().enumerate() {
             let call_id = call
                 .get("call_id")
                 .and_then(Value::as_str)
@@ -344,6 +353,7 @@ async fn turn(
                 .to_string();
             let (output, ok) = execute(registry, policy, call, tx, cancel).await;
             all_failed &= !ok;
+            let _ = tx.send(AgentEvent::Item(sent + items.len() + index));
             results.push(json!({
                 "type": "function_call_output",
                 "call_id": call_id,
@@ -485,8 +495,13 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     detail: format!("{tag} {}", found.detail),
                     ..found
                 })),
-                // The parent reads the final text; streaming it would interleave.
-                AgentEvent::Reasoning(_) | AgentEvent::Text(_) | AgentEvent::TurnEnd => continue,
+                // The parent reads the final text; streaming it would interleave. Calls
+                // and items index the child's history, not the parent's.
+                AgentEvent::Reasoning(_)
+                | AgentEvent::Text(_)
+                | AgentEvent::TurnEnd
+                | AgentEvent::Call(_)
+                | AgentEvent::Item(_) => continue,
                 AgentEvent::Approval {
                     tool,
                     command,
@@ -959,6 +974,23 @@ mod tests {
             .filter(|e| matches!(e, AgentEvent::ChildUsage(u) if *u == fake::USAGE))
             .count();
         assert_eq!(child_usage, 2);
+        // Only the parent's own calls and items reach the transcript's attribution.
+        let items: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Item(index) => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items, [0, 2]);
+        let sent: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Call(call) => Some(call.sent),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, [1, 3]);
         let output = events
             .iter()
             .find_map(|e| match e {

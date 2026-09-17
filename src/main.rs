@@ -372,7 +372,7 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
             AgentEvent::Cache(Some(found)) => {
                 println!("\n[cache break] {}: {}", found.field, found.detail)
             }
-            AgentEvent::Cache(None) => {}
+            AgentEvent::Cache(None) | AgentEvent::Call(_) | AgentEvent::Item(_) => {}
             AgentEvent::CacheHit(hit) => {
                 if let (Some(expected), Some(ratio)) = (hit.expected_cached, hit.hit_ratio) {
                     println!("[cache] expected={expected} hit={:.0}%", ratio * 100.0);
@@ -564,17 +564,30 @@ async fn run(
             .push(app::Entry::Info(format!("debug server on http://{addr}")));
         tokio::spawn(server::serve(listener, session));
     }
+    // Mouse motion arrives in floods, so it only redraws when the hover changes.
+    let mut dirty = true;
     while !app.quit {
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
+        if dirty {
+            terminal.draw(|frame| ui::render(frame, &mut app))?;
+        }
         let Some(event) = rx_event.recv().await else {
             break;
         };
-        match event {
-            Event::Key(key) => app.on_key(key),
+        dirty = match event {
+            Event::Key(key) => {
+                app.on_key(key);
+                true
+            }
             Event::Mouse(mouse) => app.on_mouse(mouse),
-            Event::Session(event) => app.on_event(event),
-            Event::Tick => app.tick(),
-        }
+            Event::Session(event) => {
+                app.on_event(event);
+                true
+            }
+            Event::Tick => {
+                app.tick();
+                true
+            }
+        };
     }
 
     Ok(())

@@ -12,7 +12,7 @@ use crate::agent::{AgentEvent, Control};
 use crate::cache::{CacheBreak, Hit};
 use crate::client::Usage;
 use crate::permissions::{Answer, Mode, Offers, Policy, Remember};
-use crate::profile::Profile;
+use crate::profile::{CallTokens, Profile};
 
 /// Events a slow consumer can fall behind by before it starts missing them.
 const EVENT_BUFFER: usize = 4096;
@@ -45,6 +45,10 @@ pub enum Event {
     Usage(Usage),
     /// Usage of a child agent's model call.
     ChildUsage(Usage),
+    /// A finished model call, split for per-entry token badges.
+    Call(CallTokens),
+    /// The user message or tool result just shown is history item `index`.
+    Item(usize),
     /// A request broke the prompt cache, or `None` when the parent's last one was clean.
     Cache(Option<CacheBreak>),
     /// How well the cache served a judged call.
@@ -80,6 +84,8 @@ pub struct State {
     pub cached_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
+    /// Model calls finished, children not included.
+    pub calls: u64,
     /// Usage of the most recent model call.
     pub last_usage: Option<Usage>,
     /// Usage of every child agent, summed; not in the counts above.
@@ -109,6 +115,7 @@ impl fmt::Display for SubmitError {
 struct Inner {
     working: bool,
     total: Usage,
+    calls: u64,
     children: Usage,
     last_usage: Option<Usage>,
     last_cache_break: Option<CacheBreak>,
@@ -163,6 +170,7 @@ impl Session {
             cached_tokens: inner.total.cached,
             output_tokens: inner.total.output,
             reasoning_tokens: inner.total.reasoning,
+            calls: inner.calls,
             last_usage: inner.last_usage,
             children: inner.children,
             last_cache_break: inner.last_cache_break.clone(),
@@ -294,6 +302,11 @@ impl Session {
                 }
                 Event::Cache(found)
             }
+            AgentEvent::Call(call) => {
+                inner.calls += 1;
+                Event::Call(call)
+            }
+            AgentEvent::Item(index) => Event::Item(index),
             AgentEvent::CacheHit(hit) => Event::CacheHit(hit),
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Error(s) => Event::Error(s),
@@ -489,6 +502,8 @@ mod tests {
         assert_eq!((state.input_tokens, state.output_tokens), (7, 3));
         assert_eq!((state.cached_tokens, state.reasoning_tokens), (2, 1));
         assert_eq!(state.last_usage, Some(usage(4, 2, 2, 0)));
+        session.on_agent(AgentEvent::Call(CallTokens::default()));
+        assert_eq!(session.state().calls, 1);
 
         // A child's usage is counted apart and leaves the last call alone.
         session.on_agent(AgentEvent::ChildUsage(usage(10, 5, 3, 1)));
