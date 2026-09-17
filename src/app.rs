@@ -4,6 +4,7 @@ use ratatui::crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
+use ratatui::layout::{Position, Rect};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
@@ -62,7 +63,17 @@ pub struct App {
     mouse_row: Option<u16>,
     /// Entries whose badge stays up.
     pub pinned: HashSet<usize>,
+    /// Tool output entries shown in full rather than collapsed.
+    pub expanded: HashSet<usize>,
     pub all_badges: bool,
+    /// Clickable approval choices and the key each stands for, filled in by the renderer.
+    pub buttons: Vec<(Rect, KeyCode)>,
+    /// The input text's area and horizontal scroll, filled in by the renderer.
+    pub input_area: Option<(Rect, usize)>,
+    /// The transcript scrollbar, filled in by the renderer when the transcript overflows.
+    pub scrollbar: Option<Rect>,
+    /// A left drag that started on the scrollbar is in progress.
+    dragging: bool,
     attribution: Attribution,
     pub input: Input,
     pub working: bool,
@@ -104,7 +115,12 @@ impl App {
             hover: None,
             mouse_row: None,
             pinned: HashSet::new(),
+            expanded: HashSet::new(),
             all_badges: false,
+            buttons: Vec::new(),
+            input_area: None,
+            scrollbar: None,
+            dragging: false,
             attribution: Attribution::default(),
             input: Input::default(),
             working: false,
@@ -187,16 +203,76 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_row = Some(mouse.row);
-                let Some(entry) = self.entry_at(mouse.row) else {
-                    return false;
-                };
-                if !self.pinned.remove(&entry) {
-                    self.pinned.insert(entry);
-                }
+                return self.click(mouse.column, mouse.row);
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => self.drag_to(mouse.row),
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging = false;
+                return false;
             }
             _ => return false,
         }
         true
+    }
+
+    /// A left click: an approval choice acts as its key, the scrollbar starts a drag,
+    /// the input moves its cursor, tool output expands or collapses and any other
+    /// entry pins its badge. Returns whether the screen needs a redraw.
+    fn click(&mut self, x: u16, y: u16) -> bool {
+        let at = Position::new(x, y);
+        let button = self.buttons.iter().find(|(area, _)| area.contains(at));
+        if let Some(&(_, code)) = button.filter(|_| self.pending.is_some()) {
+            self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+            return true;
+        }
+        if self.scrollbar.is_some_and(|bar| bar.contains(at)) {
+            self.dragging = true;
+            self.drag_to(y);
+            return true;
+        }
+        if let Some((area, scroll)) = self.input_area.filter(|(area, _)| area.contains(at)) {
+            return self.place_cursor(scroll + (x - area.x) as usize);
+        }
+        let Some(entry) = self.entry_at(y) else {
+            return false;
+        };
+        let set = if matches!(self.entries.get(entry), Some(Entry::Output(_))) {
+            &mut self.expanded
+        } else {
+            &mut self.pinned
+        };
+        if !set.remove(&entry) {
+            set.insert(entry);
+        }
+        true
+    }
+
+    /// Put the input cursor at display column `column`; false when there is no text.
+    fn place_cursor(&mut self, column: usize) -> bool {
+        if self.input.value().is_empty() {
+            return false;
+        }
+        let chars = self.input.value().chars().count();
+        let mut input = std::mem::take(&mut self.input);
+        for cursor in 0..=chars {
+            input = input.with_cursor(cursor);
+            if input.visual_cursor() >= column {
+                break;
+            }
+        }
+        self.input = input;
+        true
+    }
+
+    /// Scroll in proportion to where row `y` sits on the scrollbar.
+    fn drag_to(&mut self, y: u16) {
+        let Some(bar) = self.scrollbar else {
+            return;
+        };
+        let track = bar.height.saturating_sub(1).max(1) as usize;
+        let offset = y.saturating_sub(bar.y).min(bar.height.saturating_sub(1)) as usize;
+        let target = (offset * self.max_scroll + track / 2) / track;
+        self.scroll_by(target as isize - self.scroll as isize);
     }
 
     /// The entry drawn on screen row `y`.

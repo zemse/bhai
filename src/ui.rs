@@ -1,16 +1,20 @@
 //! Rendering. Text is hard-wrapped here so the scroll offset can be computed exactly.
 
 use ratatui::Frame;
+use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use std::ops::Range;
 
 use crate::app::{App, Entry};
 use crate::client::Usage;
 use crate::permissions::Mode;
 use crate::profile::{Method, Tokens};
+
+/// Rows a tool output shows until it is clicked open.
+const COLLAPSED_LINES: usize = 3;
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
@@ -39,8 +43,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_status(frame, status_area, app);
     render_transcript(frame, transcript_area, app);
     if app.pending.is_some() {
+        app.input_area = None;
         render_approval(frame, bottom_area, app);
     } else {
+        app.buttons.clear();
         render_input(frame, bottom_area, app);
     }
 }
@@ -88,11 +94,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     }
     spans.push(Span::styled(
         if app.pending.is_some() {
-            "  a accept · r reject"
+            "  y yes · n no · or click a choice"
         } else if app.working {
             "  ctrl+c interrupt"
         } else {
-            "  enter send · shift+tab mode · wheel/pgup scroll · ctrl+t tokens · ctrl+c quit"
+            "  enter send · shift+tab mode · wheel/pgup scroll · click expands output, pins other badges · ctrl+t tokens · ctrl+c quit"
         },
         dim,
     ));
@@ -110,12 +116,14 @@ fn compact(n: u64) -> String {
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
-    let width = area.width.saturating_sub(1).max(10) as usize;
+    let [text_area, bar_area] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    let width = text_area.width.max(10) as usize;
     let mut lines: Vec<Line> = Vec::new();
     let mut spans = Vec::with_capacity(app.entries.len());
     for (index, entry) in app.entries.iter().enumerate() {
         let start = lines.len();
-        lines.extend(entry_lines(entry, width));
+        lines.extend(entry_lines(entry, width, app.expanded.contains(&index)));
         // The blank separator line belongs to no entry.
         spans.push((start..lines.len() - 1, index));
     }
@@ -132,8 +140,23 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     app.rows = row_map(&spans, app.scroll, area);
     app.rehover();
 
-    frame.render_widget(Paragraph::new(lines).scroll((app.scroll as u16, 0)), area);
-    render_badges(frame, area, app);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((app.scroll as u16, 0)),
+        text_area,
+    );
+    render_badges(frame, text_area, app);
+
+    app.scrollbar = (max_scroll > 0).then_some(bar_area);
+    if max_scroll > 0 {
+        // Positions run 0..=max_scroll, so the thumb reaches the bottom when following.
+        let mut state = ScrollbarState::new(max_scroll + 1)
+            .position(app.scroll)
+            .viewport_content_length(height);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(bar, bar_area, &mut state);
+    }
 }
 
 /// Screen rows of each entry that is at least partly visible.
@@ -216,7 +239,9 @@ fn usage_badge(usage: Usage) -> String {
     parts.join(" · ")
 }
 
-fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
+/// An entry's rows plus a blank separator; long tool output shows only its head
+/// unless `expanded`.
+fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>> {
     let (prefix, text, style) = match entry {
         Entry::User(t) => ("› ", t, Style::new().fg(Color::Cyan).bold()),
         Entry::Assistant(t) => ("", t, Style::new()),
@@ -230,10 +255,13 @@ fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
 
     let indent = " ".repeat(prefix.chars().count());
     let mut lines: Vec<Line> = Vec::new();
-    for (i, wrapped) in wrap(text, width.saturating_sub(prefix.len()).max(4))
-        .into_iter()
-        .enumerate()
-    {
+    let mut wrapped_lines = wrap(text, width.saturating_sub(prefix.len()).max(4));
+    let hidden = match entry {
+        Entry::Output(_) if !expanded => wrapped_lines.len().saturating_sub(COLLAPSED_LINES),
+        _ => 0,
+    };
+    wrapped_lines.truncate(wrapped_lines.len() - hidden);
+    for (i, wrapped) in wrapped_lines.into_iter().enumerate() {
         let lead = if i == 0 {
             prefix.to_string()
         } else {
@@ -241,11 +269,17 @@ fn entry_lines(entry: &Entry, width: usize) -> Vec<Line<'static>> {
         };
         lines.push(Line::from(Span::styled(format!("{lead}{wrapped}"), style)));
     }
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("[+{hidden} lines]"),
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
     lines.push(Line::from(""));
     lines
 }
 
-fn render_input(frame: &mut Frame, area: Rect, app: &App) {
+fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::bordered().border_style(Style::new().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -261,6 +295,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     // One column is reserved so the cursor itself is never off-screen.
     let width = text_area.width.saturating_sub(1) as usize;
     let scroll = app.input.visual_scroll(width);
+    app.input_area = Some((text_area, scroll));
     frame.render_widget(
         Paragraph::new(app.input.value()).scroll((0, scroll as u16)),
         text_area,
@@ -272,7 +307,9 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     ));
 }
 
-fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
+/// The approval prompt. Each `[k]` choice is recorded in `app.buttons` so a click on
+/// it acts exactly as pressing `k`.
+fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(pending) = &app.pending else {
         return;
     };
@@ -289,9 +326,11 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
 
     let key = |k: &'static str, color| Span::styled(k, Style::new().fg(color).bold());
     let mut options = Vec::new();
+    let mut option_keys = Vec::new();
     let bash = pending.tool == "bash";
     if let Some(rule) = &pending.offers.exact {
         let what = if bash { "command" } else { "file" };
+        option_keys.push('a');
         options.push(Line::from(vec![
             key("[a]", Color::Cyan),
             Span::raw(format!(" always allow this exact {what}: {rule}")),
@@ -303,6 +342,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             "always allow edits under this directory"
         };
+        option_keys.push('p');
         options.push(Line::from(vec![
             key("[p]", Color::Cyan),
             Span::raw(format!(" {what}: {rule}")),
@@ -315,6 +355,14 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
     lines.truncate(inner.height.saturating_sub(2 + options.len() as u16) as usize);
     lines.push(Line::from(""));
+    let row = inner.y + lines.len() as u16;
+    let mut buttons = vec![
+        (Rect::new(inner.x, row, 5, 1), 'y'),
+        (Rect::new(inner.x + 8, row, 4, 1), 'n'),
+    ];
+    for (i, k) in option_keys.into_iter().enumerate() {
+        buttons.push((Rect::new(inner.x, row + 1 + i as u16, inner.width, 1), k));
+    }
     lines.push(Line::from(vec![
         key("[y]", Color::Green),
         Span::raw("es   "),
@@ -323,6 +371,11 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
     ]));
     lines.extend(options);
     frame.render_widget(Paragraph::new(lines), inner);
+    app.buttons = buttons
+        .into_iter()
+        .map(|(spot, k)| (spot.intersection(inner), KeyCode::Char(k)))
+        .filter(|(spot, _)| !spot.is_empty())
+        .collect();
 }
 
 /// Greedy word wrap that keeps existing newlines and never loses characters.
@@ -364,9 +417,12 @@ fn char_index(s: &str, chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::Offers;
+    use crate::session::Approval;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use tui_input::Input;
 
     fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
         Usage {
@@ -460,11 +516,185 @@ mod tests {
         assert!(app.on_mouse(moved));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(
-            row_text(&terminal, rows.end - 1).ends_with(" in 5 (tokenized)"),
+            row_text(&terminal, rows.end - 1)
+                .trim_end()
+                .ends_with(" in 5 (tokenized)"),
             "{:?}",
             row_text(&terminal, rows.end - 1)
         );
         assert!(row_text(&terminal, rows.start).starts_with("› hello"));
+    }
+
+    fn left(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn down(column: u16, row: u16) -> MouseEvent {
+        left(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                row.trim_end().to_string() + "\n"
+            })
+            .collect()
+    }
+
+    fn approval(exact: Option<&str>) -> Approval {
+        Approval {
+            id: 7,
+            tool: "bash".to_string(),
+            command: "ls".to_string(),
+            offers: Offers {
+                exact: exact.map(str::to_string),
+                prefix: None,
+            },
+        }
+    }
+
+    #[test]
+    fn clicking_an_approval_choice_answers_it() {
+        let mut app = App::detached();
+        app.pending = Some(approval(None));
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let &(yes, _) = app
+            .buttons
+            .iter()
+            .find(|(_, k)| *k == KeyCode::Char('y'))
+            .unwrap();
+        assert!(
+            screen(&terminal)
+                .lines()
+                .nth(yes.y as usize)
+                .unwrap()
+                .contains("[y]es")
+        );
+        // Nothing offers an exact rule, so `a` is not a button and a click there is inert.
+        assert!(app.buttons.iter().all(|(_, k)| *k != KeyCode::Char('a')));
+        assert!(!app.on_mouse(down(yes.right() + 1, yes.y)));
+        assert!(app.pending.is_some());
+        assert!(app.on_mouse(down(yes.x + 1, yes.y)));
+        assert!(app.pending.is_none());
+
+        app.pending = Some(approval(Some("ls")));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let &(always, _) = app
+            .buttons
+            .iter()
+            .find(|(_, k)| *k == KeyCode::Char('a'))
+            .unwrap();
+        assert!(
+            screen(&terminal)
+                .lines()
+                .nth(always.y as usize)
+                .unwrap()
+                .contains("[a]")
+        );
+        assert!(app.on_mouse(down(always.x + 10, always.y)));
+        assert!(app.pending.is_none());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.buttons.is_empty());
+        app.on_mouse(down(always.x, always.y));
+        assert_eq!(app.input.value(), "", "a stale button types nothing");
+    }
+
+    #[test]
+    fn long_tool_output_collapses_until_clicked() {
+        let mut app = App::detached();
+        app.entries
+            .push(Entry::Output("one\ntwo\nthree\nfour\nfive".to_string()));
+        app.entries.push(Entry::Output("short".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("one\ntwo\nthree\n[+2 lines]\n"), "{text}");
+        assert!(!text.contains("four"));
+        assert!(text.contains("short\n"));
+
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(app.on_mouse(down(2, rows.start)));
+        assert!(app.pinned.is_empty(), "a click on output does not pin");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("three\nfour\nfive\n"), "{text}");
+        assert!(!text.contains("[+2 lines]"));
+
+        assert!(app.on_mouse(down(2, rows.start)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("[+2 lines]"));
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_scrolls_in_proportion() {
+        let mut app = App::detached();
+        for i in 0..40 {
+            app.entries.push(Entry::User(format!("message {i}")));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let bar = app.scrollbar.unwrap();
+        assert_eq!(bar.x, 39);
+        assert!(app.max_scroll > 0);
+        assert_eq!(app.scroll, app.max_scroll);
+
+        assert!(app.on_mouse(down(bar.x, bar.y)));
+        assert_eq!(app.scroll, 0);
+        assert!(!app.follow);
+        let middle = bar.y + (bar.height - 1) / 2;
+        assert!(app.on_mouse(left(MouseEventKind::Drag(MouseButton::Left), 5, middle)));
+        let half = app.max_scroll / 2;
+        assert!(
+            app.scroll.abs_diff(half) <= app.max_scroll / 10,
+            "{}",
+            app.scroll
+        );
+        let dragged = app.scroll;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.scroll, dragged, "a redraw keeps the dragged offset");
+
+        assert!(app.on_mouse(left(
+            MouseEventKind::Drag(MouseButton::Left),
+            5,
+            bar.bottom() + 5
+        )));
+        assert_eq!(app.scroll, app.max_scroll);
+        assert!(app.follow);
+
+        assert!(!app.on_mouse(left(MouseEventKind::Up(MouseButton::Left), 5, 0)));
+        let before = app.scroll;
+        assert!(!app.on_mouse(left(MouseEventKind::Drag(MouseButton::Left), 5, bar.y)));
+        assert_eq!(app.scroll, before, "a drag after release does nothing");
+    }
+
+    #[test]
+    fn clicking_the_input_moves_the_cursor() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (area, _) = app.input_area.unwrap();
+        assert!(
+            !app.on_mouse(down(area.x + 2, area.y)),
+            "nothing to move through"
+        );
+
+        app.input = Input::new("héllo world".to_string());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.on_mouse(down(area.x + 3, area.y)));
+        assert_eq!(app.input.cursor(), 3);
+        assert!(app.on_mouse(down(area.right() - 1, area.y)));
+        assert_eq!(app.input.cursor(), 11);
     }
 
     #[test]
