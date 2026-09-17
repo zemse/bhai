@@ -7,9 +7,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use std::ops::Range;
 
-use crate::app::{App, Entry, Tokens};
+use crate::app::{App, Entry};
 use crate::client::Usage;
 use crate::permissions::Mode;
+use crate::profile::{Method, Tokens};
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
@@ -172,7 +173,10 @@ fn render_badges(frame: &mut Frame, area: Rect, app: &App) {
 fn badge(tokens: &Tokens) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(input) = tokens.input {
-        let how = if tokens.exact { "" } else { " (tokenized)" };
+        let how = match tokens.method {
+            Method::Exact => String::new(),
+            method => format!(" ({})", method.name()),
+        };
         parts.push(format!("in {}{how}", compact(input)));
     }
     if tokens.resends > 0 {
@@ -391,7 +395,7 @@ mod tests {
         assert_eq!(badge(&fresh).unwrap(), "call: in 1.5M new · out 12");
         let resent = Tokens {
             input: Some(999),
-            exact: true,
+            method: Method::Exact,
             resends: 3,
             cached: 2_000,
             ..Tokens::default()
@@ -399,6 +403,7 @@ mod tests {
         assert_eq!(badge(&resent).unwrap(), "in 999 · resent 3x, 2.0k cached");
         let guessed = Tokens {
             input: Some(5),
+            method: Method::Tokenized,
             ..Tokens::default()
         };
         assert_eq!(badge(&guessed).unwrap(), "in 5 (tokenized)");
@@ -426,6 +431,7 @@ mod tests {
             1,
             Tokens {
                 input: Some(5),
+                method: Method::Tokenized,
                 ..Tokens::default()
             },
         );

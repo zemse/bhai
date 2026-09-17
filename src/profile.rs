@@ -46,18 +46,19 @@ pub struct Span {
 }
 
 /// How a row's tokens were counted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Method {
     Exact,
     Tokenized,
     Estimated,
     /// Encrypted reasoning with no usage to go by.
+    #[default]
     Unknown,
 }
 
 impl Method {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Exact => "exact",
             Self::Tokenized => "tokenized",
@@ -85,6 +86,48 @@ pub struct Profile {
     pub items: Vec<Item>,
     /// Child agents run so far, with their own usage; not part of this context.
     pub children: Vec<ChildUsage>,
+    /// Per-entry tokens from the TUI transcript; absent elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<Transcript>,
+}
+
+/// What an entry cost, as far as the usage events pin it down.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize)]
+pub struct Tokens {
+    /// Input tokens of the call that first sent this entry.
+    pub input: Option<u64>,
+    /// How `input` was counted.
+    pub method: Method,
+    /// Later calls that sent this entry again.
+    pub resends: u64,
+    /// Tokens of those resends served from the cache.
+    pub cached: u64,
+    /// Output tokens, reasoning not included.
+    pub output: Option<u64>,
+    pub reasoning: Option<u64>,
+    /// Totals of the call this entry ended.
+    pub call: Option<Usage>,
+    /// The calls of the child agent this entry reports on.
+    pub child: Option<Usage>,
+}
+
+/// The transcript's per-entry tokens and the session totals `GET /state` reports.
+#[derive(Debug, Clone, Serialize)]
+pub struct Transcript {
+    pub entries: Vec<EntryTokens>,
+    /// Summed usage of the session's own calls.
+    pub totals: Usage,
+    pub calls: u64,
+}
+
+/// One transcript entry and its hover badge numbers.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryTokens {
+    pub index: usize,
+    pub kind: &'static str,
+    pub label: String,
+    #[serde(flatten)]
+    pub tokens: Tokens,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,8 +207,8 @@ pub struct CallTokens {
     pub outputs: usize,
     /// Tokens of each item new to this call: history items `sent - inputs.len()..sent`.
     pub inputs: Vec<u64>,
-    /// False when `inputs` are tokenizer counts rather than an exact usage delta.
-    pub exact: bool,
+    /// Exact for a usage delta, else how the tokenizer counted `inputs`.
+    pub method: Method,
     /// Output tokens minus reasoning that went to assistant text.
     pub text: u64,
     /// The same for each function call, in output order.
@@ -191,9 +234,10 @@ pub fn call_tokens(
             .into_iter()
             .find(|s| s.reasoning.is_none() && !s.reasoning_dropped)
     });
-    let (inputs, exact) = match span {
-        Some(span) => (split(span.tokens, &weights), true),
-        None => (weights, false),
+    let (inputs, method) = match span {
+        Some(span) => (split(span.tokens, &weights), Method::Exact),
+        None if tokenizer.estimates() => (weights, Method::Estimated),
+        None => (weights, Method::Tokenized),
     };
 
     let is = |item: &Value, kind: &str| item.get("type").and_then(Value::as_str) == Some(kind);
@@ -206,7 +250,7 @@ pub fn call_tokens(
         sent: call.sent,
         outputs: call.outputs,
         inputs,
-        exact,
+        method,
         text: parts[0],
         calls: parts[1..].to_vec(),
     }
@@ -382,6 +426,7 @@ pub fn build(
         categories,
         items,
         children: Vec::new(),
+        transcript: None,
     }
 }
 
@@ -514,6 +559,9 @@ those rows fall back to tokenized.",
                 );
             }
         }
+        if let Some(t) = &self.transcript {
+            out.push_str(&transcript_markdown(t));
+        }
         out
     }
 
@@ -546,6 +594,51 @@ those rows fall back to tokenized.",
         }
         out
     }
+}
+
+/// The per-entry table: first-write cost, resends and what they got from the cache.
+fn transcript_markdown(t: &Transcript) -> String {
+    let cell = |n: Option<u64>| n.map_or("-".to_string(), |n| n.to_string());
+    let mut out = String::from("\n## Transcript\n\n");
+    out.push_str(
+        "Entry output leaves thinking out; the total row is `GET /state`, where input \
+minus cached is new input and output includes thinking.\n\n",
+    );
+    out.push_str(
+        "| # | entry | kind | new input | method | resends | cached input | output | thinking |\n",
+    );
+    out.push_str("|---:|---|---|---:|---|---:|---:|---:|---:|\n");
+    for e in &t.entries {
+        let tokens = &e.tokens;
+        let method = if tokens.input.is_some() {
+            tokens.method.name()
+        } else {
+            "-"
+        };
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {method} | {} | {} | {} | {} |",
+            e.index,
+            e.label.replace('|', "\\|"),
+            e.kind,
+            cell(tokens.input),
+            tokens.resends,
+            tokens.cached,
+            cell(tokens.output),
+            cell(tokens.reasoning)
+        );
+    }
+    let u = t.totals;
+    let _ = writeln!(
+        out,
+        "| | total ({} calls, as `/state`) | | {} | exact | | {} | {} | {} |",
+        t.calls,
+        u.input - u.cached.min(u.input),
+        u.cached,
+        u.output,
+        u.reasoning
+    );
+    out
 }
 
 /// Where debug output goes: `.bhai/debug` under the working directory.
@@ -732,7 +825,7 @@ mod tests {
             outputs: 2,
         };
         let tokens = call_tokens(None, &first, &h[..1], &h[1..3], &ByteEstimate);
-        assert_eq!((tokens.inputs, tokens.exact), (vec![1], false));
+        assert_eq!((tokens.inputs, tokens.method), (vec![1], Method::Estimated));
         assert_eq!((tokens.text, tokens.calls), (0, vec![20]));
 
         let second = Call {
@@ -741,7 +834,7 @@ mod tests {
             outputs: 1,
         };
         let tokens = call_tokens(Some(&first), &second, &h[..4], &h[4..], &ByteEstimate);
-        assert_eq!((tokens.inputs, tokens.exact), (vec![570], true));
+        assert_eq!((tokens.inputs, tokens.method), (vec![570], Method::Exact));
         assert_eq!((tokens.text, tokens.calls), (3, vec![]));
 
         // A negative delta is not usable, so the tokenizer answers instead.
@@ -750,7 +843,10 @@ mod tests {
             ..second
         };
         let tokens = call_tokens(Some(&first), &dropped, &h[..4], &h[4..], &ByteEstimate);
-        assert_eq!((tokens.inputs, tokens.exact), (vec![500], false));
+        assert_eq!(
+            (tokens.inputs, tokens.method),
+            (vec![500], Method::Estimated)
+        );
     }
 
     #[test]
@@ -824,6 +920,54 @@ mod tests {
         // Largest item comes before the smallest in the items table.
         let items = &md[md.find("## Items").unwrap()..];
         assert!(items.find("#3 function_call_output") < items.find("system prompt"));
+    }
+
+    #[test]
+    fn markdown_lists_transcript_entries_and_state_totals() {
+        let mut profile = build(&plain("be brief"), &[], &[], &[], &ByteEstimate);
+        assert!(!profile.markdown().contains("## Transcript"));
+        profile.transcript = Some(Transcript {
+            entries: vec![
+                EntryTokens {
+                    index: 1,
+                    kind: "user",
+                    label: "list a|b".to_string(),
+                    tokens: Tokens {
+                        input: Some(12),
+                        method: Method::Exact,
+                        resends: 2,
+                        cached: 20,
+                        ..Tokens::default()
+                    },
+                },
+                EntryTokens {
+                    index: 2,
+                    kind: "thinking",
+                    label: "plan".to_string(),
+                    tokens: Tokens {
+                        reasoning: Some(7),
+                        ..Tokens::default()
+                    },
+                },
+            ],
+            totals: Usage {
+                input: 300,
+                cached: 200,
+                output: 30,
+                reasoning: 7,
+            },
+            calls: 3,
+        });
+        let md = profile.markdown();
+        let table = &md[md.find("## Transcript").unwrap()..];
+        assert!(table.ends_with(
+            "|---:|---|---|---:|---|---:|---:|---:|---:|\n\
+| 1 | list a\\|b | user | 12 | exact | 2 | 20 | - | - |\n\
+| 2 | plan | thinking | - | - | 0 | 0 | - | 7 |\n\
+| | total (3 calls, as `/state`) | | 100 | exact | | 200 | 30 | 7 |\n"
+        ));
+        let json = serde_json::to_value(&profile).unwrap();
+        assert_eq!(json["transcript"]["entries"][0]["method"], "exact");
     }
 
     #[test]

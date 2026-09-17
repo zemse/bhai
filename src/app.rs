@@ -14,12 +14,14 @@ use tui_input::backend::crossterm::to_input_request;
 
 use crate::client::Usage;
 use crate::permissions::{Answer, Mode, Remember};
-use crate::profile::{self, CallTokens};
+use crate::profile::{self, CallTokens, EntryTokens, Tokens, Transcript};
 use crate::session::{Approval, Event, Session};
 use crate::skills::Skill;
 
 /// Lines a mouse wheel notch moves the transcript.
 const WHEEL_LINES: usize = 3;
+/// Characters of an entry the `/context` transcript table shows.
+const LABEL_CHARS: usize = 40;
 
 #[derive(Debug)]
 pub enum Entry {
@@ -31,26 +33,6 @@ pub enum Entry {
     Rejected(String),
     Error(String),
     Info(String),
-}
-
-/// What an entry cost, as far as the usage events pin it down.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct Tokens {
-    /// Input tokens of the call that first sent this entry.
-    pub input: Option<u64>,
-    /// False when `input` is a tokenizer count.
-    pub exact: bool,
-    /// Later calls that sent this entry again.
-    pub resends: u64,
-    /// Tokens of those resends served from the cache.
-    pub cached: u64,
-    /// Output tokens, reasoning not included.
-    pub output: Option<u64>,
-    pub reasoning: Option<u64>,
-    /// Totals of the call this entry ended.
-    pub call: Option<Usage>,
-    /// The calls of the child agent this entry reports on.
-    pub child: Option<Usage>,
 }
 
 /// Ties history items and calls to the entries that show them.
@@ -367,17 +349,50 @@ impl App {
     /// Handle `/context` locally: export the breakdown and report where it went.
     fn export_context(&mut self) {
         self.follow = true;
+        let transcript = self.transcript();
         let session = Arc::clone(&self.session);
         tokio::spawn(async move {
             let event = match session.context().await {
-                Some(profile) => match profile::export(&profile, &profile::debug_dir()) {
-                    Ok(path) => Event::Info(profile.summary(&path)),
-                    Err(e) => Event::Error(format!("context export failed: {e:#}")),
-                },
+                Some(mut profile) => {
+                    profile.transcript = Some(transcript);
+                    match profile::export(&profile, &profile::debug_dir()) {
+                        Ok(path) => Event::Info(profile.summary(&path)),
+                        Err(e) => Event::Error(format!("context export failed: {e:#}")),
+                    }
+                }
                 None => Event::Error("the agent is not running".to_string()),
             };
             session.publish(event);
         });
+    }
+
+    /// The badge numbers of every attributed entry, with the session totals.
+    fn transcript(&self) -> Transcript {
+        let mut entries: Vec<EntryTokens> = self
+            .tokens
+            .iter()
+            .map(|(&index, &tokens)| {
+                let entry = &self.entries[index];
+                EntryTokens {
+                    index,
+                    kind: entry.kind(),
+                    label: entry.label(),
+                    tokens,
+                }
+            })
+            .collect();
+        entries.sort_by_key(|e| e.index);
+        let state = self.session.state();
+        Transcript {
+            entries,
+            totals: Usage {
+                input: state.input_tokens,
+                cached: state.cached_tokens,
+                output: state.output_tokens,
+                reasoning: state.reasoning_tokens,
+            },
+            calls: state.calls,
+        }
     }
 
     /// A remember key does nothing unless the prompt offers that rule.
@@ -414,7 +429,7 @@ impl App {
             if let Some(&entry) = self.attribution.items.get(&(first + offset)) {
                 let tokens = self.tokens.entry(entry).or_default();
                 tokens.input = Some(input);
-                tokens.exact = call.exact;
+                tokens.method = call.method;
             }
         }
         // The usage only says how much of the whole call was cached, so each resent
@@ -540,6 +555,28 @@ impl Entry {
             | Entry::Info(t) => t,
         }
     }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Entry::User(_) => "user",
+            Entry::Assistant(_) => "assistant",
+            Entry::Reasoning(_) => "thinking",
+            Entry::Command(_) => "command",
+            Entry::Output(_) => "output",
+            Entry::Rejected(_) => "rejected",
+            Entry::Error(_) => "error",
+            Entry::Info(_) => "info",
+        }
+    }
+
+    /// The first line, cut to `LABEL_CHARS`.
+    pub fn label(&self) -> String {
+        let line = self.text().trim().lines().next().unwrap_or_default();
+        match line.char_indices().nth(LABEL_CHARS) {
+            Some((end, _)) => format!("{}...", &line[..end]),
+            None => line.to_string(),
+        }
+    }
 }
 
 /// What `/as` prints. The identity is fixed for the session, so switching needs a new one.
@@ -622,6 +659,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::Method;
 
     fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
         Usage {
@@ -654,7 +692,7 @@ mod tests {
             sent: 1,
             outputs: 3,
             inputs: vec![5],
-            exact: false,
+            method: Method::Tokenized,
             text: 12,
             calls: vec![8],
         }));
@@ -672,7 +710,7 @@ mod tests {
             sent: 5,
             outputs: 2,
             inputs: vec![20],
-            exact: true,
+            method: Method::Exact,
             text: 4,
             calls: vec![],
         }));
@@ -684,6 +722,7 @@ mod tests {
             get(1),
             Tokens {
                 input: Some(5),
+                method: Method::Tokenized,
                 resends: 1,
                 cached: 3,
                 ..Tokens::default()
@@ -699,7 +738,7 @@ mod tests {
             "child entries are not the parent's"
         );
         let result = get(7);
-        assert_eq!((result.input, result.exact), (Some(20), true));
+        assert_eq!((result.input, result.method), (Some(20), Method::Exact));
         assert_eq!(result.resends, 0);
         assert_eq!(result.child, Some(usage(7, 2, 1, 0)));
         assert_eq!(get(8).reasoning, Some(1));
