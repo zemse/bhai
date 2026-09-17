@@ -340,8 +340,10 @@ async fn run_with(
             let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
         }
         // Between turns the history holds every call's output, so it can be rewritten.
+        // After an interrupt the summary call would be cut off, so the next turn does it.
         let size = calls.last().map(|call| call.usage.input);
-        if compact_next || size.is_some_and(|input| limits.over(model.name(), input)) {
+        let over = compact_next || size.is_some_and(|input| limits.over(model.name(), input));
+        if over && !cancel.load(Ordering::Relaxed) {
             let pass = Compaction {
                 model: model.as_ref(),
                 tools: &tools,
