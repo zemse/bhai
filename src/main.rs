@@ -9,6 +9,7 @@ mod config;
 mod frontmatter;
 mod identity;
 mod instructions;
+mod mcp;
 mod permissions;
 mod profile;
 mod prompt;
@@ -65,8 +66,11 @@ async fn main() -> Result<()> {
     // `bhai --probe [prompt]` does one non-interactive model call, for checking that
     // auth and the wire format still work without entering the TUI.
     if args.first().is_some_and(|a| a == "--probe") {
-        let (prompt, _) = load(Flags::default(), identity::DEFAULT)?;
-        return probe(prompt, args.get(1).cloned()).await;
+        let (prompt, _) = load(Flags::default(), identity::DEFAULT).await?;
+        let hub = prompt.mcp.clone();
+        let result = probe(prompt, args.get(1).cloned()).await;
+        shutdown(hub).await;
+        return result;
     }
     let args = match parse_args(&args) {
         Ok(parsed) => parsed,
@@ -80,7 +84,9 @@ async fn main() -> Result<()> {
     let (prompt, policy) = load(
         args.flags,
         args.identity.as_deref().unwrap_or(identity::DEFAULT),
-    )?;
+    )
+    .await?;
+    let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
     let model = client::Client::new()?
         .with_overrides(identity.model.clone(), identity.effort.clone())
@@ -97,7 +103,13 @@ async fn main() -> Result<()> {
 
     // Bind before taking over the terminal so a busy port is a plain error.
     let listener = match args.serve {
-        Some(port) => Some(server::bind(port).await?),
+        Some(port) => match server::bind(port).await {
+            Ok(listener) => Some(listener),
+            Err(e) => {
+                shutdown(hub).await;
+                return Err(e);
+            }
+        },
         None => None,
     };
     let usage_log = args
@@ -110,19 +122,38 @@ async fn main() -> Result<()> {
             eprintln!("bhai: {notice}");
         }
         eprintln!("bhai: debug server on http://{}", listener.local_addr()?);
-        return server::serve(listener, session).await;
+        let result = server::serve(listener, session).await;
+        shutdown(hub).await;
+        return result;
     }
 
     let terminal = ratatui::init();
     // Mouse capture is what turns the wheel into scroll events. It also takes over
     // click-drag, so terminals need shift (or option) held to select text while bhai runs.
     let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(terminal, session, events, listener, notices, skills).await;
+    let result = run(
+        terminal,
+        session,
+        events,
+        listener,
+        notices,
+        skills,
+        hub.clone(),
+    )
+    .await;
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
     ratatui::restore();
+    shutdown(hub).await;
     result
+}
+
+/// Stop the MCP servers, if any were started.
+async fn shutdown(hub: Option<Arc<mcp::Hub>>) {
+    if let Some(hub) = hub {
+        hub.shutdown().await;
+    }
 }
 
 /// Command-line flags, apart from `--probe`.
@@ -139,13 +170,14 @@ struct Args {
 }
 
 /// Config and instruction files for the working directory, as the system prompt for
-/// the identity called `name` and the permission policy.
-fn load(flags: Flags, name: &str) -> Result<(SystemPrompt, Policy)> {
+/// the identity called `name` and the permission policy. Starts the MCP servers.
+async fn load(flags: Flags, name: &str) -> Result<(SystemPrompt, Policy)> {
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
     let identity = identity::find(&identity::discover(&roots), name)?;
-    let mut prompt = identity::build(&config, &roots, &identity);
+    let hub = mcp::start(&config, &roots, &identity).await;
+    let mut prompt = identity::build(&config, &roots, &identity).with_mcp(hub);
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
     Ok((prompt, policy))
@@ -304,6 +336,7 @@ async fn run(
     listener: Option<TcpListener>,
     notices: Vec<String>,
     skills: Vec<skills::Skill>,
+    hub: Option<Arc<mcp::Hub>>,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -343,6 +376,7 @@ async fn run(
 
     let mut app = App::new(Arc::clone(&session));
     app.skills = skills;
+    app.mcp = hub;
     app.entries
         .extend(notices.into_iter().map(app::Entry::Info));
     if let Some(listener) = listener {

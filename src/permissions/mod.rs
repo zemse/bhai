@@ -208,6 +208,15 @@ impl Policy {
                     )
                 }
             }
+            ("mcp_call", _, _) => match mcp_name(args) {
+                Some(name) => (
+                    Rule::parse(&name).ok(),
+                    name["mcp__".len()..]
+                        .split_once("__")
+                        .and_then(|(server, _)| Rule::parse(&format!("mcp__{server}")).ok()),
+                ),
+                None => (None, None),
+            },
             _ => (None, None),
         };
         let works = |rule: Option<Rule>| {
@@ -293,6 +302,12 @@ impl Policy {
     }
 }
 
+/// The lowercase `mcp__server__tool` name an `mcp_call` runs, as rules name it.
+fn mcp_name(args: &Value) -> Option<String> {
+    let name = args.get("name").and_then(Value::as_str)?;
+    name.starts_with("mcp__").then(|| name.to_lowercase())
+}
+
 /// One decision against a fixed set of rules and a mode.
 struct Checker<'a> {
     rules: &'a Rules,
@@ -307,6 +322,10 @@ impl Checker<'_> {
             "bash" => self.check_bash(text("command").unwrap_or_default()),
             "read" | "write" | "edit" => match text("path") {
                 Some(path) => self.check_path(tool, Path::new(path), needs_approval),
+                None => Decision::Ask,
+            },
+            "mcp_call" => match mcp_name(args) {
+                Some(name) => self.check_other(&name, needs_approval),
                 None => Decision::Ask,
             },
             _ => self.check_other(tool, needs_approval),
@@ -472,6 +491,38 @@ mod tests {
 
     fn allowed(reason: &str) -> Decision {
         Decision::Allow(reason.to_string())
+    }
+
+    #[test]
+    fn mcp_calls_are_checked_by_their_mcp_name() {
+        let call = |name: &str| json!({ "name": name, "arguments": {} });
+        let p = policy(
+            Mode::Auto,
+            &["mcp__github__get_issue", "mcp__fs"],
+            &["mcp__github__delete*"],
+            &["mcp__fs__write"],
+        );
+        let check = |name: &str| p.check("mcp_call", &call(name), true);
+        assert_eq!(
+            check("mcp__github__get_issue"),
+            allowed("rule mcp__github__get_issue")
+        );
+        assert!(matches!(
+            check("mcp__github__delete_repo"),
+            Decision::Deny(_)
+        ));
+        assert_eq!(check("mcp__github__create_issue"), Decision::Ask);
+        assert!(matches!(check("mcp__fs__read"), Decision::Allow(_)));
+        assert_eq!(check("mcp__fs__write"), Decision::Ask);
+        assert_eq!(p.check("mcp_call", &json!({}), true), Decision::Ask);
+
+        let offers = p.offers("mcp_call", &call("mcp__GitHub__create_issue"));
+        assert_eq!(offers.exact.as_deref(), Some("mcp__github__create_issue"));
+        assert_eq!(offers.prefix.as_deref(), Some("mcp__github"));
+        assert_eq!(
+            p.offers("mcp_call", &call("mcp__fs__write")),
+            Offers::default()
+        );
     }
 
     #[test]

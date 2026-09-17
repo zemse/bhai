@@ -113,12 +113,13 @@ pub fn claude(home: Option<&Path>, cwd: &Path) -> (Rules, Vec<String>) {
     (rules, notices)
 }
 
-/// A Claude Code rule for a tool bhai has; `None` for any other tool.
+/// A Claude Code rule for a tool bhai has, MCP tools included; `None` for any other tool.
 fn claude_rule(text: &str) -> Option<Result<Rule, String>> {
     let name = text.split('(').next().unwrap_or_default().trim();
     match name {
         "Bash" | "Read" | "Edit" | "Write" => Some(Rule::parse(text)),
         "MultiEdit" => Some(Rule::parse(&text.trim().replacen("MultiEdit", "Edit", 1))),
+        _ if name.starts_with("mcp__") => Some(Rule::parse(text)),
         _ => None,
     }
 }
@@ -241,7 +242,12 @@ mod tests {
         let (rules, notices) = claude(Some(&home), &cwd);
         assert_eq!(
             texts(&rules.allow),
-            ["Bash(git log:*)", "Edit(src/**)", "Read"]
+            [
+                "Bash(git log:*)",
+                "mcp__github__get",
+                "Edit(src/**)",
+                "Read"
+            ]
         );
         assert_eq!(texts(&rules.deny), ["Read(*.pem)"]);
         assert_eq!(texts(&rules.ask), ["Write(docs/**)"]);

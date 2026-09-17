@@ -46,7 +46,7 @@ impl Rule {
             }
             None => (trimmed, None),
         };
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        if !is_tool_name(name) {
             return Err(bad("expected a tool name"));
         }
         let tool = name.to_lowercase();
@@ -73,9 +73,19 @@ impl Rule {
         }
     }
 
-    /// `Edit` rules cover every tool that changes files, as in Claude Code.
+    /// `Edit` rules cover every tool that changes files, as in Claude Code. `mcp__server`
+    /// and `mcp__server__*` cover every tool of that server.
     pub fn applies_to(&self, tool: &str) -> bool {
-        self.tool == tool || (self.tool == "edit" && tool == "write")
+        if self.tool == tool || (self.tool == "edit" && tool == "write") {
+            return true;
+        }
+        let Some(rest) = self.tool.strip_prefix("mcp__") else {
+            return false;
+        };
+        match self.tool.strip_suffix('*') {
+            Some(prefix) => tool.starts_with(prefix),
+            None => !rest.contains("__") && tool.starts_with(&format!("{}__", self.tool)),
+        }
     }
 
     pub fn is_any(&self) -> bool {
@@ -129,6 +139,20 @@ impl Rule {
             }
             Pattern::Command { .. } => false,
         }
+    }
+}
+
+/// A plain tool name, or an MCP name like `mcp__chrome-devtools__*` whose only `*` ends it.
+fn is_tool_name(name: &str) -> bool {
+    let plain = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    match name.strip_prefix("mcp__") {
+        Some(rest) => {
+            let rest = rest.strip_suffix('*').unwrap_or(rest);
+            rest.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                && (!rest.is_empty() || name.ends_with('*'))
+        }
+        None => plain(name),
     }
 }
 
@@ -388,8 +412,38 @@ mod tests {
             "Bash(git log*)",
             "Skill(x)",
             "Ba sh",
+            "mcp__",
+            "mcp__a*b",
+            "mcp__x(y)",
         ] {
             assert!(Rule::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn mcp_rules_match_a_tool_or_a_whole_server() {
+        let cases = [
+            ("mcp__github__get_issue", "mcp__github__get_issue", true),
+            ("mcp__github__get_issue", "mcp__github__get_issues", false),
+            ("mcp__GitHub", "mcp__github__get_issue", true),
+            ("mcp__github", "mcp__github2__get_issue", false),
+            ("mcp__github", "mcp__github", true),
+            ("mcp__github__*", "mcp__github__x", true),
+            ("mcp__github__*", "mcp__githubx__x", false),
+            (
+                "mcp__chrome-devtools__*",
+                "mcp__chrome-devtools__click",
+                true,
+            ),
+            ("mcp__*", "mcp__any__thing", true),
+            ("mcp__*", "bash", false),
+            ("mcp__github__get", "mcp__github__get__x", false),
+            ("Bash", "mcp__bash__x", false),
+        ];
+        for (rule, tool, want) in cases {
+            let rule = Rule::parse(rule).unwrap();
+            assert!(rule.is_any());
+            assert_eq!(rule.applies_to(tool), want, "{} vs {tool}", rule.text);
         }
     }
 

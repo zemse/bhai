@@ -4,9 +4,11 @@
 //! cacheable prefix stays first.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use crate::identity::Identity;
 use crate::instructions::File;
+use crate::mcp::Hub;
 use crate::skills::Skill;
 
 /// The system prompt and the instruction files and skills appended to it.
@@ -18,6 +20,10 @@ pub struct SystemPrompt {
     pub skills: Vec<Skill>,
     /// Bytes the skills listing adds to the prompt.
     pub skills_bytes: usize,
+    /// The MCP servers, which `mcp_search` and `mcp_call` reach.
+    pub mcp: Option<Arc<Hub>>,
+    /// Bytes the MCP server lines add to the prompt.
+    pub mcp_bytes: usize,
     /// Imports refused while loading the instruction files.
     pub skipped: Vec<String>,
     /// The identity the prompt was built for.
@@ -44,12 +50,27 @@ impl SystemPrompt {
         if self.skills_bytes > 0 {
             list.push(format!("skills ({})", tokens(self.skills_bytes)));
         }
+        if self.mcp_bytes > 0 {
+            list.push(format!("mcp ({})", tokens(self.mcp_bytes)));
+        }
         let mut lines = Vec::new();
         if !list.is_empty() {
             lines.push(format!("loaded: {}", list.join(", ")));
         }
         lines.extend(self.skipped.iter().cloned());
+        lines.extend(self.mcp.iter().flat_map(|hub| hub.notices()));
         lines
+    }
+
+    /// Append the MCP server lines; they go last, after the skills listing.
+    pub fn with_mcp(mut self, hub: Option<Arc<Hub>>) -> Self {
+        if let Some(hub) = &hub {
+            let section = hub.prompt_section();
+            self.mcp_bytes = section.len();
+            self.text.push_str(&section);
+        }
+        self.mcp = hub;
+        self
     }
 }
 
@@ -94,6 +115,8 @@ pub fn system_prompt(files: &[File], skills: Vec<Skill>) -> SystemPrompt {
         text,
         sources,
         skills,
+        mcp: None,
+        mcp_bytes: 0,
         skipped: Vec::new(),
         identity: Identity::default(),
     }

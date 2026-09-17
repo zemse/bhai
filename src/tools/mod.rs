@@ -3,11 +3,13 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use serde_json::Value;
 
 pub mod bash;
 pub mod edit;
+pub mod mcp;
 pub mod read;
 pub mod skill;
 pub mod write;
@@ -50,13 +52,25 @@ impl Registry {
         Self { tools }
     }
 
-    /// The tools a session's prompt allows: its skills, narrowed to its identity's tools.
+    /// `mcp_search` and `mcp_call`, when the hub has tools to offer.
+    pub fn with_mcp(mut self, hub: Option<Arc<crate::mcp::Hub>>) -> Self {
+        if let Some(hub) = hub.filter(|h| h.has_tools()) {
+            self.tools.push(Box::new(mcp::Search {
+                hub: Arc::clone(&hub),
+            }));
+            self.tools.push(Box::new(mcp::Call { hub }));
+        }
+        self
+    }
+
+    /// The tools a session's prompt allows: its skills, narrowed to its identity's tools,
+    /// and the MCP tools, which its identity's `mcp` globs already narrowed.
     pub fn for_prompt(prompt: &crate::prompt::SystemPrompt) -> Self {
         let mut registry = Self::new(prompt.skills.clone());
         registry
             .tools
             .retain(|t| prompt.identity.allows_tool(t.name()));
-        registry
+        registry.with_mcp(prompt.mcp.clone())
     }
 
     pub fn schemas(&self) -> Vec<Value> {
@@ -112,7 +126,7 @@ fn path_arg(args: &Value) -> Result<&Path, String> {
     Ok(Path::new(path))
 }
 
-fn truncate(s: &str) -> String {
+pub fn truncate(s: &str) -> String {
     if s.len() <= MAX_OUTPUT {
         return s.to_string();
     }

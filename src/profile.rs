@@ -75,8 +75,9 @@ pub fn build(
     history: &[Value],
     measured: Option<Measured>,
 ) -> Profile {
-    let appended: usize =
-        prompt.sources.iter().map(|s| s.bytes).sum::<usize>() + prompt.skills_bytes;
+    let appended: usize = prompt.sources.iter().map(|s| s.bytes).sum::<usize>()
+        + prompt.skills_bytes
+        + prompt.mcp_bytes;
     let mut items = vec![item(
         "system prompt".to_string(),
         "system prompt",
@@ -94,6 +95,16 @@ pub fn build(
             format!("skills listing ({})", prompt.skills.len()),
             "skills",
             prompt.skills_bytes,
+        ));
+    }
+    if prompt.mcp_bytes > 0 {
+        let servers = prompt.mcp.as_ref().map_or(0, |hub| {
+            hub.servers.iter().filter(|s| !s.tools.is_empty()).count()
+        });
+        items.push(item(
+            format!("mcp servers listing ({servers})"),
+            "mcp",
+            prompt.mcp_bytes,
         ));
     }
     for tool in tools {

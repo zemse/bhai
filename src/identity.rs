@@ -40,7 +40,7 @@ pub struct Identity {
     pub tools: Option<Vec<String>>,
     /// Skill name globs, `!pat` to exclude; empty allows every skill.
     pub skills: Vec<String>,
-    /// MCP server or tool globs, kept for when MCP lands.
+    /// MCP server or `server__tool` globs, `!pat` to exclude; empty allows every server.
     pub mcp: Vec<String>,
     /// Instruction sources to load; `None` keeps the config's.
     pub instructions: Option<Vec<Source>>,
@@ -87,6 +87,41 @@ impl Identity {
         (includes.is_empty() || includes.iter().any(|p| glob(p, name)))
             && !excludes.iter().any(|p| glob(&p[1..], name))
     }
+
+    /// Whether to start `server`: a pattern names it or one of its tools, and no
+    /// server pattern excludes it.
+    pub fn allows_mcp_server(&self, server: &str) -> bool {
+        let (excludes, includes) = self.mcp_patterns();
+        let server_part = |p: &str| p.split_once("__").map_or(p, |(s, _)| s).to_string();
+        (includes.is_empty() || includes.iter().any(|p| glob(&server_part(p), server)))
+            && !excludes
+                .iter()
+                .any(|p| glob(p.strip_suffix("__*").unwrap_or(p), server))
+    }
+
+    /// Server patterns match every tool of the server; `server__tool` patterns match one.
+    pub fn allows_mcp_tool(&self, server: &str, tool: &str) -> bool {
+        let full = format!("{server}__{tool}");
+        let hit = |p: &str| {
+            if p.contains("__") {
+                glob(p, &full)
+            } else {
+                glob(p, server)
+            }
+        };
+        let (excludes, includes) = self.mcp_patterns();
+        (includes.is_empty() || includes.iter().any(|p| hit(p))) && !excludes.iter().any(|p| hit(p))
+    }
+
+    /// The `mcp` excludes with their `!` dropped, and the includes.
+    fn mcp_patterns(&self) -> (Vec<&str>, Vec<&str>) {
+        let (excludes, includes): (Vec<&str>, Vec<&str>) = self
+            .mcp
+            .iter()
+            .map(String::as_str)
+            .partition(|p| p.starts_with('!'));
+        (excludes.iter().map(|p| &p[1..]).collect(), includes)
+    }
 }
 
 fn general() -> Identity {
@@ -100,6 +135,7 @@ fn router() -> Identity {
     Identity {
         tools: Some(vec![tools::read::NAME.to_string()]),
         skills: vec!["!*".to_string()],
+        mcp: vec!["!*".to_string()],
         prompt: ROUTER_PROMPT.to_string(),
         ..Identity::builtin(
             "router",
@@ -368,6 +404,30 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         assert_eq!(open.tools, None);
         assert!(open.allows_tool("write"));
         assert!(parse("---\ndescription: x\n---\n", Path::new("/b.md"), "").is_none());
+    }
+
+    #[test]
+    fn mcp_globs_filter_servers_and_tools() {
+        let with = |mcp: &[&str]| Identity {
+            mcp: mcp.iter().map(|s| s.to_string()).collect(),
+            ..general()
+        };
+        let all = with(&[]);
+        assert!(all.allows_mcp_server("x") && all.allows_mcp_tool("x", "t"));
+        assert!(!router().allows_mcp_server("x"));
+
+        let one = with(&["tavily", "xcode__build*", "!xcode__build_clean"]);
+        assert!(one.allows_mcp_server("tavily") && one.allows_mcp_server("xcode"));
+        assert!(!one.allows_mcp_server("github"));
+        assert!(one.allows_mcp_tool("tavily", "search"));
+        assert!(one.allows_mcp_tool("xcode", "build_sim"));
+        assert!(!one.allows_mcp_tool("xcode", "build_clean"));
+        assert!(!one.allows_mcp_tool("xcode", "list_sims"));
+
+        let but = with(&["!github", "!fs__*", "!x__rm"]);
+        assert!(!but.allows_mcp_server("github") && !but.allows_mcp_server("fs"));
+        assert!(but.allows_mcp_server("x") && but.allows_mcp_tool("x", "ls"));
+        assert!(!but.allows_mcp_tool("x", "rm"));
     }
 
     #[test]

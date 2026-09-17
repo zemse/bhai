@@ -50,6 +50,8 @@ pub struct App {
     pub last_usage: Option<Usage>,
     /// The skills in the system prompt, for `/skills`.
     pub skills: Vec<Skill>,
+    /// The session's MCP servers, for `/mcp`.
+    pub mcp: Option<Arc<crate::mcp::Hub>>,
     pub quit: bool,
     session: Arc<Session>,
 }
@@ -76,6 +78,7 @@ impl App {
             tokens_out: 0,
             last_usage: None,
             skills: Vec::new(),
+            mcp: None,
             quit: false,
             session,
         }
@@ -211,6 +214,12 @@ impl App {
             self.follow = true;
             self.entries
                 .push(Entry::Info(switch_notice(&self.identity, rest.trim())));
+            return;
+        }
+        if message.starts_with("/mcp") {
+            self.follow = true;
+            self.entries
+                .push(Entry::Info(crate::mcp::report(self.mcp.as_deref())));
             return;
         }
         if message.starts_with("/skills") {

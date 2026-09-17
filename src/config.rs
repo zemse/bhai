@@ -1,8 +1,10 @@
 //! bhai's own switches: `~/.config/bhai/config.toml`, then `.bhai/config.toml` in the
 //! working directory on top, then command-line flags on top of both. The project file
 //! may only tighten permissions: its `permission_mode` and `allow` rules are ignored, so
-//! a cloned repo cannot approve its own commands.
+//! a cloned repo cannot approve its own commands. MCP servers are likewise only read
+//! from the global file.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -22,6 +24,8 @@ pub struct Config {
     /// Where skills are discovered from.
     pub skill_sources: Vec<Source>,
     pub mcp: bool,
+    /// `[mcp.servers.<name>]` from the global file.
+    pub mcp_servers: BTreeMap<String, McpServer>,
     pub permission_mode: Mode,
     pub permissions: Rules,
     /// Rules from Claude Code's `settings.json` files.
@@ -37,6 +41,7 @@ impl Default for Config {
             skills: true,
             skill_sources: Source::ALL.to_vec(),
             mcp: false,
+            mcp_servers: BTreeMap::new(),
             permission_mode: Mode::Ask,
             permissions: Rules::default(),
             import_claude_permissions: true,
@@ -69,6 +74,16 @@ impl Source {
     }
 }
 
+/// A stdio MCP server started with `command` and `args`, with `env` added.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct McpServer {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
 /// One config file: only the keys it sets override what came before.
 #[derive(Debug, Default, Deserialize)]
 struct Layer {
@@ -76,7 +91,7 @@ struct Layer {
     load_global_agents: Option<bool>,
     load_project_instructions: Option<bool>,
     skills: Option<SkillsLayer>,
-    mcp: Option<bool>,
+    mcp: Option<McpLayer>,
     permission_mode: Option<Mode>,
     import_claude_permissions: Option<bool>,
     #[serde(default)]
@@ -91,6 +106,18 @@ enum SkillsLayer {
     Table {
         enabled: Option<bool>,
         sources: Option<Vec<Source>>,
+    },
+}
+
+/// `mcp = true`, or an `[mcp]` table with servers.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum McpLayer {
+    Enabled(bool),
+    Table {
+        enabled: Option<bool>,
+        #[serde(default)]
+        servers: BTreeMap<String, McpServer>,
     },
 }
 
@@ -187,6 +214,9 @@ impl Config {
         {
             self.import_claude_permissions = import;
         }
+        if trusted && let Some(McpLayer::Table { servers, .. }) = &layer.mcp {
+            self.mcp_servers.extend(servers.clone());
+        }
         self.apply(layer);
         Ok(())
     }
@@ -213,7 +243,11 @@ impl Config {
             }
             None => {}
         }
-        set(&mut self.mcp, layer.mcp);
+        match layer.mcp {
+            Some(McpLayer::Enabled(enabled)) => self.mcp = enabled,
+            Some(McpLayer::Table { enabled, .. }) => set(&mut self.mcp, enabled),
+            None => {}
+        }
     }
 }
 
@@ -348,6 +382,29 @@ mod tests {
             "[skills]\nsources = [\"x\"]\n",
         );
         assert!(Config::load(Some(&home), &cwd).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mcp_servers_come_only_from_the_global_file() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &home.join(".config/bhai/config.toml"),
+            "[mcp]\nenabled = true\n[mcp.servers.fs]\ncommand = \"fs-mcp\"\nargs = [\"/tmp\"]\n",
+        );
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[mcp.servers.evil]\ncommand = \"sh\"\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(config.mcp);
+        let names: Vec<_> = config.mcp_servers.keys().collect();
+        assert_eq!(names, ["fs"]);
+        assert_eq!(config.mcp_servers["fs"].args, ["/tmp"]);
+        assert!(config.mcp_servers["fs"].env.is_empty());
+        write(&cwd.join(".bhai/config.toml"), "mcp = false\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().mcp);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
