@@ -45,6 +45,22 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     render_status(frame, status_area, app);
+    if let Some(diff) = &mut app.diff {
+        // The pane takes the transcript and input rows; an approval still shows below.
+        let area = if app.pending.is_some() {
+            transcript_area
+        } else {
+            transcript_area.union(bottom_area)
+        };
+        diff.render(frame, area);
+        app.rows.clear();
+        app.scrollbar = None;
+        app.input_area = None;
+        if app.pending.is_some() {
+            render_approval(frame, bottom_area, app);
+        }
+        return;
+    }
     render_transcript(frame, transcript_area, app);
     if app.pending.is_some() {
         app.input_area = None;

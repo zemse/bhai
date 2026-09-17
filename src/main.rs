@@ -8,6 +8,7 @@ mod cache;
 mod client;
 mod compact;
 mod config;
+mod diff;
 mod frontmatter;
 mod identity;
 mod input;

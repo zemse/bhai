@@ -14,6 +14,7 @@ use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::client::Usage;
+use crate::diff::DiffView;
 use crate::input::{Editor, History};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, CallTokens, EntryTokens, Tokens, Transcript};
@@ -101,6 +102,8 @@ pub struct App {
     pub skills: Vec<Skill>,
     /// The session's MCP servers, for `/mcp`.
     pub mcp: Option<Arc<crate::mcp::Hub>>,
+    /// The `/diff` pane, shown instead of the transcript while open.
+    pub diff: Option<DiffView>,
     pub quit: bool,
     session: Arc<Session>,
 }
@@ -143,6 +146,7 @@ impl App {
             cache_miss: None,
             skills: Vec::new(),
             mcp: None,
+            diff: None,
             quit: false,
             session,
         }
@@ -165,6 +169,15 @@ impl App {
                 }
                 KeyCode::Char('c') if ctrl => self.interrupt(),
                 _ => {}
+            }
+            return;
+        }
+
+        if let Some(diff) = &mut self.diff
+            && !(ctrl && key.code == KeyCode::Char('c'))
+        {
+            if !diff.on_key(key.code) {
+                self.diff = None;
             }
             return;
         }
@@ -217,13 +230,17 @@ impl App {
 
     /// Bracketed paste: the text goes into the input as typed, newlines and all.
     pub fn on_paste(&mut self, text: &str) {
-        if self.pending.is_none() {
+        if self.pending.is_none() && self.diff.is_none() {
             self.input.insert(text);
         }
     }
 
     /// Returns whether the screen needs a redraw.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
+        // With an approval up, clicks still reach its buttons.
+        if let Some(diff) = self.diff.as_mut().filter(|_| self.pending.is_none()) {
+            return diff_mouse(diff, mouse);
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_by(-(WHEEL_LINES as isize)),
             MouseEventKind::ScrollDown => self.scroll_by(WHEEL_LINES as isize),
@@ -442,6 +459,11 @@ impl App {
         if let Err(e) = self.history.push(&message) {
             self.entries
                 .push(Entry::Error(format!("could not save prompt history: {e}")));
+        }
+        if message == "/diff" {
+            let dir = std::env::current_dir().unwrap_or_default();
+            self.diff = Some(DiffView::open(&dir));
+            return;
         }
         if message.starts_with("/context") {
             self.export_context();
@@ -759,6 +781,17 @@ fn skills_report(skills: &[Skill]) -> String {
         ));
     }
     out
+}
+
+/// Mouse input while the diff pane is open. Returns whether the screen needs a redraw.
+fn diff_mouse(diff: &mut DiffView, mouse: MouseEvent) -> bool {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => diff.scroll_by(-(WHEEL_LINES as isize)),
+        MouseEventKind::ScrollDown => diff.scroll_by(WHEEL_LINES as isize),
+        MouseEventKind::Down(MouseButton::Left) => diff.click(mouse.column, mouse.row),
+        _ => return false,
+    }
+    true
 }
 
 #[derive(Clone, Copy)]
