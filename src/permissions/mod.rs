@@ -546,7 +546,8 @@ impl Checker<'_> {
 }
 
 /// The words as written, and again from the real program with its path dropped. Behind a
-/// wrapper, every later word may be the program, since wrapper flags can take values.
+/// wrapper, every later word may be the program, since wrapper flags can take values, and a
+/// command run as an argument (`find ... -exec git push \;`) is added the same way.
 fn loose_forms(command: &bash::Command) -> Vec<Vec<String>> {
     let mut forms = vec![command.words.clone()];
     let wrapped = command.unwrapped().len() < command.words.len();
@@ -561,6 +562,9 @@ fn loose_forms(command: &bash::Command) -> Vec<Vec<String>> {
             *first = bash::basename(first).to_string();
         }
         forms.push(words);
+    }
+    for nested in command.nested() {
+        forms.extend(loose_forms(&nested));
     }
     forms
 }
@@ -672,6 +676,7 @@ mod tests {
             (&bypass, "env -u FOO rm x", deny_rm.clone()),
             (&bypass, "timeout -s KILL 5 rm x", deny_rm.clone()),
             (&bypass, "xargs -I X rm X", deny_rm.clone()),
+            (&bypass, r"find . -name x -exec rm {} \;", deny_rm.clone()),
             (
                 &auto,
                 "git push origin main",
@@ -786,6 +791,30 @@ mod tests {
             "{described}"
         );
         assert!(!auto.describe().contains("inactive"));
+    }
+
+    #[test]
+    fn nested_commands_only_add_deny_and_ask() {
+        let rule = "Bash(git push:*)";
+        let deny_policy = policy(Mode::Bypass, &[], &[rule], &[]);
+        let deny = Decision::Deny(format!("deny rule {rule}"));
+        for command in [
+            r"find . -name x -exec git push \;",
+            r"find . -execdir /usr/bin/git push origin main \;",
+            "xargs -n1 git push",
+            "xargs -n1 -0 git push",
+        ] {
+            assert_eq!(bash(&deny_policy, command), deny, "{command}");
+        }
+        let ask_policy = policy(Mode::Bypass, &[], &[], &[rule]);
+        assert_eq!(
+            bash(&ask_policy, r"find . -exec git push \;"),
+            Decision::Ask
+        );
+        // The allow side only ever sees the command as written.
+        let allow = policy(Mode::Auto, &["Bash(git push:*)"], &[], &[]);
+        assert_eq!(bash(&allow, r"find . -exec git push \;"), Decision::Ask);
+        assert_eq!(bash(&allow, "xargs -n1 git push"), Decision::Ask);
     }
 
     #[test]

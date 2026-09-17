@@ -18,6 +18,8 @@ const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tc
 const WRAPPERS: &[&str] = &[
     "env", "nohup", "time", "timeout", "nice", "xargs", "stdbuf", "!",
 ];
+/// `find` flags whose arguments, up to a `;` or `+` word, are a command of their own.
+const EXEC_FLAGS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
 
 /// Split `input` into simple commands, or `None` for anything this parser does not
 /// fully understand (substitutions, subshells, redirection to files, `eval`, ...).
@@ -42,6 +44,33 @@ impl Command {
             }
         }
         words
+    }
+
+    /// The commands this one runs as arguments: `find ... -exec git push \;` runs `git push`.
+    pub fn nested(&self) -> Vec<Command> {
+        let words = self.unwrapped();
+        if words.first().map(|w| basename(w)) != Some("find") {
+            return Vec::new();
+        }
+        let mut nested = Vec::new();
+        let mut rest = &words[1..];
+        while let Some(at) = rest.iter().position(|w| EXEC_FLAGS.contains(&w.as_str())) {
+            // The argument list ends at a `;` or `+` word, or at the end of the command.
+            rest = &rest[at + 1..];
+            let end = rest
+                .iter()
+                .position(|w| w == ";" || w == "+")
+                .unwrap_or(rest.len());
+            let (command, tail) = rest.split_at(end);
+            if !command.is_empty() {
+                nested.push(Command {
+                    words: command.to_vec(),
+                    dot_glob: false,
+                });
+            }
+            rest = tail;
+        }
+        nested
     }
 }
 
@@ -154,6 +183,12 @@ impl Tokenizer {
                     }
                     self.end_word();
                     redirect(&mut chars)?;
+                }
+                // An empty pair of braces is literal in bash: the `{}` of `find -exec`.
+                '{' if chars.peek() == Some(&'}') => {
+                    chars.next();
+                    self.in_word = true;
+                    self.word.push_str("{}");
                 }
                 '$' | '`' | '(' | ')' | '<' | '{' | '}' => return None,
                 '#' if !self.in_word => while chars.next_if(|c| *c != '\n').is_some() {},
@@ -359,6 +394,27 @@ mod tests {
         assert_eq!(unwrapped("xargs -n 1 rm"), "rm");
         assert_eq!(unwrapped("! rm x"), "rm x");
         assert_eq!(unwrapped("git status"), "git status");
+    }
+
+    #[test]
+    fn nested_commands_behind_find_exec() {
+        let nested = |input: &str| {
+            parse(input).unwrap()[0]
+                .nested()
+                .iter()
+                .map(|c| c.words.join(" "))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(nested(r"find . -name x -exec git push \;"), ["git push"]);
+        assert_eq!(nested("find . -execdir rm {} +"), ["rm {}"]);
+        assert_eq!(
+            nested(r"find . -ok rm {} \; -okdir /bin/chmod 777 {} \;"),
+            ["rm {}", "/bin/chmod 777 {}"]
+        );
+        // No terminator: the rest of the words are the command.
+        assert_eq!(nested("timeout 5 find . -exec rm x"), ["rm x"]);
+        assert_eq!(nested("find . -name x"), [] as [String; 0]);
+        assert_eq!(nested("git push"), [] as [String; 0]);
     }
 
     #[test]
