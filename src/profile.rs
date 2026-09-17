@@ -73,7 +73,8 @@ pub fn build(
     history: &[Value],
     measured: Option<Measured>,
 ) -> Profile {
-    let appended: usize = prompt.sources.iter().map(|s| s.bytes).sum();
+    let appended: usize =
+        prompt.sources.iter().map(|s| s.bytes).sum::<usize>() + prompt.skills_bytes;
     let mut items = vec![item(
         "system prompt".to_string(),
         "system prompt",
@@ -84,6 +85,13 @@ pub fn build(
             format!("instructions: {}", source.label),
             "instructions",
             source.bytes,
+        ));
+    }
+    if prompt.skills_bytes > 0 {
+        items.push(item(
+            format!("skills listing ({})", prompt.skills.len()),
+            "skills",
+            prompt.skills_bytes,
         ));
     }
     for tool in tools {
@@ -315,7 +323,7 @@ mod tests {
     fn plain(text: &str) -> SystemPrompt {
         SystemPrompt {
             text: text.to_string(),
-            sources: Vec::new(),
+            ..SystemPrompt::default()
         }
     }
 
@@ -376,15 +384,24 @@ mod tests {
         let files = [crate::instructions::File {
             path: "CLAUDE.md".into(),
             label: "./CLAUDE.md".to_string(),
-            content: "z".repeat(300),
+            content: "z".repeat(600),
         }];
-        let prompt = crate::prompt::system_prompt(&files);
+        let skill = crate::skills::Skill {
+            name: "s".to_string(),
+            description: "d".repeat(200),
+            dir: "/s".into(),
+            source: "~/.claude/skills".to_string(),
+        };
+        let prompt = crate::prompt::system_prompt(&files, vec![skill]);
         let profile = build(&prompt, &[], &[], None);
-        assert_eq!(profile.items.len(), 2);
+        assert_eq!(profile.items.len(), 3);
         assert_eq!(profile.items[0].label, "system prompt");
         assert_eq!(profile.items[1].label, "instructions: ./CLAUDE.md");
         assert_eq!(profile.items[1].category, "instructions");
         assert_eq!(profile.items[1].bytes, prompt.sources[0].bytes);
+        assert_eq!(profile.items[2].label, "skills listing (1)");
+        assert_eq!(profile.items[2].category, "skills");
+        assert_eq!(profile.items[2].bytes, prompt.skills_bytes);
         assert_eq!(profile.total_bytes, prompt.text.len());
     }
 

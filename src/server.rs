@@ -173,7 +173,7 @@ mod tests {
                 let _ = reply.send(profile::build(
                     &SystemPrompt {
                         text: "sys".to_string(),
-                        sources: Vec::new(),
+                        ..SystemPrompt::default()
                     },
                     &[],
                     &[],

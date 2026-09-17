@@ -63,7 +63,7 @@ pub async fn run(
             return;
         }
     };
-    let registry = Registry::new();
+    let registry = Registry::new(prompt.skills.clone());
     let tools = registry.schemas();
     let mut history: Vec<Value> = Vec::new();
     let mut measured: Option<Measured> = None;
@@ -293,7 +293,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
         tokio::spawn(run(
-            crate::prompt::system_prompt(&[]),
+            crate::prompt::system_prompt(&[], Vec::new()),
             rx_user,
             rx_control,
             tx,

@@ -9,6 +9,7 @@ use serde_json::Value;
 pub mod bash;
 pub mod edit;
 pub mod read;
+pub mod skill;
 pub mod write;
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
@@ -32,16 +33,18 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Every built-in tool.
-    pub fn new() -> Self {
-        Self {
-            tools: vec![
-                Box::new(bash::Bash),
-                Box::new(read::Read),
-                Box::new(write::Write),
-                Box::new(edit::Edit),
-            ],
+    /// Every built-in tool, plus `skill` when there are skills to load.
+    pub fn new(skills: Vec<crate::skills::Skill>) -> Self {
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(bash::Bash),
+            Box::new(read::Read),
+            Box::new(write::Write),
+            Box::new(edit::Edit),
+        ];
+        if !skills.is_empty() {
+            tools.push(Box::new(skill::Skill { skills }));
         }
+        Self { tools }
     }
 
     pub fn schemas(&self) -> Vec<Value> {
@@ -140,7 +143,7 @@ mod tests {
 
     #[test]
     fn schemas_serialize_with_the_expected_names() {
-        let names: Vec<_> = Registry::new()
+        let names: Vec<_> = Registry::new(Vec::new())
             .schemas()
             .iter()
             .map(|s| {
@@ -153,17 +156,26 @@ mod tests {
     }
 
     #[test]
-    fn only_read_skips_approval() {
-        let registry = Registry::new();
+    fn only_read_and_skill_skip_approval() {
+        let skill = crate::skills::Skill {
+            name: "s".to_string(),
+            description: String::new(),
+            dir: "/s".into(),
+            source: "~/.claude/skills".to_string(),
+        };
+        let registry = Registry::new(vec![skill]);
+        assert_eq!(registry.schemas().len(), 5);
         for name in ["bash", "write", "edit"] {
             assert!(registry.get(name).unwrap().needs_approval(), "{name}");
         }
         assert!(!registry.get("read").unwrap().needs_approval());
+        assert!(!registry.get("skill").unwrap().needs_approval());
+        assert!(Registry::new(Vec::new()).get("skill").is_none());
     }
 
     #[test]
     fn an_unknown_tool_lists_the_available_ones() {
-        let registry = Registry::new();
+        let registry = Registry::new(Vec::new());
         assert!(registry.get("nope").is_none());
         let out = registry.unknown("nope");
         assert!(out.contains("`nope`"), "{out}");

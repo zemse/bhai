@@ -12,6 +12,7 @@ use tui_input::backend::crossterm::to_input_request;
 use crate::client::Usage;
 use crate::profile;
 use crate::session::{Approval, Event, Session};
+use crate::skills::Skill;
 
 /// Lines a mouse wheel notch moves the transcript.
 const WHEEL_LINES: usize = 3;
@@ -44,6 +45,8 @@ pub struct App {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub last_usage: Option<Usage>,
+    /// The skills in the system prompt, for `/skills`.
+    pub skills: Vec<Skill>,
     pub quit: bool,
     session: Arc<Session>,
 }
@@ -67,6 +70,7 @@ impl App {
             tokens_in: 0,
             tokens_out: 0,
             last_usage: None,
+            skills: Vec::new(),
             quit: false,
             session,
         }
@@ -175,6 +179,11 @@ impl App {
             self.export_context();
             return;
         }
+        if message.starts_with("/skills") {
+            self.follow = true;
+            self.entries.push(Entry::Info(skills_report(&self.skills)));
+            return;
+        }
         // The transcript entry arrives back as `Event::User` once the session accepts it.
         if let Err(e) = self.session.submit(message) {
             self.entries.push(Entry::Error(e.to_string()));
@@ -240,6 +249,27 @@ impl App {
             Stream::Reasoning => Entry::Reasoning(text),
         });
     }
+}
+
+/// What `/skills` prints: each skill, where it came from and its listing cost.
+fn skills_report(skills: &[Skill]) -> String {
+    if skills.is_empty() {
+        return "skills: none loaded".to_string();
+    }
+    let total: usize = skills.iter().map(|s| s.entry().len() + 1).sum();
+    let mut out = format!(
+        "skills: {} listed, about {} tokens",
+        skills.len(),
+        total.div_ceil(4)
+    );
+    for skill in skills {
+        let tokens = (skill.entry().len() + 1).div_ceil(4);
+        out.push_str(&format!(
+            "\n{:>5} tok  {}  ({})",
+            tokens, skill.name, skill.source
+        ));
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -316,6 +346,22 @@ mod tests {
         assert_eq!(
             input_request(key(KeyCode::Left, KeyModifiers::CONTROL)),
             Some(InputRequest::GoToPrevWord)
+        );
+    }
+
+    #[test]
+    fn skills_report_lists_source_and_cost() {
+        assert_eq!(skills_report(&[]), "skills: none loaded");
+        let skill = Skill {
+            name: "pdf".to_string(),
+            description: "Read PDFs.".to_string(),
+            dir: "/s/pdf".into(),
+            source: "~/.claude/skills".to_string(),
+        };
+        // "- pdf: Read PDFs." plus its newline is 18 bytes.
+        assert_eq!(
+            skills_report(&[skill]),
+            "skills: 1 listed, about 5 tokens\n    5 tok  pdf  (~/.claude/skills)"
         );
     }
 

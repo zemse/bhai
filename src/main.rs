@@ -11,6 +11,7 @@ mod profile;
 mod prompt;
 mod server;
 mod session;
+mod skills;
 mod tools;
 mod ui;
 
@@ -71,6 +72,7 @@ async fn main() -> Result<()> {
     };
     let prompt = load_prompt(args.flags)?;
     let loaded = prompt.loaded();
+    let skills = prompt.skills.clone();
 
     // Bind before taking over the terminal so a busy port is a plain error.
     let listener = match args.serve {
@@ -94,7 +96,7 @@ async fn main() -> Result<()> {
     // Mouse capture is what turns the wheel into scroll events. It also takes over
     // click-drag, so terminals need shift (or option) held to select text while bhai runs.
     let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(terminal, session, events, listener, loaded).await;
+    let result = run(terminal, session, events, listener, loaded, skills).await;
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -118,7 +120,15 @@ fn load_prompt(flags: Flags) -> Result<SystemPrompt> {
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
-    Ok(prompt::system_prompt(&instructions::load(&config, &roots)))
+    let skills = if config.skills {
+        skills::discover(&roots)
+    } else {
+        Vec::new()
+    };
+    Ok(prompt::system_prompt(
+        &instructions::load(&config, &roots),
+        skills,
+    ))
 }
 
 fn parse_args(args: &[String]) -> Result<Args> {
@@ -220,6 +230,7 @@ async fn run(
     mut events: broadcast::Receiver<session::Event>,
     listener: Option<TcpListener>,
     loaded: Option<String>,
+    skills: Vec<skills::Skill>,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -258,6 +269,7 @@ async fn run(
     });
 
     let mut app = App::new(Arc::clone(&session));
+    app.skills = skills;
     if let Some(loaded) = loaded {
         app.entries.push(app::Entry::Info(loaded));
     }

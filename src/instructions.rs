@@ -86,12 +86,16 @@ pub fn load(config: &Config, roots: &Roots) -> Vec<File> {
     files
 }
 
-/// The git repo root (or `cwd` outside a repo) and every directory down to `cwd`.
-fn project_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let root = cwd
-        .ancestors()
+/// The git repo root, or `cwd` outside a repo.
+pub fn project_root(cwd: &Path) -> &Path {
+    cwd.ancestors()
         .find(|dir| dir.join(".git").exists())
-        .unwrap_or(cwd);
+        .unwrap_or(cwd)
+}
+
+/// The project root and every directory down to `cwd`.
+fn project_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let root = project_root(cwd);
     let mut dirs: Vec<PathBuf> = cwd
         .ancestors()
         .take_while(|dir| *dir != root)
@@ -131,7 +135,8 @@ fn import(line: &str, from: &Path, home: Option<&Path>) -> Option<PathBuf> {
     Some(from.parent()?.join(target))
 }
 
-fn label(path: &Path, roots: &Roots) -> String {
+/// The path as shown to the user: `./`, `~/` or absolute.
+pub fn label(path: &Path, roots: &Roots) -> String {
     if let Ok(rest) = path.strip_prefix(&roots.cwd) {
         return format!("./{}", rest.display());
     }

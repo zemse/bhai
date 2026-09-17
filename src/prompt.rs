@@ -1,16 +1,22 @@
 //! The system prompt. Kept short on purpose: the model is already trained to be a
 //! coding agent, so this only states what this particular harness can and cannot do.
-//! Instruction files go after the static text, so the cacheable prefix stays first.
+//! Instruction files and then the skills listing go after the static text, so the
+//! cacheable prefix stays first.
 
 use std::fmt::Write as _;
 
 use crate::instructions::File;
+use crate::skills::Skill;
 
-/// The system prompt and the instruction files appended to it.
-#[derive(Debug, Clone)]
+/// The system prompt and the instruction files and skills appended to it.
+#[derive(Debug, Clone, Default)]
 pub struct SystemPrompt {
     pub text: String,
     pub sources: Vec<Source>,
+    /// The skills listed, which the `skill` tool loads.
+    pub skills: Vec<Skill>,
+    /// Bytes the skills listing adds to the prompt.
+    pub skills_bytes: usize,
 }
 
 /// One appended instruction file.
@@ -36,7 +42,7 @@ impl SystemPrompt {
     }
 }
 
-pub fn system_prompt(files: &[File]) -> SystemPrompt {
+pub fn system_prompt(files: &[File], skills: Vec<Skill>) -> SystemPrompt {
     let mut text = base();
     let mut sources = Vec::new();
     for file in files {
@@ -52,7 +58,22 @@ pub fn system_prompt(files: &[File]) -> SystemPrompt {
             bytes: text.len() - start,
         });
     }
-    SystemPrompt { text, sources }
+    let start = text.len();
+    if !skills.is_empty() {
+        text.push_str(
+            "\n\n# Skills\n\nSkills are task-specific instructions. Before using one, call the \
+`skill` tool with its name to load its full instructions.\n",
+        );
+        for skill in &skills {
+            let _ = write!(text, "\n{}", skill.entry());
+        }
+    }
+    SystemPrompt {
+        skills_bytes: text.len() - start,
+        text,
+        sources,
+        skills,
+    }
 }
 
 fn base() -> String {
@@ -105,7 +126,7 @@ mod tests {
 
     #[test]
     fn files_are_appended_after_the_static_text() {
-        let bare = system_prompt(&[]);
+        let bare = system_prompt(&[], Vec::new());
         assert_eq!(bare.text, base());
         assert!(bare.sources.is_empty());
         assert_eq!(bare.loaded(), None);
@@ -114,7 +135,7 @@ mod tests {
             file("~/.claude/CLAUDE.md", "be terse\n"),
             file("./CLAUDE.md", &"x".repeat(420)),
         ];
-        let prompt = system_prompt(&files);
+        let prompt = system_prompt(&files, Vec::new());
         assert!(prompt.text.starts_with(&bare.text));
         assert!(
             prompt
@@ -128,5 +149,25 @@ mod tests {
             prompt.loaded().unwrap(),
             "loaded: ~/.claude/CLAUDE.md (0.1k), ./CLAUDE.md (0.5k)"
         );
+        assert_eq!(prompt.skills_bytes, 0);
+    }
+
+    #[test]
+    fn skills_are_listed_after_the_files() {
+        let skill = Skill {
+            name: "pdf".to_string(),
+            description: "Read PDFs.".to_string(),
+            dir: PathBuf::from("/s/pdf"),
+            source: "~/.claude/skills".to_string(),
+        };
+        let files = [file("./CLAUDE.md", "be terse")];
+        let without = system_prompt(&files, Vec::new());
+        let prompt = system_prompt(&files, vec![skill]);
+        assert!(prompt.text.starts_with(&without.text));
+        assert!(prompt.text.ends_with(
+            "`skill` tool with its name to load its full instructions.\n\n- pdf: Read PDFs."
+        ));
+        assert_eq!(without.text.len() + prompt.skills_bytes, prompt.text.len());
+        assert_eq!(prompt.skills.len(), 1);
     }
 }
