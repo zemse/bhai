@@ -276,10 +276,9 @@ mod tests {
             total - *first_at >= Duration::from_millis(200),
             "{chunks:?}"
         );
-        assert_eq!(
-            chunks.iter().map(|(_, c)| c.as_str()).collect::<String>(),
-            "a\nb\ne"
-        );
+        // The two pipes can be read in either order once both are ready.
+        let joined = chunks.iter().map(|(_, c)| c.as_str()).collect::<String>();
+        assert!(joined == "a\nb\ne" || joined == "a\neb\n", "{joined:?}");
 
         let plain = std::process::Command::new("bash")
             .arg("-lc")
