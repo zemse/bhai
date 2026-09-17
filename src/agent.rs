@@ -79,7 +79,7 @@ pub async fn run(
                 None => break,
             },
         };
-        cancel.store(false, Ordering::Relaxed);
+        // `Session::submit` clears `cancel` before sending, so an early interrupt holds.
         history.push(json!({
             "type": "message",
             "role": "user",

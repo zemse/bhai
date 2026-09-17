@@ -141,6 +141,9 @@ impl Session {
         if inner.working {
             return Err(SubmitError::Busy);
         }
+        // Cleared here, not when the agent picks the message up, so an interrupt that
+        // lands in between still stops the turn.
+        self.cancel.store(false, Ordering::Relaxed);
         self.tx_user
             .try_send(text.clone())
             .map_err(|_| SubmitError::Closed)?;
@@ -319,6 +322,16 @@ mod tests {
             }
         );
         assert!(session.state().pending.is_none());
+    }
+
+    #[test]
+    fn an_interrupt_before_the_agent_starts_survives() {
+        let (session, _rx) = session();
+        session.cancel.store(true, Ordering::Relaxed);
+        session.submit("hi".to_string()).unwrap();
+        assert!(!session.cancel.load(Ordering::Relaxed));
+        assert!(session.interrupt());
+        assert!(session.cancel.load(Ordering::Relaxed));
     }
 
     #[test]
