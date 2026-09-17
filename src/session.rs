@@ -12,6 +12,7 @@ use crate::agent::{AgentEvent, Control};
 use crate::cache::{CacheBreak, Hit};
 use crate::client::Usage;
 use crate::entries::Entries;
+use crate::limits::RateLimits;
 use crate::permissions::{Answer, Mode, Offers, Policy, Remember};
 use crate::profile::{CallTokens, EntryTokens, Profile};
 
@@ -56,6 +57,8 @@ pub enum Event {
     Cache(Option<CacheBreak>),
     /// How well the cache served a judged call.
     CacheHit(Hit),
+    /// The latest rate-limit headroom.
+    RateLimits(RateLimits),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
     /// History was compacted; earlier history indexes no longer hold.
@@ -97,6 +100,8 @@ pub struct State {
     pub children: Usage,
     /// The most recent prompt cache break, if there has been one.
     pub last_cache_break: Option<CacheBreak>,
+    /// The latest rate-limit headroom, once the backend has reported it.
+    pub rate_limits: Option<RateLimits>,
     pub pending: Option<Approval>,
     /// Transcript entries with token attribution, as the hover badges show them.
     pub entries: Vec<EntryTokens>,
@@ -126,6 +131,7 @@ struct Inner {
     children: Usage,
     last_usage: Option<Usage>,
     last_cache_break: Option<CacheBreak>,
+    rate_limits: Option<RateLimits>,
     next_id: u64,
     pending: Option<(Approval, oneshot::Sender<Answer>)>,
 }
@@ -183,6 +189,7 @@ impl Session {
             last_usage: inner.last_usage,
             children: inner.children,
             last_cache_break: inner.last_cache_break.clone(),
+            rate_limits: inner.rate_limits,
             pending: inner.pending.as_ref().map(|(approval, _)| approval.clone()),
             entries: self.entries().attributed(),
         }
@@ -344,6 +351,10 @@ impl Session {
             }
             AgentEvent::Item(index) => Event::Item(index),
             AgentEvent::CacheHit(hit) => Event::CacheHit(hit),
+            AgentEvent::RateLimits(limits) => {
+                inner.rate_limits = Some(limits);
+                Event::RateLimits(limits)
+            }
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Compacted(s) => Event::Compacted(s),
             AgentEvent::Error(s) => Event::Error(s),

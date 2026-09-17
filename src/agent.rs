@@ -16,6 +16,7 @@ use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
 use crate::client::{Client, Delta, Usage};
 use crate::compact::{self, Limits};
 use crate::identity::Identity;
+use crate::limits::RateLimits;
 use crate::permissions::{Answer, Decision, Offers, Policy};
 use crate::profile::{self, Call, CallTokens, Profile};
 use crate::prompt::SystemPrompt;
@@ -62,6 +63,8 @@ pub enum AgentEvent {
     Cache(Option<CacheBreak>),
     /// How well the cache served a call that was judged; a child's only when it missed.
     CacheHit(Hit),
+    /// The latest rate-limit headroom; one account, so a child's counts too.
+    RateLimits(RateLimits),
     Error(String),
     /// The agent is done with this turn and is waiting for input.
     TurnEnd,
@@ -421,6 +424,7 @@ async fn turn(
                     monitor.sent(found.as_ref(), Instant::now());
                     AgentEvent::Cache(found)
                 }
+                Delta::RateLimits(limits) => AgentEvent::RateLimits(limits),
             });
         };
 
@@ -564,10 +568,14 @@ impl Compaction<'_> {
         let mut input = history.to_vec();
         input.push(compact::request());
         let tx = self.tx;
-        let mut on_delta = |delta: Delta| {
-            if let Delta::Usage(usage) = delta {
+        let mut on_delta = |delta: Delta| match delta {
+            Delta::Usage(usage) => {
                 let _ = tx.send(AgentEvent::Usage(usage));
             }
+            Delta::RateLimits(limits) => {
+                let _ = tx.send(AgentEvent::RateLimits(limits));
+            }
+            _ => {}
         };
         let items = self
             .model
@@ -756,7 +764,9 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     failure = Some(s.clone());
                     AgentEvent::Error(format!("{tag} {s}"))
                 }
-                other @ (AgentEvent::ChildUsage(_) | AgentEvent::CacheHit(_)) => other,
+                other @ (AgentEvent::ChildUsage(_)
+                | AgentEvent::CacheHit(_)
+                | AgentEvent::RateLimits(_)) => other,
             };
             let _ = child.tx.send(event);
         }

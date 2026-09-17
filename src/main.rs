@@ -14,6 +14,7 @@ mod frontmatter;
 mod identity;
 mod input;
 mod instructions;
+mod limits;
 mod markdown;
 mod mcp;
 mod permissions;
@@ -131,7 +132,10 @@ async fn main() -> Result<()> {
     if let Some(loaded) = &resumed {
         client = client.with_session(&loaded.header.session);
     }
-    let client = client.strict_cache(args.strict_cache);
+    let client = client.strict_cache(args.strict_cache).log_headers(
+        args.profile
+            .then(|| profile::debug_dir().join("headers.jsonl")),
+    );
     let saved = match resumed {
         Some(loaded) => {
             let header = &loaded.header;
@@ -531,6 +535,11 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
             AgentEvent::CacheHit(hit) => {
                 if let (Some(expected), Some(ratio)) = (hit.expected_cached, hit.hit_ratio) {
                     println!("[cache] expected={expected} hit={:.0}%", ratio * 100.0);
+                }
+            }
+            AgentEvent::RateLimits(limits) => {
+                for w in limits.windows() {
+                    println!("[rate limit] {} {:.0}%", w.label(), w.used_percent);
                 }
             }
             AgentEvent::Error(message) => println!("\n[error] {message}"),

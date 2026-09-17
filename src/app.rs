@@ -17,6 +17,7 @@ use crate::diff::DiffView;
 use crate::entries::Entries;
 pub use crate::entries::Entry;
 use crate::input::{Editor, History};
+use crate::limits::RateLimits;
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
 use crate::session::{Approval, Event, Session};
@@ -65,6 +66,11 @@ pub struct App {
     pub cache_break: Option<String>,
     /// The hit percent of the last judged call, when it missed.
     pub cache_miss: Option<f64>,
+    pub rate_limits: Option<RateLimits>,
+    /// The rate-limit segment of the status bar, filled in by the renderer.
+    pub limits_area: Option<Rect>,
+    /// The mouse is over the rate-limit segment, so it shows reset times.
+    pub limits_hover: bool,
     /// The skills in the system prompt, for `/skills`.
     pub skills: Vec<Skill>,
     /// The session's MCP servers, for `/mcp`.
@@ -109,6 +115,9 @@ impl App {
             last_usage: None,
             cache_break: None,
             cache_miss: None,
+            rate_limits: None,
+            limits_area: None,
+            limits_hover: false,
             skills: Vec::new(),
             mcp: None,
             diff: None,
@@ -211,7 +220,10 @@ impl App {
             MouseEventKind::ScrollDown => self.scroll_by(WHEEL_LINES as isize),
             MouseEventKind::Moved => {
                 self.mouse_row = Some(mouse.row);
-                return self.rehover();
+                let at = Position::new(mouse.column, mouse.row);
+                let over = self.limits_area.is_some_and(|area| area.contains(at));
+                let changed = std::mem::replace(&mut self.limits_hover, over) != over;
+                return self.rehover() | changed;
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_row = Some(mouse.row);
@@ -333,6 +345,7 @@ impl App {
                     .filter(|_| hit.miss())
                     .map(|ratio| ratio * 100.0);
             }
+            Event::RateLimits(limits) => self.rate_limits = Some(limits),
             Event::Mode(mode) => self.mode = mode,
             Event::TurnEnd => self.working = false,
             _ => {}

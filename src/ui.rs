@@ -10,6 +10,7 @@ use std::ops::Range;
 
 use crate::app::{App, Entry};
 use crate::client::Usage;
+use crate::limits::{self, RateLimits};
 use crate::markdown;
 use crate::permissions::Mode;
 use crate::profile::{Method, Tokens};
@@ -71,7 +72,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
     let dim = Style::new().fg(Color::DarkGray);
     let mut spans = vec![
         Span::styled(" bhai ", Style::new().fg(Color::Black).bg(Color::Cyan)),
@@ -112,6 +113,13 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Yellow).bold(),
         ));
     }
+    app.limits_area = app.rate_limits.map(|found| {
+        let x = area.x + spans.iter().map(Span::width).sum::<usize>() as u16;
+        let segment = limit_spans(&found, app.limits_hover);
+        let width = segment.iter().map(Span::width).sum::<usize>() as u16;
+        spans.extend(segment);
+        Rect::new(x, area.y, width, 1).intersection(area)
+    });
     spans.push(Span::styled(
         if app.pending.is_some() {
             "  y yes · n no · or click a choice"
@@ -123,6 +131,32 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         dim,
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// `5h 42% · wk 17% `, each window coloured by how close it is to its limit; with
+/// reset times when `hover`.
+fn limit_spans(found: &RateLimits, hover: bool) -> Vec<Span<'static>> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let now = chrono::Local::now();
+    let mut spans = Vec::new();
+    for (i, window) in found.windows().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("· ", dim));
+        }
+        let style = if window.used_percent >= limits::ALERT {
+            Style::new().fg(Color::Red).bold()
+        } else if window.used_percent >= limits::WARN {
+            Style::new().fg(Color::Yellow)
+        } else {
+            dim
+        };
+        let mut text = format!("{} {:.0}% ", window.label(), window.used_percent);
+        if let Some(at) = window.reset_label(now).filter(|_| hover) {
+            text.push_str(&format!("resets {at} "));
+        }
+        spans.push(Span::styled(text, style));
+    }
+    spans
 }
 
 fn compact(n: u64) -> String {
@@ -841,5 +875,74 @@ mod tests {
     #[test]
     fn wrap_handles_multibyte_text() {
         assert_eq!(wrap("héllo wörld", 5), vec!["héllo", "wörld"]);
+    }
+
+    fn window(used_percent: f64, window_minutes: u64) -> limits::Window {
+        limits::Window {
+            used_percent,
+            window_minutes: Some(window_minutes),
+            resets_at: Some(chrono::Local::now().timestamp() + 60),
+        }
+    }
+
+    /// The status bar cell under the first character of `text`.
+    fn status_cell<'a>(
+        terminal: &'a Terminal<TestBackend>,
+        text: &str,
+    ) -> &'a ratatui::buffer::Cell {
+        let row = screen(terminal).lines().next().unwrap().to_string();
+        let x = row[..row.find(text).unwrap()].chars().count() as u16;
+        &terminal.backend().buffer()[(x, 0)]
+    }
+
+    #[test]
+    fn status_bar_shows_rate_limits_coloured_by_headroom() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.limits_area.is_none());
+
+        let cases = [
+            (42.0, Color::DarkGray),
+            (75.0, Color::Yellow),
+            (90.0, Color::Red),
+        ];
+        for (used, colour) in cases {
+            app.on_event(Event::RateLimits(RateLimits {
+                primary: Some(window(used, 300)),
+                secondary: Some(window(17.0, 10080)),
+            }));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let top = screen(&terminal);
+            let expected = format!("5h {used:.0}% · wk 17% ");
+            assert!(top.lines().next().unwrap().contains(&expected), "{top}");
+            assert_eq!(status_cell(&terminal, "5h ").fg, colour);
+            assert_eq!(status_cell(&terminal, "wk ").fg, Color::DarkGray);
+        }
+    }
+
+    #[test]
+    fn hovering_the_rate_limits_shows_reset_times() {
+        let mut app = App::detached();
+        app.on_event(Event::RateLimits(RateLimits {
+            primary: Some(window(10.0, 300)),
+            secondary: None,
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("resets"));
+
+        let area = app.limits_area.unwrap();
+        assert!(app.on_mouse(left(MouseEventKind::Moved, area.x + 1, 0)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let top = screen(&terminal);
+        assert!(
+            top.lines().next().unwrap().contains("5h 10% resets "),
+            "{top}"
+        );
+
+        assert!(app.on_mouse(left(MouseEventKind::Moved, 0, 0)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("resets"));
     }
 }

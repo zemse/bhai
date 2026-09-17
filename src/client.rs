@@ -4,6 +4,7 @@
 //! and `codex-rs/model-provider-info`): `POST https://chatgpt.com/backend-api/codex/responses`
 //! with the ChatGPT access token as a bearer and the workspace id in `ChatGPT-Account-ID`.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +16,7 @@ use serde_json::{Value, json};
 
 use crate::auth::{self, Auth};
 use crate::cache::{CacheBreak, CacheGuard};
+use crate::limits::{self, RateLimits};
 
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const ORIGINATOR: &str = "codex_cli_rs";
@@ -32,6 +34,8 @@ pub enum Delta {
     Usage(Usage),
     /// The request about to be sent breaks the prompt cache, or `None` when it is clean.
     Cache(Option<CacheBreak>),
+    /// Rate-limit headroom from the response headers or a stream event.
+    RateLimits(RateLimits),
 }
 
 /// Token counts for one model call, as `response.completed` reports them.
@@ -78,6 +82,8 @@ pub struct Client {
     effort: String,
     /// The conversation's cache guard; shared by clones, fresh for each child.
     guard: Arc<Mutex<CacheGuard>>,
+    /// `--profile`: where the rate-limit response headers are logged.
+    header_log: Option<PathBuf>,
 }
 
 impl Client {
@@ -95,12 +101,19 @@ impl Client {
             session_id,
             model,
             effort,
+            header_log: None,
         })
     }
 
     /// `--strict-cache`: refuse to send a request that breaks the prompt cache.
     pub fn strict_cache(mut self, strict: bool) -> Self {
         self.guard = guard(&self.session_id, strict);
+        self
+    }
+
+    /// Append the rate-limit response headers of every call to `path`.
+    pub fn log_headers(mut self, path: Option<PathBuf>) -> Self {
+        self.header_log = path;
         self
     }
 
@@ -232,6 +245,16 @@ impl Client {
             .await
             .map_err(|e| Error::Retryable(anyhow!("request failed: {e}")))?;
 
+        // A debug aid only; a failed write must not fail the call or draw over the TUI.
+        if let Some(path) = &self.header_log {
+            let _ = limits::log_headers(path, resp.headers());
+        }
+        if let Some(found) =
+            RateLimits::from_headers(resp.headers(), chrono::Utc::now().timestamp())
+        {
+            on_delta(Delta::RateLimits(found));
+        }
+
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -310,6 +333,12 @@ impl Client {
                             items = output.clone();
                         }
                         on_delta(Delta::Usage(Usage::from_completed(&event)));
+                    }
+                    "codex.rate_limits" => {
+                        let now = chrono::Utc::now().timestamp();
+                        if let Some(found) = RateLimits::from_event(&event, now) {
+                            on_delta(Delta::RateLimits(found));
+                        }
                     }
                     "response.failed" => {
                         let msg = event
