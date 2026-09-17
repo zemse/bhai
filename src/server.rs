@@ -15,6 +15,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::permissions::Mode;
 use crate::session::{Session, SubmitError};
 
 /// Port `--serve` listens on when none is given.
@@ -37,6 +38,7 @@ fn router(session: Arc<Session>) -> Router {
         .route("/approve", post(approve))
         .route("/reject", post(reject))
         .route("/interrupt", post(interrupt))
+        .route("/mode", post(mode))
         .route("/context", get(context))
         .layer(middleware::from_fn(local_only))
         .with_state(session)
@@ -63,6 +65,11 @@ async fn local_only(request: Request, next: Next) -> Response {
 #[derive(Deserialize)]
 struct Prompt {
     text: String,
+}
+
+#[derive(Deserialize)]
+struct ModeBody {
+    mode: Mode,
 }
 
 async fn state(State(session): State<Arc<Session>>) -> Response {
@@ -121,6 +128,11 @@ async fn interrupt(State(session): State<Arc<Session>>) -> Response {
     }
 }
 
+async fn mode(State(session): State<Arc<Session>>, Json(body): Json<ModeBody>) -> Response {
+    session.set_mode(body.mode);
+    Json(json!({ "ok": true, "mode": body.mode })).into_response()
+}
+
 async fn context(State(session): State<Arc<Session>>) -> Response {
     match session.context().await {
         Some(profile) => Json(profile).into_response(),
@@ -149,6 +161,7 @@ mod tests {
     use super::*;
     use crate::agent::{AgentEvent, Control};
     use crate::client::Usage;
+    use crate::permissions::Policy;
     use crate::prompt::SystemPrompt;
     use crate::{profile, session};
 
@@ -166,6 +179,7 @@ mod tests {
             tx_user,
             tx_control,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(Policy::default()),
         );
         tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
         tokio::spawn(async move {
@@ -319,6 +333,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rebound.status().as_u16(), 403);
+    }
+
+    #[tokio::test]
+    async fn mode_is_set_over_http() {
+        let (base, _) = start().await;
+        let http = reqwest::Client::new();
+        assert_eq!(
+            get_json(&http, format!("{base}/state")).await["mode"],
+            "ask"
+        );
+        assert_eq!(
+            post(&http, format!("{base}/mode"), json!({"mode": "bypass"})).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_json(&http, format!("{base}/state")).await["mode"],
+            "bypass"
+        );
+        assert!(
+            post(&http, format!("{base}/mode"), json!({"mode": "yolo"}))
+                .await
+                .is_client_error()
+        );
     }
 
     #[tokio::test]

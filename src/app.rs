@@ -10,6 +10,7 @@ use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::client::Usage;
+use crate::permissions::Mode;
 use crate::profile;
 use crate::session::{Approval, Event, Session};
 use crate::skills::Skill;
@@ -42,6 +43,7 @@ pub struct App {
     pub follow: bool,
     pub spinner: usize,
     pub model: String,
+    pub mode: Mode,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub last_usage: Option<Usage>,
@@ -67,6 +69,7 @@ impl App {
             follow: true,
             spinner: 0,
             model: session.state().model,
+            mode: session.state().mode,
             tokens_in: 0,
             tokens_out: 0,
             last_usage: None,
@@ -103,6 +106,7 @@ impl App {
             }
             KeyCode::Char('d') if ctrl && self.input.value().is_empty() => self.quit = true,
             KeyCode::Esc if self.working => self.interrupt(),
+            KeyCode::BackTab => self.mode = self.session.cycle_mode(),
             KeyCode::Enter => self.submit(),
             KeyCode::PageUp => self.scroll_by(-(self.page as isize)),
             KeyCode::PageDown => self.scroll_by(self.page as isize),
@@ -158,6 +162,7 @@ impl App {
                 self.last_usage = Some(usage);
             }
             Event::Info(message) => self.entries.push(Entry::Info(message)),
+            Event::Mode(mode) => self.mode = mode,
             Event::Error(message) => self.entries.push(Entry::Error(message)),
             Event::Interrupted => self.entries.push(Entry::Info("interrupted".to_string())),
             Event::TurnEnd => self.working = false,

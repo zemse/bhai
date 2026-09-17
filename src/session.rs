@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::agent::{AgentEvent, Control};
 use crate::client::Usage;
+use crate::permissions::{Mode, Policy};
 use crate::profile::Profile;
 
 /// Events a slow consumer can fall behind by before it starts missing them.
@@ -39,6 +40,8 @@ pub enum Event {
     Usage(Usage),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
+    /// The permission mode changed.
+    Mode(Mode),
     Error(String),
     Interrupted,
     TurnEnd,
@@ -56,6 +59,7 @@ pub struct Approval {
 #[derive(Debug, Clone, Serialize)]
 pub struct State {
     pub model: String,
+    pub mode: Mode,
     pub working: bool,
     pub input_tokens: u64,
     pub cached_tokens: u64,
@@ -98,6 +102,7 @@ pub struct Session {
     tx_user: mpsc::Sender<String>,
     tx_control: mpsc::Sender<Control>,
     cancel: Arc<AtomicBool>,
+    policy: Arc<Policy>,
 }
 
 impl Session {
@@ -106,6 +111,7 @@ impl Session {
         tx_user: mpsc::Sender<String>,
         tx_control: mpsc::Sender<Control>,
         cancel: Arc<AtomicBool>,
+        policy: Arc<Policy>,
     ) -> Arc<Self> {
         Arc::new(Self {
             model,
@@ -114,6 +120,7 @@ impl Session {
             tx_user,
             tx_control,
             cancel,
+            policy,
         })
     }
 
@@ -125,6 +132,7 @@ impl Session {
         let inner = self.lock();
         State {
             model: self.model.clone(),
+            mode: self.policy.mode(),
             working: inner.working,
             input_tokens: inner.total.input,
             cached_tokens: inner.total.cached,
@@ -180,6 +188,22 @@ impl Session {
         true
     }
 
+    /// Switch the permission mode. The prompt and tools stay as they are.
+    pub fn set_mode(&self, mode: Mode) {
+        let _inner = self.lock();
+        self.policy.set_mode(mode);
+        self.publish(Event::Mode(mode));
+    }
+
+    /// Move to the next permission mode and return it.
+    pub fn cycle_mode(&self) -> Mode {
+        let _inner = self.lock();
+        let mode = self.policy.mode().next();
+        self.policy.set_mode(mode);
+        self.publish(Event::Mode(mode));
+        mode
+    }
+
     /// Ask the agent for a token breakdown of its context; `None` if it has gone away.
     pub async fn context(&self) -> Option<Profile> {
         let (reply, wait) = oneshot::channel();
@@ -221,6 +245,7 @@ impl Session {
                 inner.last_usage = Some(usage);
                 Event::Usage(usage)
             }
+            AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnEnd => {
                 inner.working = false;
@@ -256,8 +281,9 @@ mod tests {
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, _) = mpsc::channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
+        let policy = Arc::new(Policy::default());
         (
-            Session::new("m".to_string(), tx_user, tx_control, cancel),
+            Session::new("m".to_string(), tx_user, tx_control, cancel, policy),
             rx_user,
         )
     }
@@ -343,6 +369,20 @@ mod tests {
         assert!(session.interrupt());
         assert!(session.cancel.load(Ordering::Relaxed));
         assert_eq!(wait.try_recv(), Ok(false));
+    }
+
+    #[test]
+    fn mode_changes_are_published_and_reported() {
+        let (session, _rx) = session();
+        let mut events = session.subscribe();
+        assert_eq!(session.state().mode, Mode::Ask);
+        assert_eq!(session.cycle_mode(), Mode::Auto);
+        assert_eq!(events.try_recv().unwrap(), Event::Mode(Mode::Auto));
+        session.set_mode(Mode::Ask);
+        assert_eq!(events.try_recv().unwrap(), Event::Mode(Mode::Ask));
+        assert_eq!(session.state().mode, Mode::Ask);
+        let json = serde_json::to_value(Event::Mode(Mode::Bypass)).unwrap();
+        assert_eq!(json, serde_json::json!({"type": "mode", "data": "bypass"}));
     }
 
     #[test]

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::client::{Client, Delta, Usage};
+use crate::permissions::{Decision, Policy};
 use crate::profile::{self, Measured, Profile};
 use crate::prompt::SystemPrompt;
 use crate::tools::{self, Registry};
@@ -33,6 +34,8 @@ pub enum AgentEvent {
     ToolStart(String),
     ToolOutput(String),
     ToolRejected(String),
+    /// A notice for the transcript, such as a call the policy allowed.
+    Info(String),
     /// Token counts for the model call that just finished.
     Usage(Usage),
     Error(String),
@@ -48,8 +51,10 @@ pub enum Control {
 }
 
 /// `usage_log` is the JSONL file each model call's usage is appended to, if any.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     prompt: SystemPrompt,
+    policy: Arc<Policy>,
     mut rx_user: mpsc::Receiver<String>,
     mut rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
@@ -92,6 +97,7 @@ pub async fn run(
             let turn = turn(
                 &client,
                 &registry,
+                &policy,
                 &tools,
                 &prompt.text,
                 &mut history,
@@ -126,6 +132,7 @@ pub async fn run(
 async fn turn(
     client: &Client,
     registry: &Registry,
+    policy: &Policy,
     tools: &[Value],
     instructions: &str,
     history: &mut Vec<Value>,
@@ -187,7 +194,7 @@ async fn turn(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let (output, ok) = execute(registry, call, tx, cancel).await;
+            let (output, ok) = execute(registry, policy, call, tx, cancel).await;
             all_failed &= !ok;
             results.push(json!({
                 "type": "function_call_output",
@@ -222,6 +229,7 @@ async fn turn(
 /// Returns the tool output and whether it counts as a success.
 async fn execute(
     registry: &Registry,
+    policy: &Policy,
     call: &Value,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     cancel: &Arc<AtomicBool>,
@@ -249,30 +257,29 @@ async fn execute(
         Err(e) => return (format!("Invalid tool call: {e}"), false),
     };
 
-    if tool.needs_approval() {
-        let (reply, wait) = oneshot::channel();
-        if tx
-            .send(AgentEvent::Approval {
-                tool: name.to_string(),
-                command: summary.clone(),
-                reply,
-            })
-            .is_err()
-        {
+    // The policy answers first; only `Ask` reaches the prompt.
+    match policy.check(name, &args, tool.needs_approval()) {
+        Decision::Allow(reason) => {
+            if tool.needs_approval() {
+                let _ = tx.send(AgentEvent::Info(format!(
+                    "auto-allowed: {summary} ({reason})"
+                )));
+            }
+        }
+        Decision::Deny(reason) => {
+            let _ = tx.send(AgentEvent::ToolRejected(format!("{summary} ({reason})")));
             return (
-                "Not executed: the session is shutting down.".to_string(),
+                format!(
+                    "Blocked by the user's permission settings ({reason}); it did not run. Do \
+not retry it. Try a different approach, or ask the user."
+                ),
                 false,
             );
         }
-
-        if !wait.await.unwrap_or(false) {
-            let _ = tx.send(AgentEvent::ToolRejected(summary));
-            return (
-                "The user rejected this call; it did not run. Do not retry it as-is. Ask what \
-they want instead, or try a different approach."
-                    .to_string(),
-                false,
-            );
+        Decision::Ask => {
+            if let Some(result) = ask(name, &summary, tx).await {
+                return result;
+            }
         }
     }
 
@@ -280,6 +287,39 @@ they want instead, or try a different approach."
     let (output, ok) = tool.execute(&args).await;
     let _ = tx.send(AgentEvent::ToolOutput(output.clone()));
     (output, ok)
+}
+
+/// Prompt the user for a call. `None` means approved; otherwise the result to return.
+async fn ask(
+    name: &str,
+    summary: &str,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) -> Option<(String, bool)> {
+    let (reply, wait) = oneshot::channel();
+    if tx
+        .send(AgentEvent::Approval {
+            tool: name.to_string(),
+            command: summary.to_string(),
+            reply,
+        })
+        .is_err()
+    {
+        return Some((
+            "Not executed: the session is shutting down.".to_string(),
+            false,
+        ));
+    }
+
+    if wait.await.unwrap_or(false) {
+        return None;
+    }
+    let _ = tx.send(AgentEvent::ToolRejected(summary.to_string()));
+    Some((
+        "The user rejected this call; it did not run. Do not retry it as-is. Ask what they \
+want instead, or try a different approach."
+            .to_string(),
+        false,
+    ))
 }
 
 #[cfg(test)]
@@ -294,6 +334,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         tokio::spawn(run(
             crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
             rx_user,
             rx_control,
             tx,

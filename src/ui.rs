@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::{App, Entry};
+use crate::permissions::Mode;
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
@@ -42,6 +43,14 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled(" bhai ", Style::new().fg(Color::Black).bg(Color::Cyan)),
         Span::styled(format!(" {} ", app.model), dim),
+        Span::styled(
+            format!("{} ", app.mode),
+            match app.mode {
+                Mode::Ask => dim,
+                Mode::Auto => Style::new().fg(Color::Yellow),
+                Mode::Bypass => Style::new().fg(Color::Red),
+            },
+        ),
     ];
     if app.working {
         spans.push(Span::styled(
@@ -64,7 +73,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         } else if app.working {
             "  ctrl+c interrupt"
         } else {
-            "  enter send · wheel/pgup scroll · ctrl+c quit"
+            "  enter send · shift+tab mode · wheel/pgup scroll · ctrl+c quit"
         },
         dim,
     ));

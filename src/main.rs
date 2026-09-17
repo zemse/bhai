@@ -7,6 +7,7 @@ mod auth;
 mod client;
 mod config;
 mod instructions;
+mod permissions;
 mod profile;
 mod prompt;
 mod server;
@@ -31,6 +32,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::agent::{AgentEvent, Control};
 use crate::app::App;
 use crate::config::{Config, Flags};
+use crate::permissions::Policy;
 use crate::prompt::SystemPrompt;
 use crate::session::Session;
 
@@ -58,19 +60,19 @@ async fn main() -> Result<()> {
     // auth and the wire format still work without entering the TUI.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "--probe") {
-        let prompt = load_prompt(Flags::default())?;
+        let (prompt, _) = load(Flags::default())?;
         return probe(prompt, args.get(1).cloned()).await;
     }
     let args = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [--probe [prompt]] [--serve [port] [--headless]] [--profile] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [--probe [prompt]] [--serve [port] [--headless]] [--profile] [--mode ask|auto|bypass] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
     };
-    let prompt = load_prompt(args.flags)?;
+    let (prompt, policy) = load(args.flags)?;
     let notices = prompt.notices();
     let skills = prompt.skills.clone();
 
@@ -82,7 +84,7 @@ async fn main() -> Result<()> {
     let usage_log = args
         .profile
         .then(|| profile::debug_dir().join("usage.jsonl"));
-    let (session, events) = start(model, prompt, usage_log);
+    let (session, events) = start(model, prompt, policy, usage_log);
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         for notice in &notices {
@@ -115,8 +117,9 @@ struct Args {
     flags: Flags,
 }
 
-/// Config and instruction files for the working directory, as the system prompt.
-fn load_prompt(flags: Flags) -> Result<SystemPrompt> {
+/// Config and instruction files for the working directory, as the system prompt and
+/// the permission policy.
+fn load(flags: Flags) -> Result<(SystemPrompt, Policy)> {
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
@@ -128,7 +131,13 @@ fn load_prompt(flags: Flags) -> Result<SystemPrompt> {
     let loaded = instructions::load(&config, &roots);
     let mut prompt = prompt::system_prompt(&loaded.files, skills);
     prompt.skipped = loaded.skipped;
-    Ok(prompt)
+    let policy = Policy::new(
+        config.permission_mode,
+        config.permissions,
+        roots.home,
+        roots.cwd,
+    );
+    Ok((prompt, policy))
 }
 
 fn parse_args(args: &[String]) -> Result<Args> {
@@ -147,6 +156,12 @@ fn parse_args(args: &[String]) -> Result<Args> {
             }
             "--headless" => parsed.headless = true,
             "--profile" => parsed.profile = true,
+            "--mode" => {
+                let mode = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--mode needs a value"))?;
+                parsed.flags.mode = Some(mode.parse().map_err(anyhow::Error::msg)?);
+            }
             "--no-global" => parsed.flags.no_global = true,
             "--no-project" => parsed.flags.no_project = true,
             "--bare" => parsed.flags.bare = true,
@@ -164,23 +179,32 @@ fn parse_args(args: &[String]) -> Result<Args> {
 fn start(
     model: String,
     prompt: SystemPrompt,
+    policy: Policy,
     usage_log: Option<PathBuf>,
 ) -> (Arc<Session>, broadcast::Receiver<session::Event>) {
     let (tx_user, rx_user) = mpsc::channel::<String>(16);
     let (tx_control, rx_control) = mpsc::channel::<Control>(16);
     let (tx_agent, rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
-    let session = Session::new(model, tx_user, tx_control, Arc::clone(&cancel));
+    let policy = Arc::new(policy);
+    let session = Session::new(
+        model,
+        tx_user,
+        tx_control,
+        Arc::clone(&cancel),
+        Arc::clone(&policy),
+    );
     let events = session.subscribe();
     tokio::spawn(agent::run(
-        prompt, rx_user, rx_control, tx_agent, cancel, usage_log,
+        prompt, policy, rx_user, rx_control, tx_agent, cancel, usage_log,
     ));
     tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
     (session, events)
 }
 
 /// Drive the real agent loop without the TUI, rejecting every command. Checks auth,
-/// the wire format and the tool-result replay path without executing anything.
+/// the wire format and the tool-result replay path without executing anything, so it
+/// runs in `ask` mode with no rules whatever the config says.
 async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
     let (tx_user, rx_user) = mpsc::channel::<String>(1);
     let (_tx_control, rx_control) = mpsc::channel::<Control>(1);
@@ -188,6 +212,7 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
     let cancel = Arc::new(AtomicBool::new(false));
     tokio::spawn(agent::run(
         system,
+        Arc::new(Policy::default()),
         rx_user,
         rx_control,
         tx_agent,
@@ -213,6 +238,7 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
             AgentEvent::ToolStart(command) => println!("\n$ {command}"),
             AgentEvent::ToolOutput(output) => println!("{output}"),
             AgentEvent::ToolRejected(command) => println!("[rejected] {command}"),
+            AgentEvent::Info(message) => println!("[info] {message}"),
             AgentEvent::Usage(u) => println!(
                 "\n[usage] input={} cached={} output={} reasoning={}",
                 u.input, u.cached, u.output, u.reasoning
@@ -332,6 +358,21 @@ mod tests {
         assert!(flags(&["--no-project"]).no_project);
         let bare = flags(&["--bare", "--profile"]);
         assert!(bare.bare && !bare.no_global);
+    }
+
+    #[test]
+    fn mode_flag() {
+        let mode = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse_args(&args).map(|a| a.flags.mode)
+        };
+        assert_eq!(mode(&[]).unwrap(), None);
+        assert_eq!(
+            mode(&["--mode", "auto"]).unwrap(),
+            Some(permissions::Mode::Auto)
+        );
+        assert!(mode(&["--mode"]).is_err());
+        assert!(mode(&["--mode", "yolo"]).is_err());
     }
 
     #[test]

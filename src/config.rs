@@ -1,12 +1,16 @@
 //! bhai's own switches: `~/.config/bhai/config.toml`, then `.bhai/config.toml` in the
-//! working directory on top, then command-line flags on top of both.
+//! working directory on top, then command-line flags on top of both. The project file
+//! may only tighten permissions: its `permission_mode` and `allow` rules are ignored, so
+//! a cloned repo cannot approve its own commands.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+use crate::permissions::{Mode, Rule, Rules};
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// `~/.claude/CLAUDE.md`.
     pub load_global_claude: bool,
@@ -16,6 +20,8 @@ pub struct Config {
     pub load_project_instructions: bool,
     pub skills: bool,
     pub mcp: bool,
+    pub permission_mode: Mode,
+    pub permissions: Rules,
 }
 
 impl Default for Config {
@@ -26,6 +32,8 @@ impl Default for Config {
             load_project_instructions: true,
             skills: true,
             mcp: false,
+            permission_mode: Mode::Ask,
+            permissions: Rules::default(),
         }
     }
 }
@@ -38,6 +46,20 @@ struct Layer {
     load_project_instructions: Option<bool>,
     skills: Option<bool>,
     mcp: Option<bool>,
+    permission_mode: Option<Mode>,
+    #[serde(default)]
+    permissions: RulesLayer,
+}
+
+/// `[permissions]`: rule lists add up across files.
+#[derive(Debug, Default, Deserialize)]
+struct RulesLayer {
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    ask: Vec<String>,
 }
 
 /// Command-line overrides.
@@ -47,6 +69,8 @@ pub struct Flags {
     pub no_project: bool,
     /// Everything off.
     pub bare: bool,
+    /// `--mode`.
+    pub mode: Option<Mode>,
 }
 
 impl Config {
@@ -54,13 +78,17 @@ impl Config {
     pub fn load(home: Option<&Path>, cwd: &Path) -> Result<Self> {
         let mut config = Self::default();
         if let Some(home) = home {
-            config.apply_file(&home.join(".config/bhai/config.toml"))?;
+            config.apply_file(&home.join(".config/bhai/config.toml"), true)?;
         }
-        config.apply_file(&cwd.join(".bhai/config.toml"))?;
+        config.apply_file(&cwd.join(".bhai/config.toml"), false)?;
         Ok(config)
     }
 
+    /// `--bare` turns off everything that adds context; permissions stay as configured.
     pub fn with_flags(mut self, flags: Flags) -> Self {
+        if let Some(mode) = flags.mode {
+            self.permission_mode = mode;
+        }
         if flags.bare {
             return Self {
                 load_global_claude: false,
@@ -68,6 +96,7 @@ impl Config {
                 load_project_instructions: false,
                 skills: false,
                 mcp: false,
+                ..self
             };
         }
         if flags.no_global {
@@ -80,13 +109,34 @@ impl Config {
         self
     }
 
-    /// A missing file changes nothing; a malformed one is an error.
-    fn apply_file(&mut self, path: &Path) -> Result<()> {
+    /// A missing file changes nothing; a malformed one is an error. Only a `trusted`
+    /// file may set the mode or add allow rules.
+    fn apply_file(&mut self, path: &Path, trusted: bool) -> Result<()> {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Ok(());
         };
         let layer: Layer =
             toml::from_str(&text).with_context(|| format!("bad config {}", path.display()))?;
+        let bad = |e| anyhow::anyhow!("bad config {}: {e}", path.display());
+        let parse = |rules: &[String]| {
+            rules
+                .iter()
+                .map(|r| Rule::parse(r))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(bad)
+        };
+        self.permissions
+            .deny
+            .extend(parse(&layer.permissions.deny)?);
+        self.permissions.ask.extend(parse(&layer.permissions.ask)?);
+        if trusted {
+            self.permissions
+                .allow
+                .extend(parse(&layer.permissions.allow)?);
+            if let Some(mode) = layer.permission_mode {
+                self.permission_mode = mode;
+            }
+        }
         self.apply(layer);
         Ok(())
     }
@@ -154,9 +204,44 @@ mod tests {
                 load_project_instructions: true,
                 skills: true,
                 mcp: true,
+                ..Config::default()
             }
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn permissions_add_up_and_the_project_can_only_tighten() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &home.join(".config/bhai/config.toml"),
+            "permission_mode = \"auto\"\n[permissions]\nallow = [\"Bash(ls)\"]\ndeny = [\"Read(a)\"]\n",
+        );
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "permission_mode = \"bypass\"\n[permissions]\nallow = [\"Bash\"]\ndeny = [\"Read(b)\"]\nask = [\"Edit\"]\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert_eq!(config.permission_mode, Mode::Auto);
+        let texts = |rules: &[Rule]| rules.iter().map(|r| r.text.clone()).collect::<Vec<_>>();
+        assert_eq!(texts(&config.permissions.allow), ["Bash(ls)"]);
+        assert_eq!(texts(&config.permissions.deny), ["Read(a)", "Read(b)"]);
+        assert_eq!(texts(&config.permissions.ask), ["Edit"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bad_rules_and_modes_are_errors() {
+        for text in [
+            "[permissions]\ndeny = [\"Bash(ls\"]\n",
+            "permission_mode = \"yolo\"\n",
+        ] {
+            let dir = temp_dir();
+            write(&dir.join(".bhai/config.toml"), text);
+            assert!(Config::load(None, &dir).is_err(), "{text}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
@@ -173,14 +258,14 @@ mod tests {
             mcp: true,
             ..Config::default()
         };
-        let no_global = base.with_flags(Flags {
+        let no_global = base.clone().with_flags(Flags {
             no_global: true,
             ..Flags::default()
         });
         assert!(!no_global.load_global_claude && !no_global.load_global_agents);
         assert!(no_global.load_project_instructions && no_global.mcp);
 
-        let no_project = base.with_flags(Flags {
+        let no_project = base.clone().with_flags(Flags {
             no_project: true,
             ..Flags::default()
         });
@@ -188,8 +273,10 @@ mod tests {
 
         let bare = base.with_flags(Flags {
             bare: true,
+            mode: Some(Mode::Auto),
             ..Flags::default()
         });
+        assert_eq!(bare.permission_mode, Mode::Auto);
         assert!(
             !bare.load_global_claude
                 && !bare.load_global_agents
