@@ -11,7 +11,7 @@ use tui_input::backend::crossterm::to_input_request;
 
 use crate::client::Usage;
 use crate::profile;
-use crate::session::{Event, Session};
+use crate::session::{Approval, Event, Session};
 
 /// Lines a mouse wheel notch moves the transcript.
 const WHEEL_LINES: usize = 3;
@@ -32,8 +32,8 @@ pub struct App {
     pub entries: Vec<Entry>,
     pub input: Input,
     pub working: bool,
-    /// The command waiting for approval and its id in the session.
-    pub pending: Option<(String, u64)>,
+    /// The tool call waiting for approval.
+    pub pending: Option<Approval>,
     pub scroll: usize,
     pub max_scroll: usize,
     /// Transcript viewport height, filled in by the renderer so page keys match the view.
@@ -52,7 +52,7 @@ impl App {
     pub fn new(session: Arc<Session>) -> Self {
         Self {
             entries: vec![Entry::Info(
-                "bhai · one tool (bash), every command needs your approval. Type a task and hit enter."
+                "bhai · bash, read, write and edit; every change needs your approval. Type a task and hit enter."
                     .to_string(),
             )],
             input: Input::default(),
@@ -131,13 +131,11 @@ impl App {
             }
             Event::Text(delta) => self.append(delta, Stream::Assistant),
             Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
-            Event::Approval { id, command } => self.pending = Some((command, id)),
+            Event::Approval { id, tool, command } => {
+                self.pending = Some(Approval { id, tool, command });
+            }
             Event::Resolved { id, .. } => {
-                if self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|(_, pending)| *pending == id)
-                {
+                if self.pending.as_ref().is_some_and(|p| p.id == id) {
                     self.pending = None;
                 }
             }
@@ -200,8 +198,8 @@ impl App {
     }
 
     fn answer(&mut self, accept: bool) {
-        if let Some((_, id)) = self.pending.take() {
-            self.session.answer(accept, Some(id));
+        if let Some(pending) = self.pending.take() {
+            self.session.answer(accept, Some(pending.id));
         }
     }
 

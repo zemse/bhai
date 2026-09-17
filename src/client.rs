@@ -65,11 +65,6 @@ impl Usage {
     }
 }
 
-/// The tool schemas sent with every request.
-pub fn tools() -> Vec<Value> {
-    vec![crate::bash::tool_schema()]
-}
-
 pub struct Client {
     http: reqwest::Client,
     session_id: String,
@@ -101,6 +96,7 @@ impl Client {
     pub async fn respond(
         &self,
         instructions: &str,
+        tools: &[Value],
         input: &[Value],
         on_delta: &mut impl FnMut(Delta),
         cancel: &Arc<AtomicBool>,
@@ -109,7 +105,7 @@ impl Client {
             "model": self.model,
             "instructions": instructions,
             "input": input,
-            "tools": tools(),
+            "tools": tools,
             "tool_choice": "auto",
             "parallel_tool_calls": false,
             "reasoning": { "effort": self.effort, "summary": "auto" },

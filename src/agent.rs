@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::bash;
-use crate::client::{self, Client, Delta, Usage};
+use crate::client::{Client, Delta, Usage};
 use crate::profile::{self, Measured, Profile};
 use crate::prompt::SystemPrompt;
+use crate::tools::{self, Registry};
 
 /// Hard cap on model calls in a single turn, so a confused loop cannot run forever.
 const MAX_STEPS: usize = 40;
@@ -23,8 +23,10 @@ const MAX_ERROR_ROUNDS: usize = 3;
 pub enum AgentEvent {
     Reasoning(String),
     Text(String),
-    /// The agent wants to run a command; `reply` carries the user's decision back.
+    /// The agent wants to run a tool call; `reply` carries the user's decision back.
     Approval {
+        tool: String,
+        /// The command, or a one-line summary of the call.
         command: String,
         reply: oneshot::Sender<bool>,
     },
@@ -61,7 +63,8 @@ pub async fn run(
             return;
         }
     };
-    let tools = client::tools();
+    let registry = Registry::new();
+    let tools = registry.schemas();
     let mut history: Vec<Value> = Vec::new();
     let mut measured: Option<Measured> = None;
 
@@ -88,6 +91,8 @@ pub async fn run(
         let result = {
             let turn = turn(
                 &client,
+                &registry,
+                &tools,
                 &prompt.text,
                 &mut history,
                 &tx,
@@ -117,8 +122,11 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn turn(
     client: &Client,
+    registry: &Registry,
+    tools: &[Value],
     instructions: &str,
     history: &mut Vec<Value>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
@@ -152,7 +160,7 @@ async fn turn(
         // On interrupt or failure nothing is appended, so the history never holds a
         // function_call without its matching output.
         let items = match client
-            .respond(instructions, history, &mut on_delta, cancel)
+            .respond(instructions, tools, history, &mut on_delta, cancel)
             .await
         {
             Ok(items) => items,
@@ -179,7 +187,7 @@ async fn turn(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let (output, ok) = execute(call, tx, cancel).await;
+            let (output, ok) = execute(registry, call, tx, cancel).await;
             all_failed &= !ok;
             results.push(json!({
                 "type": "function_call_output",
@@ -213,6 +221,7 @@ async fn turn(
 
 /// Returns the tool output and whether it counts as a success.
 async fn execute(
+    registry: &Registry,
     call: &Value,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     cancel: &Arc<AtomicBool>,
@@ -225,53 +234,52 @@ async fn execute(
     }
 
     let name = call.get("name").and_then(Value::as_str).unwrap_or_default();
-    if name != bash::NAME {
-        return (
-            format!(
-                "Unknown tool `{name}`. The only available tool is `{}`.",
-                bash::NAME
-            ),
-            false,
-        );
-    }
+    let Some(tool) = registry.get(name) else {
+        return (registry.unknown(name), false);
+    };
 
     let arguments = call
         .get("arguments")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let command = match bash::parse_command(arguments) {
-        Ok(command) => command,
+    let (args, summary) = match tools::parse_arguments(arguments)
+        .and_then(|args| tool.describe(&args).map(|summary| (args, summary)))
+    {
+        Ok(parsed) => parsed,
         Err(e) => return (format!("Invalid tool call: {e}"), false),
     };
 
-    let (reply, wait) = oneshot::channel();
-    if tx
-        .send(AgentEvent::Approval {
-            command: command.clone(),
-            reply,
-        })
-        .is_err()
-    {
-        return (
-            "Not executed: the session is shutting down.".to_string(),
-            false,
-        );
-    }
+    if tool.needs_approval() {
+        let (reply, wait) = oneshot::channel();
+        if tx
+            .send(AgentEvent::Approval {
+                tool: name.to_string(),
+                command: summary.clone(),
+                reply,
+            })
+            .is_err()
+        {
+            return (
+                "Not executed: the session is shutting down.".to_string(),
+                false,
+            );
+        }
 
-    if !wait.await.unwrap_or(false) {
-        let _ = tx.send(AgentEvent::ToolRejected(command));
-        return (
-            "The user rejected this command; it did not run. Do not retry it as-is. Ask what \
+        if !wait.await.unwrap_or(false) {
+            let _ = tx.send(AgentEvent::ToolRejected(summary));
+            return (
+                "The user rejected this call; it did not run. Do not retry it as-is. Ask what \
 they want instead, or try a different approach."
-                .to_string(),
-            false,
-        );
+                    .to_string(),
+                false,
+            );
+        }
     }
 
-    let _ = tx.send(AgentEvent::ToolStart(command.clone()));
-    let output = bash::run(&command).await;
+    let _ = tx.send(AgentEvent::ToolStart(summary));
+    let (output, ok) = tool.execute(&args).await;
     let _ = tx.send(AgentEvent::ToolOutput(output.clone()));
-    (output, true)
+    (output, ok)
 }
 
 #[cfg(test)]
@@ -299,6 +307,7 @@ mod tests {
         let labels: Vec<_> = profile.items.iter().map(|i| i.label.as_str()).collect();
         assert!(labels.contains(&"system prompt"));
         assert!(labels.contains(&"tool: bash"));
+        assert!(labels.contains(&"tool: edit"));
         assert!(profile.calibration.is_none());
     }
 }

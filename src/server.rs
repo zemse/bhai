@@ -186,6 +186,7 @@ mod tests {
             let _ = tx_agent.send(AgentEvent::Text("hi".to_string()));
             let (reply, wait) = oneshot::channel();
             let _ = tx_agent.send(AgentEvent::Approval {
+                tool: "bash".to_string(),
                 command: "ls".to_string(),
                 reply,
             });
@@ -285,7 +286,7 @@ mod tests {
         for want in [
             r#"{"type":"user","data":"go"}"#,
             r#"{"type":"text","data":"hi"}"#,
-            r#"{"type":"approval","data":{"id":1,"command":"ls"}}"#,
+            r#"{"type":"approval","data":{"id":1,"tool":"bash","command":"ls"}}"#,
             r#"{"type":"resolved","data":{"id":1,"accepted":true}}"#,
         ] {
             assert!(body.contains(want), "missing {want} in {body}");

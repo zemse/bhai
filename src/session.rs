@@ -25,6 +25,7 @@ pub enum Event {
     Text(String),
     Approval {
         id: u64,
+        tool: String,
         command: String,
     },
     /// A pending approval was answered, by whichever consumer got there first.
@@ -43,10 +44,11 @@ pub enum Event {
     TurnEnd,
 }
 
-/// A command waiting for approval.
+/// A tool call waiting for approval.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Approval {
     pub id: u64,
+    pub tool: String,
     pub command: String,
 }
 
@@ -187,15 +189,21 @@ impl Session {
         let event = match event {
             AgentEvent::Reasoning(s) => Event::Reasoning(s),
             AgentEvent::Text(s) => Event::Text(s),
-            AgentEvent::Approval { command, reply } => {
+            AgentEvent::Approval {
+                tool,
+                command,
+                reply,
+            } => {
                 inner.next_id += 1;
                 let approval = Approval {
                     id: inner.next_id,
+                    tool: tool.clone(),
                     command: command.clone(),
                 };
                 inner.pending = Some((approval, reply));
                 Event::Approval {
                     id: inner.next_id,
+                    tool,
                     command,
                 }
             }
@@ -254,6 +262,7 @@ mod tests {
     fn approval(session: &Session) -> oneshot::Receiver<bool> {
         let (reply, wait) = oneshot::channel();
         session.on_agent(AgentEvent::Approval {
+            tool: "bash".to_string(),
             command: "ls".to_string(),
             reply,
         });
@@ -293,6 +302,7 @@ mod tests {
             events.try_recv().unwrap(),
             Event::Approval {
                 id: 1,
+                tool: "bash".to_string(),
                 command: "ls".to_string()
             }
         );

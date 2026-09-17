@@ -14,9 +14,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let approval_height = app
         .pending
         .as_ref()
-        .map(|(command, _)| {
+        .map(|pending| {
             let width = frame.area().width.saturating_sub(4).max(10) as usize;
-            let lines = wrap(command, width).len() as u16;
+            let lines = wrap(&pending.command, width).len() as u16;
             (lines + 4).min(frame.area().height / 2).max(5)
         })
         .unwrap_or(3);
@@ -156,16 +156,21 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
-    let Some((command, _)) = &app.pending else {
+    let Some(pending) = &app.pending else {
         return;
     };
+    let title = if pending.tool == "bash" {
+        " run this command? ".to_string()
+    } else {
+        format!(" allow {}? ", pending.tool)
+    };
     let block = Block::bordered()
-        .title(" run this command? ")
+        .title(title)
         .border_style(Style::new().fg(Color::Yellow));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines: Vec<Line> = wrap(command, inner.width.max(4) as usize)
+    let mut lines: Vec<Line> = wrap(&pending.command, inner.width.max(4) as usize)
         .into_iter()
         .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Yellow))))
         .collect();

@@ -1,4 +1,4 @@
-//! The only tool: run a shell command, after the user approves it.
+//! Run a shell command, after the user approves it.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -6,13 +6,42 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
+use super::{BoxFuture, Tool, string_arg, truncate};
+
 pub const NAME: &str = "bash";
 
 const TIMEOUT: Duration = Duration::from_secs(120);
-/// Tool output past this is trimmed in the middle; the tail usually carries the error.
-const MAX_OUTPUT: usize = 20_000;
 
-pub fn tool_schema() -> Value {
+pub struct Bash;
+
+impl Tool for Bash {
+    fn name(&self) -> &str {
+        NAME
+    }
+
+    fn schema(&self) -> Value {
+        tool_schema()
+    }
+
+    fn needs_approval(&self) -> bool {
+        true
+    }
+
+    fn describe(&self, args: &Value) -> Result<String, String> {
+        parse_command(args)
+    }
+
+    fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
+        Box::pin(async move {
+            match parse_command(args) {
+                Ok(command) => (run(&command).await, true),
+                Err(e) => (e, false),
+            }
+        })
+    }
+}
+
+fn tool_schema() -> Value {
     json!({
         "type": "function",
         "name": NAME,
@@ -35,19 +64,15 @@ pub fn tool_schema() -> Value {
     })
 }
 
-/// Pull the command out of a `function_call`'s JSON-string arguments.
-pub fn parse_command(arguments: &str) -> Result<String, String> {
-    let parsed: Value = serde_json::from_str(arguments)
-        .map_err(|e| format!("arguments were not valid JSON: {e}. Send a JSON object."))?;
-    parsed
-        .get("command")
-        .and_then(Value::as_str)
+/// Pull the command out of a call's arguments.
+fn parse_command(args: &Value) -> Result<String, String> {
+    string_arg(args, "command")
         .filter(|c| !c.trim().is_empty())
         .map(str::to_string)
         .ok_or_else(|| "missing required string field `command`.".to_string())
 }
 
-pub async fn run(command: &str) -> String {
+async fn run(command: &str) -> String {
     let child = Command::new("bash")
         .arg("-lc")
         .arg(command)
@@ -88,57 +113,21 @@ to the background and poll for the result.",
     format!("exit code: {code}\n{}", truncate(&body))
 }
 
-fn truncate(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT {
-        return s.to_string();
-    }
-    let head = floor_boundary(s, MAX_OUTPUT / 2);
-    let tail = ceil_boundary(s, s.len() - MAX_OUTPUT / 2);
-    format!(
-        "{}\n\n[... {} bytes trimmed ...]\n\n{}",
-        &s[..head],
-        tail - head,
-        &s[tail..]
-    )
-}
-
-fn floor_boundary(s: &str, mut i: usize) -> usize {
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-fn ceil_boundary(s: &str, mut i: usize) -> usize {
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_a_well_formed_call() {
-        assert_eq!(parse_command(r#"{"command":"ls -la"}"#).unwrap(), "ls -la");
+        let args = json!({"command": "ls -la"});
+        assert_eq!(parse_command(&args).unwrap(), "ls -la");
     }
 
     #[test]
     fn rejects_a_missing_or_empty_command() {
-        assert!(parse_command("{}").is_err());
-        assert!(parse_command(r#"{"command":"  "}"#).is_err());
-        assert!(parse_command("not json").is_err());
-    }
-
-    #[test]
-    fn truncate_keeps_both_ends_and_stays_valid_utf8() {
-        let long = "é".repeat(MAX_OUTPUT);
-        let out = truncate(&long);
-        assert!(out.len() < long.len());
-        assert!(out.contains("bytes trimmed"));
-        assert!(out.starts_with('é') && out.ends_with('é'));
+        assert!(parse_command(&json!({})).is_err());
+        assert!(parse_command(&json!({"command": "  "})).is_err());
+        assert!(parse_command(&json!({"command": 1})).is_err());
     }
 
     #[tokio::test]

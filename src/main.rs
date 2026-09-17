@@ -1,10 +1,9 @@
-//! bhai: a very small coding agent. One tool (bash), one loop, one approval prompt.
+//! bhai: a very small coding agent. A few tools, one loop, one approval prompt.
 //! Inference runs through the Codex CLI's ChatGPT-subscription credentials.
 
 mod agent;
 mod app;
 mod auth;
-mod bash;
 mod client;
 mod config;
 mod instructions;
@@ -12,6 +11,7 @@ mod profile;
 mod prompt;
 mod server;
 mod session;
+mod tools;
 mod ui;
 
 use std::path::PathBuf;
@@ -196,7 +196,7 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             AgentEvent::Reasoning(_) => {}
-            AgentEvent::Approval { command, reply } => {
+            AgentEvent::Approval { command, reply, .. } => {
                 println!("\n[would run] {command}\n[probe rejects it]");
                 let _ = reply.send(false);
             }
