@@ -181,11 +181,15 @@ impl Policy {
     }
 
     pub fn with_trust(self, trust: Trust) -> Self {
-        Self {
-            trusted: AtomicBool::new(trust.is_trusted()),
+        let trusted = trust.is_trusted();
+        let policy = Self {
             trust: Some(trust),
             ..self
+        };
+        if trusted {
+            policy.set_trusted();
         }
+        policy
     }
 
     pub fn mode(&self) -> Mode {
@@ -275,7 +279,7 @@ impl Policy {
             settings::remember(store, text)?;
             if let Some(trust) = keep {
                 trust.trust()?;
-                self.trusted.store(true, Ordering::Relaxed);
+                self.set_trusted();
             }
         }
         Ok(self.store.as_deref())
@@ -285,7 +289,7 @@ impl Policy {
     pub fn trust(&self) -> anyhow::Result<String> {
         let trust = self.trust.as_ref().context("no trust store")?;
         trust.trust()?;
-        self.trusted.store(true, Ordering::Relaxed);
+        self.set_trusted();
         let rules = trust.allow_rules();
         let mut out = format!("trusted {} repo-supplied allow rules", rules.len());
         for (source, rule) in rules {
@@ -310,6 +314,21 @@ impl Policy {
         let count = trust.allow_rules().len();
         (count > 0 && !self.trusted())
             .then(|| format!("this repo ships {count} allow rules; /trust to honour them"))
+    }
+
+    /// Honour the repo-supplied allow rules, replacing the loaded ones with the files as
+    /// they are now, so the rules that apply are the ones trusted.
+    fn set_trusted(&self) {
+        let Some(trust) = &self.trust else { return };
+        let fresh = trust.load_allow();
+        let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
+        rules.allow.retain(|r| !r.repo);
+        let fresh: Vec<Rule> = fresh
+            .into_iter()
+            .filter(|f| !rules.allow.iter().any(|r| r.text == f.text))
+            .collect();
+        rules.allow.extend(fresh);
+        self.trusted.store(true, Ordering::Relaxed);
     }
 
     fn trusted(&self) -> bool {
@@ -998,6 +1017,44 @@ mod tests {
         reloaded.untrust().unwrap();
         policy.untrust().unwrap();
         assert_eq!(bash(&policy, "make all"), Decision::Ask);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn trusting_reloads_the_repo_allow_rules_from_disk() {
+        let dir = std::env::temp_dir().join(format!("bhai-policy-{}", uuid::Uuid::new_v4()));
+        let repo = dir.join("repo");
+        write_settings(
+            &repo.join(settings::LOCAL),
+            json!({"permissions": {"allow": ["Bash(make:*)"]}}),
+        );
+        write_settings(
+            &repo.join(settings::CLAUDE_LOCAL),
+            json!({"permissions": {"allow": ["Bash(npm test)"]}}),
+        );
+        let policy = repo_policy(&dir, &repo);
+        policy.set_mode(Mode::Auto);
+        write_settings(
+            &repo.join(settings::LOCAL),
+            json!({"permissions": {"allow": ["Bash(cargo fmt)"]}}),
+        );
+        write_settings(&repo.join(settings::CLAUDE_LOCAL), json!({}));
+
+        let trusted = policy.trust().unwrap();
+        assert!(trusted.starts_with("trusted 1 "), "{trusted}");
+        assert_eq!(bash(&policy, "make all"), Decision::Ask);
+        assert_eq!(bash(&policy, "npm test"), Decision::Ask);
+        assert_eq!(bash(&policy, "cargo fmt"), allowed("rule Bash(cargo fmt)"));
+        let described = policy.describe();
+        assert!(!described.contains("Bash(make:*)"), "{described}");
+
+        // Auto-trust on remember reloads too: the old rule does not come back.
+        policy.untrust().unwrap();
+        let fresh = repo_policy(&dir, &repo);
+        write_settings(&repo.join(settings::LOCAL), json!({}));
+        fresh.remember("Bash(ls)").unwrap();
+        assert!(fresh.trusted());
+        assert_eq!(bash(&fresh, "cargo fmt"), Decision::Ask);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

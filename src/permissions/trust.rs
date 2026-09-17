@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-use super::settings;
+use super::{Rule, settings};
 
 /// The trust store, under bhai's config directory.
 const FILE: &str = "trust.json";
@@ -22,6 +22,8 @@ pub struct Trust {
     cwd: PathBuf,
     /// The canonical project root, as the store keys it.
     root: String,
+    /// Whether rules from `.claude/settings.local.json` are imported.
+    claude: bool,
 }
 
 impl Trust {
@@ -31,7 +33,12 @@ impl Trust {
             store: config_dir.join(FILE),
             cwd: cwd.to_path_buf(),
             root: root.display().to_string(),
+            claude: true,
         }
+    }
+
+    pub fn with_claude(self, claude: bool) -> Self {
+        Self { claude, ..self }
     }
 
     /// Whether the stored hash matches the files as they are now.
@@ -57,14 +64,31 @@ impl Trust {
 
     /// Each allow rule the files hold, with the file it is in.
     pub fn allow_rules(&self) -> Vec<(&'static str, String)> {
-        SOURCES
-            .into_iter()
+        self.sources()
             .flat_map(|source| {
                 settings::allow_texts(&self.cwd.join(source))
                     .into_iter()
                     .map(move |rule| (source, rule))
             })
             .collect()
+    }
+
+    /// The allow rules the files hold now, parsed as startup loads them.
+    pub fn load_allow(&self) -> Vec<Rule> {
+        let mut rules = settings::load_local(&self.cwd.join(settings::LOCAL)).0;
+        if self.claude {
+            let (claude, _) = settings::claude(None, &self.cwd);
+            rules.extend(claude.allow.into_iter().filter(|r| r.repo));
+        }
+        rules
+    }
+
+    /// The files whose allow rules are imported.
+    fn sources(&self) -> impl Iterator<Item = &'static str> {
+        let claude = self.claude;
+        SOURCES
+            .into_iter()
+            .filter(move |&source| claude || source != settings::CLAUDE_LOCAL)
     }
 
     /// sha256 of the files, each prefixed with its length; a missing file is empty.
