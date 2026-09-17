@@ -10,6 +10,7 @@ mod compact;
 mod config;
 mod frontmatter;
 mod identity;
+mod input;
 mod instructions;
 mod mcp;
 mod permissions;
@@ -30,9 +31,11 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyEvent, MouseEvent,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TermEvent, KeyEvent, KeyboardEnhancementFlags, MouseEvent,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use ratatui::crossterm::execute;
+use ratatui::crossterm::{execute, terminal};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 
@@ -50,6 +53,7 @@ const TICK: Duration = Duration::from_millis(120);
 enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Paste(String),
     Session(session::Event),
     Tick,
 }
@@ -208,6 +212,17 @@ async fn main() -> Result<()> {
     // Mouse capture is what turns the wheel into scroll events. It also takes over
     // click-drag, so terminals need shift (or option) held to select text while bhai runs.
     let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
+    let paste = execute!(std::io::stdout(), EnableBracketedPaste).is_ok();
+    // Disambiguated keys are how a terminal reports shift+enter; not all of them can.
+    let keyboard = terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
+    let prompts = input::History::load(
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/bhai/history.jsonl")),
+    );
     let result = run(
         terminal,
         session,
@@ -217,8 +232,15 @@ async fn main() -> Result<()> {
         skills,
         hub.clone(),
         &history,
+        prompts,
     )
     .await;
+    if keyboard {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    if paste {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    }
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -633,6 +655,7 @@ async fn run(
     skills: Vec<skills::Skill>,
     hub: Option<Arc<mcp::Hub>>,
     history: &[serde_json::Value],
+    prompts: input::History,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -644,6 +667,7 @@ async fn run(
                 Ok(true) => match event::read() {
                     Ok(TermEvent::Key(key)) => Event::Key(key),
                     Ok(TermEvent::Mouse(mouse)) => Event::Mouse(mouse),
+                    Ok(TermEvent::Paste(text)) => Event::Paste(text),
                     Ok(_) => Event::Tick,
                     Err(_) => break,
                 },
@@ -673,6 +697,7 @@ async fn run(
     let mut app = App::new(Arc::clone(&session));
     app.skills = skills;
     app.mcp = hub;
+    app.history = prompts;
     app.restore(history);
     app.entries
         .extend(notices.into_iter().map(app::Entry::Info));
@@ -697,6 +722,10 @@ async fn run(
                 true
             }
             Event::Mouse(mouse) => app.on_mouse(mouse),
+            Event::Paste(text) => {
+                app.on_paste(&text);
+                true
+            }
             Event::Session(event) => {
                 app.on_event(event);
                 true

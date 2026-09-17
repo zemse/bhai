@@ -16,6 +16,9 @@ use crate::profile::{Method, Tokens};
 /// Rows a tool output shows until it is clicked open.
 const COLLAPSED_LINES: usize = 3;
 
+/// Lines the input grows to before it scrolls.
+const MAX_INPUT_LINES: usize = 8;
+
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -31,7 +34,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 .count() as u16;
             (lines + offers + 4).min(frame.area().height / 2).max(5)
         })
-        .unwrap_or(3);
+        .unwrap_or_else(|| app.input.value().split('\n').count().min(MAX_INPUT_LINES) as u16 + 2);
 
     let [status_area, transcript_area, bottom_area] = Layout::vertical([
         Constraint::Length(1),
@@ -291,19 +294,20 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
         marker_area,
     );
 
-    // tui-input tracks the cursor; the widget only has to scroll the value to follow it.
-    // One column is reserved so the cursor itself is never off-screen.
+    // The widget scrolls the text so the cursor stays in view. One column is reserved
+    // so the cursor itself is never off-screen.
     let width = text_area.width.saturating_sub(1) as usize;
-    let scroll = app.input.visual_scroll(width);
-    app.input_area = Some((text_area, scroll));
+    let top = app.input.top(text_area.height.max(1) as usize);
+    let (row, column) = app.input.cursor_position();
+    let scroll = column.max(width) - width;
+    app.input_area = Some((text_area, top, scroll));
     frame.render_widget(
-        Paragraph::new(app.input.value()).scroll((0, scroll as u16)),
+        Paragraph::new(app.input.value()).scroll((top as u16, scroll as u16)),
         text_area,
     );
-    let cursor_x = app.input.visual_cursor().max(scroll) - scroll;
     frame.set_cursor_position((
-        (text_area.x + cursor_x as u16).min(text_area.right().saturating_sub(1)),
-        text_area.y,
+        (text_area.x + (column - scroll) as u16).min(text_area.right().saturating_sub(1)),
+        text_area.y + (row - top) as u16,
     ));
 }
 
@@ -422,7 +426,6 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    use tui_input::Input;
 
     fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
         Usage {
@@ -683,18 +686,40 @@ mod tests {
         let mut app = App::detached();
         let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let (area, _) = app.input_area.unwrap();
+        let (area, ..) = app.input_area.unwrap();
         assert!(
             !app.on_mouse(down(area.x + 2, area.y)),
             "nothing to move through"
         );
 
-        app.input = Input::new("héllo world".to_string());
+        app.input.set("héllo world".to_string());
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(app.on_mouse(down(area.x + 3, area.y)));
         assert_eq!(app.input.cursor(), 3);
         assert!(app.on_mouse(down(area.right() - 1, area.y)));
         assert_eq!(app.input.cursor(), 11);
+    }
+
+    #[test]
+    fn the_input_grows_with_its_lines_then_scrolls() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        app.input.set("one\ntwo".to_string());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (area, top, _) = app.input_area.unwrap();
+        assert_eq!((area.height, top), (2, 0));
+        assert!(screen(&terminal).contains("› one"));
+        assert!(app.on_mouse(down(area.x + 1, area.y + 1)));
+        assert_eq!(app.input.cursor(), 5);
+
+        let lines: Vec<String> = (0..12).map(|i| format!("line {i}")).collect();
+        app.input.set(lines.join("\n"));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (area, top, _) = app.input_area.unwrap();
+        assert_eq!((area.height, top), (MAX_INPUT_LINES as u16, 4));
+        let text = screen(&terminal);
+        assert!(text.contains("line 11") && !text.contains("line 3"));
+        assert_eq!(terminal.get_cursor_position().unwrap().y, area.bottom() - 1);
     }
 
     #[test]

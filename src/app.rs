@@ -10,11 +10,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tui_input::Input;
 use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::client::Usage;
+use crate::input::{Editor, History};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, CallTokens, EntryTokens, Tokens, Transcript};
 use crate::session::{Approval, Event, Session};
@@ -68,14 +68,16 @@ pub struct App {
     pub all_badges: bool,
     /// Clickable approval choices and the key each stands for, filled in by the renderer.
     pub buttons: Vec<(Rect, KeyCode)>,
-    /// The input text's area and horizontal scroll, filled in by the renderer.
-    pub input_area: Option<(Rect, usize)>,
+    /// The input text's area and its line and column scroll, filled in by the renderer.
+    pub input_area: Option<(Rect, usize, usize)>,
     /// The transcript scrollbar, filled in by the renderer when the transcript overflows.
     pub scrollbar: Option<Rect>,
     /// A left drag that started on the scrollbar is in progress.
     dragging: bool,
     attribution: Attribution,
-    pub input: Input,
+    pub input: Editor,
+    /// Submitted prompts, for `ctrl+p` and `ctrl+n`.
+    pub history: History,
     pub working: bool,
     /// The tool call waiting for approval.
     pub pending: Option<Approval>,
@@ -122,7 +124,8 @@ impl App {
             scrollbar: None,
             dragging: false,
             attribution: Attribution::default(),
-            input: Input::default(),
+            input: Editor::default(),
+            history: History::default(),
             working: false,
             pending: None,
             scroll: 0,
@@ -174,14 +177,34 @@ impl App {
                     self.quit = true;
                 }
             }
-            KeyCode::Char('d') if ctrl && self.input.value().is_empty() => self.quit = true,
+            KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
             KeyCode::Esc if self.working => self.interrupt(),
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
             KeyCode::BackTab => self.mode = self.session.cycle_mode(),
+            // Most terminals cannot report shift+enter, so alt+enter and ctrl+j also work.
+            KeyCode::Enter if !key.modifiers.is_empty() => self.input.newline(),
+            KeyCode::Char('j') if ctrl => self.input.newline(),
             KeyCode::Enter => self.submit(),
+            KeyCode::Char('p') if ctrl => {
+                if let Some(text) = self.history.prev(self.input.value()) {
+                    self.input.set(text);
+                }
+            }
+            KeyCode::Char('n') if ctrl => {
+                if let Some(text) = self.history.next() {
+                    self.input.set(text);
+                }
+            }
             KeyCode::PageUp => self.scroll_by(-(self.page as isize)),
             KeyCode::PageDown => self.scroll_by(self.page as isize),
-            // Left/Right belong to the cursor, so the transcript scrolls with up/down.
+            // Left/Right belong to the cursor, so the transcript scrolls with up/down
+            // unless the input has lines to move between.
+            KeyCode::Up if self.input.is_multiline() => {
+                self.input.move_line(-1);
+            }
+            KeyCode::Down if self.input.is_multiline() => {
+                self.input.move_line(1);
+            }
             KeyCode::Up => self.scroll_by(-1),
             KeyCode::Down => self.scroll_by(1),
             _ => {
@@ -189,6 +212,13 @@ impl App {
                     self.input.handle(request);
                 }
             }
+        }
+    }
+
+    /// Bracketed paste: the text goes into the input as typed, newlines and all.
+    pub fn on_paste(&mut self, text: &str) {
+        if self.pending.is_none() {
+            self.input.insert(text);
         }
     }
 
@@ -230,8 +260,13 @@ impl App {
             self.drag_to(y);
             return true;
         }
-        if let Some((area, scroll)) = self.input_area.filter(|(area, _)| area.contains(at)) {
-            return self.place_cursor(scroll + (x - area.x) as usize);
+        if let Some((area, top, scroll)) = self.input_area.filter(|(area, ..)| area.contains(at)) {
+            if self.input.is_empty() {
+                return false;
+            }
+            let row = top + (y - area.y) as usize;
+            self.input.place(row, scroll + (x - area.x) as usize);
+            return true;
         }
         let Some(entry) = self.entry_at(y) else {
             return false;
@@ -244,23 +279,6 @@ impl App {
         if !set.remove(&entry) {
             set.insert(entry);
         }
-        true
-    }
-
-    /// Put the input cursor at display column `column`; false when there is no text.
-    fn place_cursor(&mut self, column: usize) -> bool {
-        if self.input.value().is_empty() {
-            return false;
-        }
-        let chars = self.input.value().chars().count();
-        let mut input = std::mem::take(&mut self.input);
-        for cursor in 0..=chars {
-            input = input.with_cursor(cursor);
-            if input.visual_cursor() >= column {
-                break;
-            }
-        }
-        self.input = input;
         true
     }
 
@@ -420,7 +438,11 @@ impl App {
         if self.input.value().trim().is_empty() {
             return;
         }
-        let message = self.input.value_and_reset().trim().to_string();
+        let message = self.input.take().trim().to_string();
+        if let Err(e) = self.history.push(&message) {
+            self.entries
+                .push(Entry::Error(format!("could not save prompt history: {e}")));
+        }
         if message.starts_with("/context") {
             self.export_context();
             return;
@@ -1015,5 +1037,49 @@ mod tests {
             input_request(key(KeyCode::Char('x'), KeyModifiers::NONE)),
             Some(InputRequest::InsertChar('x'))
         );
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn modified_enter_and_ctrl_j_insert_newlines() {
+        let mut app = App::detached();
+        type_text(&mut app, "a");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
+        type_text(&mut app, "b");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::ALT));
+        app.on_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.value(), "a\nb\n\n");
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input.cursor_position(), (1, 0));
+    }
+
+    #[test]
+    fn paste_inserts_newlines_without_submitting() {
+        let mut app = App::detached();
+        app.on_paste("one\ntwo\n");
+        assert_eq!(app.input.value(), "one\ntwo\n");
+        assert!(!app.working);
+        assert!(app.history.prev("").is_none(), "nothing was submitted");
+    }
+
+    #[test]
+    fn ctrl_p_and_ctrl_n_walk_history_and_restore_the_draft() {
+        let mut app = App::detached();
+        type_text(&mut app, "/permissions");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.input.is_empty());
+        type_text(&mut app, "draft");
+        app.on_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.value(), "/permissions");
+        app.on_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.value(), "/permissions");
+        app.on_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.value(), "draft");
     }
 }
