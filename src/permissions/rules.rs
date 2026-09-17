@@ -14,6 +14,8 @@ pub struct Rule {
     pub source: String,
     /// The user wrote or remembered it, so as an allow rule it also applies in `ask` mode.
     pub user: bool,
+    /// It came from a repo-supplied settings file, so as an allow rule it needs `/trust`.
+    pub repo: bool,
     /// Lowercase tool name.
     tool: String,
     pattern: Pattern,
@@ -64,6 +66,7 @@ impl Rule {
             text: trimmed.to_string(),
             source: String::new(),
             user: false,
+            repo: false,
             tool,
             pattern,
         })
@@ -78,6 +81,10 @@ impl Rule {
 
     pub fn by_user(self) -> Self {
         Self { user: true, ..self }
+    }
+
+    pub fn repo_supplied(self) -> Self {
+        Self { repo: true, ..self }
     }
 
     /// `Edit` rules cover every tool that changes files, as in Claude Code. `mcp__server`

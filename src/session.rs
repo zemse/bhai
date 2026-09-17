@@ -251,6 +251,16 @@ impl Session {
         self.policy.describe()
     }
 
+    /// Honour the repo-supplied allow rules, for `/trust`.
+    pub fn trust(&self) -> anyhow::Result<String> {
+        self.policy.trust()
+    }
+
+    /// Stop honouring the repo-supplied allow rules, for `/untrust`.
+    pub fn untrust(&self) -> anyhow::Result<String> {
+        self.policy.untrust()
+    }
+
     /// Ask the agent for a token breakdown of its context; `None` if it has gone away.
     pub async fn context(&self) -> Option<Profile> {
         let (reply, wait) = oneshot::channel();

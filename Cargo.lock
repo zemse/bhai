@@ -167,6 +167,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "tiktoken-rs",
  "tokio",
  "toml",

@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [--probe [prompt]] [--cache-check] [--as <identity>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [--probe [prompt]] [--cache-check] [--as <identity>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
@@ -105,6 +105,10 @@ async fn main() -> Result<()> {
         .with_overrides(identity.model.clone(), identity.effort.clone())
         .strict_cache(args.strict_cache);
     let mut notices = prompt.notices();
+    if args.trust {
+        notices.push(policy.trust()?);
+    }
+    notices.extend(policy.trust_notice());
     if identity.name != identity::DEFAULT {
         notices.insert(
             0,
@@ -180,6 +184,8 @@ struct Args {
     strict_cache: bool,
     /// `--as`: the identity to run as.
     identity: Option<String>,
+    /// Honour the repo-supplied allow rules as they are now.
+    trust: bool,
     flags: Flags,
 }
 
@@ -225,7 +231,13 @@ fn permissions(config: Config, home: Option<PathBuf>, cwd: PathBuf) -> (Policy, 
     let (remembered, skipped) = permissions::settings::load_local(&store);
     rules.allow.extend(remembered);
     notices.extend(skipped);
-    let policy = Policy::new(config.permission_mode, rules, home, cwd).with_store(store);
+    let trust = home
+        .as_ref()
+        .map(|home| permissions::Trust::new(&home.join(".config/bhai"), &cwd));
+    let mut policy = Policy::new(config.permission_mode, rules, home, cwd).with_store(store);
+    if let Some(trust) = trust {
+        policy = policy.with_trust(trust);
+    }
     (policy, notices)
 }
 
@@ -257,6 +269,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
             "--headless" => parsed.headless = true,
             "--profile" => parsed.profile = true,
             "--strict-cache" => parsed.strict_cache = true,
+            "--trust" => parsed.trust = true,
             "--mode" => {
                 let mode = args
                     .next()

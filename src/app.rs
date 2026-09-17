@@ -327,6 +327,18 @@ impl App {
             self.entries.push(Entry::Info(self.session.permissions()));
             return;
         }
+        if message == "/trust" || message == "/untrust" {
+            self.follow = true;
+            let result = match message.as_str() {
+                "/trust" => self.session.trust(),
+                _ => self.session.untrust(),
+            };
+            self.entries.push(match result {
+                Ok(text) => Entry::Info(text),
+                Err(e) => Entry::Error(format!("{e:#}")),
+            });
+            return;
+        }
         if let Some(rest) = message.strip_prefix("/as")
             && (rest.is_empty() || rest.starts_with(' '))
         {

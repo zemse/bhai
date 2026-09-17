@@ -4,18 +4,21 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod bash;
 pub mod rules;
 pub mod settings;
+pub mod trust;
 
 use rules::Base;
 pub use rules::Rule;
+pub use trust::Trust;
 
 /// How much the policy may decide on its own. Deny rules reject in every mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +155,9 @@ pub struct Policy {
     cwd: PathBuf,
     /// Where remembered rules are saved; `None` keeps them for this session only.
     store: Option<PathBuf>,
+    trust: Option<Trust>,
+    /// Whether repo-supplied allow rules apply.
+    trusted: AtomicBool,
 }
 
 impl Policy {
@@ -162,12 +168,22 @@ impl Policy {
             home,
             cwd,
             store: None,
+            trust: None,
+            trusted: AtomicBool::new(false),
         }
     }
 
     pub fn with_store(self, store: PathBuf) -> Self {
         Self {
             store: Some(store),
+            ..self
+        }
+    }
+
+    pub fn with_trust(self, trust: Trust) -> Self {
+        Self {
+            trusted: AtomicBool::new(trust.is_trusted()),
+            trust: Some(trust),
             ..self
         }
     }
@@ -250,16 +266,61 @@ impl Policy {
             }
         }
         if let Some(store) = &self.store {
+            // The user's own approvals keep a trusted project trusted, and make a
+            // project with no repo-supplied allow rules trusted.
+            let keep = self
+                .trust
+                .as_ref()
+                .filter(|t| t.is_trusted() || t.allow_rules().is_empty());
             settings::remember(store, text)?;
+            if let Some(trust) = keep {
+                trust.trust()?;
+                self.trusted.store(true, Ordering::Relaxed);
+            }
         }
         Ok(self.store.as_deref())
+    }
+
+    /// Honour the repo-supplied allow rules as the files are now, for `/trust`.
+    pub fn trust(&self) -> anyhow::Result<String> {
+        let trust = self.trust.as_ref().context("no trust store")?;
+        trust.trust()?;
+        self.trusted.store(true, Ordering::Relaxed);
+        let rules = trust.allow_rules();
+        let mut out = format!("trusted {} repo-supplied allow rules", rules.len());
+        for (source, rule) in rules {
+            out.push_str(&format!("\n  {rule}  ({source})"));
+        }
+        Ok(out)
+    }
+
+    /// Stop honouring the repo-supplied allow rules, for `/untrust`.
+    pub fn untrust(&self) -> anyhow::Result<String> {
+        let trust = self.trust.as_ref().context("no trust store")?;
+        self.trusted.store(false, Ordering::Relaxed);
+        Ok(match trust.untrust()? {
+            true => "untrusted this project's allow rules".to_string(),
+            false => "this project was not trusted".to_string(),
+        })
+    }
+
+    /// The startup notice when the repo ships allow rules that are not trusted.
+    pub fn trust_notice(&self) -> Option<String> {
+        let trust = self.trust.as_ref()?;
+        let count = trust.allow_rules().len();
+        (count > 0 && !self.trusted())
+            .then(|| format!("this repo ships {count} allow rules; /trust to honour them"))
+    }
+
+    fn trusted(&self) -> bool {
+        self.trusted.load(Ordering::Relaxed)
     }
 
     /// What `/permissions` prints: the mode, then each rule, where it came from and
     /// whether the mode ignores it.
     pub fn describe(&self) -> String {
         let rules = self.rules();
-        let mode = self.mode();
+        let (mode, trusted) = (self.mode(), self.trusted());
         let mut out = format!("permission mode: {mode}");
         if mode == Mode::Ask {
             out.push_str(
@@ -281,7 +342,11 @@ impl Policy {
                     "" => "built in",
                     source => source,
                 };
-                let inactive = if name == "allow" && !allows_in(rule, mode) {
+                let inactive = if name != "allow" {
+                    String::new()
+                } else if rule.repo && !trusted {
+                    ", untrusted".to_string()
+                } else if !allows_in(rule, mode, trusted) {
                     format!(", inactive in {mode} mode")
                 } else {
                     String::new()
@@ -300,6 +365,7 @@ impl Policy {
         Checker {
             rules,
             mode,
+            trusted: self.trusted(),
             base: self.base(),
         }
     }
@@ -312,9 +378,10 @@ impl Policy {
     }
 }
 
-/// Whether an allow rule counts in `mode`: `ask` only honours the user's own rules.
-fn allows_in(rule: &Rule, mode: Mode) -> bool {
-    mode != Mode::Ask || rule.user
+/// Whether an allow rule counts in `mode`: `ask` only honours the user's own rules, and
+/// repo-supplied rules need trust.
+fn allows_in(rule: &Rule, mode: Mode, trusted: bool) -> bool {
+    (trusted || !rule.repo) && (mode != Mode::Ask || rule.user)
 }
 
 /// The lowercase `mcp__server__tool` name an `mcp_call` runs, as rules name it.
@@ -327,6 +394,7 @@ fn mcp_name(args: &Value) -> Option<String> {
 struct Checker<'a> {
     rules: &'a Rules,
     mode: Mode,
+    trusted: bool,
     base: Base<'a>,
 }
 
@@ -444,7 +512,7 @@ impl Checker<'_> {
         self.rules
             .allow
             .iter()
-            .filter(|r| allows_in(r, self.mode))
+            .filter(|r| allows_in(r, self.mode, self.trusted))
             .cloned()
             .collect()
     }
@@ -866,5 +934,102 @@ mod tests {
         let memory = Policy::default();
         assert_eq!(memory.remember("Bash(ls)").unwrap(), None);
         assert!(memory.describe().contains("Bash(ls)  (this session)"));
+    }
+
+    /// A policy for `repo` as `main` builds it, with its trust store under `dir`.
+    fn repo_policy(dir: &Path, repo: &Path) -> Policy {
+        let store = repo.join(settings::LOCAL);
+        let (mut rules, _) = settings::claude(None, repo);
+        rules.allow.extend(settings::load_local(&store).0);
+        Policy::new(Mode::Ask, rules, None, repo.to_path_buf())
+            .with_store(store)
+            .with_trust(Trust::new(&dir.join("config"), repo))
+    }
+
+    fn write_settings(path: &Path, value: Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, value.to_string()).unwrap();
+    }
+
+    #[test]
+    fn untrusted_repos_lose_their_allow_rules_but_keep_deny() {
+        let dir = std::env::temp_dir().join(format!("bhai-policy-{}", uuid::Uuid::new_v4()));
+        let repo = dir.join("repo");
+        write_settings(
+            &repo.join(settings::LOCAL),
+            json!({"permissions": {"allow": ["Bash(make:*)"]}}),
+        );
+        write_settings(
+            &repo.join(settings::CLAUDE_LOCAL),
+            json!({"permissions": {"allow": ["Bash(npm test)"], "deny": ["Bash(rm:*)"]}}),
+        );
+        let policy = repo_policy(&dir, &repo);
+        policy.set_mode(Mode::Auto);
+        let deny_rm = Decision::Deny("deny rule Bash(rm:*)".to_string());
+        assert_eq!(bash(&policy, "make all"), Decision::Ask);
+        assert_eq!(bash(&policy, "npm test"), Decision::Ask);
+        assert_eq!(bash(&policy, "rm x"), deny_rm);
+        assert_eq!(
+            policy.trust_notice().as_deref(),
+            Some("this repo ships 2 allow rules; /trust to honour them")
+        );
+        let described = policy.describe();
+        assert!(described.contains("Bash(make:*)  ("), "{described}");
+        assert_eq!(described.matches(", untrusted)").count(), 2, "{described}");
+
+        let trusted = policy.trust().unwrap();
+        assert!(trusted.contains("Bash(npm test)"), "{trusted}");
+        assert_eq!(bash(&policy, "make all"), allowed("rule Bash(make:*)"));
+        assert_eq!(bash(&policy, "rm x"), deny_rm);
+        assert_eq!(policy.trust_notice(), None);
+        assert!(repo_policy(&dir, &repo).trusted());
+
+        // An edit bhai did not make untrusts the project again.
+        write_settings(
+            &repo.join(settings::LOCAL),
+            json!({"permissions": {"allow": ["Bash(make:*)", "Bash(curl:*)"]}}),
+        );
+        let reloaded = repo_policy(&dir, &repo);
+        assert!(!reloaded.trusted());
+        assert_eq!(
+            reloaded.trust_notice().unwrap(),
+            "this repo ships 3 allow rules; /trust to honour them"
+        );
+        reloaded.untrust().unwrap();
+        policy.untrust().unwrap();
+        assert_eq!(bash(&policy, "make all"), Decision::Ask);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remembering_an_approval_keeps_trust_as_it_was() {
+        let dir = std::env::temp_dir().join(format!("bhai-policy-{}", uuid::Uuid::new_v4()));
+        let repo = dir.join("repo");
+        write_settings(
+            &repo.join(settings::LOCAL),
+            json!({"permissions": {"allow": ["Bash(make:*)"]}}),
+        );
+        let policy = repo_policy(&dir, &repo);
+        policy.trust().unwrap();
+        policy.remember("Bash(cargo test:*)").unwrap();
+        assert!(repo_policy(&dir, &repo).trusted());
+
+        // Untrusted with allow rules: the user's approval does not vouch for them.
+        policy.untrust().unwrap();
+        policy.remember("Bash(cargo fmt)").unwrap();
+        assert!(!repo_policy(&dir, &repo).trusted());
+        assert_eq!(bash(&policy, "cargo fmt"), allowed("rule Bash(cargo fmt)"));
+        assert_eq!(bash(&policy, "make all"), Decision::Ask);
+
+        // Untrusted with no allow rules: the resulting file is the user's own.
+        let fresh = dir.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let policy = repo_policy(&dir, &fresh);
+        assert!(!policy.trusted());
+        assert_eq!(policy.trust_notice(), None);
+        policy.remember("Bash(ls)").unwrap();
+        assert!(policy.trusted());
+        assert!(repo_policy(&dir, &fresh).trusted());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

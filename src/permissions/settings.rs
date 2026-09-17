@@ -11,6 +11,9 @@ use super::{Rule, Rules};
 /// Remembered approvals, under the project directory.
 pub const LOCAL: &str = ".bhai/settings.local.json";
 
+/// Claude Code's uncommitted project settings, which a repo may still ship.
+pub const CLAUDE_LOCAL: &str = ".claude/settings.local.json";
+
 /// The allow rules bhai saved in `path`, which count as the user's, and a notice for each one that does not parse.
 pub fn load_local(path: &Path) -> (Vec<Rule>, Vec<String>) {
     let mut notices = Vec::new();
@@ -20,7 +23,11 @@ pub fn load_local(path: &Path) -> (Vec<Rule>, Vec<String>) {
     };
     let rules = strings(&settings, "allow")
         .filter_map(|text| match Rule::parse(text) {
-            Ok(rule) => Some(rule.with_source(path.display().to_string()).by_user()),
+            Ok(rule) => Some(
+                rule.with_source(path.display().to_string())
+                    .by_user()
+                    .repo_supplied(),
+            ),
             Err(e) => {
                 notices.push(format!("skipped in {}: {e}", path.display()));
                 None
@@ -56,8 +63,16 @@ pub fn remember(path: &Path, rule: &str) -> Result<()> {
     write_atomic(path, text.as_bytes())
 }
 
+/// The allow rules in `path` as written, parsed or not; none if it cannot be read.
+pub fn allow_texts(path: &Path) -> Vec<String> {
+    match read(path) {
+        Ok(settings) => strings(&settings, "allow").map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Write to a temporary file next to `path`, then rename it over `path`.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().context("settings path has no directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -78,11 +93,12 @@ pub fn claude(home: Option<&Path>, cwd: &Path) -> (Rules, Vec<String>) {
     let files = [
         global.clone().map(|p| (p, true, true)),
         (global.as_ref() != Some(&shared)).then_some((shared, false, false)),
-        Some((cwd.join(".claude/settings.local.json"), true, false)),
+        Some((cwd.join(CLAUDE_LOCAL), true, false)),
     ];
     let mut rules = Rules::default();
     let mut notices = Vec::new();
     for (path, trusted, user) in files.into_iter().flatten() {
+        let repo = path == cwd.join(CLAUDE_LOCAL);
         let settings = match read(&path) {
             Ok(settings) => settings,
             Err(e) => {
@@ -95,7 +111,11 @@ pub fn claude(home: Option<&Path>, cwd: &Path) -> (Rules, Vec<String>) {
                 match claude_rule(text) {
                     Some(Ok(rule)) => {
                         let rule = rule.with_source(path.display().to_string());
-                        into.push(if user { rule.by_user() } else { rule });
+                        into.push(match (user, repo) {
+                            (true, _) => rule.by_user(),
+                            (false, true) => rule.repo_supplied(),
+                            (false, false) => rule,
+                        });
                     }
                     Some(Err(e)) => notices.push(format!("skipped in {}: {e}", path.display())),
                     None => {}
@@ -255,6 +275,8 @@ mod tests {
         );
         let users: Vec<bool> = rules.allow.iter().map(|r| r.user).collect();
         assert_eq!(users, [true, true, true, false]);
+        let repo: Vec<bool> = rules.allow.iter().map(|r| r.repo).collect();
+        assert_eq!(repo, [false, false, false, true]);
         assert_eq!(texts(&rules.deny), ["Read(*.pem)"]);
         assert_eq!(texts(&rules.ask), ["Write(docs/**)"]);
         assert_eq!(
