@@ -16,6 +16,7 @@ mod profile;
 mod prompt;
 mod server;
 mod session;
+mod sessions;
 mod skills;
 mod tokens;
 mod tools;
@@ -34,7 +35,7 @@ use ratatui::crossterm::execute;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::agent::{AgentEvent, Control, Delegation};
+use crate::agent::{AgentEvent, Control, Delegation, Saved};
 use crate::app::App;
 use crate::config::{Config, Flags};
 use crate::permissions::Policy;
@@ -56,6 +57,11 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "identities") {
         return identities();
+    }
+    if args.first().is_some_and(|a| a == "sessions") {
+        let dir = std::env::current_dir()?.join(sessions::DIR);
+        print!("{}", sessions::report(&sessions::list(&dir)));
+        return Ok(());
     }
 
     // Fail before taking over the terminal if there is nothing to authenticate with.
@@ -89,22 +95,74 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [--probe [prompt]] [--cache-check] [--as <identity>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--as <identity>] [--resume [id]] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
     };
-    let (prompt, policy, delegation) = load(
-        args.flags,
-        args.identity.as_deref().unwrap_or(identity::DEFAULT),
-    )
-    .await?;
+    let cwd = std::env::current_dir()?;
+    let dir = cwd.join(sessions::DIR);
+    let resumed = match &args.resume {
+        Some(id) => Some(sessions::find(&dir, id.as_deref())?),
+        None => None,
+    };
+    let mut warnings = Vec::new();
+    let name = match &resumed {
+        Some(loaded) => resumed_identity(&loaded.header, &cwd, &mut warnings),
+        None => args
+            .identity
+            .clone()
+            .unwrap_or_else(|| identity::DEFAULT.to_string()),
+    };
+    let (prompt, policy, delegation) = load(args.flags, &name).await?;
     let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
-    let client = client::Client::new()?
-        .with_overrides(identity.model.clone(), identity.effort.clone())
-        .strict_cache(args.strict_cache);
+    let mut client =
+        client::Client::new()?.with_overrides(identity.model.clone(), identity.effort.clone());
+    if let Some(loaded) = &resumed {
+        client = client.with_session(&loaded.header.session);
+    }
+    let client = client.strict_cache(args.strict_cache);
+    let saved = match resumed {
+        Some(loaded) => {
+            let header = &loaded.header;
+            if (header.model.as_str(), header.effort.as_str()) != (client.model(), client.effort())
+            {
+                warnings.push(format!(
+                    "warning: the session ran on {} ({}), now {} ({}), so the cached prefix will differ",
+                    header.model,
+                    header.effort,
+                    client.model(),
+                    client.effort()
+                ));
+            }
+            warnings.push(format!(
+                "resumed session {} ({} items)",
+                header.session,
+                loaded.items.len()
+            ));
+            warnings.extend(loaded.warnings.iter().map(|w| format!("warning: {w}")));
+            Saved {
+                writer: sessions::Writer::resume(&dir, &loaded)?,
+                history: loaded.items,
+            }
+        }
+        None => {
+            let header = sessions::Header::new(
+                client.session_id(),
+                &identity.name,
+                client.model(),
+                client.effort(),
+                &cwd,
+            );
+            Saved {
+                writer: sessions::Writer::create(&dir, header),
+                history: Vec::new(),
+            }
+        }
+    };
     let mut notices = prompt.notices();
+    notices.extend(warnings);
     if args.trust {
         notices.push(policy.trust()?);
     }
@@ -131,7 +189,8 @@ async fn main() -> Result<()> {
     let usage_log = args
         .profile
         .then(|| profile::debug_dir().join("usage.jsonl"));
-    let (session, events) = start(client, prompt, policy, usage_log, delegation);
+    let history = saved.history.clone();
+    let (session, events) = start(client, prompt, policy, usage_log, delegation, saved);
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         for notice in &notices {
@@ -155,6 +214,7 @@ async fn main() -> Result<()> {
         notices,
         skills,
         hub.clone(),
+        &history,
     )
     .await;
     if mouse {
@@ -186,6 +246,8 @@ struct Args {
     identity: Option<String>,
     /// Honour the repo-supplied allow rules as they are now.
     trust: bool,
+    /// `--resume [id]`: continue a saved session, the latest when no id is given.
+    resume: Option<Option<String>>,
     flags: Flags,
 }
 
@@ -241,6 +303,28 @@ fn permissions(config: Config, home: Option<PathBuf>, cwd: PathBuf) -> (Policy, 
     (policy, notices)
 }
 
+/// The identity a resumed session runs as: its own, or the default with a warning
+/// when that no longer exists.
+fn resumed_identity(
+    header: &sessions::Header,
+    cwd: &std::path::Path,
+    warnings: &mut Vec<String>,
+) -> String {
+    let roots = instructions::Roots::from_env(cwd.to_path_buf());
+    if identity::discover(&roots)
+        .iter()
+        .any(|i| i.name == header.identity)
+    {
+        return header.identity.clone();
+    }
+    warnings.push(format!(
+        "warning: identity `{}` no longer exists, resuming as `{}`; the cached prefix will differ",
+        header.identity,
+        identity::DEFAULT
+    ));
+    identity::DEFAULT.to_string()
+}
+
 /// `bhai identities`: every identity with its baseline context cost.
 fn identities() -> Result<()> {
     let roots = instructions::Roots::from_env(std::env::current_dir()?);
@@ -282,6 +366,9 @@ fn parse_args(args: &[String]) -> Result<Args> {
                     .ok_or_else(|| anyhow::anyhow!("--as needs an identity name"))?;
                 parsed.identity = Some(name.clone());
             }
+            "--resume" => {
+                parsed.resume = Some(args.next_if(|a| !a.starts_with("--")).cloned());
+            }
             "--no-global" => parsed.flags.no_global = true,
             "--no-project" => parsed.flags.no_project = true,
             "--bare" => parsed.flags.bare = true,
@@ -290,6 +377,9 @@ fn parse_args(args: &[String]) -> Result<Args> {
     }
     if parsed.headless && parsed.serve.is_none() {
         bail!("--headless needs --serve");
+    }
+    if parsed.resume.is_some() && parsed.identity.is_some() {
+        bail!("--resume keeps the session's identity, so it takes no --as");
     }
     Ok(parsed)
 }
@@ -302,6 +392,7 @@ fn start(
     policy: Policy,
     usage_log: Option<PathBuf>,
     delegation: Delegation,
+    saved: Saved,
 ) -> (Arc<Session>, broadcast::Receiver<session::Event>) {
     let (tx_user, rx_user) = mpsc::channel::<String>(16);
     let (tx_control, rx_control) = mpsc::channel::<Control>(16);
@@ -327,6 +418,7 @@ fn start(
         cancel,
         usage_log,
         Some(delegation),
+        Some(saved),
     ));
     tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
     (session, events)
@@ -352,6 +444,7 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
         rx_control,
         tx_agent,
         Arc::clone(&cancel),
+        None,
         None,
         None,
     ));
@@ -521,6 +614,7 @@ fn cache_check_passed(rows: &[CacheRow]) -> bool {
     rows.iter().skip(1).all(|row| row.usage.cached > 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     mut terminal: ratatui::DefaultTerminal,
     session: Arc<Session>,
@@ -529,6 +623,7 @@ async fn run(
     notices: Vec<String>,
     skills: Vec<skills::Skill>,
     hub: Option<Arc<mcp::Hub>>,
+    history: &[serde_json::Value],
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -569,6 +664,7 @@ async fn run(
     let mut app = App::new(Arc::clone(&session));
     app.skills = skills;
     app.mcp = hub;
+    app.restore(history);
     app.entries
         .extend(notices.into_iter().map(app::Entry::Info));
     if let Some(listener) = listener {
@@ -728,6 +824,21 @@ mod tests {
             Some("router")
         );
         assert!(identity(&["--as"]).is_err());
+    }
+
+    #[test]
+    fn resume_flag() {
+        let resume = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse_args(&args).map(|a| a.resume)
+        };
+        assert_eq!(resume(&[]).unwrap(), None);
+        assert_eq!(resume(&["--resume"]).unwrap(), Some(None));
+        assert_eq!(
+            resume(&["--resume", "abc", "--profile"]).unwrap(),
+            Some(Some("abc".to_string()))
+        );
+        assert!(resume(&["--resume", "--as", "router"]).is_err());
     }
 
     #[test]

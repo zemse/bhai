@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
+use serde_json::Value;
 use tui_input::Input;
 use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
@@ -210,6 +211,46 @@ impl App {
     pub fn rehover(&mut self) -> bool {
         let hover = self.mouse_row.and_then(|y| self.entry_at(y));
         std::mem::replace(&mut self.hover, hover) != hover
+    }
+
+    /// Show a history resumed from disk. Encrypted reasoning without a summary is skipped.
+    pub fn restore(&mut self, history: &[Value]) {
+        for (index, item) in history.iter().enumerate() {
+            let text = |key: &str| {
+                item[key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let entry = match item["type"].as_str() {
+                Some("message") if item["role"] == "user" => Entry::User(text("content")),
+                Some("message") => Entry::Assistant(text("content")),
+                Some("reasoning") if !text("summary").is_empty() => {
+                    Entry::Reasoning(text("summary"))
+                }
+                Some("function_call") => Entry::Command(format!(
+                    "{} {}",
+                    item["name"].as_str().unwrap_or_default(),
+                    item["arguments"].as_str().unwrap_or_default()
+                )),
+                Some("function_call_output") => Entry::Output(
+                    item["output"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .trim_end()
+                        .to_string(),
+                ),
+                _ => continue,
+            };
+            if matches!(entry, Entry::User(_) | Entry::Output(_)) {
+                self.attribution.items.insert(index, self.entries.len());
+            }
+            self.entries.push(entry);
+        }
+        self.attribution.mark = self.entries.len();
     }
 
     pub fn on_event(&mut self, event: Event) {
@@ -836,6 +877,23 @@ mod tests {
             input_request(key(KeyCode::Left, KeyModifiers::CONTROL)),
             Some(InputRequest::GoToPrevWord)
         );
+    }
+
+    #[test]
+    fn a_restored_history_shows_as_entries() {
+        let mut app = App::detached();
+        let history = [
+            serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}),
+            serde_json::json!({"type": "reasoning", "encrypted_content": "x", "summary": []}),
+            serde_json::json!({"type": "function_call", "call_id": "c", "name": "bash", "arguments": "{}"}),
+            serde_json::json!({"type": "function_call_output", "call_id": "c", "output": "ok\n"}),
+            serde_json::json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}),
+        ];
+        app.restore(&history);
+        let kinds: Vec<_> = app.entries[1..].iter().map(Entry::kind).collect();
+        assert_eq!(kinds, ["user", "command", "output", "assistant"]);
+        assert_eq!(app.entries[3].text(), "ok");
+        assert_eq!(app.attribution.items.get(&3), Some(&3));
     }
 
     #[test]

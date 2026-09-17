@@ -115,6 +115,35 @@ impl Client {
         &self.model
     }
 
+    pub fn effort(&self) -> &str {
+        &self.effort
+    }
+
+    /// Continue session `id`, so the prompt cache key stays the same. Call before
+    /// `strict_cache`, which keeps this id.
+    pub fn with_session(mut self, id: &str) -> Self {
+        self.session_id = id.to_string();
+        self.cache_key = self.session_id.clone();
+        self.guard = guard(&self.session_id, false);
+        self
+    }
+
+    /// Take `input` as already sent with these instructions and tools.
+    pub fn seed(&self, instructions: &str, tools: &[Value], input: &[Value]) {
+        let body = request_body(
+            &self.model,
+            &self.effort,
+            &self.cache_key,
+            instructions,
+            tools,
+            input,
+        );
+        self.guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .seed(&body);
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }

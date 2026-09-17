@@ -1,3 +1,4 @@
 /target
 /.bhai/debug/
 /.bhai/settings.local.json
+/.bhai/sessions/

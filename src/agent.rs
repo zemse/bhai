@@ -18,6 +18,7 @@ use crate::identity::Identity;
 use crate::permissions::{Answer, Decision, Offers, Policy};
 use crate::profile::{self, Call, CallTokens, Profile};
 use crate::prompt::SystemPrompt;
+use crate::sessions::{self, Writer};
 use crate::tokens;
 use crate::tools::{self, BoxFuture, Registry};
 
@@ -85,6 +86,9 @@ pub trait Model: Send + Sync {
 
     /// The model's name, which picks its tokenizer.
     fn name(&self) -> &str;
+
+    /// Take `input` as already sent, for a conversation resumed from disk.
+    fn seed(&self, _instructions: &str, _tools: &[Value], _input: &[Value]) {}
 }
 
 impl Model for Client {
@@ -107,6 +111,10 @@ impl Model for Client {
 
     fn name(&self) -> &str {
         self.model()
+    }
+
+    fn seed(&self, instructions: &str, tools: &[Value], input: &[Value]) {
+        Client::seed(self, instructions, tools, input);
     }
 }
 
@@ -134,7 +142,28 @@ pub struct ChildUsage {
 /// Every child agent of a session, shared by the `agent` tool and the profiler.
 pub type Children = Arc<Mutex<Vec<ChildUsage>>>;
 
+/// A session written to disk as it runs, with the history it resumes from.
+pub struct Saved {
+    pub writer: Writer,
+    pub history: Vec<Value>,
+}
+
+/// Where history items are written as they land.
+enum Sink<'a> {
+    Discard,
+    /// A child's transcript, one item per line.
+    Sidechain(&'a Path),
+    Session(&'a mut Writer),
+}
+
+impl<'a> From<Option<&'a Path>> for Sink<'a> {
+    fn from(path: Option<&'a Path>) -> Self {
+        path.map_or(Sink::Discard, Sink::Sidechain)
+    }
+}
+
 /// `usage_log` is the JSONL file each model call's usage is appended to, if any.
+/// `saved` persists the session and holds the history it resumes from.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: Client,
@@ -146,11 +175,13 @@ pub async fn run(
     cancel: Arc<AtomicBool>,
     usage_log: Option<PathBuf>,
     delegation: Option<Delegation>,
+    saved: Option<Saved>,
 ) {
     let session_id = client.session_id().to_string();
     let model: Arc<dyn Model> = Arc::new(client);
     run_with(
         model, session_id, prompt, policy, rx_user, rx_control, tx, cancel, usage_log, delegation,
+        saved,
     )
     .await;
 }
@@ -168,6 +199,7 @@ async fn run_with(
     cancel: Arc<AtomicBool>,
     usage_log: Option<PathBuf>,
     delegation: Option<Delegation>,
+    saved: Option<Saved>,
 ) {
     let children = Children::default();
     let mut registry = Registry::for_prompt(&prompt);
@@ -192,7 +224,24 @@ async fn run_with(
         profile.children = children.lock().unwrap_or_else(|e| e.into_inner()).clone();
         profile
     };
-    let mut history: Vec<Value> = Vec::new();
+    let (mut history, mut writer) = match saved {
+        Some(saved) => (saved.history, Some(saved.writer)),
+        None => (Vec::new(), None),
+    };
+    if let Some(writer) = &mut writer {
+        let prefix = sessions::prefix(model.name(), &prompt.text, &tools);
+        if history.is_empty() {
+            writer.header.prefix = prefix;
+        } else {
+            if writer.header.prefix != prefix {
+                let _ = tx.send(AgentEvent::Error(
+                    "warning: the model, system prompt or tools changed since this session was saved, so the cached prefix will differ".to_string(),
+                ));
+            }
+            // The first call then checks as an append-only continuation.
+            model.seed(&prompt.text, &tools, &history);
+        }
+    }
     let mut calls: Vec<Call> = Vec::new();
     let mut monitor = CacheMonitor::default();
 
@@ -214,6 +263,8 @@ async fn run_with(
             "content": [{ "type": "input_text", "text": message }],
         }));
         let _ = tx.send(AgentEvent::Item(history.len() - 1));
+        let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
+        record(&mut sink, &history[history.len() - 1..], &tx);
 
         // The turn holds the history, so mid-turn requests see it as the turn started.
         let (before, calls_before) = (history.clone(), calls.clone());
@@ -230,7 +281,7 @@ async fn run_with(
                 &mut calls,
                 &mut monitor,
                 usage_log.as_deref(),
-                None,
+                &mut sink,
             );
             tokio::pin!(turn);
             loop {
@@ -249,8 +300,7 @@ async fn run_with(
     }
 }
 
-/// Returns the number of model calls made. `transcript` gets every history item
-/// appended as JSONL as it lands.
+/// Returns the number of model calls made. `sink` gets every history item as it lands.
 #[allow(clippy::too_many_arguments)]
 async fn turn(
     model: &dyn Model,
@@ -264,7 +314,7 @@ async fn turn(
     ledger: &mut Vec<Call>,
     monitor: &mut CacheMonitor,
     usage_log: Option<&Path>,
-    transcript: Option<&Path>,
+    sink: &mut Sink<'_>,
 ) -> anyhow::Result<usize> {
     let mut error_rounds = 0usize;
 
@@ -339,7 +389,7 @@ async fn turn(
 
         if calls.is_empty() {
             history.extend(items.iter().cloned());
-            record(transcript, &history[sent..], tx);
+            record(sink, &history[sent..], tx);
             return Ok(step);
         }
 
@@ -364,7 +414,7 @@ async fn turn(
         // Append the assistant items and every matching result together.
         history.extend(items.iter().cloned());
         history.extend(results);
-        record(transcript, &history[sent..], tx);
+        record(sink, &history[sent..], tx);
 
         if cancel.load(Ordering::Relaxed) {
             return Ok(step);
@@ -385,11 +435,14 @@ async fn turn(
     Ok(MAX_STEPS)
 }
 
-/// Append `items` to the transcript, if there is one.
-fn record(transcript: Option<&Path>, items: &[Value], tx: &mpsc::UnboundedSender<AgentEvent>) {
-    if let Some(path) = transcript
-        && let Err(e) = append_jsonl(path, items)
-    {
+/// Write `items` to the sink.
+fn record(sink: &mut Sink<'_>, items: &[Value], tx: &mpsc::UnboundedSender<AgentEvent>) {
+    let result = match sink {
+        Sink::Discard => Ok(()),
+        Sink::Sidechain(path) => append_jsonl(path, items),
+        Sink::Session(writer) => items.iter().try_for_each(|item| writer.append(item)),
+    };
+    if let Err(e) = result {
         let _ = tx.send(AgentEvent::Error(format!("transcript: {e:#}")));
     }
 }
@@ -457,7 +510,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             "role": "user",
             "content": [{ "type": "input_text", "text": child.task }],
         })];
-        record(child.transcript, &history, &tx_child);
+        let mut sink = Sink::from(child.transcript);
+        record(&mut sink, &history, &tx_child);
         let mut ledger = Vec::new();
         let mut monitor = CacheMonitor::default();
         let result = turn(
@@ -472,7 +526,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             &mut ledger,
             &mut monitor,
             None,
-            child.transcript,
+            &mut sink,
         )
         .await;
         (result, history)
@@ -856,6 +910,18 @@ pub mod fake {
         fn name(&self) -> &str {
             "fake"
         }
+
+        fn seed(&self, instructions: &str, tools: &[Value], input: &[Value]) {
+            let body = crate::client::request_body(
+                "fake",
+                "medium",
+                &self.key,
+                instructions,
+                tools,
+                input,
+            );
+            self.guard.lock().unwrap().seed(&body);
+        }
     }
 }
 
@@ -878,6 +944,7 @@ mod tests {
             rx_control,
             tx,
             cancel,
+            None,
             None,
             None,
         ));
@@ -940,6 +1007,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             None,
             Some(delegation),
+            None,
         ));
         tx_user.send("go".to_string()).await.unwrap();
         let mut events = Vec::new();
@@ -1139,6 +1207,7 @@ mod tests {
             Arc::clone(&cancel),
             None,
             Some(delegation),
+            None,
         ));
         let accept = Answer::Accept(None);
         let mut turn = async |message: &str, answers: &[Answer]| {
@@ -1217,6 +1286,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resumed_session_continues_its_file_and_its_cache() {
+        use crate::sessions::{self, Header};
+        use fake::{Fake, say};
+
+        let dir = tools::temp_dir();
+        let session = async |fake: &Fake, saved: Saved, message: &str| {
+            let (tx_user, rx_user) = mpsc::channel(1);
+            let (_tx_control, rx_control) = mpsc::channel(1);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let cancel = Arc::new(AtomicBool::new(false));
+            tokio::spawn(run_with(
+                Arc::new(fake.clone()),
+                "sess".to_string(),
+                crate::prompt::system_prompt(&[], Vec::new()),
+                Arc::new(Policy::default()),
+                rx_user,
+                rx_control,
+                tx,
+                Arc::clone(&cancel),
+                None,
+                None,
+                Some(saved),
+            ));
+            drive(&tx_user, &mut rx, &cancel, message, &[]).await
+        };
+        let header = Header::new("sess", "general", "fake", "medium", &dir);
+        let fresh = Saved {
+            writer: Writer::create(&dir, header),
+            history: Vec::new(),
+        };
+        session(&Fake::new(vec![vec![say("one")]]), fresh, "first").await;
+
+        let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
+        assert_eq!(loaded.items.len(), 2);
+        let resumed = Saved {
+            writer: Writer::resume(&dir, &loaded).unwrap(),
+            history: loaded.items.clone(),
+        };
+        // A fresh guard seeded from the file, so a changed prefix would show as a break.
+        let fake = Fake::new(vec![vec![say("two")]]);
+        let events = session(&fake, resumed, "second").await;
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let bodies = fake.bodies.lock().unwrap();
+        let input = bodies[0].1["input"].as_array().unwrap();
+        assert_eq!(&input[..2], loaded.items.as_slice());
+
+        let reloaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
+        assert_eq!(reloaded.items.len(), 4);
+        assert!(reloaded.warnings.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn repeated_cache_misses_pause_for_the_user() {
         use fake::{Fake, call, say};
 
@@ -1241,6 +1364,7 @@ mod tests {
             rx_control,
             tx,
             Arc::clone(&cancel),
+            None,
             None,
             None,
         ));

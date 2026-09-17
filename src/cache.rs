@@ -81,6 +81,11 @@ impl CacheGuard {
         Ok(found)
     }
 
+    /// Remember `body` as sent without checking it, for a conversation resumed from disk.
+    pub fn seed(&mut self, body: &Value) {
+        self.previous = Some(record(body));
+    }
+
     /// Forget the last request, for a break that is intended, such as a compaction.
     #[allow(dead_code)] // no intended break exists yet
     pub fn reset(&mut self, reason: &str) {
@@ -456,6 +461,17 @@ mod tests {
         assert!(monitor.tripped());
         monitor.resume();
         assert!(!monitor.tripped());
+    }
+
+    #[test]
+    fn a_seeded_guard_checks_the_next_call_against_the_seed() {
+        let mut guard = CacheGuard::new("c1", None, true);
+        guard.seed(&body("i", tools(), &[message("a")]));
+        let next = body("i", tools(), &[message("a"), message("b")]);
+        assert_eq!(guard.check(&next).unwrap(), None);
+        let mut guard = CacheGuard::new("c1", None, true);
+        guard.seed(&body("i", tools(), &[message("a")]));
+        assert!(guard.check(&body("j", tools(), &[message("a")])).is_err());
     }
 
     #[test]
