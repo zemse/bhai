@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, Control};
+use crate::client::Usage;
+use crate::profile::Profile;
 
 /// Events a slow consumer can fall behind by before it starts missing them.
 const EVENT_BUFFER: usize = 4096;
@@ -33,10 +35,9 @@ pub enum Event {
     ToolStart(String),
     ToolOutput(String),
     ToolRejected(String),
-    Usage {
-        input: u64,
-        output: u64,
-    },
+    Usage(Usage),
+    /// A local notice, such as where `/context` wrote its export.
+    Info(String),
     Error(String),
     Interrupted,
     TurnEnd,
@@ -55,7 +56,11 @@ pub struct State {
     pub model: String,
     pub working: bool,
     pub input_tokens: u64,
+    pub cached_tokens: u64,
     pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// Usage of the most recent model call.
+    pub last_usage: Option<Usage>,
     pub pending: Option<Approval>,
 }
 
@@ -78,8 +83,8 @@ impl fmt::Display for SubmitError {
 #[derive(Default)]
 struct Inner {
     working: bool,
-    input_tokens: u64,
-    output_tokens: u64,
+    total: Usage,
+    last_usage: Option<Usage>,
     next_id: u64,
     pending: Option<(Approval, oneshot::Sender<bool>)>,
 }
@@ -89,16 +94,23 @@ pub struct Session {
     events: broadcast::Sender<Event>,
     inner: Mutex<Inner>,
     tx_user: mpsc::Sender<String>,
+    tx_control: mpsc::Sender<Control>,
     cancel: Arc<AtomicBool>,
 }
 
 impl Session {
-    pub fn new(model: String, tx_user: mpsc::Sender<String>, cancel: Arc<AtomicBool>) -> Arc<Self> {
+    pub fn new(
+        model: String,
+        tx_user: mpsc::Sender<String>,
+        tx_control: mpsc::Sender<Control>,
+        cancel: Arc<AtomicBool>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             model,
             events: broadcast::channel(EVENT_BUFFER).0,
             inner: Mutex::default(),
             tx_user,
+            tx_control,
             cancel,
         })
     }
@@ -112,8 +124,11 @@ impl Session {
         State {
             model: self.model.clone(),
             working: inner.working,
-            input_tokens: inner.input_tokens,
-            output_tokens: inner.output_tokens,
+            input_tokens: inner.total.input,
+            cached_tokens: inner.total.cached,
+            output_tokens: inner.total.output,
+            reasoning_tokens: inner.total.reasoning,
+            last_usage: inner.last_usage,
             pending: inner.pending.as_ref().map(|(approval, _)| approval.clone()),
         }
     }
@@ -160,6 +175,13 @@ impl Session {
         true
     }
 
+    /// Ask the agent for a token breakdown of its context; `None` if it has gone away.
+    pub async fn context(&self) -> Option<Profile> {
+        let (reply, wait) = oneshot::channel();
+        self.tx_control.send(Control::Context(reply)).await.ok()?;
+        wait.await.ok()
+    }
+
     fn on_agent(&self, event: AgentEvent) {
         let mut inner = self.lock();
         let event = match event {
@@ -180,10 +202,13 @@ impl Session {
             AgentEvent::ToolStart(s) => Event::ToolStart(s),
             AgentEvent::ToolOutput(s) => Event::ToolOutput(s),
             AgentEvent::ToolRejected(s) => Event::ToolRejected(s),
-            AgentEvent::Usage { input, output } => {
-                inner.input_tokens += input;
-                inner.output_tokens += output;
-                Event::Usage { input, output }
+            AgentEvent::Usage(usage) => {
+                inner.total.input += usage.input;
+                inner.total.cached += usage.cached;
+                inner.total.output += usage.output;
+                inner.total.reasoning += usage.reasoning;
+                inner.last_usage = Some(usage);
+                Event::Usage(usage)
             }
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnEnd => {
@@ -195,7 +220,7 @@ impl Session {
         self.publish(event);
     }
 
-    fn publish(&self, event: Event) {
+    pub fn publish(&self, event: Event) {
         // No subscribers is fine; the event is simply dropped.
         let _ = self.events.send(event);
     }
@@ -218,8 +243,12 @@ mod tests {
 
     fn session() -> (Arc<Session>, mpsc::Receiver<String>) {
         let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, _) = mpsc::channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
-        (Session::new("m".to_string(), tx_user, cancel), rx_user)
+        (
+            Session::new("m".to_string(), tx_user, tx_control, cancel),
+            rx_user,
+        )
     }
 
     fn approval(session: &Session) -> oneshot::Receiver<bool> {
@@ -229,6 +258,12 @@ mod tests {
             reply,
         });
         wait
+    }
+
+    #[tokio::test]
+    async fn context_is_none_once_the_agent_is_gone() {
+        let (session, _rx) = session();
+        assert!(session.context().await.is_none());
     }
 
     #[test]
@@ -290,15 +325,17 @@ mod tests {
     #[test]
     fn usage_accumulates() {
         let (session, _rx) = session();
-        session.on_agent(AgentEvent::Usage {
-            input: 3,
-            output: 1,
-        });
-        session.on_agent(AgentEvent::Usage {
-            input: 4,
-            output: 2,
-        });
+        let usage = |input, cached, output, reasoning| Usage {
+            input,
+            cached,
+            output,
+            reasoning,
+        };
+        session.on_agent(AgentEvent::Usage(usage(3, 0, 1, 1)));
+        session.on_agent(AgentEvent::Usage(usage(4, 2, 2, 0)));
         let state = session.state();
         assert_eq!((state.input_tokens, state.output_tokens), (7, 3));
+        assert_eq!((state.cached_tokens, state.reasoning_tokens), (2, 1));
+        assert_eq!(state.last_usage, Some(usage(4, 2, 2, 0)));
     }
 }

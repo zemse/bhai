@@ -9,6 +9,8 @@ use tui_input::Input;
 use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
+use crate::client::Usage;
+use crate::profile;
 use crate::session::{Event, Session};
 
 /// Lines a mouse wheel notch moves the transcript.
@@ -41,6 +43,7 @@ pub struct App {
     pub model: String,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    pub last_usage: Option<Usage>,
     pub quit: bool,
     session: Arc<Session>,
 }
@@ -63,6 +66,7 @@ impl App {
             model: session.state().model,
             tokens_in: 0,
             tokens_out: 0,
+            last_usage: None,
             quit: false,
             session,
         }
@@ -146,10 +150,12 @@ impl App {
                 self.entries
                     .push(Entry::Rejected(format!("rejected: {command}")));
             }
-            Event::Usage { input, output } => {
-                self.tokens_in += input;
-                self.tokens_out += output;
+            Event::Usage(usage) => {
+                self.tokens_in += usage.input;
+                self.tokens_out += usage.output;
+                self.last_usage = Some(usage);
             }
+            Event::Info(message) => self.entries.push(Entry::Info(message)),
             Event::Error(message) => self.entries.push(Entry::Error(message)),
             Event::Interrupted => self.entries.push(Entry::Info("interrupted".to_string())),
             Event::TurnEnd => self.working = false,
@@ -167,10 +173,30 @@ impl App {
             return;
         }
         let message = self.input.value_and_reset().trim().to_string();
+        if message.starts_with("/context") {
+            self.export_context();
+            return;
+        }
         // The transcript entry arrives back as `Event::User` once the session accepts it.
         if let Err(e) = self.session.submit(message) {
             self.entries.push(Entry::Error(e.to_string()));
         }
+    }
+
+    /// Handle `/context` locally: export the breakdown and report where it went.
+    fn export_context(&mut self) {
+        self.follow = true;
+        let session = Arc::clone(&self.session);
+        tokio::spawn(async move {
+            let event = match session.context().await {
+                Some(profile) => match profile::export(&profile, &profile::debug_dir()) {
+                    Ok(path) => Event::Info(profile.summary(&path)),
+                    Err(e) => Event::Error(format!("context export failed: {e:#}")),
+                },
+                None => Event::Error("the agent is not running".to_string()),
+            };
+            session.publish(event);
+        });
     }
 
     fn answer(&mut self, accept: bool) {

@@ -6,11 +6,13 @@ mod app;
 mod auth;
 mod bash;
 mod client;
+mod profile;
 mod prompt;
 mod server;
 mod session;
 mod ui;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -23,7 +25,7 @@ use ratatui::crossterm::execute;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, Control};
 use crate::app::App;
 use crate::session::Session;
 
@@ -53,21 +55,26 @@ async fn main() -> Result<()> {
     if args.first().is_some_and(|a| a == "--probe") {
         return probe(args.get(1).cloned()).await;
     }
-    let (serve, headless) = match parse_args(&args) {
+    let args = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(e) => {
-            eprintln!("bhai: {e:#}\nusage: bhai [--probe [prompt]] [--serve [port] [--headless]]");
+            eprintln!(
+                "bhai: {e:#}\nusage: bhai [--probe [prompt]] [--serve [port] [--headless]] [--profile]"
+            );
             std::process::exit(2);
         }
     };
 
     // Bind before taking over the terminal so a busy port is a plain error.
-    let listener = match serve {
+    let listener = match args.serve {
         Some(port) => Some(server::bind(port).await?),
         None => None,
     };
-    let (session, events) = start(model);
-    if headless {
+    let usage_log = args
+        .profile
+        .then(|| profile::debug_dir().join("usage.jsonl"));
+    let (session, events) = start(model, usage_log);
+    if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         eprintln!("bhai: debug server on http://{}", listener.local_addr()?);
         return server::serve(listener, session).await;
@@ -85,41 +92,54 @@ async fn main() -> Result<()> {
     result
 }
 
-/// Parse `--serve [port]` and `--headless` into the port to serve on and the mode.
-fn parse_args(args: &[String]) -> Result<(Option<u16>, bool)> {
-    let mut serve = None;
-    let mut headless = false;
+/// Command-line flags, apart from `--probe`.
+#[derive(Debug, Default, PartialEq)]
+struct Args {
+    /// Port for the debug server, when `--serve` is given.
+    serve: Option<u16>,
+    headless: bool,
+    /// Log every model call's usage to `.bhai/debug/usage.jsonl`.
+    profile: bool,
+}
+
+fn parse_args(args: &[String]) -> Result<Args> {
+    let mut parsed = Args::default();
     let mut args = args.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--serve" => {
                 let port = args.next_if(|a| !a.starts_with("--"));
-                serve = Some(match port {
+                parsed.serve = Some(match port {
                     Some(port) => port
                         .parse()
                         .map_err(|_| anyhow::anyhow!("bad port `{port}`"))?,
                     None => server::DEFAULT_PORT,
                 });
             }
-            "--headless" => headless = true,
+            "--headless" => parsed.headless = true,
+            "--profile" => parsed.profile = true,
             other => bail!("unknown argument `{other}`"),
         }
     }
-    if headless && serve.is_none() {
+    if parsed.headless && parsed.serve.is_none() {
         bail!("--headless needs --serve");
     }
-    Ok((serve, headless))
+    Ok(parsed)
 }
 
 /// Spawn the agent behind a session. The returned receiver is subscribed before the
 /// agent starts, so the TUI sees every event.
-fn start(model: String) -> (Arc<Session>, broadcast::Receiver<session::Event>) {
+fn start(
+    model: String,
+    usage_log: Option<PathBuf>,
+) -> (Arc<Session>, broadcast::Receiver<session::Event>) {
     let (tx_user, rx_user) = mpsc::channel::<String>(16);
+    let (tx_control, rx_control) = mpsc::channel::<Control>(16);
     let (tx_agent, rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
-    let session = Session::new(model, tx_user, Arc::clone(&cancel));
+    let session = Session::new(model, tx_user, tx_control, Arc::clone(&cancel));
     let events = session.subscribe();
-    tokio::spawn(agent::run(rx_user, tx_agent, cancel));
+    tokio::spawn(agent::run(rx_user, rx_control, tx_agent, cancel, usage_log));
     tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
     (session, events)
 }
@@ -128,9 +148,16 @@ fn start(model: String) -> (Arc<Session>, broadcast::Receiver<session::Event>) {
 /// the wire format and the tool-result replay path without executing anything.
 async fn probe(prompt: Option<String>) -> Result<()> {
     let (tx_user, rx_user) = mpsc::channel::<String>(1);
+    let (_tx_control, rx_control) = mpsc::channel::<Control>(1);
     let (tx_agent, mut rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
-    tokio::spawn(agent::run(rx_user, tx_agent, Arc::clone(&cancel)));
+    tokio::spawn(agent::run(
+        rx_user,
+        rx_control,
+        tx_agent,
+        Arc::clone(&cancel),
+        None,
+    ));
 
     tx_user
         .send(prompt.unwrap_or_else(|| "Reply with just: ok".to_string()))
@@ -150,9 +177,10 @@ async fn probe(prompt: Option<String>) -> Result<()> {
             AgentEvent::ToolStart(command) => println!("\n$ {command}"),
             AgentEvent::ToolOutput(output) => println!("{output}"),
             AgentEvent::ToolRejected(command) => println!("[rejected] {command}"),
-            AgentEvent::Usage { input, output } => {
-                println!("\n[usage] input={input} output={output}");
-            }
+            AgentEvent::Usage(u) => println!(
+                "\n[usage] input={} cached={} output={} reasoning={}",
+                u.input, u.cached, u.output, u.reasoning
+            ),
             AgentEvent::Error(message) => println!("\n[error] {message}"),
             AgentEvent::TurnEnd => break,
         }
@@ -231,6 +259,7 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<(Option<u16>, bool)> {
         parse_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+            .map(|a| (a.serve, a.headless))
     }
 
     #[test]
@@ -242,8 +271,19 @@ mod tests {
             parse(&["--serve", "--headless"]).unwrap(),
             (Some(7878), true)
         );
+        assert_eq!(
+            parse(&["--serve", "--profile"]).unwrap(),
+            (Some(7878), false)
+        );
         assert!(parse(&["--headless"]).is_err());
         assert!(parse(&["--serve", "nope"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
+    }
+
+    #[test]
+    fn profile_flag() {
+        let args = ["--profile"].map(String::from);
+        assert!(parse_args(&args).unwrap().profile);
+        assert!(!parse_args(&[]).unwrap().profile);
     }
 }

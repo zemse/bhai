@@ -121,11 +121,11 @@ async fn interrupt(State(session): State<Arc<Session>>) -> Response {
     }
 }
 
-async fn context() -> Response {
-    error(
-        StatusCode::NOT_IMPLEMENTED,
-        "context export is not built yet; the token profiler will fill this in",
-    )
+async fn context(State(session): State<Arc<Session>>) -> Response {
+    match session.context().await {
+        Some(profile) => Json(profile).into_response(),
+        None => error(StatusCode::SERVICE_UNAVAILABLE, "the agent is not running"),
+    }
 }
 
 fn ok() -> Response {
@@ -147,8 +147,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::agent::AgentEvent;
-    use crate::session;
+    use crate::agent::{AgentEvent, Control};
+    use crate::client::Usage;
+    use crate::{profile, session};
 
     const WAIT: Duration = Duration::from_secs(5);
 
@@ -156,14 +157,21 @@ mod tests {
     /// to run one command, and reports the decision on the returned channel.
     async fn start() -> (String, oneshot::Receiver<bool>) {
         let (tx_user, mut rx_user) = mpsc::channel::<String>(1);
+        let (tx_control, mut rx_control) = mpsc::channel::<Control>(1);
         let (tx_agent, rx_agent) = mpsc::unbounded_channel();
         let (tx_decision, rx_decision) = oneshot::channel();
         let session = Session::new(
             "test-model".to_string(),
             tx_user,
+            tx_control,
             Arc::new(AtomicBool::new(false)),
         );
         tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
+        tokio::spawn(async move {
+            while let Some(Control::Context(reply)) = rx_control.recv().await {
+                let _ = reply.send(profile::build("sys", &[], &[], None));
+            }
+        });
         tokio::spawn(async move {
             let _prompt = rx_user.recv().await;
             let _ = tx_agent.send(AgentEvent::Text("hi".to_string()));
@@ -174,10 +182,12 @@ mod tests {
             });
             let accepted = wait.await.unwrap_or(false);
             let _ = tx_decision.send(accepted);
-            let _ = tx_agent.send(AgentEvent::Usage {
+            let _ = tx_agent.send(AgentEvent::Usage(Usage {
                 input: 5,
+                cached: 4,
                 output: 2,
-            });
+                reasoning: 1,
+            }));
             let _ = tx_agent.send(AgentEvent::TurnEnd);
             // Stay alive so the session keeps accepting messages.
             let _ = rx_user.recv().await;
@@ -248,6 +258,8 @@ mod tests {
         let state = get_json(&http, format!("{base}/state")).await;
         assert_eq!(state["input_tokens"], 5);
         assert_eq!(state["output_tokens"], 2);
+        assert_eq!(state["cached_tokens"], 4);
+        assert_eq!(state["last_usage"]["reasoning"], 1);
         assert!(state["pending"].is_null());
 
         // The stream saw the whole turn, approval id included.
@@ -272,10 +284,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_is_not_implemented_yet() {
+    async fn context_returns_the_breakdown() {
         let (base, _) = start().await;
-        let response = reqwest::get(format!("{base}/context")).await.unwrap();
-        assert_eq!(response.status().as_u16(), 501);
+        let context = get_json(&reqwest::Client::new(), format!("{base}/context")).await;
+        assert_eq!(context["items"][0]["label"], "system prompt");
+        assert_eq!(context["total_bytes"], 3);
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::auth::{self, Auth};
@@ -27,7 +28,46 @@ const MAX_ATTEMPTS: usize = 3;
 pub enum Delta {
     Reasoning(String),
     Text(String),
-    Usage { input: u64, output: u64 },
+    Usage(Usage),
+}
+
+/// Token counts for one model call, as `response.completed` reports them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Usage {
+    pub input: u64,
+    /// Input tokens served from the prompt cache.
+    pub cached: u64,
+    pub output: u64,
+    /// Output tokens spent on reasoning.
+    pub reasoning: u64,
+}
+
+impl Usage {
+    /// Read the counts from a `response.completed` event; missing fields count as zero.
+    pub fn from_completed(event: &Value) -> Self {
+        let count = |path: &str| {
+            event
+                .pointer(&format!("/response/usage/{path}"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        Self {
+            input: count("input_tokens"),
+            cached: count("input_tokens_details/cached_tokens"),
+            output: count("output_tokens"),
+            reasoning: count("output_tokens_details/reasoning_tokens"),
+        }
+    }
+
+    /// Percent of the input that was a cache hit, when there was any input.
+    pub fn cache_rate(&self) -> Option<f64> {
+        (self.input > 0).then(|| self.cached as f64 * 100.0 / self.input as f64)
+    }
+}
+
+/// The tool schemas sent with every request.
+pub fn tools() -> Vec<Value> {
+    vec![crate::bash::tool_schema()]
 }
 
 pub struct Client {
@@ -69,7 +109,7 @@ impl Client {
             "model": self.model,
             "instructions": instructions,
             "input": input,
-            "tools": [crate::bash::tool_schema()],
+            "tools": tools(),
             "tool_choice": "auto",
             "parallel_tool_calls": false,
             "reasoning": { "effort": self.effort, "summary": "auto" },
@@ -189,17 +229,7 @@ impl Client {
                         {
                             items = output.clone();
                         }
-                        let usage = event.pointer("/response/usage");
-                        on_delta(Delta::Usage {
-                            input: usage
-                                .and_then(|u| u.get("input_tokens"))
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                            output: usage
-                                .and_then(|u| u.get("output_tokens"))
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                        });
+                        on_delta(Delta::Usage(Usage::from_completed(&event)));
                     }
                     "response.failed" => {
                         let msg = event
@@ -315,4 +345,38 @@ fn toml_string(line: &str, key: &str) -> Option<String> {
     let rest = line.strip_prefix(key)?.trim_start();
     let rest = rest.strip_prefix('=')?.trim();
     Some(rest.trim_matches('"').to_string()).filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_is_read_from_response_completed() {
+        let event: Value = serde_json::from_str(
+            r#"{"type":"response.completed","response":{"id":"r1","output":[],"usage":{
+                "input_tokens":1200,"input_tokens_details":{"cached_tokens":900},
+                "output_tokens":80,"output_tokens_details":{"reasoning_tokens":64},
+                "total_tokens":1280}}}"#,
+        )
+        .unwrap();
+        let usage = Usage::from_completed(&event);
+        assert_eq!(
+            usage,
+            Usage {
+                input: 1200,
+                cached: 900,
+                output: 80,
+                reasoning: 64,
+            }
+        );
+        assert_eq!(usage.cache_rate(), Some(75.0));
+    }
+
+    #[test]
+    fn missing_usage_counts_as_zero() {
+        let usage = Usage::from_completed(&json!({"type": "response.completed"}));
+        assert_eq!(usage, Usage::default());
+        assert_eq!(usage.cache_rate(), None);
+    }
 }
