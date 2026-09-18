@@ -84,14 +84,6 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut spans = vec![
         Span::styled(" bhai ", Style::new().fg(Color::Black).bg(Color::Cyan)),
         Span::styled(format!(" {} ", app.model), dim),
-        Span::styled(
-            format!("{} ", app.mode),
-            match app.mode {
-                Mode::Ask => dim,
-                Mode::Auto => Style::new().fg(Color::Yellow),
-                Mode::Bypass => Style::new().fg(Color::Red),
-            },
-        ),
     ];
     if app.working {
         spans.push(Span::styled(
@@ -133,7 +125,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
         } else if app.working {
             "  ctrl+c interrupt"
         } else {
-            "  enter send · shift+tab mode · wheel/pgup scroll · drag to select · ctrl+y copy · click expands output · ctrl+t tokens · ctrl+c quit"
+            "  enter send · wheel/pgup scroll · drag to select · ctrl+y copy · click expands output · ctrl+t tokens · ctrl+c quit"
         },
         dim,
     ));
@@ -418,8 +410,21 @@ fn input_width(area_width: u16) -> usize {
     area_width.saturating_sub(3).max(1) as usize
 }
 
+/// The permission mode, drawn on the bottom border of whatever the user is looking at
+/// so it stays in sight while typing and while an approval is up.
+fn mode_chip(mode: Mode) -> Line<'static> {
+    let style = match mode {
+        Mode::Ask => Style::new().fg(Color::DarkGray),
+        Mode::Auto => Style::new().fg(Color::Yellow),
+        Mode::Bypass => Style::new().fg(Color::Red),
+    };
+    Line::styled(format!(" {mode} · shift+tab "), style).right_aligned()
+}
+
 fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
-    let block = Block::bordered().border_style(Style::new().fg(Color::DarkGray));
+    let block = Block::bordered()
+        .border_style(Style::new().fg(Color::DarkGray))
+        .title_bottom(mode_chip(app.mode));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -484,6 +489,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     let block = Block::bordered()
         .title(title)
+        .title_bottom(mode_chip(app.mode))
         .border_style(Style::new().fg(Color::Yellow));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1126,6 +1132,42 @@ mod tests {
         app.on_event(Event::Cache(None));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!screen(&terminal).contains("cache break"));
+    }
+
+    #[test]
+    fn the_mode_chip_sits_on_the_bottom_bar_not_the_top() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let cases = [
+            (Mode::Ask, "ask", Color::DarkGray),
+            (Mode::Auto, "auto", Color::Yellow),
+            (Mode::Bypass, "bypass", Color::Red),
+        ];
+        for pending in [None, Some(approval(None))] {
+            app.pending = pending;
+            for (mode, name, colour) in cases {
+                app.mode = mode;
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                let screen = screen(&terminal);
+                let chip = format!("{name} · shift+tab ");
+                let bottom = screen.lines().next_back().unwrap();
+                assert!(bottom.contains(&chip), "{screen}");
+                let top = screen.lines().next().unwrap();
+                assert!(!top.contains(name), "{screen}");
+
+                let y = terminal.backend().buffer().area.height - 1;
+                let x = bottom[..bottom.find(name).unwrap()].chars().count() as u16;
+                assert_eq!(terminal.backend().buffer()[(x, y)].fg, colour);
+            }
+        }
+        assert!(
+            !screen(&terminal)
+                .lines()
+                .next()
+                .unwrap()
+                .contains("shift+tab"),
+            "the top bar keeps its other hints but not the mode"
+        );
     }
 
     #[test]
