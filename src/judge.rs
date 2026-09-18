@@ -227,6 +227,11 @@ impl Judge {
         if !self.settings.on {
             return None;
         }
+        // A target the summary would cut short is not judgeable: the judge would be ruling
+        // on a fragment, and a deny is cached for the session. Ask the user instead.
+        if target.chars().count() > TARGET_CLIP {
+            return None;
+        }
         let key = format!("{tool}\u{0}{target}");
         let request = {
             let mut state = self.lock();
@@ -686,6 +691,17 @@ mod tests {
         Verdict::Approve {
             reason: reason.to_string(),
         }
+    }
+
+    /// A command too long to show the judge in full is asked, not judged, so a cached
+    /// deny can never make a legitimate long chain unapprovable for the session.
+    #[tokio::test]
+    async fn an_over_long_command_skips_the_judge() {
+        let (judge, backend) = judge(Answers::Verdict(approve("fine")), Path::new("/p"));
+        let long = "echo ".to_string() + &"x".repeat(TARGET_CLIP);
+        assert_eq!(judge.decide("bash", &long, "").await, None);
+        assert!(backend.calls.lock().unwrap().is_empty(), "never called");
+        assert!(judge.decide("bash", "echo hi", "").await.is_some());
     }
 
     #[tokio::test]
