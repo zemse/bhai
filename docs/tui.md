@@ -8,6 +8,11 @@ A running command streams its output into the transcript as it arrives, so a lon
 or test run can be watched rather than waited on. Tool output collapses to a few lines;
 click it to expand.
 
+A prompt typed while the agent works joins a queue rather than being refused. It shows
+dim in the transcript, the status bar counts what is waiting, and each one runs as a turn
+of its own in the order it was typed. `/queue` lists them and `/queue clear` drops them;
+an interrupt drops them too, because stop means stop.
+
 ## Keys
 
 | key | what it does |

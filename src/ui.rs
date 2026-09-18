@@ -91,6 +91,9 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::new().fg(Color::Yellow),
         ));
     }
+    if app.queued > 0 {
+        spans.push(Span::styled(format!("{} queued ", app.queued), dim));
+    }
     if app.tokens_in + app.tokens_out > 0 {
         spans.push(Span::styled(
             format!("↑{} ↓{} ", compact(app.tokens_in), compact(app.tokens_out)),
@@ -355,6 +358,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>
     }
     let (prefix, text, style): (&str, &str, Style) = match entry {
         Entry::User(t) => ("› ", t, Style::new().fg(Color::Cyan).bold()),
+        Entry::Queued(t) => ("queued › ", t, Style::new().fg(Color::DarkGray)),
         Entry::Assistant(t) => ("", t, Style::new()),
         Entry::Reasoning(t) => ("", t, Style::new().fg(Color::DarkGray).italic()),
         Entry::Command(t) => ("$ ", t, Style::new().fg(Color::Yellow)),
@@ -758,6 +762,22 @@ mod tests {
                 row.trim_end().to_string() + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn a_queued_prompt_shows_dim_with_the_count_in_the_status_bar() {
+        let mut app = App::detached();
+        app.working = true;
+        app.on_event(Event::Queued {
+            position: 1,
+            text: "later".to_string(),
+        });
+        app.entries().push(Entry::Queued("later".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = screen(&terminal);
+        assert!(screen.contains("1 queued"), "{screen}");
+        assert!(screen.contains("queued › later"), "{screen}");
     }
 
     #[test]

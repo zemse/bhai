@@ -1406,6 +1406,77 @@ mod tests {
         events
     }
 
+    /// A prompt typed mid-turn waits, then runs as a turn of its own on the same
+    /// history, so it appends like any other and the cache holds.
+    #[tokio::test]
+    async fn a_queued_prompt_runs_next_and_keeps_the_cache() {
+        use crate::session::{Session, Submitted};
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![vec![say("one")], vec![say("two")]]);
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, rx_agent) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let policy = Arc::new(Policy::default());
+        let session = Session::new(
+            "fake".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            Arc::clone(&cancel),
+            Arc::clone(&policy),
+        );
+        let mut events = session.subscribe();
+        tokio::spawn(crate::session::pump(Arc::clone(&session), rx_agent));
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            policy,
+            rx_user,
+            rx_control,
+            tx,
+            cancel,
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+
+        assert_eq!(session.submit("first".to_string()), Ok(Submitted::Started));
+        assert_eq!(
+            session.submit("second".to_string()),
+            Ok(Submitted::Queued { position: 1 })
+        );
+        let mut ends = 0;
+        while ends < 2 {
+            match events.recv().await.expect("the session stayed up") {
+                crate::session::Event::TurnEnd => ends += 1,
+                _ => continue,
+            }
+        }
+        assert!(!session.state().working);
+        assert!(session.state().queued.is_empty());
+
+        // The queued prompt became a user entry where it was typed, not a second one.
+        let entries = session.entries();
+        let shown: Vec<(&str, &str)> = entries.list.iter().map(|e| (e.kind(), e.text())).collect();
+        // The fake streams no text, so the transcript is the two prompts alone.
+        assert_eq!(shown, [("user", "first"), ("user", "second")]);
+        drop(entries);
+
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        assert_eq!(*fake.resets.lock().unwrap(), []);
+        let bodies = fake.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        // The second turn appends to the first, so its prefix is unchanged.
+        let first = bodies[0].1["input"].as_array().unwrap();
+        let second = bodies[1].1["input"].as_array().unwrap();
+        assert_eq!(&second[..first.len()], first.as_slice());
+        assert_eq!(second.last().unwrap()["content"][0]["text"], "second");
+    }
+
     #[tokio::test]
     async fn a_scripted_session_never_breaks_the_prompt_cache() {
         use crate::mcp::{Hub, ToolInfo};

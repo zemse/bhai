@@ -138,6 +138,8 @@ pub struct App {
     /// Submitted prompts, for `ctrl+p` and `ctrl+n`.
     pub history: History,
     pub working: bool,
+    /// Prompts waiting behind the running turn, for the status bar.
+    pub queued: usize,
     /// The tool call waiting for approval.
     pub pending: Option<Approval>,
     pub scroll: usize,
@@ -201,6 +203,7 @@ impl App {
             input: Editor::default(),
             history: History::default(),
             working: false,
+            queued: 0,
             pending: None,
             scroll: 0,
             max_scroll: 0,
@@ -565,7 +568,14 @@ impl App {
             Event::User(_) => {
                 self.follow = true;
                 self.working = true;
+                // Nothing waits unless a turn runs, so a user message with a queue
+                // behind it is the front of that queue starting.
+                self.queued = self.queued.saturating_sub(1);
             }
+            // The position is the length of the queue the prompt joined.
+            Event::Queued { position, .. } => self.queued = position,
+            // An interrupt drops whatever was waiting.
+            Event::Interrupted => self.queued = 0,
             Event::Approval {
                 id,
                 tool,
@@ -691,10 +701,31 @@ impl App {
             self.note(Entry::Info(skills_report(&self.skills)));
             return;
         }
+        if let Some(rest) = message.strip_prefix("/queue")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            self.queue(rest.trim());
+            return;
+        }
         // The transcript entry arrives back as `Event::User` once the session accepts it.
         if let Err(e) = self.session.submit(message) {
             self.note(Entry::Error(e.to_string()));
         }
+    }
+
+    /// `/queue` lists the prompts waiting behind the turn; `/queue clear` drops them.
+    fn queue(&mut self, rest: &str) {
+        if rest == "clear" {
+            if self.session.clear_queue() == 0 {
+                self.note(Entry::Info("queue: nothing waiting".to_string()));
+            }
+            self.queued = 0;
+            return;
+        }
+        let queued = self.session.queued();
+        self.queued = queued.len();
+        self.note(Entry::Info(queue_report(&queued)));
     }
 
     /// `/workflow <name> [input]`: the agent asks for confirmation before it launches
@@ -810,6 +841,19 @@ fn mouse_notice(on: bool) -> String {
                 .to_string()
         }
     }
+}
+
+/// What `/queue` prints: each waiting prompt in the order it will run.
+fn queue_report(queued: &[String]) -> String {
+    if queued.is_empty() {
+        return "queue: nothing waiting. /queue clear drops what is.".to_string();
+    }
+    let mut out = format!("queue: {} waiting", queued.len());
+    for (i, text) in queued.iter().enumerate() {
+        let line = text.trim().lines().next().unwrap_or_default();
+        out.push_str(&format!("\n{:>3}. {}", i + 1, line));
+    }
+    out
 }
 
 /// What `/skills` prints: each skill, where it came from and its listing cost.
@@ -1002,6 +1046,38 @@ mod tests {
             "identity: general. Usage: /as <name>"
         );
         assert!(switch_notice("general", "router").ends_with("run: bhai --as router"));
+    }
+
+    #[test]
+    fn the_queue_count_follows_the_events() {
+        let mut app = App::detached();
+        let queued = |position| Event::Queued {
+            position,
+            text: format!("p{position}"),
+        };
+        app.on_event(queued(1));
+        app.on_event(queued(2));
+        assert_eq!(app.queued, 2);
+        // The front of the queue starting is a user message like any other.
+        app.on_event(Event::User("p1".to_string()));
+        assert_eq!(app.queued, 1);
+        app.on_event(Event::Interrupted);
+        assert_eq!(app.queued, 0);
+        app.on_event(Event::User("fresh".to_string()));
+        assert_eq!(app.queued, 0);
+    }
+
+    #[test]
+    fn queue_report_lists_the_waiting_prompts() {
+        assert_eq!(
+            queue_report(&[]),
+            "queue: nothing waiting. /queue clear drops what is."
+        );
+        let queued = ["fix the test".to_string(), "then\nship it".to_string()];
+        assert_eq!(
+            queue_report(&queued),
+            "queue: 2 waiting\n  1. fix the test\n  2. then"
+        );
     }
 
     #[test]

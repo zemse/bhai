@@ -6,10 +6,10 @@ a session from a script.
 
 | endpoint | what it does |
 | --- | --- |
-| `GET /state` | the whole session: mode, transcript entries with their tokens, totals, and the pending approval |
+| `GET /state` | the whole session: mode, transcript entries with their tokens, totals, queued prompts and the pending approval |
 | `GET /events` | the same events the tui gets, as SSE |
 | `GET /context` | the token profile as JSON |
-| `POST /prompt` | `{"text": "..."}`, rejected with 409 while a turn is running |
+| `POST /prompt` | `{"text": "..."}`; while a turn is running it answers `{"queued": <position>}` and the prompt starts when the queue reaches it |
 | `POST /approve` | answer the pending approval; optional body `{"remember": "exact"}` or `"prefix"` |
 | `POST /reject` | reject the pending approval |
 | `POST /interrupt` | stop the running turn |

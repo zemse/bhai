@@ -1,6 +1,7 @@
 //! The session hub: fans agent events out to every consumer (the TUI, the debug server)
 //! and holds the pending approval so exactly one of them answers it.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -26,6 +27,11 @@ const EVENT_BUFFER: usize = 4096;
 pub enum Event {
     /// A user message was accepted and a turn started.
     User(String),
+    /// A user message typed while a turn ran; it waits at `position` in the queue.
+    Queued {
+        position: usize,
+        text: String,
+    },
     Reasoning(String),
     Text(String),
     Approval {
@@ -89,6 +95,8 @@ pub struct State {
     pub identity: String,
     pub mode: Mode,
     pub working: bool,
+    /// Prompts waiting for the running turn, in the order they will run.
+    pub queued: Vec<String>,
     pub input_tokens: u64,
     pub cached_tokens: u64,
     pub output_tokens: u64,
@@ -106,6 +114,15 @@ pub struct State {
     pub pending: Option<Approval>,
     /// Transcript entries with token attribution, as the hover badges show them.
     pub entries: Vec<EntryTokens>,
+}
+
+/// What `submit` did with the message.
+#[derive(Debug, PartialEq)]
+pub enum Submitted {
+    /// The turn started.
+    Started,
+    /// A turn was running, so the message waits at this place in the queue.
+    Queued { position: usize },
 }
 
 /// Why a message was not submitted.
@@ -127,6 +144,8 @@ impl fmt::Display for SubmitError {
 #[derive(Default)]
 struct Inner {
     working: bool,
+    /// Prompts typed while a turn ran, oldest first.
+    queue: VecDeque<String>,
     total: Usage,
     calls: u64,
     children: Usage,
@@ -182,6 +201,7 @@ impl Session {
             identity: self.identity.clone(),
             mode: self.policy.mode(),
             working: inner.working,
+            queued: inner.queue.iter().cloned().collect(),
             input_tokens: inner.total.input,
             cached_tokens: inner.total.cached,
             output_tokens: inner.total.output,
@@ -196,11 +216,14 @@ impl Session {
         }
     }
 
-    /// Start a turn with `text`, unless one is already running.
-    pub fn submit(&self, text: String) -> Result<(), SubmitError> {
+    /// Start a turn with `text`, or queue it when one is already running.
+    pub fn submit(&self, text: String) -> Result<Submitted, SubmitError> {
         let mut inner = self.lock();
         if inner.working {
-            return Err(SubmitError::Busy);
+            inner.queue.push_back(text.clone());
+            let position = inner.queue.len();
+            self.publish(Event::Queued { position, text });
+            return Ok(Submitted::Queued { position });
         }
         // Cleared here, not when the agent picks the message up, so an interrupt that
         // lands in between still stops the turn.
@@ -210,7 +233,38 @@ impl Session {
             .map_err(|_| SubmitError::Closed)?;
         inner.working = true;
         self.publish(Event::User(text));
-        Ok(())
+        Ok(Submitted::Started)
+    }
+
+    /// The prompts waiting for the running turn, for `/queue`.
+    pub fn queued(&self) -> Vec<String> {
+        self.lock().queue.iter().cloned().collect()
+    }
+
+    /// Drop every queued prompt, for `/queue clear`. Returns how many there were.
+    pub fn clear_queue(&self) -> usize {
+        let dropped = self.lock().queue.drain(..).count();
+        if dropped > 0 {
+            self.entries().drop_queued();
+            self.publish(Event::Info(format!("dropped {dropped} queued prompt(s)")));
+        }
+        dropped
+    }
+
+    /// Hand the next queued prompt to the agent, with the state locked. A prompt the
+    /// agent will not take keeps its place rather than being lost.
+    fn start_queued(&self, inner: &mut Inner) {
+        let Some(text) = inner.queue.pop_front() else {
+            return;
+        };
+        self.cancel.store(false, Ordering::Relaxed);
+        if self.tx_user.try_send(text.clone()).is_err() {
+            inner.queue.push_front(text);
+            inner.working = false;
+            return;
+        }
+        inner.working = true;
+        self.publish(Event::User(text));
     }
 
     /// Answer the pending approval, only if it is `id` when one is given, and only with
@@ -245,6 +299,8 @@ impl Session {
         self.cancel.store(true, Ordering::Relaxed);
         self.answer(Answer::Reject, None);
         self.publish(Event::Interrupted);
+        // Stop means stop, so nothing that was waiting behind the turn runs.
+        self.clear_queue();
         true
     }
 
@@ -375,12 +431,17 @@ impl Session {
             AgentEvent::Compacted(s) => Event::Compacted(s),
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnEnd => {
-                inner.working = false;
+                // The session keeps working while queued prompts wait behind the turn.
+                inner.working = !inner.queue.is_empty();
                 Event::TurnEnd
             }
         };
+        let ended = event == Event::TurnEnd;
         // Published under the lock so the state and the event order always agree.
         self.publish(event);
+        if ended {
+            self.start_queued(&mut inner);
+        }
     }
 
     pub fn publish(&self, event: Event) {
@@ -416,6 +477,7 @@ pub async fn pump(session: Arc<Session>, mut rx_agent: mpsc::UnboundedReceiver<A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entries::Entry;
 
     fn session() -> (Arc<Session>, mpsc::Receiver<String>) {
         let (tx_user, rx_user) = mpsc::channel(1);
@@ -464,13 +526,98 @@ mod tests {
     }
 
     #[test]
-    fn submit_is_rejected_while_a_turn_runs() {
+    fn prompts_sent_while_a_turn_runs_queue_in_order() {
         let (session, mut rx_user) = session();
-        assert_eq!(session.submit("a".to_string()), Ok(()));
+        let mut events = session.subscribe();
+        assert_eq!(session.submit("a".to_string()), Ok(Submitted::Started));
         assert_eq!(rx_user.try_recv().unwrap(), "a");
-        assert_eq!(session.submit("b".to_string()), Err(SubmitError::Busy));
+        assert_eq!(
+            session.submit("b".to_string()),
+            Ok(Submitted::Queued { position: 1 })
+        );
+        assert_eq!(
+            session.submit("c".to_string()),
+            Ok(Submitted::Queued { position: 2 })
+        );
+        let state = session.state();
+        assert!(state.working);
+        assert_eq!(state.queued, ["b", "c"]);
+
+        // The first queued prompt starts as the turn ends, the next behind it.
         session.on_agent(AgentEvent::TurnEnd);
-        assert_eq!(session.submit("c".to_string()), Ok(()));
+        assert_eq!(rx_user.try_recv().unwrap(), "b");
+        assert!(session.state().working);
+        assert_eq!(session.state().queued, ["c"]);
+        session.on_agent(AgentEvent::TurnEnd);
+        assert_eq!(rx_user.try_recv().unwrap(), "c");
+        session.on_agent(AgentEvent::TurnEnd);
+        assert!(!session.state().working);
+        assert!(session.state().queued.is_empty());
+
+        let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            seen,
+            [
+                Event::User("a".to_string()),
+                Event::Queued {
+                    position: 1,
+                    text: "b".to_string()
+                },
+                Event::Queued {
+                    position: 2,
+                    text: "c".to_string()
+                },
+                Event::TurnEnd,
+                Event::User("b".to_string()),
+                Event::TurnEnd,
+                Event::User("c".to_string()),
+                Event::TurnEnd,
+            ]
+        );
+        // The queued entries became the user entries, with nothing left over.
+        let entries = session.entries();
+        let kinds: Vec<_> = entries.list.iter().map(Entry::kind).collect();
+        assert_eq!(kinds, ["user", "user", "user"]);
+        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        assert_eq!(texts, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn an_interrupt_drops_the_queue() {
+        let (session, mut rx_user) = session();
+        session.submit("a".to_string()).unwrap();
+        assert_eq!(rx_user.try_recv().unwrap(), "a");
+        session.submit("b".to_string()).unwrap();
+        session.submit("c".to_string()).unwrap();
+        assert!(session.interrupt());
+        assert!(session.state().queued.is_empty());
+        session.on_agent(AgentEvent::TurnEnd);
+        assert!(!session.state().working);
+        assert!(rx_user.try_recv().is_err());
+        let entries = session.entries();
+        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        assert_eq!(
+            texts,
+            [
+                "a",
+                "dropped: b",
+                "dropped: c",
+                "interrupted",
+                "dropped 2 queued prompt(s)"
+            ]
+        );
+    }
+
+    #[test]
+    fn clearing_the_queue_leaves_the_turn_running() {
+        let (session, _rx) = session();
+        assert_eq!(session.clear_queue(), 0);
+        session.submit("a".to_string()).unwrap();
+        session.submit("b".to_string()).unwrap();
+        assert_eq!(session.queued(), ["b"]);
+        assert_eq!(session.clear_queue(), 1);
+        assert!(session.queued().is_empty());
+        assert!(session.state().working);
     }
 
     #[test]

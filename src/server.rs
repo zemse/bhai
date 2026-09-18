@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::permissions::{Answer, Mode, Remember};
-use crate::session::{Session, SubmitError};
+use crate::session::{Session, Submitted};
 
 /// Port `--serve` listens on when none is given.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -100,9 +100,12 @@ async fn prompt(State(session): State<Arc<Session>>, Json(body): Json<Prompt>) -
         return error(StatusCode::BAD_REQUEST, "text is empty");
     }
     match session.submit(text) {
-        Ok(()) => ok(),
-        Err(e @ SubmitError::Busy) => error(StatusCode::CONFLICT, &e.to_string()),
-        Err(e @ SubmitError::Closed) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+        Ok(Submitted::Started) => ok(),
+        Ok(Submitted::Queued { position }) => {
+            Json(json!({ "ok": true, "queued": position })).into_response()
+        }
+        // A busy session queues instead of refusing, so the agent is gone.
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
     }
 }
 
@@ -248,6 +251,9 @@ mod tests {
                 ..Usage::default()
             }));
             let _ = tx_agent.send(AgentEvent::TurnEnd);
+            // The queued prompt starts as that turn ends.
+            let _ = rx_user.recv().await;
+            let _ = tx_agent.send(AgentEvent::TurnEnd);
             // Stay alive so the session keeps accepting messages.
             let _ = rx_user.recv().await;
         });
@@ -300,9 +306,14 @@ mod tests {
             post(&http, format!("{base}/prompt"), json!({"text": "go"})).await,
             StatusCode::OK
         );
+        // A second prompt joins the queue instead of being refused.
         assert_eq!(
             post(&http, format!("{base}/prompt"), json!({"text": "again"})).await,
-            StatusCode::CONFLICT
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_json(&http, format!("{base}/state")).await["queued"],
+            json!(["again"])
         );
 
         wait_state(&http, &base, |s| s["pending"]["command"] == "ls").await;
