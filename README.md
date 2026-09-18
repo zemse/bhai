@@ -45,13 +45,14 @@ inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/au
 ## flags
 
 ```
-bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--as <identity>]
-     [--resume [id]] [--workflow <name> [input] [--workflow-yes]]
+bhai [identities] [sessions] [--probe [prompt]] [--cache-check]
+     [--judge-eval [file]] [--as <identity>] [--resume [id]]
+     [--workflow <name> [input] [--workflow-yes]]
      [--serve [port] [--headless]] [--profile] [--strict-cache]
      [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]
 ```
 
-`identities` and `sessions` print what is available and exit. `--probe` does one non-interactive model call to check auth and the wire format. `--profile` logs every call's usage and response headers under `.bhai/debug/`. `--trust` trusts the repo's allow rules at startup. `--no-global`, `--no-project` and `--bare` drop instruction files and skills, `--bare` all of them.
+`identities` and `sessions` print what is available and exit. `--probe` does one non-interactive model call to check auth and the wire format. `--judge-eval` scores the auto-approval judge against a file of cases, `tests/fixtures/judge-cases.jsonl` by default, and exits 1 when any verdict is not the one the case expected. `--profile` logs every call's usage and response headers under `.bhai/debug/`. `--trust` trusts the repo's allow rules at startup. `--no-global`, `--no-project` and `--bare` drop instruction files and skills, `--bare` all of them.
 
 ## not built yet
 

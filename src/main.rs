@@ -827,6 +827,9 @@ async fn judge_eval(
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let cases = judge::cases(&text)?;
+    if cases.is_empty() {
+        bail!("no cases in {}", path.display());
+    }
     let client = client::Client::new()?.with_overrides(
         system.identity.model.clone(),
         system.identity.effort.clone(),
