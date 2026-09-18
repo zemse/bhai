@@ -121,6 +121,32 @@ pub struct State {
     pub entries: Vec<EntryTokens>,
 }
 
+/// A submitted prompt: what the agent is sent, and what the transcript shows. The two
+/// differ for `/<skill>`, which reads as a command but goes to the model as a request to
+/// use that skill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Prompt {
+    pub text: String,
+    pub shown: String,
+}
+
+impl Prompt {
+    /// A prompt shown as something other than what it sends.
+    pub fn shown_as(text: String, shown: String) -> Self {
+        Self { text, shown }
+    }
+}
+
+/// A plain prompt shows exactly what it sends.
+impl From<String> for Prompt {
+    fn from(text: String) -> Self {
+        Self {
+            shown: text.clone(),
+            text,
+        }
+    }
+}
+
 /// What `submit` did with the message.
 #[derive(Debug, PartialEq)]
 pub enum Submitted {
@@ -150,7 +176,7 @@ impl fmt::Display for SubmitError {
 struct Inner {
     working: bool,
     /// Prompts typed while a turn ran, oldest first.
-    queue: VecDeque<String>,
+    queue: VecDeque<Prompt>,
     total: Usage,
     calls: u64,
     children: Usage,
@@ -210,7 +236,7 @@ impl Session {
             identity: self.identity.clone(),
             mode: self.policy.mode(),
             working: inner.working,
-            queued: inner.queue.iter().cloned().collect(),
+            queued: inner.queue.iter().map(|p| p.shown.clone()).collect(),
             input_tokens: inner.total.input,
             cached_tokens: inner.total.cached,
             output_tokens: inner.total.output,
@@ -229,11 +255,13 @@ impl Session {
         }
     }
 
-    /// Start a turn with `text`, or queue it when one is already running.
-    pub fn submit(&self, text: String) -> Result<Submitted, SubmitError> {
+    /// Start a turn with `prompt`, or queue it when one is already running.
+    pub fn submit(&self, prompt: impl Into<Prompt>) -> Result<Submitted, SubmitError> {
+        let prompt = prompt.into();
         let mut inner = self.lock();
         if inner.working {
-            inner.queue.push_back(text.clone());
+            let text = prompt.shown.clone();
+            inner.queue.push_back(prompt);
             let position = inner.queue.len();
             self.publish(Event::Queued { position, text });
             return Ok(Submitted::Queued { position });
@@ -242,16 +270,16 @@ impl Session {
         // lands in between still stops the turn.
         self.cancel.store(false, Ordering::Relaxed);
         self.tx_user
-            .try_send(text.clone())
+            .try_send(prompt.text)
             .map_err(|_| SubmitError::Closed)?;
         inner.working = true;
-        self.publish(Event::User(text));
+        self.publish(Event::User(prompt.shown));
         Ok(Submitted::Started)
     }
 
-    /// The prompts waiting for the running turn, for `/queue`.
+    /// The prompts waiting for the running turn, for `/queue`, as they were typed.
     pub fn queued(&self) -> Vec<String> {
-        self.lock().queue.iter().cloned().collect()
+        self.lock().queue.iter().map(|p| p.shown.clone()).collect()
     }
 
     /// Drop every queued prompt, for `/queue clear`. Returns how many there were.
@@ -267,17 +295,19 @@ impl Session {
     /// Hand the next queued prompt to the agent, with the state locked. A prompt the
     /// agent will not take keeps its place rather than being lost.
     fn start_queued(&self, inner: &mut Inner) {
-        let Some(text) = inner.queue.pop_front() else {
+        let Some(prompt) = inner.queue.pop_front() else {
             return;
         };
         self.cancel.store(false, Ordering::Relaxed);
-        if self.tx_user.try_send(text.clone()).is_err() {
-            inner.queue.push_front(text);
+        if let Err(e) = self.tx_user.try_send(prompt.text.clone()) {
+            inner
+                .queue
+                .push_front(Prompt::shown_as(e.into_inner(), prompt.shown));
             inner.working = false;
             return;
         }
         inner.working = true;
-        self.publish(Event::User(text));
+        self.publish(Event::User(prompt.shown));
     }
 
     /// Answer the pending approval, only if it is `id` when one is given, and only with
@@ -602,6 +632,28 @@ mod tests {
         assert_eq!(kinds, ["user", "user", "user"]);
         let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
         assert_eq!(texts, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_prompt_can_show_something_other_than_what_it_sends() {
+        let (session, mut rx_user) = session();
+        let mut events = session.subscribe();
+        let typed = || Prompt::shown_as("Use the `pdf` skill.".to_string(), "/pdf".to_string());
+        session.submit(typed()).unwrap();
+        assert_eq!(rx_user.try_recv().unwrap(), "Use the `pdf` skill.");
+        assert_eq!(events.try_recv(), Ok(Event::User("/pdf".to_string())));
+
+        // Queued, and then started from the queue, it still shows as it was typed.
+        session.submit(typed()).unwrap();
+        assert_eq!(session.queued(), ["/pdf"]);
+        assert_eq!(session.state().queued, ["/pdf"]);
+        session.on_agent(AgentEvent::TurnEnd);
+        assert_eq!(rx_user.try_recv().unwrap(), "Use the `pdf` skill.");
+        let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(seen.contains(&Event::User("/pdf".to_string())), "{seen:?}");
+        let entries = session.entries();
+        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        assert_eq!(texts, ["/pdf", "/pdf"]);
     }
 
     #[test]

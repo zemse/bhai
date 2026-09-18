@@ -23,7 +23,7 @@ use crate::input::{Editor, History};
 use crate::limits::RateLimits;
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
-use crate::session::{Approval, Event, Session};
+use crate::session::{Approval, Event, Prompt, Session};
 use crate::skills::Skill;
 use crate::workflow::{self, Found};
 
@@ -796,10 +796,11 @@ impl App {
             return;
         }
         // `/<skill>` is the one slash form that reaches the model: it asks for the skill
-        // by name, and the agent loads it through the `skill` tool.
-        let message = match command(&message) {
+        // by name, and the agent loads it through the `skill` tool. The transcript keeps
+        // showing what was typed, not the sentence it turns into.
+        let prompt = match command(&message) {
             Some((name, input)) if commands::skill(name, &self.skills).is_some() => {
-                commands::skill_prompt(name, input)
+                Prompt::shown_as(commands::skill_prompt(name, input), message)
             }
             Some((name, _)) => {
                 self.follow = true;
@@ -808,10 +809,10 @@ impl App {
                 )));
                 return;
             }
-            None => message,
+            None => Prompt::from(message),
         };
         // The transcript entry arrives back as `Event::User` once the session accepts it.
-        if let Err(e) = self.session.submit(message) {
+        if let Err(e) = self.session.submit(prompt) {
             self.note(Entry::Error(e.to_string()));
         }
     }
