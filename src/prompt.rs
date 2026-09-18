@@ -223,7 +223,13 @@ Environment:
 runs. A rejected call did not execute; take the rejection as direction and change course \
 rather than retrying the same thing.
 - Use absolute paths. Relative paths are a common source of mistakes.
-- Prefer small, checkable commands over one long chain, so a rejection is cheap.
+- Plan the whole shell step and join its parts with `&&` instead of one call per \
+command. Conditionals, loops, subshells, command substitution and heredocs cannot be \
+checked by the permission layer, so they always stop for approval; plain commands joined \
+by `&&` do not.
+- Do not retry a failed command with small variations. Read the error and decide.
+- Prefer `grep`, `sed` and `awk` over writing a script for what one command does.
+- When a test states the requirement, fix the code under test, not the test.
 - Never run anything interactive (editors, pagers, REPLs, `git rebase -i`); it will hang \
 until the 120-second timeout kills it.
 - Read before you write. Look at a file before editing it, and verify after editing.
