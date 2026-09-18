@@ -447,9 +447,11 @@ impl App {
     /// Extend the transcript selection to the cell under the pointer.
     /// Returns whether the screen needs a redraw.
     fn drag_selection(&mut self, x: u16, y: u16) -> bool {
-        if self.press != Some((x, y)) {
-            self.press = None;
+        // A drag reported on the press cell has not moved yet, so it is still a click.
+        if self.press == Some((x, y)) {
+            return false;
         }
+        self.press = None;
         let (Some(anchor), Some(head)) = (self.anchor, self.cell_at(x, y)) else {
             return false;
         };
@@ -1100,6 +1102,15 @@ mod tests {
         app.on_mouse(space);
         app.on_mouse(space);
         assert_eq!(app.selected_text(), None, "a space alone trims to nothing");
+    }
+
+    #[test]
+    fn a_drag_that_never_left_the_press_cell_stays_a_click() {
+        let mut app = transcript(&["one two"]);
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 4, 0));
+        assert!(!app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 4, 0)));
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 4, 0));
+        assert_eq!(app.selection, None);
     }
 
     #[test]
