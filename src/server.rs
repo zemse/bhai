@@ -209,6 +209,7 @@ mod tests {
             tx_control,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Policy::default()),
+            None,
         );
         tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
         tokio::spawn(async move {
@@ -388,6 +389,7 @@ mod tests {
             tx_control,
             Arc::clone(&cancel),
             Arc::clone(&policy),
+            None,
         );
         tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
         tokio::spawn(crate::agent::run_with(
@@ -395,6 +397,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             policy,
+            None,
             rx_user,
             rx_control,
             tx_agent,

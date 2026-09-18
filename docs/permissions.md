@@ -33,6 +33,40 @@ project gets none of it and `ask` mode gets none of it either. Turn each off wit
 `auto_project_writes = false` and `auto_project_commands = false`; a project config file
 may turn them off but never on. `/permissions` prints which of them apply.
 
+## The judge
+
+What is left in `auto` in a trusted project is every call no rule names: an unknown
+binary, a write the relaxations do not cover, an MCP tool. Rather than prompt for each,
+a small model call decides whether the call is a reasonable step toward the task you
+actually asked for and whether its blast radius stays inside the project. It answers
+`approve` or `deny`, nothing else.
+
+The judge only ever sees what would otherwise have prompted, so allow and deny rules are
+never overridden. These never reach it and prompt as before: a protected path, a write or
+edit outside the project root, `sudo`, and any command the tokenizer refuses. A deny is
+final for that call and goes back to the model as `denied by auto policy: <reason>`, so
+it can adapt; you are not asked afterwards. Anything else the judge cannot settle, an
+error, a timeout, a malformed reply or a spent budget, falls back to the prompt.
+
+The request is a compact summary, well under 1k tokens: your latest message, the tool,
+the exact command or path, a diff summary for an edit, the cwd and root, the last few
+tool calls one line each, and the verdicts given so far. It runs on its own
+`prompt_cache_key`, is never appended to the conversation, and its tokens are counted
+apart in `/context` and `GET /state`. A verdict is reused for an identical call for the
+rest of the session, and at most `judge_max_per_turn` calls are judged per turn.
+
+Every decision is appended to `.bhai/debug/judge.jsonl`, and the transcript shows
+`auto-approved: <reason>` or `auto-denied: <reason>`. `/permissions` prints whether the
+judge is on and what is left of this turn's budget.
+
+```toml
+judge = false            # off; it is on by default and only ever runs in `auto`
+judge_model = "gpt-5.5"  # the session's model unless set
+judge_effort = "low"
+judge_timeout_ms = 15000
+judge_max_per_turn = 20
+```
+
 ## Rules
 
 Claude Code syntax: `Bash(git log:*)`, `Bash(cargo *test)`, `Read(~/notes/**)`,

@@ -235,6 +235,15 @@ impl Policy {
             .check(tool, args, needs_approval)
     }
 
+    /// Whether a call the rules left at `Ask` may go to the auto-approval judge. Only in
+    /// `auto` mode in a trusted project, and never for what must always reach the user: a
+    /// protected path, a write or edit outside the project, or a command the tokenizer
+    /// refuses, which is how `sudo` and everything it cannot read are kept out.
+    pub fn judgeable(&self, tool: &str, args: &Value) -> bool {
+        let rules = self.rules();
+        self.checker(&rules, self.mode()).judgeable(tool, args)
+    }
+
     /// The rules the approval prompt for this call may offer: each one is offered only
     /// if, once added, it would let this very call run in `auto` mode.
     pub fn offers(&self, tool: &str, args: &Value) -> Offers {
@@ -598,6 +607,31 @@ impl Checker<'_> {
             }
         }
         self.fallback(Some(reasons.join(", ")))
+    }
+
+    /// See `Policy::judgeable`.
+    fn judgeable(&self, tool: &str, args: &Value) -> bool {
+        if !self.relaxed() {
+            return false;
+        }
+        let text = |key| args.get(key).and_then(Value::as_str);
+        match tool {
+            "bash" => match bash::parse(text("command").unwrap_or_default()) {
+                Some(commands) => !commands.iter().any(bash::mentions_protected),
+                None => false,
+            },
+            "read" | "write" | "edit" => match text("path") {
+                Some(path) => {
+                    let path = Path::new(path);
+                    !rules::is_protected(path, self.base.home)
+                        && rules::is_inside(path, self.base.cwd)
+                }
+                None => false,
+            },
+            // An MCP server the user has not approved is never connected, so an
+            // `mcp_call` that gets this far names one they did approve.
+            _ => true,
+        }
     }
 
     /// Whether a trusted project's relaxations apply at all: only in `auto`, and only
@@ -1196,6 +1230,39 @@ mod tests {
             untrusted.describe().contains("if you /trust this project"),
             "{described}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_auto_in_a_trusted_project_reaches_the_judge() {
+        let dir = std::env::temp_dir().join(format!("bhai-judgeable-{}", uuid::Uuid::new_v4()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        let p = Policy::new(Mode::Auto, Rules::default(), None, repo.clone())
+            .with_trust(Trust::new(&dir.join("config"), &repo));
+        let command = |c: &str| p.judgeable("bash", &json!({ "command": c }));
+        let path = |tool: &str, path: &PathBuf| p.judgeable(tool, &json!({ "path": path }));
+
+        // An untrusted project never reaches it, however harmless the call.
+        assert!(!command("cargo clippy"));
+        p.trust().unwrap();
+        assert!(command("cargo clippy"));
+        assert!(path("write", &repo.join("src/a.rs")));
+
+        // The categories that always reach the user instead.
+        assert!(!command("sudo cargo clippy"), "sudo");
+        assert!(!command("ls $(rm x)"), "unparseable");
+        assert!(!command("cat .env"), "protected path");
+        assert!(!path("write", &dir.join("outside/x.rs")), "outside");
+        assert!(!path("edit", &repo.join(".env")), "protected");
+        assert!(!p.judgeable("write", &json!({})), "no path");
+
+        // Neither other mode ever asks the judge, trusted or not.
+        for mode in [Mode::Ask, Mode::Bypass] {
+            p.set_mode(mode);
+            assert!(!command("cargo clippy"), "{mode}");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

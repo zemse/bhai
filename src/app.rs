@@ -940,6 +940,7 @@ impl App {
             tx_control,
             Arc::default(),
             Arc::default(),
+            None,
         ))
     }
 }

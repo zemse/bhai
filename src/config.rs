@@ -33,6 +33,8 @@ pub struct Config {
     pub auto_project_writes: bool,
     /// In `auto`, a trusted project runs the built-in build and test commands.
     pub auto_project_commands: bool,
+    /// `judge*`: the auto-approval judge, which only ever runs in `auto`.
+    pub judge: crate::judge::Settings,
     /// Rules from Claude Code's `settings.json` files.
     pub import_claude_permissions: bool,
     /// When history is compacted: `context_window` and `compact_at`.
@@ -53,6 +55,7 @@ impl Default for Config {
             permissions: Rules::default(),
             auto_project_writes: true,
             auto_project_commands: true,
+            judge: crate::judge::Settings::default(),
             import_claude_permissions: true,
             limits: Limits::default(),
         }
@@ -120,6 +123,11 @@ struct Layer {
     permission_mode: Option<Mode>,
     auto_project_writes: Option<bool>,
     auto_project_commands: Option<bool>,
+    judge: Option<bool>,
+    judge_model: Option<String>,
+    judge_effort: Option<String>,
+    judge_timeout_ms: Option<u64>,
+    judge_max_per_turn: Option<usize>,
     import_claude_permissions: Option<bool>,
     context_window: Option<u64>,
     compact_at: Option<f64>,
@@ -247,6 +255,7 @@ impl Config {
         for (field, value) in [
             (&mut self.auto_project_writes, layer.auto_project_writes),
             (&mut self.auto_project_commands, layer.auto_project_commands),
+            (&mut self.judge.on, layer.judge),
             (
                 &mut self.import_claude_permissions,
                 layer.import_claude_permissions,
@@ -283,6 +292,18 @@ impl Config {
         }
         if let Some(at) = layer.compact_at {
             self.limits.compact_at = at;
+        }
+        if layer.judge_model.is_some() {
+            self.judge.model = layer.judge_model;
+        }
+        if let Some(effort) = layer.judge_effort {
+            self.judge.effort = effort;
+        }
+        if let Some(ms) = layer.judge_timeout_ms {
+            self.judge.timeout = std::time::Duration::from_millis(ms);
+        }
+        if let Some(max) = layer.judge_max_per_turn {
+            self.judge.max_per_turn = max;
         }
         match layer.skills {
             Some(SkillsLayer::Enabled(enabled)) => self.skills = enabled,

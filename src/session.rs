@@ -13,6 +13,7 @@ use crate::agent::{AgentEvent, Control};
 use crate::cache::{CacheBreak, Hit};
 use crate::client::Usage;
 use crate::entries::Entries;
+use crate::judge::Judge;
 use crate::limits::RateLimits;
 use crate::permissions::{Answer, Mode, Offers, Policy, Remember};
 use crate::profile::{CallTokens, EntryTokens, Profile};
@@ -109,6 +110,8 @@ pub struct State {
     pub last_usage: Option<Usage>,
     /// Usage of every child agent, summed; not in the counts above.
     pub children: Usage,
+    /// Usage of the auto-approval judge; not in the counts above either.
+    pub judge: Usage,
     /// The most recent prompt cache break, if there has been one.
     pub last_cache_break: Option<CacheBreak>,
     /// The latest rate-limit headroom, once the backend has reported it.
@@ -168,6 +171,8 @@ pub struct Session {
     tx_control: mpsc::Sender<Control>,
     cancel: Arc<AtomicBool>,
     policy: Arc<Policy>,
+    /// The auto-approval judge, when one runs; it owns its own usage and budget.
+    judge: Option<Arc<Judge>>,
 }
 
 impl Session {
@@ -178,6 +183,7 @@ impl Session {
         tx_control: mpsc::Sender<Control>,
         cancel: Arc<AtomicBool>,
         policy: Arc<Policy>,
+        judge: Option<Arc<Judge>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             model,
@@ -189,6 +195,7 @@ impl Session {
             tx_control,
             cancel,
             policy,
+            judge,
         })
     }
 
@@ -211,6 +218,10 @@ impl Session {
             calls: inner.calls,
             last_usage: inner.last_usage,
             children: inner.children,
+            judge: self
+                .judge
+                .as_ref()
+                .map_or_else(Usage::default, |j| j.total()),
             last_cache_break: inner.last_cache_break.clone(),
             rate_limits: inner.rate_limits,
             pending: inner.pending.as_ref().map(|(approval, _)| approval.clone()),
@@ -324,7 +335,14 @@ impl Session {
 
     /// What `/permissions` prints.
     pub fn permissions(&self) -> String {
-        self.policy.describe()
+        let mut out = self.policy.describe();
+        if self.policy.mode() == Mode::Auto {
+            out.push_str(&match &self.judge {
+                Some(judge) => judge.describe(),
+                None => "\njudge: off".to_string(),
+            });
+        }
+        out
     }
 
     /// Honour the repo-supplied allow rules, for `/trust`.
@@ -495,6 +513,7 @@ mod tests {
                 tx_control,
                 cancel,
                 policy,
+                None,
             ),
             rx_user,
         )

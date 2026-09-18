@@ -249,6 +249,48 @@ impl Client {
         Err(last_err.unwrap_or_else(|| anyhow!("request failed")))
     }
 
+    /// One call outside the conversation: no tools, its own `prompt_cache_key` suffix,
+    /// and no cache guard, so it never disturbs the conversation's cached prefix. One
+    /// attempt only, so a caller's timeout means what it says. Returns the assistant's
+    /// text and what the call cost.
+    pub async fn aside(
+        &self,
+        key: &str,
+        model: &str,
+        effort: &str,
+        instructions: &str,
+        text: &str,
+    ) -> Result<(String, Usage)> {
+        let input = [json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": text }],
+        })];
+        let body = request_body(
+            model,
+            effort,
+            &format!("{}-{key}", self.session_id),
+            instructions,
+            &[],
+            &input,
+        );
+        let mut usage = Usage::default();
+        let mut on_delta = |delta: Delta| {
+            if let Delta::Usage(found) = delta {
+                usage = found;
+            }
+        };
+        let items = match self
+            .attempt(&body, &mut on_delta, &Arc::new(AtomicBool::new(false)))
+            .await
+        {
+            Ok(items) => items,
+            Err(Error::Interrupted) => bail!("interrupted"),
+            Err(Error::Retryable(e) | Error::Fatal(e)) => return Err(e),
+        };
+        Ok((output_text(&items), usage))
+    }
+
     async fn attempt(
         &self,
         body: &Value,
@@ -436,6 +478,17 @@ pub fn request_body(
         "include": ["reasoning.encrypted_content"],
         "prompt_cache_key": cache_key,
     })
+}
+
+/// The assistant's text across the output items of one call.
+fn output_text(items: &[Value]) -> String {
+    items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect()
 }
 
 enum Error {

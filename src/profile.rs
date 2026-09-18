@@ -86,6 +86,8 @@ pub struct Profile {
     pub items: Vec<Item>,
     /// Child agents run so far, with their own usage; not part of this context.
     pub children: Vec<ChildUsage>,
+    /// What the auto-approval judge has cost; never part of the totals above.
+    pub judge: Usage,
     /// Per-entry tokens from the TUI transcript; absent elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript: Option<Transcript>,
@@ -426,6 +428,7 @@ pub fn build(
         categories,
         items,
         children: Vec::new(),
+        judge: Usage::default(),
         transcript: None,
     }
 }
@@ -590,6 +593,13 @@ those rows fall back to tokenized.",
                 out,
                 "\nchildren: {} run, {input} input / {output} output tokens",
                 self.children.len()
+            );
+        }
+        if self.judge.input > 0 {
+            let _ = write!(
+                out,
+                "\njudge: {} input / {} output tokens",
+                self.judge.input, self.judge.output
             );
         }
         out

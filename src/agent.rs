@@ -16,6 +16,7 @@ use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
 use crate::client::{Client, Delta, Usage};
 use crate::compact::{self, Limits};
 use crate::identity::Identity;
+use crate::judge::{self, Judge, Verdict};
 use crate::limits::RateLimits;
 use crate::permissions::{Answer, Decision, Offers, Policy};
 use crate::profile::{self, Call, CallTokens, Profile};
@@ -198,12 +199,13 @@ impl<'a> From<Option<&'a Path>> for Sink<'a> {
 
 /// `usage_log` is the JSONL file each model call's usage is appended to, if any.
 /// `saved` persists the session and holds the history it resumes from. `limits` say
-/// when history is compacted.
+/// when history is compacted. `judge` decides the calls `auto` mode would prompt for.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: Client,
     prompt: SystemPrompt,
     policy: Arc<Policy>,
+    judge: Option<Arc<Judge>>,
     rx_user: mpsc::Receiver<String>,
     rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
@@ -216,8 +218,8 @@ pub async fn run(
     let session_id = client.session_id().to_string();
     let model: Arc<dyn Model> = Arc::new(client);
     run_with(
-        model, session_id, prompt, policy, rx_user, rx_control, tx, cancel, usage_log, delegation,
-        saved, limits,
+        model, session_id, prompt, policy, judge, rx_user, rx_control, tx, cancel, usage_log,
+        delegation, saved, limits,
     )
     .await;
 }
@@ -229,6 +231,7 @@ pub(crate) async fn run_with(
     session_id: String,
     prompt: SystemPrompt,
     policy: Arc<Policy>,
+    judge: Option<Arc<Judge>>,
     mut rx_user: mpsc::Receiver<String>,
     mut rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
@@ -264,6 +267,7 @@ pub(crate) async fn run_with(
     let report = |history: &[Value], calls: &[Call]| {
         let mut profile = profile::build(&prompt, &tools, history, calls, tokenizer);
         profile.children = children.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        profile.judge = judge.as_ref().map_or_else(Usage::default, |j| j.total());
         profile
     };
     let (mut history, mut writer) = match saved {
@@ -347,6 +351,10 @@ pub(crate) async fn run_with(
             let _ = tx.send(AgentEvent::TurnEnd);
             continue;
         };
+        // The judge decides against the task the user just gave, with a fresh budget.
+        if let Some(judge) = &judge {
+            judge.start_turn(&message);
+        }
         // `Session::submit` clears `cancel` before sending, so an early interrupt holds.
         history.push(json!({
             "type": "message",
@@ -364,6 +372,7 @@ pub(crate) async fn run_with(
                 model.as_ref(),
                 &registry,
                 &policy,
+                judge.as_deref(),
                 &tools,
                 &prompt.text,
                 &mut history,
@@ -428,6 +437,7 @@ async fn turn(
     model: &dyn Model,
     registry: &Registry,
     policy: &Policy,
+    judge: Option<&Judge>,
     tools: &[Value],
     instructions: &str,
     history: &mut Vec<Value>,
@@ -529,7 +539,7 @@ async fn turn(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let (output, ok) = execute(registry, policy, call, tx, cancel).await;
+            let (output, ok) = execute(registry, policy, judge, call, tx, cancel).await;
             all_failed &= !ok;
             let _ = tx.send(AgentEvent::Item(sent + items.len() + index));
             results.push(json!({
@@ -763,6 +773,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             child.model,
             &registry,
             child.policy,
+            // A child works on its own task, not the user's, so it never reaches the judge.
+            None,
             &tools,
             &child.prompt.text,
             &mut history,
@@ -891,6 +903,7 @@ fn final_text(history: &[Value]) -> Option<String> {
 async fn execute(
     registry: &Registry,
     policy: &Policy,
+    judge: Option<&Judge>,
     call: &Value,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     cancel: &Arc<AtomicBool>,
@@ -938,14 +951,37 @@ not retry it. Try a different approach, or ask the user."
             );
         }
         Decision::Ask => {
-            let offers = policy.offers(name, &args);
-            if let Some(result) = ask(name, &summary, &offers, policy, tx).await {
-                return result;
+            let (target, detail) = judge::target(name, &args, &summary);
+            // A verdict is final; anything else is not a third verdict, it prompts.
+            match judged(judge, policy, name, &args, &target, &detail).await {
+                Some(Verdict::Approve { reason }) => {
+                    let _ = tx.send(AgentEvent::Info(format!(
+                        "auto-approved: {summary} ({reason})"
+                    )));
+                }
+                Some(Verdict::Deny { reason }) => {
+                    let _ = tx.send(AgentEvent::ToolRejected(format!(
+                        "auto-denied: {summary} ({reason})"
+                    )));
+                    return (
+                        format!(
+                            "denied by auto policy: {reason}. It did not run. Do not retry it \
+as-is. Try a different approach, or ask the user."
+                        ),
+                        false,
+                    );
+                }
+                None => {
+                    let offers = policy.offers(name, &args);
+                    if let Some(result) = ask(name, &summary, &offers, policy, tx).await {
+                        return result;
+                    }
+                }
             }
         }
     }
 
-    let _ = tx.send(AgentEvent::ToolStart(summary));
+    let _ = tx.send(AgentEvent::ToolStart(summary.clone()));
     let progress = |chunk: String| {
         let _ = tx.send(AgentEvent::ToolProgress(chunk));
     };
@@ -954,8 +990,29 @@ not retry it. Try a different approach, or ask the user."
         cancel,
     };
     let (output, ok) = tool.execute_live(&args, live).await;
+    if let Some(judge) = judge {
+        judge.note(&format!(
+            "{summary} -> {}",
+            output.lines().next().unwrap_or_default()
+        ));
+    }
     let _ = tx.send(AgentEvent::ToolOutput(output.clone()));
     (output, ok)
+}
+
+/// The judge's verdict on a call the rules left at `Ask`, or `None` when the user must be
+/// asked: no judge, a category the judge never sees, or a call it could not decide.
+async fn judged(
+    judge: Option<&Judge>,
+    policy: &Policy,
+    name: &str,
+    args: &Value,
+    target: &str,
+    detail: &str,
+) -> Option<Verdict> {
+    let judge = judge?;
+    policy.judgeable(name, args).then_some(())?;
+    judge.decide(name, target, detail).await
 }
 
 /// Prompt the user for a call. `None` means approved; otherwise the result to return.
@@ -1233,6 +1290,7 @@ mod tests {
             Client::new().unwrap(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(Policy::default()),
+            None,
             rx_user,
             rx_control,
             tx,
@@ -1295,6 +1353,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(policy),
+            None,
             rx_user,
             rx_control,
             tx,
@@ -1435,6 +1494,223 @@ mod tests {
         events
     }
 
+    /// What one judged turn produced: its events, the judge's requests, what the judge
+    /// cost, and every tool result the model was sent.
+    struct Judged {
+        events: Vec<AgentEvent>,
+        backend: Arc<crate::judge::fake::Backend>,
+        cost: Usage,
+        outputs: Vec<String>,
+    }
+
+    /// One turn in a trusted `auto` project, with both relaxations off so the write the
+    /// model asks for is left at `Ask` and reaches the judge.
+    async fn judged(
+        answers: crate::judge::fake::Answers,
+        deny: &[&str],
+        replies: &[Answer],
+    ) -> Judged {
+        use crate::permissions::{Relax, Rule, Rules, Trust};
+        use fake::{Fake, call, say};
+
+        let dir = tools::temp_dir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let rules = Rules {
+            deny: deny.iter().map(|r| Rule::parse(r).unwrap()).collect(),
+            ..Rules::default()
+        };
+        let policy = Policy::new(Mode::Auto, rules, None, repo.clone())
+            .with_relax(Relax {
+                writes: false,
+                commands: false,
+            })
+            .with_trust(Trust::new(&dir.join("config"), &repo));
+        policy.trust().unwrap();
+
+        let target = repo.join("notes.txt");
+        let fake = Fake::new(vec![
+            vec![call(
+                "write",
+                json!({"path": target, "content": "the parser splits on commas"}),
+            )],
+            vec![say("done")],
+        ]);
+        let (judge, backend) = crate::judge::fake::judge(answers, &repo);
+        let judge = Arc::new(judge);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(policy),
+            Some(Arc::clone(&judge)),
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        let events = drive(
+            &tx_user,
+            &mut rx,
+            &cancel,
+            "write down what the parser does",
+            replies,
+        )
+        .await;
+
+        let outputs: Vec<String> = fake
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, body)| body["input"].as_array().unwrap().clone())
+            .filter(|item| item["type"] == "function_call_output")
+            .map(|item| item["output"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let _ = std::fs::remove_dir_all(dir);
+        Judged {
+            events,
+            backend,
+            cost: judge.total(),
+            outputs,
+        }
+    }
+
+    fn asked(events: &[AgentEvent]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Info(m) if m.starts_with("asked: ")))
+    }
+
+    fn info(events: &[AgentEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Info(m) => Some(m.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_approved_call_runs_without_prompting() {
+        use crate::judge::Verdict;
+        use crate::judge::fake::Answers;
+
+        let run = judged(
+            Answers::Verdict(Verdict::Approve {
+                reason: "writes a note inside the project".to_string(),
+            }),
+            &[],
+            &[],
+        )
+        .await;
+        assert!(!asked(&run.events));
+        assert!(
+            info(&run.events).iter().any(|m| {
+                m.starts_with("auto-approved: write ")
+                    && m.ends_with("(writes a note inside the project)")
+            }),
+            "{:?}",
+            info(&run.events)
+        );
+        assert_eq!(run.outputs.len(), 1);
+        assert!(run.outputs[0].starts_with("Wrote "), "{}", run.outputs[0]);
+        // The judge cost is its own; no model call reported it.
+        assert_eq!(run.cost.input, 700);
+        assert!(
+            !run.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Usage(u) if u.input == 700))
+        );
+        // The judge saw the task and the exact path, never the transcript.
+        let calls = run.backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].task, "write down what the parser does");
+        assert_eq!(calls[0].tool, "write");
+        assert!(
+            calls[0].target.ends_with("notes.txt"),
+            "{}",
+            calls[0].target
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_call_tells_the_model_and_never_prompts() {
+        use crate::judge::Verdict;
+        use crate::judge::fake::Answers;
+
+        let run = judged(
+            Answers::Verdict(Verdict::Deny {
+                reason: "unrelated to the stated task".to_string(),
+            }),
+            &[],
+            &[],
+        )
+        .await;
+        assert!(!asked(&run.events));
+        assert_eq!(run.outputs.len(), 1);
+        assert!(
+            run.outputs[0].starts_with("denied by auto policy: unrelated to the stated task."),
+            "{}",
+            run.outputs[0]
+        );
+        assert!(
+            run.events.iter().any(
+                |e| matches!(e, AgentEvent::ToolRejected(m) if m.starts_with("auto-denied: "))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_judge_that_cannot_decide_falls_back_to_the_user() {
+        use crate::judge::fake::Answers;
+
+        for answers in [
+            Answers::Error("429: too many requests".to_string()),
+            Answers::Hang,
+            Answers::Reply("looks fine to me".to_string()),
+        ] {
+            let run = judged(answers, &[], &[Answer::Reject]).await;
+            assert!(asked(&run.events));
+            assert!(
+                run.outputs[0].starts_with("The user rejected this call"),
+                "{}",
+                run.outputs[0]
+            );
+            assert_eq!(run.cost, Usage::default());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deny_rule_never_reaches_the_judge() {
+        use crate::judge::Verdict;
+        use crate::judge::fake::Answers;
+
+        let run = judged(
+            Answers::Verdict(Verdict::Approve {
+                reason: "fine".to_string(),
+            }),
+            &["Write(/**)"],
+            &[],
+        )
+        .await;
+        assert!(run.backend.calls.lock().unwrap().is_empty());
+        assert!(
+            run.outputs[0].starts_with("Blocked by the user's permission settings"),
+            "{}",
+            run.outputs[0]
+        );
+    }
+
     /// A prompt typed mid-turn waits, then runs as a turn of its own on the same
     /// history, so it appends like any other and the cache holds.
     #[tokio::test]
@@ -1455,6 +1731,7 @@ mod tests {
             tx_control,
             Arc::clone(&cancel),
             Arc::clone(&policy),
+            None,
         );
         let mut events = session.subscribe();
         tokio::spawn(crate::session::pump(Arc::clone(&session), rx_agent));
@@ -1463,6 +1740,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             policy,
+            None,
             rx_user,
             rx_control,
             tx,
@@ -1587,6 +1865,7 @@ mod tests {
             "sess".to_string(),
             prompt(),
             Arc::clone(&policy),
+            None,
             rx_user,
             rx_control,
             tx,
@@ -1691,6 +1970,7 @@ mod tests {
             "sess".to_string(),
             prompt(),
             Arc::clone(&policy),
+            None,
             rx_user,
             rx_control,
             tx,
@@ -1775,6 +2055,7 @@ mod tests {
                 "sess".to_string(),
                 crate::prompt::system_prompt(&[], Vec::new()),
                 Arc::new(Policy::default()),
+                None,
                 rx_user,
                 rx_control,
                 tx,
@@ -1852,6 +2133,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(policy),
+            None,
             rx_user,
             rx_control,
             tx,
@@ -1948,6 +2230,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(Policy::default()),
+            None,
             rx_user,
             rx_control,
             tx,
@@ -1983,6 +2266,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(Policy::default()),
+            None,
             rx_user,
             rx_control,
             tx,
@@ -2050,6 +2334,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(policy),
+            None,
             rx_user,
             rx_control,
             tx,
@@ -2135,6 +2420,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(policy),
+            None,
             rx_user,
             rx_control,
             tx,

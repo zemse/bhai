@@ -15,6 +15,7 @@ mod frontmatter;
 mod identity;
 mod input;
 mod instructions;
+mod judge;
 mod limits;
 mod markdown;
 mod mcp;
@@ -49,6 +50,7 @@ use crate::agent::{AgentEvent, Control, Delegation, Saved};
 use crate::app::App;
 use crate::compact::Limits;
 use crate::config::{Config, Flags};
+use crate::judge::{Judge, ModelJudge};
 use crate::permissions::Policy;
 use crate::prompt::SystemPrompt;
 use crate::session::Session;
@@ -86,7 +88,7 @@ async fn main() -> Result<()> {
     // `bhai --probe [prompt]` does one non-interactive model call, for checking that
     // auth and the wire format still work without entering the TUI.
     if args.first().is_some_and(|a| a == "--probe") {
-        let (prompt, _, _, _) = load(Flags::default(), identity::DEFAULT).await?;
+        let (prompt, ..) = load(Flags::default(), identity::DEFAULT).await?;
         let hub = prompt.mcp.clone();
         let result = probe(prompt, args.get(1).cloned()).await;
         shutdown(hub).await;
@@ -94,7 +96,7 @@ async fn main() -> Result<()> {
     }
     // `bhai --cache-check` sends a few calls on one prefix and checks the cache served it.
     if args.first().is_some_and(|a| a == "--cache-check") {
-        let (prompt, policy, delegation, _) = load(Flags::default(), identity::DEFAULT).await?;
+        let (prompt, policy, delegation, ..) = load(Flags::default(), identity::DEFAULT).await?;
         let hub = prompt.mcp.clone();
         let result = cache_check(prompt, policy, delegation).await;
         shutdown(hub).await;
@@ -126,7 +128,7 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| identity::DEFAULT.to_string()),
     };
-    let (prompt, policy, delegation, limits) = load(args.flags, &name).await?;
+    let (prompt, policy, delegation, limits, judge) = load(args.flags, &name).await?;
     let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
     let mut client =
@@ -208,7 +210,9 @@ async fn main() -> Result<()> {
         .then(|| profile::debug_dir().join("usage.jsonl"));
     let history = saved.history.clone();
     let session_id = saved.writer.header.session.clone();
-    let (session, events) = start(client, prompt, policy, usage_log, delegation, saved, limits);
+    let (session, events) = start(
+        client, prompt, policy, judge, usage_log, delegation, saved, limits,
+    );
     // `--workflow` is a run of its own: no TUI, no turn, just the steps and their report.
     if let Some((name, input)) = args.workflow.clone() {
         for notice in &notices {
@@ -338,7 +342,10 @@ struct Args {
 /// Config and instruction files for the working directory, as the system prompt for
 /// the identity called `name`, the permission policy, and what child agents need.
 /// Starts the MCP servers.
-async fn load(flags: Flags, name: &str) -> Result<(SystemPrompt, Policy, Delegation, Limits)> {
+async fn load(
+    flags: Flags,
+    name: &str,
+) -> Result<(SystemPrompt, Policy, Delegation, Limits, judge::Settings)> {
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
@@ -359,9 +366,10 @@ async fn load(flags: Flags, name: &str) -> Result<(SystemPrompt, Policy, Delegat
         },
     };
     let limits = config.limits;
+    let settings = config.judge.clone();
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
-    Ok((prompt, policy, delegation, limits))
+    Ok((prompt, policy, delegation, limits, settings))
 }
 
 /// The policy from the config, Claude Code's settings and remembered approvals, plus
@@ -489,10 +497,12 @@ fn parse_args(args: &[String]) -> Result<Args> {
 
 /// Spawn the agent behind a session. The returned receiver is subscribed before the
 /// agent starts, so the TUI sees every event.
+#[allow(clippy::too_many_arguments)]
 fn start(
     client: client::Client,
     prompt: SystemPrompt,
     policy: Policy,
+    settings: judge::Settings,
     usage_log: Option<PathBuf>,
     delegation: Delegation,
     saved: Saved,
@@ -503,6 +513,15 @@ fn start(
     let (tx_agent, rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
     let policy = Arc::new(policy);
+    // Built whatever the mode is, since `shift+tab` cycles into `auto` mid-session; the
+    // policy is what decides that a call may reach it at all.
+    let judge = settings.on.then(|| {
+        let backend = Arc::new(ModelJudge::new(client.clone(), &settings));
+        let root = std::env::current_dir().unwrap_or_default();
+        Arc::new(
+            Judge::new(backend, root, settings).with_log(profile::debug_dir().join("judge.jsonl")),
+        )
+    });
     let session = Session::new(
         client.model().to_string(),
         prompt.identity.name.clone(),
@@ -510,12 +529,14 @@ fn start(
         tx_control,
         Arc::clone(&cancel),
         Arc::clone(&policy),
+        judge.clone(),
     );
     let events = session.subscribe();
     tokio::spawn(agent::run(
         client,
         prompt,
         policy,
+        judge,
         rx_user,
         rx_control,
         tx_agent,
@@ -595,6 +616,7 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
         client,
         system,
         Arc::new(Policy::default()),
+        None,
         rx_user,
         rx_control,
         tx_agent,
