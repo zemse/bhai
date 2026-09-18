@@ -64,6 +64,8 @@ pub enum AgentEvent {
     Cache(Option<CacheBreak>),
     /// How well the cache served a call that was judged; a child's only when it missed.
     CacheHit(Hit),
+    /// That many judged calls in a row missed the cached prefix.
+    CacheStalled(usize),
     /// The latest rate-limit headroom; one account, so a child's counts too.
     RateLimits(RateLimits),
     Error(String),
@@ -103,6 +105,11 @@ pub trait Model: Send + Sync {
     /// The model's name, which picks its tokenizer.
     fn name(&self) -> &str;
 
+    /// Whether `--strict-cache` is on, so a cache warning must stop for the user.
+    fn strict_cache(&self) -> bool {
+        false
+    }
+
     /// Take `input` as already sent, for a conversation resumed from disk.
     fn seed(&self, _instructions: &str, _tools: &[Value], _input: &[Value]) {}
 
@@ -130,6 +137,10 @@ impl Model for Client {
 
     fn name(&self) -> &str {
         self.model()
+    }
+
+    fn strict_cache(&self) -> bool {
+        Client::strict(self)
     }
 
     fn seed(&self, instructions: &str, tools: &[Value], input: &[Value]) {
@@ -431,15 +442,20 @@ async fn turn(
 
     for step in 1..=MAX_STEPS {
         if monitor.tripped() {
-            let prompt = format!(
-                "cache missed {} calls in a row; continue?",
-                cache::MAX_MISSES
-            );
-            if ask("cache", &prompt, &Offers::default(), policy, tx)
-                .await
-                .is_some()
-            {
-                return (step - 1, Ok(()));
+            // Only strict mode stops for it; a normal run is told and carries on.
+            if model.strict_cache() {
+                let prompt = format!(
+                    "cache missed {} calls in a row; continue?",
+                    cache::MAX_MISSES
+                );
+                if ask("cache", &prompt, &Offers::default(), policy, tx)
+                    .await
+                    .is_some()
+                {
+                    return (step - 1, Ok(()));
+                }
+            } else {
+                let _ = tx.send(AgentEvent::CacheStalled(cache::MAX_MISSES));
             }
             monitor.resume();
         }
@@ -809,6 +825,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 }
                 other @ (AgentEvent::ChildUsage(_)
                 | AgentEvent::CacheHit(_)
+                | AgentEvent::CacheStalled(_)
                 | AgentEvent::RateLimits(_)) => other,
             };
             let _ = child.tx.send(event);
@@ -1047,6 +1064,14 @@ pub mod fake {
             Self { usage, ..self }
         }
 
+        /// Refuse a cache break and stop for cache misses, as `--strict-cache` does.
+        pub fn strict(self) -> Self {
+            Self {
+                guard: Arc::new(Mutex::new(CacheGuard::new(&self.conversation, None, true))),
+                ..self
+            }
+        }
+
         /// The same script and records with a fresh guard, as a resumed process starts.
         pub fn restarted(&self) -> Self {
             Self {
@@ -1158,6 +1183,10 @@ pub mod fake {
 
         fn name(&self) -> &str {
             "fake"
+        }
+
+        fn strict_cache(&self) -> bool {
+            self.guard.lock().unwrap().strict()
         }
 
         fn seed(&self, instructions: &str, tools: &[Value], input: &[Value]) {
@@ -1996,16 +2025,20 @@ mod tests {
         assert_eq!(input.len(), 5);
     }
 
-    #[tokio::test]
-    async fn repeated_cache_misses_pause_for_the_user() {
-        use fake::{Fake, call, say};
+    /// A session that misses the cache on every judged call, one call per script step,
+    /// with the calls the monitor skips as it warms up.
+    fn stalled_script() -> Vec<Vec<Value>> {
+        use fake::{call, say};
 
         let echo = || vec![call("bash", json!({"command": "echo x"}))];
-        let fake =
-            Fake::new(vec![echo(), echo(), echo(), echo(), vec![say("never")]]).with_usage(Usage {
-                input: 2000,
-                ..Usage::default()
-            });
+        let calls = 5 + cache::MAX_MISSES;
+        let mut script: Vec<Vec<Value>> = (0..calls).map(|_| echo()).collect();
+        script.push(vec![say("done")]);
+        script
+    }
+
+    /// Runs `fake` on one prompt, answering approvals with `answers`.
+    async fn stall(fake: fake::Fake, answers: &[Answer]) -> Vec<AgentEvent> {
         let dir = tools::temp_dir();
         let policy = Policy::new(Mode::Bypass, Default::default(), None, dir.clone());
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2013,7 +2046,7 @@ mod tests {
         let (_tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
         tokio::spawn(run_with(
-            Arc::new(fake.clone()),
+            Arc::new(fake),
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(policy),
@@ -2026,17 +2059,54 @@ mod tests {
             None,
             Limits::default(),
         ));
-
-        let events = drive(&tx_user, &mut rx, &cancel, "go", &[Answer::Reject]).await;
-        let misses = events
-            .iter()
-            .filter(|e| matches!(e, AgentEvent::CacheHit(hit) if hit.miss()))
-            .count();
-        assert_eq!(misses, 3);
-        assert!(events.iter().any(|e| matches!(e,
-            AgentEvent::Info(m) if m == "asked: cache missed 3 calls in a row; continue?")));
-        assert_eq!(fake.bodies.lock().unwrap().len(), 4);
+        let events = drive(&tx_user, &mut rx, &cancel, "go", answers).await;
         let _ = std::fs::remove_dir_all(dir);
+        events
+    }
+
+    #[tokio::test]
+    async fn repeated_cache_misses_warn_once_without_stopping() {
+        let fake = fake::Fake::new(stalled_script()).with_usage(Usage {
+            input: 8000,
+            ..Usage::default()
+        });
+        let events = stall(fake.clone(), &[]).await;
+        let warnings = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::CacheStalled(n) if *n == cache::MAX_MISSES))
+            .count();
+        assert_eq!(warnings, 1);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Info(m) if m.starts_with("asked:")))
+        );
+        // Nothing was asked and the whole script ran.
+        assert_eq!(fake.bodies.lock().unwrap().len(), stalled_script().len());
+    }
+
+    #[tokio::test]
+    async fn repeated_cache_misses_pause_for_the_user_in_strict_mode() {
+        let fake = fake::Fake::new(stalled_script())
+            .strict()
+            .with_usage(Usage {
+                input: 8000,
+                ..Usage::default()
+            });
+        let events = stall(fake.clone(), &[Answer::Reject]).await;
+        let prompt = format!(
+            "asked: cache missed {} calls in a row; continue?",
+            cache::MAX_MISSES
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Info(m) if *m == prompt))
+        );
+        assert_eq!(
+            fake.bodies.lock().unwrap().len(),
+            stalled_script().len() - 1
+        );
     }
 
     #[tokio::test]

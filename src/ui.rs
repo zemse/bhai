@@ -109,6 +109,12 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::new().fg(Color::Red).bold(),
         ));
     }
+    if app.cache_stalled {
+        spans.push(Span::styled(
+            "cache stalled ",
+            Style::new().fg(Color::Yellow).bold(),
+        ));
+    }
     if let Some(percent) = app.cache_miss {
         spans.push(Span::styled(
             format!("cache miss {percent:.0}% "),
@@ -1152,6 +1158,25 @@ mod tests {
         app.on_event(Event::Cache(None));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!screen(&terminal).contains("cache break"));
+    }
+
+    #[test]
+    fn status_bar_shows_a_stalled_cache_until_the_next_hit() {
+        use crate::cache::Hit;
+
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        app.on_event(Event::CacheStalled(8));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("cache stalled "));
+        assert_eq!(status_cell(&terminal, "cache stalled").fg, Color::Yellow);
+
+        app.on_event(Event::CacheHit(Hit {
+            expected_cached: Some(7936),
+            hit_ratio: Some(1.0),
+        }));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("cache stalled"));
     }
 
     #[test]

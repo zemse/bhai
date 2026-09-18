@@ -158,6 +158,8 @@ pub struct App {
     pub cache_break: Option<String>,
     /// The hit percent of the last judged call, when it missed.
     pub cache_miss: Option<f64>,
+    /// Judged calls have been missing in a row, until one hits again.
+    pub cache_stalled: bool,
     pub rate_limits: Option<RateLimits>,
     /// The rate-limit segment of the status bar, filled in by the renderer.
     pub limits_area: Option<Rect>,
@@ -218,6 +220,7 @@ impl App {
             last_usage: None,
             cache_break: None,
             cache_miss: None,
+            cache_stalled: false,
             rate_limits: None,
             limits_area: None,
             limits_hover: false,
@@ -612,7 +615,9 @@ impl App {
                     .hit_ratio
                     .filter(|_| hit.miss())
                     .map(|ratio| ratio * 100.0);
+                self.cache_stalled &= hit.miss();
             }
+            Event::CacheStalled(_) => self.cache_stalled = true,
             Event::RateLimits(limits) => self.rate_limits = Some(limits),
             Event::Mode(mode) => self.mode = mode,
             Event::TurnEnd => self.working = false,

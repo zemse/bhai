@@ -111,6 +111,14 @@ impl Client {
         self
     }
 
+    /// Whether `--strict-cache` is on for this client.
+    pub fn strict(&self) -> bool {
+        self.guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .strict()
+    }
+
     /// Append the rate-limit response headers of every call to `path`.
     pub fn log_headers(mut self, path: Option<PathBuf>) -> Self {
         self.header_log = path;

@@ -639,6 +639,9 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
                     println!("[cache] expected={expected} hit={:.0}%", ratio * 100.0);
                 }
             }
+            AgentEvent::CacheStalled(misses) => {
+                println!("[cache] missed {misses} calls in a row")
+            }
             AgentEvent::RateLimits(limits) => {
                 for w in limits.windows() {
                     println!("[rate limit] {} {:.0}%", w.label(), w.used_percent);

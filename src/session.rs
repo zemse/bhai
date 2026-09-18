@@ -64,6 +64,8 @@ pub enum Event {
     Cache(Option<CacheBreak>),
     /// How well the cache served a judged call.
     CacheHit(Hit),
+    /// That many judged calls in a row missed the cached prefix.
+    CacheStalled(usize),
     /// The latest rate-limit headroom.
     RateLimits(RateLimits),
     /// A local notice, such as where `/context` wrote its export.
@@ -423,6 +425,7 @@ impl Session {
             }
             AgentEvent::Item(index) => Event::Item(index),
             AgentEvent::CacheHit(hit) => Event::CacheHit(hit),
+            AgentEvent::CacheStalled(misses) => Event::CacheStalled(misses),
             AgentEvent::RateLimits(limits) => {
                 inner.rate_limits = Some(limits);
                 Event::RateLimits(limits)

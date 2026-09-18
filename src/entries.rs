@@ -107,6 +107,9 @@ impl Entries {
                 "cache break: {}: {}",
                 found.field, found.detail
             ))),
+            Event::CacheStalled(misses) => self.push(Entry::Info(format!(
+                "cache missed {misses} calls in a row; the prefix may no longer be served"
+            ))),
             Event::Info(message) => self.push(Entry::Info(message.clone())),
             Event::Compacted(message) => {
                 self.attribution.items.clear();

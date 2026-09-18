@@ -144,8 +144,13 @@ const CACHE_STEP: u64 = 128;
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// A hit ratio below this is a miss.
 const MISS_RATIO: f64 = 0.5;
-/// Consecutive misses that pause the session.
-pub const MAX_MISSES: usize = 3;
+/// A call sending fewer tokens than this is never judged: the backend takes about ten
+/// calls to materialise a cache for a small prefix, so its misses mean nothing.
+pub const WARMUP: u64 = 2048;
+/// The opening calls of a conversation are never judged, for the same reason.
+const WARMUP_CALLS: u64 = 5;
+/// Consecutive judged misses that warn.
+pub const MAX_MISSES: usize = 8;
 
 /// How much of one call's input the cache was expected to serve, and how much it did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
@@ -175,8 +180,12 @@ pub fn expected_cached(input: u64) -> u64 {
 pub struct CacheMonitor {
     /// The previous call's input tokens and when it finished.
     previous: Option<(u64, Instant)>,
+    /// The previous call's cached tokens.
+    cached: Option<u64>,
     /// When the current call was sent, and whether its request broke the cache.
     sent: Option<(Instant, bool)>,
+    /// Calls finished so far, including the ones too small to judge.
+    calls: u64,
     misses: usize,
 }
 
@@ -196,24 +205,33 @@ impl CacheMonitor {
             .map(|(input, _)| expected_cached(input))
             .filter(|expected| *expected > 0);
         self.previous = Some((usage.input, now));
+        self.calls += 1;
+        // A cached count the backend is holding fixed while the input grows is stale,
+        // not a miss; only one that stopped growing as well counts against the streak.
+        let grew = self
+            .cached
+            .replace(usage.cached)
+            .is_some_and(|before| usage.cached > before);
         let hit = Hit {
             expected_cached: expected,
             hit_ratio: expected.map(|e| usage.cached as f64 / e as f64),
         };
-        if hit.miss() {
-            self.misses += 1;
-        } else if hit.hit_ratio.is_some() {
-            self.misses = 0;
+        if hit.hit_ratio.is_some() && self.calls > WARMUP_CALLS && usage.input >= WARMUP {
+            if hit.miss() && !grew {
+                self.misses += 1;
+            } else {
+                self.misses = 0;
+            }
         }
         hit
     }
 
-    /// Whether enough calls missed in a row that the user should be asked to go on.
+    /// Whether enough judged calls missed in a row to warn about.
     pub fn tripped(&self) -> bool {
         self.misses >= MAX_MISSES
     }
 
-    /// The user chose to go on; count misses afresh.
+    /// The warning has been given; count misses afresh.
     pub fn resume(&mut self) {
         self.misses = 0;
     }
@@ -461,27 +479,85 @@ mod tests {
         assert_eq!(small, Hit::default());
     }
 
-    #[test]
-    fn three_misses_trip_the_breaker_and_a_hit_resets_it() {
+    /// Every judged call of `usages` in order, counting the warnings it raises.
+    fn run(usages: &[(u64, u64)]) -> usize {
         let mut monitor = CacheMonitor::default();
-        let (_, mut t) = call(&mut monitor, Instant::now(), usage(2000, 0), false);
-        for _ in 0..2 {
-            t = call(&mut monitor, t, usage(2000, 0), false).1;
+        let mut t = Instant::now();
+        let mut warnings = 0;
+        for (input, cached) in usages {
+            t = call(&mut monitor, t, usage(*input, *cached), false).1;
+            if monitor.tripped() {
+                warnings += 1;
+                monitor.resume();
+            }
         }
-        // An unjudged call neither counts nor resets.
-        t = call(&mut monitor, t, usage(2000, 0), true).1;
-        assert!(!monitor.tripped());
-        t = call(&mut monitor, t, usage(2000, 0), false).1;
-        assert!(monitor.tripped());
-        t = call(&mut monitor, t, usage(2000, 1920), false).1;
-        assert!(!monitor.tripped());
+        warnings
+    }
 
-        for _ in 0..3 {
-            t = call(&mut monitor, t, usage(2000, 0), false).1;
+    /// One large-prefix call per judged miss, plus the warm-up ones that are not judged.
+    fn stalled(calls: usize) -> Vec<(u64, u64)> {
+        vec![(8000, 0); WARMUP_CALLS as usize + calls]
+    }
+
+    /// The real per-call usage of a session on a small prefix: the backend takes ten
+    /// calls to cache it, then holds the cached count fixed while the input grows.
+    #[test]
+    fn a_small_prefix_warming_up_never_warns() {
+        let recorded = [
+            (947, 0),
+            (1140, 0),
+            (1239, 0),
+            (1327, 0),
+            (1388, 0),
+            (1469, 0),
+            (1665, 0),
+            (1803, 0),
+            (1936, 0),
+            (2005, 0),
+            (2100, 1792),
+            (2154, 1792),
+            (2222, 1792),
+            (2326, 1792),
+        ];
+        assert_eq!(run(&recorded), 0);
+    }
+
+    #[test]
+    fn a_large_prefix_that_stops_hitting_warns_once() {
+        assert_eq!(run(&stalled(MAX_MISSES - 1)), 0);
+        assert_eq!(run(&stalled(MAX_MISSES)), 1);
+        assert_eq!(run(&stalled(MAX_MISSES * 2)), 2);
+    }
+
+    #[test]
+    fn a_cached_count_still_growing_is_stale_not_a_miss() {
+        let growing: Vec<(u64, u64)> = (1..=20).map(|i| (8000, 100 * i)).collect();
+        assert_eq!(run(&growing), 0);
+    }
+
+    #[test]
+    fn a_hit_clears_the_streak() {
+        let mut streak = stalled(MAX_MISSES - 1);
+        streak.push((8000, 7936));
+        streak.extend(vec![(8000, 0); MAX_MISSES - 1]);
+        assert_eq!(run(&streak), 0);
+        streak.push((8000, 0));
+        assert_eq!(run(&streak), 1);
+    }
+
+    #[test]
+    fn an_unjudged_call_neither_counts_nor_resets() {
+        let mut monitor = CacheMonitor::default();
+        let mut t = Instant::now();
+        for _ in 0..WARMUP_CALLS as usize + MAX_MISSES - 1 {
+            t = call(&mut monitor, t, usage(8000, 0), false).1;
         }
-        assert!(monitor.tripped());
-        monitor.resume();
+        // A broken request is not evidence, and neither is a small prompt.
+        t = call(&mut monitor, t, usage(8000, 0), true).1;
+        t = call(&mut monitor, t, usage(1500, 0), false).1;
         assert!(!monitor.tripped());
+        call(&mut monitor, t, usage(8000, 0), false);
+        assert!(monitor.tripped());
     }
 
     #[test]
