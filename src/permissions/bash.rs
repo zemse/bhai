@@ -7,6 +7,8 @@ pub struct Command {
     pub words: Vec<String>,
     /// A word globs a dot name (`.e*`), so it may expand to a protected path.
     pub dot_glob: bool,
+    /// The command is one element of a pipeline, so it runs in a subshell of its own.
+    pub piped: bool,
 }
 
 /// Commands that run their arguments as shell code, or as someone else.
@@ -66,6 +68,7 @@ impl Command {
                 nested.push(Command {
                     words: command.to_vec(),
                     dot_glob: false,
+                    piped: false,
                 });
             }
             rest = tail;
@@ -137,8 +140,15 @@ impl Tokenizer {
                     if chars.peek() == Some(&'&') {
                         return None;
                     }
-                    chars.next_if_eq(&'|');
+                    // `||` runs the next command in this shell; a single `|` forks a subshell.
+                    let pipe = chars.next_if_eq(&'|').is_none();
                     self.end_command();
+                    if pipe {
+                        if let Some(last) = self.commands.last_mut() {
+                            last.piped = true;
+                        }
+                        self.current.piped = true;
+                    }
                 }
                 '\'' => {
                     self.in_word = true;
@@ -502,6 +512,15 @@ mod tests {
                 .collect();
             assert_eq!(words(input), Some(want), "{input}");
         }
+    }
+
+    #[test]
+    fn a_pipeline_marks_its_elements() {
+        let piped =
+            |input: &str| -> Vec<bool> { parse(input).unwrap().iter().map(|c| c.piped).collect() };
+        assert_eq!(piped("find . | wc -l"), [true, true]);
+        assert_eq!(piped("cd src && ls | wc -l"), [false, true, true]);
+        assert_eq!(piped("a || b"), [false, false]);
     }
 
     #[test]

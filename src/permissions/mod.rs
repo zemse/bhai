@@ -563,7 +563,10 @@ impl Checker<'_> {
         // The rest of the chain runs wherever its `cd`s have left it.
         let mut cwd = self.base.cwd.to_path_buf();
         for c in &commands {
+            // A `cd` in a pipeline moves only its own subshell, so it says nothing
+            // about where the rest of the chain runs.
             if self.mode != Mode::Ask
+                && !c.piped
                 && let Some(target) = bash::cd_target(&c.words)
             {
                 // A `cd` out of the project decides nothing about what follows it.
@@ -1248,6 +1251,8 @@ mod tests {
             "cd - && cargo test".to_string(),
             "cd && cargo test".to_string(),
             "cd wordcount && python3 -m pip install x".to_string(),
+            // The `cd` runs in a subshell of its own, so `run.py` is outside the project.
+            "cd wordcount | python3 ../run.py".to_string(),
             "cd missing && cargo test".to_string(),
             format!("cd {root}/../outside && ls"),
             format!("cargo new {}/x --bin", dir.join("outside").display()),
