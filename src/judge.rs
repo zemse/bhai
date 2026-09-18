@@ -17,8 +17,13 @@ use serde_json::{Value, json};
 use crate::client::{Client, Usage};
 use crate::tools::BoxFuture;
 
-/// Transcript labels the summary carries, newest last.
-const RECENT: usize = 6;
+/// Transcript labels the summary carries, newest last. A running ledger rather than a
+/// peephole: the judge that cannot see what the turn has been doing denies reasonable
+/// steps, and the lines before the call are the same from one call to the next, so they
+/// cache instead of being re-read.
+const RECENT: usize = 30;
+/// User messages the summary carries as the task, newest last.
+const TASKS: usize = 3;
 /// Verdicts the summary carries, newest last.
 const VERDICTS: usize = 10;
 /// Longest a label or verdict line may be in the summary, in characters.
@@ -87,6 +92,8 @@ impl Verdict {
 pub struct JudgeRequest {
     /// The user's current task: the latest user message.
     pub task: String,
+    /// The user messages before it, oldest first.
+    pub earlier: Vec<String>,
     pub tool: String,
     /// The exact command, or the exact path.
     pub target: String,
@@ -101,21 +108,15 @@ pub struct JudgeRequest {
 }
 
 impl JudgeRequest {
-    /// The one message the judge reads.
+    /// The one message the judge reads. What the session has done comes first and only
+    /// ever grows, so it is the same prefix from one call to the next; the call being
+    /// judged goes last, where it is the only part that changed.
     pub fn text(&self) -> String {
-        let mut out = format!(
-            "task: {}\ntool: {}\n",
-            clip(&self.task, TASK_CLIP),
-            self.tool
-        );
-        out.push_str(&field("target", &self.target, TARGET_CLIP));
-        if !self.detail.is_empty() {
-            out.push_str(&field("detail", &self.detail, TARGET_CLIP));
-        }
-        out.push_str(&format!("cwd: {}\nproject root: {}\n", self.cwd, self.root));
+        let mut out = format!("project root: {}\ncwd: {}\n", self.root, self.cwd);
         for (header, list) in [
-            ("recent calls", &self.recent),
-            ("verdicts this session", &self.verdicts),
+            ("earlier messages", &self.earlier),
+            ("calls so far", &self.recent),
+            ("verdicts so far", &self.verdicts),
         ] {
             if list.is_empty() {
                 continue;
@@ -124,6 +125,12 @@ impl JudgeRequest {
             for line in list {
                 out.push_str(&format!("- {}\n", clip(line, CLIP)));
             }
+        }
+        out.push_str(&format!("task: {}\n", clip(&self.task, TASK_CLIP)));
+        out.push_str(&format!("the call to decide:\ntool: {}\n", self.tool));
+        out.push_str(&field("target", &self.target, TARGET_CLIP));
+        if !self.detail.is_empty() {
+            out.push_str(&field("detail", &self.detail, TARGET_CLIP));
         }
         out
     }
@@ -171,7 +178,8 @@ pub struct Judge {
 
 #[derive(Default)]
 struct State {
-    task: String,
+    /// The last few user messages, newest last; the newest is the task.
+    tasks: VecDeque<String>,
     recent: VecDeque<String>,
     verdicts: VecDeque<String>,
     /// One verdict per `tool` and target, so the same call is never judged twice.
@@ -198,10 +206,14 @@ impl Judge {
         self
     }
 
-    /// A new turn on `task`, which refills the budget.
+    /// A new turn on `task`, which refills the budget. Earlier messages are kept: a
+    /// task like "now do the same for the other file" says nothing on its own.
     pub fn start_turn(&self, task: &str) {
         let mut state = self.lock();
-        state.task = task.to_string();
+        state.tasks.push_back(clip(task, TASK_CLIP));
+        while state.tasks.len() > TASKS {
+            state.tasks.pop_front();
+        }
         state.spent = 0;
     }
 
@@ -256,7 +268,8 @@ impl Judge {
             }
             state.spent += 1;
             JudgeRequest {
-                task: state.task.clone(),
+                task: state.tasks.back().cloned().unwrap_or_default(),
+                earlier: state.tasks.iter().rev().skip(1).rev().cloned().collect(),
                 tool: tool.to_string(),
                 target: target.to_string(),
                 detail: detail.to_string(),
@@ -469,6 +482,7 @@ impl Case {
         let root = self.root.clone().unwrap_or_else(|| EVAL_ROOT.to_string());
         JudgeRequest {
             task: self.task.clone(),
+            earlier: Vec::new(),
             tool: self.tool.clone(),
             target: self.target.clone(),
             detail: self.detail.clone(),
@@ -812,6 +826,9 @@ mod tests {
             task: "the write tool truncates files over 64k, find out why and add a \
 regression test for it in src/tools/write.rs"
                 .to_string(),
+            earlier: (0..TASKS - 1)
+                .map(|i| format!("have a look at the write tool ({i})"))
+                .collect(),
             tool: "bash".to_string(),
             target: target.to_string(),
             detail: String::new(),
@@ -832,9 +849,9 @@ regression test for it in src/tools/write.rs"
     }
 
     #[test]
-    fn a_realistic_summary_stays_under_a_thousand_tokens() {
+    fn a_realistic_summary_stays_under_fifteen_hundred_tokens() {
         let count = tokens(&realistic("cargo test --all-features -- --nocapture write"));
-        assert!(count < 1000, "{count} tokens");
+        assert!(count < 1500, "{count} tokens");
     }
 
     #[test]

@@ -72,9 +72,12 @@ final for that call and goes back to the model as `denied by auto policy: <reaso
 it can adapt; you are not asked afterwards. Anything else the judge cannot settle, an
 error, a timeout, a malformed reply or a spent budget, falls back to the prompt.
 
-The request is a compact summary, well under 1k tokens: your latest message, the tool,
-the exact command or path, a diff summary for an edit, the cwd and root, the last few
-tool calls one line each, and the verdicts given so far. It runs on its own
+The request is a compact summary, a thousand tokens or so at its fullest, laid out so
+what the session has done comes first and the call to decide comes last: the project root
+and cwd, your last few messages, the calls made so far one line each, the verdicts given
+so far, your current task, then the tool and the exact command or path (with a diff
+summary for an edit). Everything before the call only ever grows, so each request extends
+the one before it and the shared part is served from the cache rather than re-read. It runs on its own
 `prompt_cache_key`, is never appended to the conversation, and its tokens are counted
 apart in `/context` and `GET /state`. A verdict is reused for an identical call for the
 rest of the session, and at most `judge_max_per_turn` calls are judged per turn.
