@@ -324,9 +324,11 @@ pub fn is_read_only(words: &[String]) -> bool {
 /// `sed` only reads when it edits no file in place, its script is one this can see, and
 /// that script has no `w` or `W` command writing a file.
 fn sed_reads_only(args: &[String]) -> bool {
+    // `-l` takes the next word as its line length, which would hide the script.
     let unseen = |a: &String| {
         is_short_flag(a, 'i')
             || is_short_flag(a, 'f')
+            || is_short_flag(a, 'l')
             || a.starts_with("--in-place")
             || a.starts_with("--file")
     };
@@ -361,11 +363,19 @@ fn awk_reads_only(args: &[String]) -> bool {
     let mut program: Option<&str> = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
-        if arg.starts_with("-f") || arg.starts_with("--file") || arg.starts_with("--source") {
+        if arg.starts_with("-f")
+            || arg.starts_with("--file")
+            || arg.starts_with("--source")
+            || arg.starts_with("-i")
+            || arg.starts_with("--include")
+            || arg.starts_with("-l")
+            || arg.starts_with("--load")
+        {
             // The program comes from a file this cannot see.
             return false;
         }
-        if arg == "-v" || arg == "--assign" {
+        // `-F sep` takes the next word, which would otherwise look like the program.
+        if arg == "-v" || arg == "--assign" || arg == "-F" || arg == "--field-separator" {
             args.next();
         } else if !arg.starts_with('-') && program.is_none() {
             program = Some(arg);
@@ -385,8 +395,9 @@ pub fn is_project_command(words: &[String], inside: &dyn Fn(&str) -> bool) -> bo
     let args = &words[1..];
     // An argument naming a path has to stay in the project: `cargo test --manifest-path
     // /elsewhere/Cargo.toml` builds someone else's code.
+    // A `~` the shell expands to the home directory leaves the project whatever follows it.
     let escapes = |a: &String| {
-        (a.contains('/') || a.starts_with('~') || a.contains("..")) && !inside(a.as_str())
+        a.starts_with('~') || ((a.contains('/') || a.contains("..")) && !inside(a.as_str()))
     };
     if args.iter().any(escapes) {
         return false;
@@ -578,6 +589,8 @@ mod tests {
             "go run x",
             "python3 -c print",
             "python3 ../outside.py",
+            "python3 ~/evil.py",
+            "make -f ~/Makefile",
             "curl example.com",
             "rm -rf x",
         ] {
@@ -646,6 +659,8 @@ mod tests {
             r#"awk '{print > "out"}' x"#,
             "awk -f prog.awk x",
             "jq -f prog.jq x",
+            r#"awk -F '{print}' '{system("rm x")}' x"#,
+            r#"sed -l 5 's/a/b/w out' x"#,
             "git remote add o u",
             "git config user.name x",
             "cargo metadata --config x",
