@@ -7,6 +7,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use std::ops::Range;
+use std::time::Duration;
 
 use crate::app::{App, Entry};
 use crate::client::Usage;
@@ -22,6 +23,9 @@ const COLLAPSED_LINES: usize = 3;
 
 /// Lines the input grows to before it scrolls.
 const MAX_INPUT_LINES: usize = 8;
+
+/// How long the note about a drag's copy stays on the input's border.
+const COPIED_FOR: Duration = Duration::from_secs(3);
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
@@ -526,9 +530,20 @@ fn menu_row(item: &Item, width: usize, selected: bool) -> Line<'static> {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_style(Style::new().fg(Color::DarkGray))
         .title_bottom(mode_chip(app.mode));
+    // A drag copies as it ends, and says so here rather than in the transcript.
+    if let Some(chars) = app
+        .copied
+        .filter(|(at, _)| at.elapsed() < COPIED_FOR)
+        .map(|(_, n)| n)
+    {
+        block = block.title_bottom(Line::styled(
+            format!(" copied {chars} chars "),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1030,7 +1045,8 @@ mod tests {
         // A press that moves is a drag, so it selects instead of collapsing again.
         assert!(app.on_mouse(down(2, rows.start)));
         assert!(app.on_mouse(left(MouseEventKind::Drag(MouseButton::Left), 4, rows.start)));
-        assert!(!app.on_mouse(up(4, rows.start)));
+        // The release copies what was dragged over, which is a redraw of its own.
+        assert!(app.on_mouse(up(4, rows.start)));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(screen(&terminal).contains("[+2 lines]"), "still collapsed");
     }

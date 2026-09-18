@@ -66,7 +66,11 @@ entry shows its badge, hovering the rate-limit segment of the status bar shows w
 window resets.
 
 A left drag over the transcript selects the text it covers, a double click takes a word
-and a triple the line; `ctrl+y` copies it, `esc` clears it, and a new prompt clears it.
+and a triple the line. Releasing the drag copies it to the clipboard on its own, with a
+`copied N chars` note on the input's border for a few seconds rather than a line in the
+transcript; a click that selects nothing copies nothing. `ctrl+y` still copies on demand
+(the selection, or the whole input when there is none), `esc` clears the selection, and a
+new prompt clears it.
 Capture takes click-drag away from the terminal, so the terminal's own selection needs
 shift (or option) held; `/mouse` turns capture off and on for the times that is what you
 want.

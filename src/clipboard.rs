@@ -6,8 +6,10 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 
 /// Commands that take the text on stdin, best first.
+#[cfg_attr(test, allow(dead_code))]
 #[cfg(target_os = "macos")]
 const WRITERS: &[&[&str]] = &[&["pbcopy"]];
+#[cfg_attr(test, allow(dead_code))]
 #[cfg(not(target_os = "macos"))]
 const WRITERS: &[&[&str]] = &[
     &["wl-copy"],
@@ -25,11 +27,31 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 
 /// Put `text` on the clipboard, by a platform command or, when none runs, by the
 /// OSC 52 escape, which is what reaches the clipboard over ssh.
+#[cfg(not(test))]
 pub fn copy(text: &str) -> Result<()> {
     if WRITERS.iter().any(|argv| write(argv, text).is_ok()) {
         return Ok(());
     }
     terminal(text)
+}
+
+/// Under test the machine's own clipboard is left alone: a drag copies as it ends, and
+/// a test run must not walk over whatever the developer had on it.
+#[cfg(test)]
+pub fn copy(text: &str) -> Result<()> {
+    LAST.with(|last| *last.borrow_mut() = Some(text.to_string()));
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// What the last `copy` on this thread took, for tests.
+#[cfg(test)]
+pub fn last_copied() -> Option<String> {
+    LAST.with(|last| last.borrow().clone())
 }
 
 /// The clipboard's text, when a platform command can read it back.
@@ -43,6 +65,7 @@ pub fn paste() -> Option<String> {
 }
 
 /// Feed `text` to one clipboard command's stdin.
+#[cfg_attr(test, allow(dead_code))]
 fn write(argv: &[&str], text: &str) -> Result<()> {
     let mut child = Command::new(argv[0])
         .args(&argv[1..])
@@ -62,6 +85,7 @@ fn write(argv: &[&str], text: &str) -> Result<()> {
 }
 
 /// Write the escape to the terminal itself rather than through the TUI's buffer.
+#[cfg_attr(test, allow(dead_code))]
 fn terminal(text: &str) -> Result<()> {
     let sequence = sequence(text, std::env::var_os("TMUX").is_some());
     let mut tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;

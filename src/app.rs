@@ -135,6 +135,9 @@ pub struct App {
     clicks: Option<(Instant, u16, u16, u8)>,
     /// Mouse capture is on; `/mouse` turns it off for the terminal's own selection.
     pub mouse: bool,
+    /// The last drag's copy: when it happened and how much it took, for the note on the
+    /// input's border.
+    pub copied: Option<(Instant, usize)>,
     pub input: Editor,
     /// The `/` menu's highlighted row, while the menu is open.
     pub menu: Option<usize>,
@@ -205,6 +208,7 @@ impl App {
             press: None,
             clicks: None,
             mouse: true,
+            copied: None,
             input: Editor::default(),
             menu: None,
             history: History::default(),
@@ -411,11 +415,15 @@ impl App {
                 return self.drag_selection(mouse.column, mouse.row);
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                let selecting = self.selecting || self.anchor.is_some();
                 self.dragging = false;
                 self.selecting = false;
                 self.anchor = None;
                 // A press and release on one cell is a click, not a drag.
                 let clicked = self.press.take() == Some((mouse.column, mouse.row));
+                if selecting && !clicked {
+                    return self.copy_selection() | self.rehover();
+                }
                 return clicked && self.click_entry(mouse.row);
             }
             _ => return false,
@@ -575,6 +583,25 @@ impl App {
             Ok(()) => self.note(Entry::Info(format!("copied {chars} chars"))),
             Err(err) => self.note(Entry::Error(format!("copy failed: {err}"))),
         }
+    }
+
+    /// What the end of a drag copies on its own: the selection it just made, and nothing
+    /// when it made none, since a click must not put the whole input on the clipboard.
+    /// It says so on the input's border rather than in the transcript, which a drag has
+    /// no business writing to. Returns whether the screen needs a redraw.
+    fn copy_selection(&mut self) -> bool {
+        let Some(text) = self.selected_text().or_else(|| self.input.selected()) else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        let chars = text.chars().count();
+        match clipboard::copy(&text) {
+            Ok(()) => self.copied = Some((Instant::now(), chars)),
+            Err(err) => self.note(Entry::Error(format!("copy failed: {err}"))),
+        }
+        true
     }
 
     /// `ctrl+v`: insert what a clipboard command reads back. The terminal's own paste
@@ -1320,6 +1347,12 @@ mod tests {
         assert_eq!(app.copy_text(), "two\nthree\nfour");
         app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 3, 2));
         assert_eq!(app.copy_text(), "two\nthree\nfour", "the release keeps it");
+        // The release copied it without being asked, and said so on the border.
+        assert_eq!(
+            clipboard::last_copied().as_deref(),
+            Some("two\nthree\nfour")
+        );
+        assert_eq!(app.copied.map(|(_, chars)| chars), Some(14));
         // A drag back up the way it came selects the same span.
         app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 3, 2));
         app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 4, 0));
@@ -1328,6 +1361,23 @@ mod tests {
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.selection, None, "esc clears it");
         assert_eq!(app.copy_text(), "", "back to the empty input");
+    }
+
+    #[test]
+    fn a_click_that_selects_nothing_copies_nothing() {
+        let mut app = transcript(&["one two"]);
+        app.input.set("a draft".to_string());
+        // A plain click in the transcript, then one in the input: neither selects, so
+        // neither may put the draft or the line on the clipboard.
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 2, 0));
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 2, 0));
+        assert_eq!(app.copied, None);
+        let row = app.transcript_area.unwrap().bottom() + 1;
+        app.input_area = Some((Rect::new(0, row, 40, 1), 0, 40));
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 1, row));
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 1, row));
+        assert_eq!(app.copied, None);
+        assert_eq!(app.input.value(), "a draft", "and the draft is untouched");
     }
 
     #[test]
