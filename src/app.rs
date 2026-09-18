@@ -572,8 +572,12 @@ impl App {
                 // behind it is the front of that queue starting.
                 self.queued = self.queued.saturating_sub(1);
             }
-            // The position is the length of the queue the prompt joined.
-            Event::Queued { position, .. } => self.queued = position,
+            // The position is the length of the queue the prompt joined. Scrolling to it
+            // is what a submitted prompt does, queued or not.
+            Event::Queued { position, .. } => {
+                self.follow = true;
+                self.queued = position;
+            }
             // An interrupt drops whatever was waiting.
             Event::Interrupted => self.queued = 0,
             Event::Approval {
@@ -1055,9 +1059,12 @@ mod tests {
             position,
             text: format!("p{position}"),
         };
+        app.follow = false;
         app.on_event(queued(1));
         app.on_event(queued(2));
         assert_eq!(app.queued, 2);
+        // A queued prompt scrolls into view like a message that starts a turn.
+        assert!(app.follow);
         // The front of the queue starting is a user message like any other.
         app.on_event(Event::User("p1".to_string()));
         assert_eq!(app.queued, 1);
