@@ -955,6 +955,13 @@ not retry it. Try a different approach, or ask the user."
             // A verdict is final; anything else is not a third verdict, it prompts.
             match judged(judge, policy, name, &args, &target, &detail).await {
                 Some(Verdict::Approve { reason }) => {
+                    // Deciding takes seconds, so an interrupt during it still means stop.
+                    if cancel.load(Ordering::Relaxed) {
+                        return (
+                            "Not executed: the user interrupted the turn.".to_string(),
+                            false,
+                        );
+                    }
                     let _ = tx.send(AgentEvent::Info(format!(
                         "auto-approved: {summary} ({reason})"
                     )));
@@ -1709,6 +1716,45 @@ mod tests {
             "{}",
             run.outputs[0]
         );
+    }
+
+    /// An interrupt while the judge is deciding still stops the call: a verdict that
+    /// arrives after it does not run the tool.
+    #[tokio::test]
+    async fn an_interrupt_while_the_judge_decides_stops_the_call() {
+        use crate::judge::fake::Answers;
+        use crate::permissions::{Relax, Rules, Trust};
+
+        let dir = tools::temp_dir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let policy = Policy::new(Mode::Auto, Rules::default(), None, repo.clone())
+            .with_relax(Relax {
+                writes: false,
+                commands: false,
+            })
+            .with_trust(Trust::new(&dir.join("config"), &repo));
+        policy.trust().unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (judge, backend) =
+            crate::judge::fake::judge(Answers::Interrupted(Arc::clone(&cancel)), &repo);
+        let target = repo.join("notes.txt");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (output, ok) = execute(
+            &Registry::new(Vec::new()),
+            &policy,
+            Some(&judge),
+            &fake::call("write", json!({"path": target, "content": "x"})),
+            &tx,
+            &cancel,
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(output, "Not executed: the user interrupted the turn.");
+        assert_eq!(backend.calls.lock().unwrap().len(), 1);
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A prompt typed mid-turn waits, then runs as a turn of its own on the same

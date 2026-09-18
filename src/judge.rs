@@ -447,6 +447,8 @@ pub mod fake {
         Error(String),
         /// Never answers, so the judge's timeout fires.
         Hang,
+        /// Approves, having first set `cancel`, so the verdict races an interrupt.
+        Interrupted(Arc<std::sync::atomic::AtomicBool>),
     }
 
     pub struct Backend {
@@ -486,6 +488,15 @@ pub mod fake {
                     Answers::Hang => {
                         std::future::pending::<()>().await;
                         unreachable!()
+                    }
+                    Answers::Interrupted(cancel) => {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Ok((
+                            Verdict::Approve {
+                                reason: "a step toward the task".to_string(),
+                            },
+                            usage,
+                        ))
                     }
                 }
             })
