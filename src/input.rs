@@ -20,6 +20,25 @@ pub struct Editor {
     top: usize,
 }
 
+/// One row of the wrapped text: the char index it starts at, and what it shows.
+#[derive(Debug, PartialEq)]
+pub struct Row {
+    pub start: usize,
+    pub text: String,
+}
+
+impl Row {
+    fn new(chars: &[char], start: usize, end: usize) -> Self {
+        let text = chars[start..end].iter().collect();
+        Row { start, text }
+    }
+}
+
+/// A char's width in terminal cells.
+fn char_width(c: char) -> usize {
+    Line::raw(c.to_string()).width()
+}
+
 impl Editor {
     pub fn value(&self) -> &str {
         self.input.value()
@@ -81,49 +100,88 @@ impl Editor {
         self.insert("\n");
     }
 
-    /// Move the cursor `delta` lines, keeping its column where the line allows.
-    /// False when there is no line that way.
-    pub fn move_line(&mut self, delta: isize) -> bool {
-        let (row, column) = self.cursor_position();
+    /// Move the cursor `delta` rows, keeping its column where the row allows.
+    /// False when there is no row that way.
+    pub fn move_line(&mut self, delta: isize, width: usize) -> bool {
+        let (row, column) = self.cursor_position(width);
         let target = row as isize + delta;
-        if target < 0 || target as usize >= self.value().split('\n').count() {
+        if target < 0 || target as usize >= self.rows(width).len() {
             return false;
         }
-        self.place(target as usize, column);
+        self.place(target as usize, column, width);
         true
     }
 
-    /// The cursor's line and display column.
-    pub fn cursor_position(&self) -> (usize, usize) {
-        let before: String = self.value().chars().take(self.cursor()).collect();
-        let line = before.rsplit('\n').next().unwrap_or("");
-        (before.matches('\n').count(), Line::raw(line).width())
+    /// The text as it is drawn: each logical line wrapped to `width`, with the char
+    /// index it starts at. A row break at a space leaves that space on the row before.
+    pub fn rows(&self, width: usize) -> Vec<Row> {
+        let width = width.max(1);
+        let chars: Vec<char> = self.value().chars().collect();
+        let mut rows = Vec::new();
+        let mut start = 0;
+        let mut column = 0;
+        let mut space = None;
+        for (i, &c) in chars.iter().enumerate() {
+            if c == '\n' {
+                rows.push(Row::new(&chars, start, i));
+                (start, column, space) = (i + 1, 0, None);
+                continue;
+            }
+            let cell = char_width(c);
+            if column + cell > width && i > start {
+                // Break after the last space on the row, or mid-word if it has none.
+                let at = space.filter(|&at| at > start).unwrap_or(i);
+                rows.push(Row::new(&chars, start, at));
+                start = if chars[at] == ' ' { at + 1 } else { at };
+                column = chars[start..i].iter().copied().map(char_width).sum();
+                space = None;
+            }
+            if c == ' ' {
+                space = Some(i);
+            }
+            column += cell;
+        }
+        rows.push(Row::new(&chars, start, chars.len()));
+        rows
+    }
+
+    /// The cursor's row and display column once the text is wrapped to `width`.
+    pub fn cursor_position(&self, width: usize) -> (usize, usize) {
+        let cursor = self.cursor();
+        let rows = self.rows(width);
+        let row = rows.iter().rposition(|r| r.start <= cursor).unwrap_or(0);
+        let column = self
+            .value()
+            .chars()
+            .skip(rows[row].start)
+            .take(cursor - rows[row].start);
+        (row, column.map(char_width).sum())
     }
 
     /// Put the cursor on `row` at display column `column`, or the nearest place to it.
-    pub fn place(&mut self, row: usize, column: usize) {
-        let mut cursor = 0;
-        for line in self.value().split('\n').take(row) {
-            cursor += line.chars().count() + 1;
-        }
-        let line = self.value().split('\n').nth(row).unwrap_or("");
-        let mut width = 0;
-        for c in line.chars() {
-            if width >= column {
+    pub fn place(&mut self, row: usize, column: usize, width: usize) {
+        let rows = self.rows(width);
+        let Some(row) = rows.get(row.min(rows.len().saturating_sub(1))) else {
+            return;
+        };
+        let mut cursor = row.start;
+        let mut at = 0;
+        for c in row.text.chars() {
+            if at >= column {
                 break;
             }
-            width += Line::raw(c.to_string()).width();
+            at += char_width(c);
             cursor += 1;
         }
         self.move_to(cursor.min(self.value().chars().count()));
     }
 
-    /// The first of `height` visible lines, moved only as far as keeps the cursor in view.
-    pub fn top(&mut self, height: usize) -> usize {
-        let row = self.cursor_position().0;
-        let lines = self.value().split('\n').count();
+    /// The first of `height` visible rows, moved only as far as keeps the cursor in view.
+    pub fn top(&mut self, height: usize, width: usize) -> usize {
+        let row = self.cursor_position(width).0;
+        let rows = self.rows(width).len();
         let top = self.top.min(row).max((row + 1).saturating_sub(height));
-        self.top = top.min(lines.saturating_sub(height));
+        self.top = top.min(rows.saturating_sub(height));
         self.top
     }
 
@@ -272,6 +330,9 @@ fn rewrite(path: &Path, entries: &[String]) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A width no test line reaches, so wrapping stays out of the way.
+    const WIDE: usize = 200;
+
     fn editor(text: &str) -> Editor {
         let mut editor = Editor::default();
         editor.set(text.to_string());
@@ -284,7 +345,7 @@ mod tests {
         editor.handle(InputRequest::GoToPrevChar);
         editor.newline();
         assert_eq!(editor.value(), "a\nb");
-        assert_eq!(editor.cursor_position(), (1, 0));
+        assert_eq!(editor.cursor_position(WIDE), (1, 0));
         editor.handle(InputRequest::InsertChar('x'));
         assert_eq!(editor.value(), "a\nxb");
     }
@@ -294,19 +355,52 @@ mod tests {
         let mut editor = editor("> ");
         editor.insert("one\r\ntwo\rthree\nfour");
         assert_eq!(editor.value(), "> one\ntwo\nthree\nfour");
-        assert_eq!(editor.cursor_position(), (3, 4));
+        assert_eq!(editor.cursor_position(WIDE), (3, 4));
     }
 
     #[test]
     fn up_and_down_keep_the_column() {
         let mut editor = editor("héllo\nab\nworld");
-        assert!(!editor.move_line(1));
-        assert!(editor.move_line(-1));
-        assert_eq!(editor.cursor_position(), (1, 2));
-        assert!(editor.move_line(-1));
-        assert_eq!(editor.cursor_position(), (0, 2));
+        assert!(!editor.move_line(1, WIDE));
+        assert!(editor.move_line(-1, WIDE));
+        assert_eq!(editor.cursor_position(WIDE), (1, 2));
+        assert!(editor.move_line(-1, WIDE));
+        assert_eq!(editor.cursor_position(WIDE), (0, 2));
         assert_eq!(editor.cursor(), 2);
-        assert!(!editor.move_line(-1));
+        assert!(!editor.move_line(-1, WIDE));
+    }
+
+    #[test]
+    fn long_text_wraps_at_the_width() {
+        let rows = |text: &str, width: usize| {
+            editor(text)
+                .rows(width)
+                .iter()
+                .map(|r| r.text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows("the quick brown fox", 10), ["the quick", "brown fox"]);
+        assert_eq!(editor("the quick brown fox").rows(10)[1].start, 10);
+        // A word longer than the row is split where it runs out.
+        assert_eq!(rows("abcdefgh", 3), ["abc", "def", "gh"]);
+        // An empty line still draws a row, and so does a trailing newline.
+        assert_eq!(editor("a\n\nb").rows(10).len(), 3);
+        assert_eq!(editor("a\n").rows(10).len(), 2);
+    }
+
+    #[test]
+    fn the_cursor_follows_the_wrapped_rows() {
+        let mut editor = editor("the quick brown fox");
+        assert_eq!(editor.cursor_position(10), (1, 9));
+        // The space a row broke at belongs to the row before it.
+        editor.handle(InputRequest::SetCursor(9));
+        assert_eq!(editor.cursor_position(10), (0, 9));
+        // Up moves between wrapped rows, not just between typed lines.
+        editor.handle(InputRequest::GoToEnd);
+        assert!(editor.move_line(-1, 10));
+        assert_eq!(editor.cursor(), 9);
+        editor.place(1, 5, 10);
+        assert_eq!(editor.cursor(), 15);
     }
 
     #[test]
@@ -330,11 +424,11 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
-        assert_eq!(editor.top(8), 4);
-        editor.move_line(-3);
-        assert_eq!(editor.top(8), 4);
-        editor.move_line(-5);
-        assert_eq!(editor.top(8), 3);
+        assert_eq!(editor.top(8, WIDE), 4);
+        editor.move_line(-3, WIDE);
+        assert_eq!(editor.top(8, WIDE), 4);
+        editor.move_line(-5, WIDE);
+        assert_eq!(editor.top(8, WIDE), 3);
     }
 
     fn temp_path() -> PathBuf {

@@ -39,7 +39,7 @@ pub struct App {
     pub all_badges: bool,
     /// Clickable approval choices and the key each stands for, filled in by the renderer.
     pub buttons: Vec<(Rect, KeyCode)>,
-    /// The input text's area and its line and column scroll, filled in by the renderer.
+    /// The input text's area, first visible row and wrap width, filled in by the renderer.
     pub input_area: Option<(Rect, usize, usize)>,
     /// The transcript scrollbar, filled in by the renderer when the transcript overflows.
     pub scrollbar: Option<Rect>,
@@ -190,11 +190,12 @@ impl App {
             KeyCode::PageDown => self.scroll_by(self.page as isize),
             // Left/Right belong to the cursor, so the transcript scrolls with up/down
             // unless the input has lines to move between.
-            KeyCode::Up if self.input.is_multiline() => {
-                self.input.move_line(-1);
+            // Up and down move within the input whenever it draws on more than one row.
+            KeyCode::Up if self.input_rows() > 1 => {
+                self.input.move_line(-1, self.input_width());
             }
-            KeyCode::Down if self.input.is_multiline() => {
-                self.input.move_line(1);
+            KeyCode::Down if self.input_rows() > 1 => {
+                self.input.move_line(1, self.input_width());
             }
             KeyCode::Up => self.scroll_by(-1),
             KeyCode::Down => self.scroll_by(1),
@@ -258,12 +259,12 @@ impl App {
             self.drag_to(y);
             return true;
         }
-        if let Some((area, top, scroll)) = self.input_area.filter(|(area, ..)| area.contains(at)) {
+        if let Some((area, top, width)) = self.input_area.filter(|(area, ..)| area.contains(at)) {
             if self.input.is_empty() {
                 return false;
             }
             let row = top + (y - area.y) as usize;
-            self.input.place(row, scroll + (x - area.x) as usize);
+            self.input.place(row, (x - area.x) as usize, width);
             return true;
         }
         let Some(entry) = self.entry_at(y) else {
@@ -295,6 +296,16 @@ impl App {
     }
 
     /// The entry drawn on screen row `y`.
+    /// The width the input wraps at, from the last frame; a wide default before one.
+    fn input_width(&self) -> usize {
+        self.input_area.map_or(80, |(.., width)| width)
+    }
+
+    /// Rows the input draws on at that width.
+    fn input_rows(&self) -> usize {
+        self.input.rows(self.input_width()).len()
+    }
+
     pub fn entry_at(&self, y: u16) -> Option<usize> {
         self.rows
             .iter()
@@ -749,7 +760,7 @@ mod tests {
         assert_eq!(app.input.value(), "a\nb\n\n");
         app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
         app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.input.cursor_position(), (1, 0));
+        assert_eq!(app.input.cursor_position(80), (1, 0));
     }
 
     #[test]

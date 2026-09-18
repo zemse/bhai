@@ -36,7 +36,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 .count() as u16;
             (lines + offers + 4).min(frame.area().height / 2).max(5)
         })
-        .unwrap_or_else(|| app.input.value().split('\n').count().min(MAX_INPUT_LINES) as u16 + 2);
+        .unwrap_or_else(|| {
+            // The input's own rows, wrapped to the width it will be drawn at.
+            let width = input_width(frame.area().width.saturating_sub(4));
+            app.input.rows(width).len().min(MAX_INPUT_LINES) as u16 + 2
+        });
 
     let [status_area, transcript_area, bottom_area] = Layout::vertical([
         Constraint::Length(1),
@@ -359,6 +363,11 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>
     lines
 }
 
+/// The width the input text wraps at: the text area less the cursor's own column.
+fn input_width(area_width: u16) -> usize {
+    area_width.saturating_sub(3).max(1) as usize
+}
+
 fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::bordered().border_style(Style::new().fg(Color::DarkGray));
     let inner = block.inner(area);
@@ -371,19 +380,21 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
         marker_area,
     );
 
-    // The widget scrolls the text so the cursor stays in view. One column is reserved
-    // so the cursor itself is never off-screen.
-    let width = text_area.width.saturating_sub(1) as usize;
-    let top = app.input.top(text_area.height.max(1) as usize);
-    let (row, column) = app.input.cursor_position();
-    let scroll = column.max(width) - width;
-    app.input_area = Some((text_area, top, scroll));
-    frame.render_widget(
-        Paragraph::new(app.input.value()).scroll((top as u16, scroll as u16)),
-        text_area,
-    );
+    // The text wraps to the width, less one column so the cursor at the end of a full
+    // row is never off-screen. The widget scrolls only when it has more rows than fit.
+    let width = input_width(text_area.width);
+    let top = app.input.top(text_area.height.max(1) as usize, width);
+    let (row, column) = app.input.cursor_position(width);
+    app.input_area = Some((text_area, top, width));
+    let rows: Vec<Line> = app
+        .input
+        .rows(width)
+        .into_iter()
+        .map(|r| Line::raw(r.text))
+        .collect();
+    frame.render_widget(Paragraph::new(rows).scroll((top as u16, 0)), text_area);
     frame.set_cursor_position((
-        (text_area.x + (column - scroll) as u16).min(text_area.right().saturating_sub(1)),
+        (text_area.x + column as u16).min(text_area.right().saturating_sub(1)),
         text_area.y + (row - top) as u16,
     ));
 }
@@ -853,6 +864,23 @@ mod tests {
         let text = screen(&terminal);
         assert!(text.contains("line 11") && !text.contains("line 3"));
         assert_eq!(terminal.get_cursor_position().unwrap().y, area.bottom() - 1);
+    }
+
+    #[test]
+    fn a_long_prompt_wraps_instead_of_running_off_the_side() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        app.input
+            .set("the quick brown fox jumps over the lazy dog".to_string());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (area, top, _) = app.input_area.unwrap();
+        assert_eq!((area.height, top), (2, 0));
+        let text = screen(&terminal);
+        assert!(text.contains("› the quick brown fox jumps over"));
+        assert!(text.contains("the lazy dog"));
+        // The cursor sits at the end of the second row, not off the right edge.
+        let at = terminal.get_cursor_position().unwrap();
+        assert_eq!((at.x, at.y), (area.x + 12, area.y + 1));
     }
 
     #[test]
