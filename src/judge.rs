@@ -17,15 +17,15 @@ use serde_json::{Value, json};
 use crate::client::{Client, Usage};
 use crate::tools::BoxFuture;
 
-/// Transcript labels the summary carries, newest last. A running ledger rather than a
-/// peephole: the judge that cannot see what the turn has been doing denies reasonable
-/// steps, and the lines before the call are the same from one call to the next, so they
-/// cache instead of being re-read.
-const RECENT: usize = 30;
-/// User messages the summary carries as the task, newest last.
-const TASKS: usize = 3;
-/// Verdicts the summary carries, newest last.
-const VERDICTS: usize = 10;
+/// Lines the ledger holds before the oldest are folded away. A running ledger rather
+/// than a peephole: a judge that cannot see what the session has been doing denies
+/// reasonable steps. It only ever grows, so each request extends the one before it and
+/// the backend serves the shared part from its cache instead of charging for it again.
+const LEDGER: usize = 48;
+/// Lines one fold takes away, leaving the rest in place. A fold is the one moment the
+/// prefix changes rather than grows, so it is worth making it rare and worth making it
+/// big: half the ledger goes at once, the way history compaction works.
+const FOLD: usize = LEDGER / 2;
 /// Longest a label or verdict line may be in the summary, in characters.
 const CLIP: usize = 200;
 /// Longest the judged command or path, and the edit detail, may be, in characters. Well
@@ -92,8 +92,6 @@ impl Verdict {
 pub struct JudgeRequest {
     /// The user's current task: the latest user message.
     pub task: String,
-    /// The user messages before it, oldest first.
-    pub earlier: Vec<String>,
     pub tool: String,
     /// The exact command, or the exact path.
     pub target: String,
@@ -101,10 +99,8 @@ pub struct JudgeRequest {
     pub detail: String,
     pub cwd: String,
     pub root: String,
-    /// The last few transcript labels, one line each.
-    pub recent: Vec<String>,
-    /// The verdicts already given this session.
-    pub verdicts: Vec<String>,
+    /// What the session has done, oldest first, one line each.
+    pub ledger: Vec<String>,
 }
 
 impl JudgeRequest {
@@ -113,16 +109,9 @@ impl JudgeRequest {
     /// judged goes last, where it is the only part that changed.
     pub fn text(&self) -> String {
         let mut out = format!("project root: {}\ncwd: {}\n", self.root, self.cwd);
-        for (header, list) in [
-            ("earlier messages", &self.earlier),
-            ("calls so far", &self.recent),
-            ("verdicts so far", &self.verdicts),
-        ] {
-            if list.is_empty() {
-                continue;
-            }
-            out.push_str(&format!("{header}:\n"));
-            for line in list {
+        if !self.ledger.is_empty() {
+            out.push_str("this session so far:\n");
+            for line in &self.ledger {
                 out.push_str(&format!("- {}\n", clip(line, CLIP)));
             }
         }
@@ -178,15 +167,44 @@ pub struct Judge {
 
 #[derive(Default)]
 struct State {
-    /// The last few user messages, newest last; the newest is the task.
-    tasks: VecDeque<String>,
-    recent: VecDeque<String>,
-    verdicts: VecDeque<String>,
+    /// The latest user message, which is the task being judged against.
+    task: String,
+    /// Everything the session has done, oldest first, appended to and never reordered:
+    /// the user's messages, the calls made and the verdicts given, in the order they
+    /// happened. Folding the oldest lines away is the only thing that rewrites it.
+    ledger: VecDeque<String>,
+    /// Lines folded away so far, named in the line that replaces them.
+    folded: usize,
     /// One verdict per `tool` and target, so the same call is never judged twice.
     cache: HashMap<String, Verdict>,
     /// Calls judged in the running turn.
     spent: usize,
     total: Usage,
+}
+
+impl State {
+    /// Add a line to the end of the ledger, folding the oldest away when it has grown
+    /// past `LEDGER`. Nothing else ever changes a line that is already there: a request
+    /// the judge sees is the previous one plus whatever happened since, which is what
+    /// lets the backend charge for the new lines alone.
+    fn append(&mut self, line: String) {
+        self.ledger.push_back(line);
+        if self.ledger.len() > LEDGER {
+            self.ledger.drain(..FOLD);
+            self.folded += FOLD;
+        }
+    }
+
+    /// The ledger as the request carries it, with the folded lines named first so the
+    /// judge knows the history is longer than what it can see.
+    fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::with_capacity(self.ledger.len() + 1);
+        if self.folded > 0 {
+            lines.push(format!("[{} earlier steps, folded away]", self.folded));
+        }
+        lines.extend(self.ledger.iter().cloned());
+        lines
+    }
 }
 
 impl Judge {
@@ -206,26 +224,21 @@ impl Judge {
         self
     }
 
-    /// A new turn on `task`, which refills the budget. Earlier messages are kept: a
-    /// task like "now do the same for the other file" says nothing on its own.
+    /// A new turn on `task`, which refills the budget. The message joins the ledger
+    /// rather than replacing what came before: a task like "now do the same for the
+    /// other file" says nothing on its own.
     pub fn start_turn(&self, task: &str) {
         let mut state = self.lock();
-        state.tasks.push_back(clip(task, TASK_CLIP));
-        while state.tasks.len() > TASKS {
-            state.tasks.pop_front();
-        }
+        state.task = clip(task, TASK_CLIP);
+        let line = format!("the user said: {}", clip(task, CLIP));
+        state.append(line);
         state.spent = 0;
     }
 
     /// Record a finished call, so the judge sees what the agent has been doing.
     pub fn note(&self, label: &str) {
         let mut state = self.lock();
-        state
-            .recent
-            .push_back(clip(&label.replace('\n', " "), CLIP));
-        while state.recent.len() > RECENT {
-            state.recent.pop_front();
-        }
+        state.append(format!("ran: {}", clip(&label.replace('\n', " "), CLIP)));
     }
 
     /// What the judge has cost so far; never part of the conversation's totals.
@@ -268,15 +281,13 @@ impl Judge {
             }
             state.spent += 1;
             JudgeRequest {
-                task: state.tasks.back().cloned().unwrap_or_default(),
-                earlier: state.tasks.iter().rev().skip(1).rev().cloned().collect(),
+                task: state.task.clone(),
                 tool: tool.to_string(),
                 target: target.to_string(),
                 detail: detail.to_string(),
                 cwd: self.root.display().to_string(),
                 root: self.root.display().to_string(),
-                recent: state.recent.iter().cloned().collect(),
-                verdicts: state.verdicts.iter().cloned().collect(),
+                ledger: state.lines(),
             }
         };
 
@@ -298,14 +309,11 @@ impl Judge {
             let mut state = self.lock();
             add(&mut state.total, usage);
             state.cache.insert(key, verdict.clone());
-            state.verdicts.push_back(format!(
-                "{}: {} ({target})",
+            state.append(format!(
+                "judged {target}: {} ({})",
                 verdict.name(),
                 verdict.reason()
             ));
-            while state.verdicts.len() > VERDICTS {
-                state.verdicts.pop_front();
-            }
         }
         self.record(&request, Some(&verdict), "", usage, elapsed);
         Some(verdict)
@@ -482,14 +490,12 @@ impl Case {
         let root = self.root.clone().unwrap_or_else(|| EVAL_ROOT.to_string());
         JudgeRequest {
             task: self.task.clone(),
-            earlier: Vec::new(),
             tool: self.tool.clone(),
             target: self.target.clone(),
             detail: self.detail.clone(),
             cwd: self.cwd.clone().unwrap_or_else(|| root.clone()),
             root,
-            recent: self.recent.clone(),
-            verdicts: Vec::new(),
+            ledger: self.recent.clone(),
         }
     }
 }
@@ -749,7 +755,13 @@ mod tests {
         // The second call carries the first verdict, and the budget is what is left.
         judge.decide("bash", "cargo build", "").await;
         let calls = backend.calls.lock().unwrap();
-        assert_eq!(calls[1].verdicts, ["approve: in the project (cargo test)"]);
+        assert_eq!(
+            calls[1].ledger,
+            [
+                "the user said: add a unit test for the parser",
+                "judged cargo test: approve (in the project)",
+            ]
+        );
         assert_eq!(calls[1].task, "add a unit test for the parser");
     }
 
@@ -820,25 +832,87 @@ mod tests {
         }
     }
 
-    /// A full summary around `target`: every list at its limit, a real task.
+    #[tokio::test]
+    async fn each_request_extends_the_one_before_it() {
+        let (judge, backend) = judge(Answers::Verdict(approve("fine")), Path::new("/p"));
+        judge.start_turn("add a unit test for the parser");
+        for i in 0..6 {
+            judge.note(&format!("bash: cargo test {i}"));
+            judge.decide("bash", &format!("cargo test {i}"), "").await;
+        }
+        judge.start_turn("now do the same for the lexer");
+        judge.decide("bash", "cargo test lexer", "").await;
+
+        // What the judge reads is the previous request plus what has happened since, so
+        // the backend is charged for the new lines and serves the rest from its cache.
+        let calls = backend.calls.lock().unwrap();
+        for pair in calls.windows(2) {
+            let (before, after) = (&pair[0], &pair[1]);
+            assert!(
+                after.ledger.starts_with(&before.ledger),
+                "{:?} does not extend {:?}",
+                after.ledger,
+                before.ledger
+            );
+        }
+        // The turn's own task line is in there, and so is every verdict.
+        let last = calls.last().unwrap();
+        assert_eq!(last.task, "now do the same for the lexer");
+        assert_eq!(
+            last.ledger.first().unwrap(),
+            "the user said: add a unit test for the parser"
+        );
+        assert_eq!(
+            last.ledger
+                .iter()
+                .filter(|l| l.starts_with("judged "))
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn a_fold_is_the_only_thing_that_rewrites_the_ledger() {
+        let mut state = State::default();
+        for i in 0..LEDGER {
+            state.append(format!("ran: step {i}"));
+        }
+        assert_eq!(state.lines().len(), LEDGER);
+        assert_eq!(state.lines()[0], "ran: step 0");
+
+        // One line past the cap folds the oldest half away, once, and says how many.
+        state.append("ran: the one over".to_string());
+        let lines = state.lines();
+        assert_eq!(lines.len(), LEDGER - FOLD + 2);
+        assert_eq!(lines[0], format!("[{FOLD} earlier steps, folded away]"));
+        assert_eq!(lines[1], format!("ran: step {FOLD}"));
+        assert_eq!(lines.last().unwrap(), "ran: the one over");
+
+        // And then it grows again, without touching what is already there.
+        let before = state.lines();
+        state.append("ran: the next one".to_string());
+        assert!(state.lines().starts_with(&before));
+    }
+
+    /// A full summary around `target`: every list at its limit, a real task.    /// A full summary around `target`: every list at its limit, a real task.
     fn realistic(target: &str) -> JudgeRequest {
         JudgeRequest {
             task: "the write tool truncates files over 64k, find out why and add a \
 regression test for it in src/tools/write.rs"
                 .to_string(),
-            earlier: (0..TASKS - 1)
-                .map(|i| format!("have a look at the write tool ({i})"))
-                .collect(),
             tool: "bash".to_string(),
             target: target.to_string(),
             detail: String::new(),
             cwd: "/home/u/workspace/bhai".to_string(),
             root: "/home/u/workspace/bhai".to_string(),
-            recent: (0..RECENT)
-                .map(|i| format!("read /home/u/workspace/bhai/src/tools/write.rs -> {i} lines"))
-                .collect(),
-            verdicts: (0..VERDICTS)
-                .map(|i| format!("approve: reads a project file ({i})"))
+            ledger: (0..LEDGER)
+                .map(|i| match i % 3 {
+                    0 => {
+                        format!("ran: read /home/u/workspace/bhai/src/tools/write.rs -> {i} lines")
+                    }
+                    1 => format!("judged cargo test -- write: approve (runs project tests) ({i})"),
+                    _ => format!("the user said: have a look at the write tool ({i})"),
+                })
                 .collect(),
         }
     }
@@ -849,9 +923,11 @@ regression test for it in src/tools/write.rs"
     }
 
     #[test]
-    fn a_realistic_summary_stays_under_fifteen_hundred_tokens() {
+    fn a_full_ledger_stays_between_the_cache_floor_and_fifteen_hundred_tokens() {
         let count = tokens(&realistic("cargo test --all-features -- --nocapture write"));
-        assert!(count < 1500, "{count} tokens");
+        // Under about a thousand tokens the backend caches nothing at all, and a full
+        // ledger is the steady state, so it is worth being over that line.
+        assert!((1100..1500).contains(&count), "{count} tokens");
     }
 
     #[test]

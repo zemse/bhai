@@ -72,12 +72,20 @@ final for that call and goes back to the model as `denied by auto policy: <reaso
 it can adapt; you are not asked afterwards. Anything else the judge cannot settle, an
 error, a timeout, a malformed reply or a spent budget, falls back to the prompt.
 
-The request is a compact summary, a thousand tokens or so at its fullest, laid out so
-what the session has done comes first and the call to decide comes last: the project root
-and cwd, your last few messages, the calls made so far one line each, the verdicts given
-so far, your current task, then the tool and the exact command or path (with a diff
-summary for an edit). Everything before the call only ever grows, so each request extends
-the one before it and the shared part is served from the cache rather than re-read. It runs on its own
+The request is a compact summary laid out so what the session has done comes first and
+the call to decide comes last: the project root and cwd, then one ledger holding your
+messages, the calls made and the verdicts given in the order they happened, then your
+current task, then the tool and the exact command or path (with a diff summary for an
+edit).
+
+The ledger is append-only. A line, once written, is never moved or dropped, so each
+request is the previous one plus whatever happened since: the backend serves the shared
+prefix from its cache and charges full price only for the new lines and the call itself,
+about 150 tokens. A full ledger is 48 lines, around 1.2k tokens with the system prompt,
+which is also what puts it over the roughly 1k floor below which nothing caches at all.
+Past 48 lines the oldest 24 fold into a single `[24 earlier steps, folded away]` line.
+That fold is the one moment the prefix changes rather than grows, so it costs one cache
+break per 24 judged steps, the same bargain history compaction makes. It runs on its own
 `prompt_cache_key`, is never appended to the conversation, and its tokens are counted
 apart in `/context` and `GET /state`. A verdict is reused for an identical call for the
 rest of the session, and at most `judge_max_per_turn` calls are judged per turn.
