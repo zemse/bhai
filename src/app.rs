@@ -357,31 +357,23 @@ impl App {
             KeyCode::Enter if !key.modifiers.is_empty() => self.input.newline(),
             KeyCode::Char('j') if ctrl => self.input.newline(),
             KeyCode::Enter => self.submit(),
-            KeyCode::Char('p') if ctrl => {
-                if let Some(text) = self.history.prev(self.input.value()) {
-                    self.input.set(text);
-                }
-            }
-            KeyCode::Char('n') if ctrl => {
-                if let Some(text) = self.history.next() {
-                    self.input.set(text);
-                }
-            }
+            KeyCode::Char('p') if ctrl => return self.recall(-1),
+            KeyCode::Char('n') if ctrl => return self.recall(1),
             KeyCode::PageUp => self.scroll_by(-(self.page as isize)),
             KeyCode::PageDown => self.scroll_by(self.page as isize),
-            // Left/Right belong to the cursor, so the transcript scrolls with up/down
-            // unless the input has lines to move between.
-            // Up and down move within the input whenever it draws on more than one row.
-            KeyCode::Up if self.input_rows() > 1 => {
+            // The transcript scrolls a line at a time with ctrl held, since the arrows
+            // themselves belong to the prompt.
+            KeyCode::Up if ctrl => self.scroll_by(-1),
+            KeyCode::Down if ctrl => self.scroll_by(1),
+            // Inside a prompt of more than one row the arrows move between its rows; off
+            // the top or bottom edge of it they walk the prompt history, as a shell does.
+            KeyCode::Up | KeyCode::Down => {
+                let delta = if key.code == KeyCode::Up { -1 } else { 1 };
                 self.input.selecting(shift);
-                self.input.move_line(-1, self.input_width());
+                if !self.input.move_line(delta, self.input_width()) && !shift {
+                    return self.recall(delta);
+                }
             }
-            KeyCode::Down if self.input_rows() > 1 => {
-                self.input.selecting(shift);
-                self.input.move_line(1, self.input_width());
-            }
-            KeyCode::Up => self.scroll_by(-1),
-            KeyCode::Down => self.scroll_by(1),
             _ => {
                 if let Some(request) = input_request(key) {
                     self.input.handle(request, shift);
@@ -397,6 +389,21 @@ impl App {
             self.input.insert(text);
             self.refresh_menu();
         }
+    }
+
+    /// Walk the prompt history: back one entry, or forward one and then to the draft the
+    /// walk started from. The cursor lands at the end, ready to edit or send.
+    fn recall(&mut self, delta: isize) {
+        let found = match delta < 0 {
+            true => self.history.prev(self.input.value()),
+            false => self.history.next(),
+        };
+        if let Some(text) = found {
+            self.input.set(text);
+        }
+        // A recalled `/command` must not take the arrows back for the menu, or the walk
+        // would stop there. The next keystroke opens it again.
+        self.menu = None;
     }
 
     /// The menu rows for what is typed; empty whenever the menu is shut.
@@ -675,6 +682,7 @@ impl App {
     }
 
     /// Rows the input draws on at that width.
+    #[cfg(test)]
     fn input_rows(&self) -> usize {
         self.input.rows(self.input_width()).len()
     }
@@ -1477,6 +1485,63 @@ mod tests {
         assert_eq!(app.input.value(), "one\ntwo\n");
         assert!(!app.working);
         assert!(app.history.prev("").is_none(), "nothing was submitted");
+    }
+
+    #[test]
+    fn the_arrows_walk_the_history_and_move_inside_a_multi_line_prompt() {
+        let mut app = App::detached();
+        for text in ["/permissions", "/skills"] {
+            type_text(&mut app, text);
+            app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        let up = |app: &mut App| app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        let down = |app: &mut App| app.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+
+        // From an empty prompt, up walks back and down walks forward again.
+        up(&mut app);
+        assert_eq!(app.input.value(), "/skills");
+        assert_eq!(app.menu, None, "a recalled command keeps the arrows");
+        up(&mut app);
+        assert_eq!(app.input.value(), "/permissions");
+        up(&mut app);
+        assert_eq!(app.input.value(), "/permissions", "the oldest one stays");
+        down(&mut app);
+        assert_eq!(app.input.value(), "/skills");
+        down(&mut app);
+        assert_eq!(app.input.value(), "", "back to the draft");
+        down(&mut app);
+        assert_eq!(app.input.value(), "", "and no further");
+
+        // Inside a prompt of several rows the arrows move between them instead, and
+        // only walk the history off the top or the bottom of it.
+        let mut app = App::detached();
+        app.history.push("earlier").unwrap();
+        type_text(&mut app, "one");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::ALT));
+        type_text(&mut app, "two");
+        assert_eq!(app.input_rows(), 2);
+        up(&mut app);
+        assert_eq!(
+            app.input.value(),
+            "one\ntwo",
+            "it moved a row, not a prompt"
+        );
+        assert_eq!(app.input.cursor(), 3);
+        up(&mut app);
+        assert_eq!(app.input.value(), "earlier");
+        down(&mut app);
+        assert_eq!(app.input.value(), "one\ntwo", "the draft comes back");
+    }
+
+    #[test]
+    fn ctrl_up_and_down_scroll_the_transcript() {
+        let mut app = transcript(&["one", "two", "three"]);
+        app.max_scroll = 2;
+        app.on_key(key(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(app.scroll, 1);
+        app.on_key(key(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(app.scroll, 0);
+        assert!(app.input.is_empty(), "the prompt is untouched");
     }
 
     #[test]

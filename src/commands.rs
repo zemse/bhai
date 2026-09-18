@@ -195,8 +195,8 @@ pub fn help() -> String {
         "\nkeys",
         "\n  enter send · alt+enter or ctrl+j newline · shift+tab permission mode",
         "\n  ctrl+c interrupt, then quit · ctrl+d quit on an empty prompt",
-        "\n  ctrl+p and ctrl+n walk the prompt history · tab completes a command",
-        "\n  wheel or pgup/pgdn scroll · click a tool output to expand it",
+        "\n  up and down walk the prompt history · tab completes a command",
+        "\n  wheel, pgup/pgdn or ctrl+up/down scroll · click a tool output to expand it",
         "\n  drag selects · ctrl+y copies · ctrl+v pastes · ctrl+t shows every badge",
     ));
     out

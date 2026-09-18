@@ -39,8 +39,9 @@ and that row is there only while a turn is actually running. The rest of the key
 | --- | --- |
 | `enter` | send |
 | `shift+enter`, `alt+enter`, `ctrl+j` | newline (most terminals cannot report shift+enter) |
-| `ctrl+p`, `ctrl+n` | previous and next prompt from the history |
-| `up`, `down` | pick a row in the `/` menu, else scroll the transcript or move between the input's lines |
+| `up`, `down` | pick a row in the `/` menu, move between a multi-line prompt's rows, else walk the prompt history |
+| `ctrl+p`, `ctrl+n` | the same walk through the history, from anywhere in the prompt |
+| `ctrl+up`, `ctrl+down` | scroll the transcript a line |
 | `pgup`, `pgdn` | scroll a page |
 | `shift+tab` | cycle the permission mode |
 | `ctrl+t` | show every token badge |
@@ -53,6 +54,10 @@ and that row is there only while a turn is actually running. The rest of the key
 
 At an approval prompt: `y` runs it once, `a` remembers that exact call, `p` remembers its
 prefix, and `n`, `r` or `esc` rejects.
+
+A history walk starts from what is typed: `up` keeps it as the draft, and walking back
+down past the newest prompt restores it. In a prompt of several rows the arrows move
+between the rows first, and walk the history only off the top or the bottom of it.
 
 Emacs and macOS motions work in the input (`alt+b`/`alt+f` and `alt+←`/`alt+→` by word,
 `cmd+←`/`cmd+→` to the ends, `ctrl+w`, `cmd+backspace`). Prompts are kept in
