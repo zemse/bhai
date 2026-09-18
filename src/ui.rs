@@ -60,6 +60,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         };
         diff.render(frame, area);
         app.rows.clear();
+        app.lines.clear();
+        app.transcript_area = None;
         app.scrollbar = None;
         app.input_area = None;
         if app.pending.is_some() {
@@ -131,7 +133,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
         } else if app.working {
             "  ctrl+c interrupt"
         } else {
-            "  enter send · shift+tab mode · wheel/pgup scroll · click expands output, pins other badges · ctrl+t tokens · ctrl+c quit"
+            "  enter send · shift+tab mode · wheel/pgup scroll · drag to select · ctrl+y copy · click expands output · ctrl+t tokens · ctrl+c quit"
         },
         dim,
     ));
@@ -199,7 +201,18 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     app.max_scroll = max_scroll;
     app.rows = row_map(&spans, app.scroll, area);
+    app.transcript_area = Some(text_area);
+    app.lines = lines.iter().map(plain).collect();
     app.rehover();
+
+    if let Some(selection) = app.selection {
+        for (index, line) in lines.iter_mut().enumerate() {
+            let Some(range) = selection.on_line(index, app.lines[index].chars().count()) else {
+                continue;
+            };
+            *line = highlight(std::mem::take(line), range);
+        }
+    }
 
     frame.render_widget(
         Paragraph::new(lines).scroll((app.scroll as u16, 0)),
@@ -218,6 +231,42 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
             .end_symbol(None);
         frame.render_stateful_widget(bar, bar_area, &mut state);
     }
+}
+
+/// One rendered line's text, which is what a selection copies.
+fn plain(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// Draw the chars in `range` of one rendered line reversed, keeping each span's style.
+fn highlight(mut line: Line<'static>, range: Range<usize>) -> Line<'static> {
+    let mut out = Vec::with_capacity(line.spans.len() + 2);
+    let mut at = 0;
+    for span in std::mem::take(&mut line.spans) {
+        let len = span.content.chars().count();
+        let start = range.start.saturating_sub(at).min(len);
+        let end = range.end.saturating_sub(at).min(len);
+        at += len;
+        if start >= end {
+            out.push(span);
+            continue;
+        }
+        let part = |from: usize, to: usize| -> String {
+            span.content.chars().skip(from).take(to - from).collect()
+        };
+        if start > 0 {
+            out.push(Span::styled(part(0, start), span.style));
+        }
+        out.push(Span::styled(part(start, end), span.style.reversed()));
+        if end < len {
+            out.push(Span::styled(part(end, len), span.style));
+        }
+    }
+    line.spans = out;
+    line
 }
 
 /// Screen rows of each entry that is at least partly visible.
@@ -684,6 +733,15 @@ mod tests {
         left(MouseEventKind::Down(MouseButton::Left), column, row)
     }
 
+    fn up(column: u16, row: u16) -> MouseEvent {
+        left(MouseEventKind::Up(MouseButton::Left), column, row)
+    }
+
+    /// A press and release on one cell, which is what counts as a click.
+    fn click(app: &mut App, column: u16, row: u16) -> bool {
+        app.on_mouse(down(column, row)) | app.on_mouse(up(column, row))
+    }
+
     fn screen(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -818,16 +876,62 @@ mod tests {
 
         let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
         assert_eq!(rows.len(), 4);
-        assert!(app.on_mouse(down(2, rows.start)));
+        assert!(click(&mut app, 2, rows.start));
         assert!(app.pinned.is_empty(), "a click on output does not pin");
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
         assert!(text.contains("three\nfour\nfive\n"), "{text}");
         assert!(!text.contains("[+2 lines]"));
 
-        assert!(app.on_mouse(down(2, rows.start)));
+        // A second click on the same cell in a row would be a double click, which
+        // selects a word instead, so this one lands on the row below.
+        assert!(click(&mut app, 2, rows.start + 1));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(screen(&terminal).contains("[+2 lines]"));
+
+        // A press that moves is a drag, so it selects instead of collapsing again.
+        assert!(app.on_mouse(down(2, rows.start)));
+        assert!(app.on_mouse(left(MouseEventKind::Drag(MouseButton::Left), 4, rows.start)));
+        assert!(!app.on_mouse(up(4, rows.start)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("[+2 lines]"), "still collapsed");
+    }
+
+    #[test]
+    fn dragging_the_transcript_selects_the_text_it_covers() {
+        let mut app = App::detached();
+        app.entries().push(Entry::User("hello there".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
+        let area = app.transcript_area.unwrap();
+
+        // The entry draws as `› hello there`, so the drag starts on the `h`.
+        assert!(app.on_mouse(down(area.x + 2, rows.start)));
+        assert!(app.on_mouse(left(
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x + 6,
+            rows.start
+        )));
+        assert_eq!(app.selected_text().as_deref(), Some("hello"));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let reversed: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(reversed, "hello");
+
+        // Scrolling away leaves the selection on the line it was made on.
+        for _ in 0..30 {
+            app.entries().push(Entry::User("filler".to_string()));
+        }
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.max_scroll > 0);
+        assert_eq!(app.selected_text().as_deref(), Some("hello"));
     }
 
     #[test]

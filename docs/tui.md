@@ -19,6 +19,8 @@ click it to expand.
 | `pgup`, `pgdn` | scroll a page |
 | `shift+tab` | cycle the permission mode |
 | `ctrl+t` | show every token badge |
+| `ctrl+y` | copy the selection, or the whole input when nothing is selected |
+| `ctrl+v` | insert what the clipboard reads back |
 | `esc` | interrupt the turn |
 | `ctrl+c` | interrupt the turn, or quit when idle |
 | `ctrl+d` | quit on an empty input |
@@ -36,6 +38,12 @@ The wheel scrolls, the scrollbar drags, clicking tool output expands it, clickin
 entry pins its token badge, and clicking a choice answers an approval prompt. Hovering an
 entry shows its badge, hovering the rate-limit segment of the status bar shows when each
 window resets.
+
+A left drag over the transcript selects the text it covers, a double click takes a word
+and a triple the line; `ctrl+y` copies it, `esc` clears it, and a new prompt clears it.
+Capture takes click-drag away from the terminal, so the terminal's own selection needs
+shift (or option) held; `/mouse` turns capture off and on for the times that is what you
+want.
 
 ## The diff pane
 

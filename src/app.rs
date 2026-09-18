@@ -8,6 +8,7 @@ use ratatui::layout::{Position, Rect};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::{Arc, MutexGuard};
+use std::time::{Duration, Instant};
 
 use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
@@ -27,6 +28,77 @@ use crate::workflow::{self, Found};
 
 /// Lines a mouse wheel notch moves the transcript.
 const WHEEL_LINES: usize = 3;
+
+/// Presses on one cell this close together count as a double or triple click.
+const MULTI_CLICK: Duration = Duration::from_millis(400);
+
+/// A selection over the transcript's wrapped lines, as (line, column) cells. Anchoring
+/// to the wrapped buffer rather than the screen keeps it put while the view scrolls.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Selection {
+    anchor: (usize, usize),
+    head: (usize, usize),
+}
+
+impl Selection {
+    /// The word around `cell`: the run of chars sharing its class.
+    fn word(text: &str, cell: (usize, usize)) -> Self {
+        let chars: Vec<char> = text.chars().collect();
+        let Some(&at) = chars.get(cell.1) else {
+            return Self::line(text, cell);
+        };
+        let mut start = cell.1;
+        let mut end = cell.1;
+        while start > 0 && class(chars[start - 1]) == class(at) {
+            start -= 1;
+        }
+        while end + 1 < chars.len() && class(chars[end + 1]) == class(at) {
+            end += 1;
+        }
+        Self {
+            anchor: (cell.0, start),
+            head: (cell.0, end),
+        }
+    }
+
+    /// The whole line the cell sits on.
+    fn line(text: &str, cell: (usize, usize)) -> Self {
+        Self {
+            anchor: (cell.0, 0),
+            head: (cell.0, text.chars().count().saturating_sub(1)),
+        }
+    }
+
+    /// The ends in document order, the far one past the cell under the pointer so both
+    /// ends of a drag are included.
+    fn range(&self) -> ((usize, usize), (usize, usize)) {
+        let (from, to) = match self.anchor <= self.head {
+            true => (self.anchor, self.head),
+            false => (self.head, self.anchor),
+        };
+        (from, (to.0, to.1 + 1))
+    }
+
+    /// The selected columns of the wrapped line `line`, which holds `len` chars.
+    pub fn on_line(&self, line: usize, len: usize) -> Option<Range<usize>> {
+        let (from, to) = self.range();
+        if line < from.0 || line > to.0 {
+            return None;
+        }
+        let start = if line == from.0 { from.1.min(len) } else { 0 };
+        let end = if line == to.0 { to.1.min(len) } else { len };
+        (start < end).then_some(start..end)
+    }
+}
+
+/// Word, whitespace or punctuation: a double click takes the run of one class.
+fn class(c: char) -> u8 {
+    match c {
+        c if c.is_alphanumeric() || c == '_' => 0,
+        c if c.is_whitespace() => 1,
+        _ => 2,
+    }
+}
 pub struct App {
     /// Screen rows of each visible entry, filled in by the renderer.
     pub rows: Vec<(Range<u16>, usize)>,
@@ -48,6 +120,20 @@ pub struct App {
     dragging: bool,
     /// A left drag that started in the input is selecting text.
     selecting: bool,
+    /// Plain text of each wrapped transcript line, filled in by the renderer.
+    pub lines: Vec<String>,
+    /// The transcript's text area, filled in by the renderer.
+    pub transcript_area: Option<Rect>,
+    /// The selected span of the transcript, drawn reversed and copied by `ctrl+y`.
+    pub selection: Option<Selection>,
+    /// The wrapped cell a transcript drag anchors at.
+    anchor: Option<(usize, usize)>,
+    /// Where a left press landed, until the pointer moves off that cell.
+    press: Option<(u16, u16)>,
+    /// The last press, for spotting a double or triple click.
+    clicks: Option<(Instant, u16, u16, u8)>,
+    /// Mouse capture is on; `/mouse` turns it off for the terminal's own selection.
+    pub mouse: bool,
     pub input: Editor,
     /// Submitted prompts, for `ctrl+p` and `ctrl+n`.
     pub history: History,
@@ -105,6 +191,13 @@ impl App {
             scrollbar: None,
             dragging: false,
             selecting: false,
+            lines: Vec::new(),
+            transcript_area: None,
+            selection: None,
+            anchor: None,
+            press: None,
+            clicks: None,
+            mouse: true,
             input: Editor::default(),
             history: History::default(),
             working: false,
@@ -175,6 +268,7 @@ impl App {
             }
             KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
             KeyCode::Esc if self.working => self.interrupt(),
+            KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
             KeyCode::Char('y') if ctrl => self.copy(),
             KeyCode::Char('v') if ctrl => self.paste(),
@@ -248,10 +342,16 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) if self.selecting => {
                 return self.select_to(mouse.column, mouse.row);
             }
+            MouseEventKind::Drag(MouseButton::Left) if self.anchor.is_some() => {
+                return self.drag_selection(mouse.column, mouse.row);
+            }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.dragging = false;
                 self.selecting = false;
-                return false;
+                self.anchor = None;
+                // A press and release on one cell is a click, not a drag.
+                let clicked = self.press.take() == Some((mouse.column, mouse.row));
+                return clicked && self.click_entry(mouse.row);
             }
             _ => return false,
         }
@@ -283,6 +383,28 @@ impl App {
             self.selecting = true;
             return true;
         }
+        // Whether it turns out to be a click is known only when the button comes up.
+        self.press = Some((x, y));
+        let Some(cell) = self.cell_at(x, y) else {
+            return false;
+        };
+        self.anchor = Some(cell);
+        let count = self.click_count(x, y);
+        // A single press drops the old selection; a drag builds the new one.
+        self.selection = match count {
+            2 => Some(Selection::word(&self.lines[cell.0], cell)),
+            3 => Some(Selection::line(&self.lines[cell.0], cell)),
+            _ => None,
+        };
+        if count > 1 {
+            self.press = None;
+        }
+        true
+    }
+
+    /// The release of a click that never moved: tool output expands or collapses and
+    /// any other entry pins its badge. Returns whether the screen needs a redraw.
+    fn click_entry(&mut self, y: u16) -> bool {
         let Some(entry) = self.entry_at(y) else {
             return false;
         };
@@ -300,6 +422,59 @@ impl App {
         true
     }
 
+    /// The wrapped transcript line and column under a screen cell, clamped to the last
+    /// line so a drag past the end still selects.
+    fn cell_at(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        let area = self
+            .transcript_area
+            .filter(|area| area.contains(Position::new(x, y)))?;
+        let last = self.lines.len().checked_sub(1)?;
+        let line = (self.scroll + (y - area.y) as usize).min(last);
+        Some((line, (x - area.x) as usize))
+    }
+
+    /// Presses in a row on the same cell: 1, 2 or 3, then round again.
+    fn click_count(&mut self, x: u16, y: u16) -> u8 {
+        let now = Instant::now();
+        let count = match self.clicks {
+            Some((at, cx, cy, n)) if (cx, cy) == (x, y) && now - at < MULTI_CLICK => n % 3 + 1,
+            _ => 1,
+        };
+        self.clicks = Some((now, x, y, count));
+        count
+    }
+
+    /// Extend the transcript selection to the cell under the pointer.
+    /// Returns whether the screen needs a redraw.
+    fn drag_selection(&mut self, x: u16, y: u16) -> bool {
+        if self.press != Some((x, y)) {
+            self.press = None;
+        }
+        let (Some(anchor), Some(head)) = (self.anchor, self.cell_at(x, y)) else {
+            return false;
+        };
+        let selection = Some(Selection { anchor, head });
+        std::mem::replace(&mut self.selection, selection) != selection
+    }
+
+    /// The selected transcript text, lines joined and trailing spaces trimmed.
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let (from, to) = selection.range();
+        let text: Vec<String> = (from.0..=to.0.min(self.lines.len().checked_sub(1)?))
+            .map(|line| {
+                let chars = self.lines[line].chars();
+                let range = selection.on_line(line, self.lines[line].chars().count());
+                let range = range.unwrap_or(0..0);
+                let part: String = chars.skip(range.start).take(range.len()).collect();
+                part.trim_end().to_string()
+            })
+            .collect();
+        text.iter()
+            .any(|line| !line.is_empty())
+            .then(|| text.join("\n"))
+    }
+
     /// Extend the input's selection to the char under the pointer. The anchor lands on
     /// the char the drag started at, since the cursor is still there.
     /// Returns whether the screen needs a redraw.
@@ -314,10 +489,11 @@ impl App {
         true
     }
 
-    /// What `ctrl+y` copies: the selection, or the whole input when there is none.
+    /// What `ctrl+y` copies: the transcript selection, else the input's own selection,
+    /// else the whole input.
     fn copy_text(&self) -> String {
-        self.input
-            .selected()
+        self.selected_text()
+            .or_else(|| self.input.selected())
             .unwrap_or_else(|| self.input.value().to_string())
     }
 
@@ -439,6 +615,7 @@ impl App {
             return;
         }
         let message = self.input.take().trim().to_string();
+        self.selection = None;
         if let Err(e) = self.history.push(&message) {
             self.note(Entry::Error(format!("could not save prompt history: {e}")));
         }
@@ -498,6 +675,13 @@ impl App {
         {
             self.follow = true;
             self.start_workflow(rest.trim());
+            return;
+        }
+        if message.starts_with("/mouse") {
+            self.follow = true;
+            self.mouse = !self.mouse;
+            self.selection = None;
+            self.note(Entry::Info(mouse_notice(self.mouse)));
             return;
         }
         if message.starts_with("/skills") {
@@ -614,6 +798,18 @@ fn switch_notice(current: &str, name: &str) -> String {
     )
 }
 
+/// What `/mouse` prints. Capture is what turns the wheel into scroll events and drags
+/// into transcript selection, so turning it off hands both back to the terminal.
+fn mouse_notice(on: bool) -> String {
+    match on {
+        true => "mouse: on. Drag selects, ctrl+y copies, the wheel scrolls.".to_string(),
+        false => {
+            "mouse: off. Select and copy with the terminal's own mouse; /mouse turns it back on."
+                .to_string()
+        }
+    }
+}
+
 /// What `/skills` prints: each skill, where it came from and its listing cost.
 fn skills_report(skills: &[Skill]) -> String {
     if skills.is_empty() {
@@ -719,13 +915,20 @@ mod tests {
         assert!(app.on_mouse(moved(4)));
         assert_eq!(app.hover, Some(1));
 
-        let click = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            ..moved(4)
+        // The entry acts on the release, so a drag can select instead of clicking.
+        let click = |app: &mut App| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                ..moved(4)
+            });
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                ..moved(4)
+            })
         };
-        assert!(app.on_mouse(click));
+        assert!(click(&mut app));
         assert!(app.pinned.contains(&1));
-        assert!(app.on_mouse(click));
+        assert!(click(&mut app));
         assert!(app.pinned.is_empty());
         let wheel = MouseEvent {
             kind: MouseEventKind::ScrollUp,
@@ -862,6 +1065,83 @@ mod tests {
         app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.input.value(), "x");
         assert_eq!(app.input.selection(), None);
+    }
+
+    fn transcript(lines: &[&str]) -> App {
+        let mut app = App::detached();
+        app.lines = lines.iter().map(|l| l.to_string()).collect();
+        app.transcript_area = Some(Rect::new(0, 0, 40, lines.len() as u16));
+        app
+    }
+
+    fn at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_double_click_takes_the_word_and_a_triple_the_line() {
+        let mut app = transcript(&["hello wide world"]);
+        let down = at(MouseEventKind::Down(MouseButton::Left), 8, 0);
+        app.on_mouse(down);
+        app.on_mouse(down);
+        assert_eq!(app.selected_text().as_deref(), Some("wide"));
+        app.on_mouse(down);
+        assert_eq!(app.selected_text().as_deref(), Some("hello wide world"));
+        // The count rounds, so a fourth press starts over and selects nothing.
+        app.on_mouse(down);
+        assert_eq!(app.selection, None);
+        // A double click on the space between words takes the space.
+        let space = at(MouseEventKind::Down(MouseButton::Left), 5, 0);
+        app.on_mouse(space);
+        app.on_mouse(space);
+        assert_eq!(app.selected_text(), None, "a space alone trims to nothing");
+    }
+
+    #[test]
+    fn a_drag_selects_across_lines_and_ctrl_y_copies_it() {
+        let mut app = transcript(&["one two", "three   ", "four"]);
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 4, 0));
+        assert_eq!(app.selection, None, "the press alone selects nothing");
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 3, 2));
+        // Both end cells are included, and each line loses its trailing spaces.
+        assert_eq!(app.selected_text().as_deref(), Some("two\nthree\nfour"));
+        assert_eq!(app.copy_text(), "two\nthree\nfour");
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 3, 2));
+        assert_eq!(app.copy_text(), "two\nthree\nfour", "the release keeps it");
+        // A drag back up the way it came selects the same span.
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 3, 2));
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 4, 0));
+        assert_eq!(app.selected_text().as_deref(), Some("two\nthree\nfour"));
+
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.selection, None, "esc clears it");
+        assert_eq!(app.copy_text(), "", "back to the empty input");
+    }
+
+    #[test]
+    fn mouse_toggles_capture_and_says_which_way() {
+        let mut app = transcript(&["one"]);
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 2, 0));
+        assert!(app.selection.is_some());
+        type_text(&mut app, "/mouse");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.mouse);
+        assert_eq!(app.selection, None, "the selection goes with the capture");
+        assert!(
+            matches!(app.entries().list.last(), Some(Entry::Info(t)) if t.starts_with("mouse: off"))
+        );
+        type_text(&mut app, "/mouse");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.mouse);
+        assert!(
+            matches!(app.entries().list.last(), Some(Entry::Info(t)) if t.starts_with("mouse: on"))
+        );
     }
 
     #[test]

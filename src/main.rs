@@ -255,6 +255,7 @@ async fn main() -> Result<()> {
     );
     let result = run(
         terminal,
+        mouse,
         session,
         events,
         listener,
@@ -270,6 +271,16 @@ async fn main() -> Result<()> {
     ratatui::restore();
     shutdown(hub).await;
     result
+}
+
+/// Turn mouse capture on or off while running, for `/mouse`; returns the state it left.
+fn set_capture(on: bool) -> bool {
+    let done = match on {
+        true => execute!(std::io::stdout(), EnableMouseCapture).is_ok(),
+        false => execute!(std::io::stdout(), DisableMouseCapture).is_ok(),
+    };
+    // A command that did not run leaves capture as it was.
+    done == on
 }
 
 /// Turn off the terminal modes the TUI turned on.
@@ -757,6 +768,7 @@ fn cache_check_passed(rows: &[CacheRow]) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn run(
     mut terminal: ratatui::DefaultTerminal,
+    mouse: bool,
     session: Arc<Session>,
     mut events: broadcast::Receiver<session::Event>,
     listener: Option<TcpListener>,
@@ -805,6 +817,7 @@ async fn run(
     });
 
     let mut app = App::new(Arc::clone(&session));
+    app.mouse = mouse;
     app.skills = skills;
     app.mcp = hub;
     app.workflows = workflows;
@@ -824,6 +837,7 @@ async fn run(
     }
     // Mouse motion arrives in floods, so it only redraws when the hover changes.
     let mut dirty = true;
+    let mut captured = mouse;
     while !app.quit {
         if dirty {
             terminal.draw(|frame| ui::render(frame, &mut app))?;
@@ -850,8 +864,16 @@ async fn run(
                 true
             }
         };
+        // `/mouse` hands the pointer back to the terminal, and takes it again.
+        if app.mouse != captured {
+            captured = set_capture(app.mouse);
+        }
     }
 
+    // Leave capture where `release_modes` expects to find it.
+    if captured != mouse {
+        set_capture(mouse);
+    }
     Ok(())
 }
 

@@ -39,6 +39,7 @@ inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/au
 | `/mcp` | list the mcp servers, their tools and any that failed |
 | `/workflows` | list the workflow definitions |
 | `/workflow <name> [input]` | run one |
+| `/mouse` | turn mouse capture off and on, for the terminal's own selection |
 
 ## flags
 
