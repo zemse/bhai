@@ -670,9 +670,11 @@ async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
             AgentEvent::Cache(Some(found)) => {
                 println!("\n[cache break] {}: {}", found.field, found.detail)
             }
+            AgentEvent::Judging(Some(call)) => println!("[judging] {call}"),
             AgentEvent::Cache(None)
             | AgentEvent::Call(_)
             | AgentEvent::Item(_)
+            | AgentEvent::Judging(None)
             | AgentEvent::ToolProgress(_) => {}
             AgentEvent::CacheHit(hit) => {
                 if let (Some(expected), Some(ratio)) = (hit.expected_cached, hit.hit_ratio) {

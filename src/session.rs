@@ -71,6 +71,8 @@ pub enum Event {
     RateLimits(RateLimits),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
+    /// The judge is deciding that call, or `None` once it has.
+    Judging(Option<String>),
     /// History was compacted; earlier history indexes no longer hold.
     Compacted(String),
     /// The permission mode changed.
@@ -479,6 +481,7 @@ impl Session {
                 Event::RateLimits(limits)
             }
             AgentEvent::Info(s) => Event::Info(s),
+            AgentEvent::Judging(what) => Event::Judging(what),
             AgentEvent::Compacted(s) => Event::Compacted(s),
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnEnd => {

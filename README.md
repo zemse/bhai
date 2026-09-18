@@ -13,7 +13,7 @@ inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/au
 ## what it does
 
 - **tools**: bash, read, write, edit, skill and agent, plus any mcp tool. running commands stream their output into the transcript while they run.
-- **permissions**: three modes (ask, auto, bypass), claude code rule syntax with `*` wildcards, approvals bhai remembers, and a trust step before a repo's own allow rules count. [docs](docs/permissions.md)
+- **permissions**: three modes (auto by default, plus ask and bypass), claude code rule syntax with `*` wildcards, approvals bhai remembers, and a trust step before a repo's own allow rules count. [docs](docs/permissions.md)
 - **identities**: `bhai --as <name>` narrows the skills, tools, instructions and model a session carries. fixed for the session, so the prompt cache holds. [docs](docs/identities.md)
 - **subagents**: the agent delegates a task to a child with a fresh context, under any identity, up to three at a time. [docs](docs/subagents.md)
 - **workflows**: a handful of child steps in dependency order under one token budget, started only by you. [docs](docs/workflows.md)

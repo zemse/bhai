@@ -24,6 +24,9 @@ const COLLAPSED_LINES: usize = 3;
 /// Lines the input grows to before it scrolls.
 const MAX_INPUT_LINES: usize = 8;
 
+/// Characters of the judged call the working row shows.
+const JUDGING_CLIP: usize = 48;
+
 /// How long the note about a drag's copy stays on the input's border.
 const COPIED_FOR: Duration = Duration::from_secs(3);
 
@@ -174,6 +177,12 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
         Style::new().fg(Color::Yellow),
     )];
     let dim = Style::new().fg(Color::DarkGray);
+    if let Some(call) = &app.judging {
+        spans.push(Span::styled(
+            format!(" · auto mode is checking {}", clip(call, JUDGING_CLIP)),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
     if app.queued > 0 {
         spans.push(Span::styled(format!(" · {} queued", app.queued), dim));
     }
@@ -206,6 +215,15 @@ fn limit_spans(found: &RateLimits, hover: bool) -> Vec<Span<'static>> {
         spans.push(Span::styled(text, style));
     }
     spans
+}
+
+/// `text` cut to `max` characters, with an ellipsis when it had more.
+fn clip(text: &str, max: usize) -> String {
+    let flat = text.replace('\n', " ");
+    match flat.chars().count() > max {
+        true => flat.chars().take(max - 1).collect::<String>() + "…",
+        false => flat,
+    }
 }
 
 fn compact(n: u64) -> String {
@@ -905,6 +923,31 @@ mod tests {
         app.pending = Some(approval(None));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!screen(&terminal).contains("working"), "{shown}");
+    }
+
+    #[test]
+    fn the_working_row_says_when_the_judge_is_deciding() {
+        let mut app = App::detached();
+        app.working = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("checking"));
+
+        app.on_event(Event::Judging(Some("bash: cargo fmt".to_string())));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(
+            shown.contains("auto mode is checking bash: cargo fmt"),
+            "{shown}"
+        );
+        app.on_event(Event::Judging(None));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("checking"));
+
+        // A long call is cut to fit beside the spinner, and never wraps the row.
+        let long = clip(&"x".repeat(200), JUDGING_CLIP);
+        assert_eq!(long, "x".repeat(47) + "\u{2026}");
+        assert_eq!(clip("one\ntwo", JUDGING_CLIP), "one two");
     }
 
     #[test]

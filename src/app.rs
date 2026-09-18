@@ -146,6 +146,8 @@ pub struct App {
     pub working: bool,
     /// Prompts waiting behind the running turn, for the status bar.
     pub queued: usize,
+    /// The call the judge is deciding, while it decides one.
+    pub judging: Option<String>,
     /// The tool call waiting for approval.
     pub pending: Option<Approval>,
     pub scroll: usize,
@@ -186,7 +188,7 @@ pub struct App {
 impl App {
     pub fn new(session: Arc<Session>) -> Self {
         session.entries().push(Entry::Info(
-            "bhai · bash, read, write and edit; every change needs your approval. Type a task and hit enter."
+            "bhai · bash, read, write and edit. Auto mode: reads, project writes and build commands run, the judge decides the rest, anything risky asks. shift+tab changes that. Type a task and hit enter."
                 .to_string(),
         ));
         Self {
@@ -214,6 +216,7 @@ impl App {
             history: History::default(),
             working: false,
             queued: 0,
+            judging: None,
             pending: None,
             scroll: 0,
             max_scroll: 0,
@@ -668,7 +671,10 @@ impl App {
                 self.queued = position;
             }
             // An interrupt drops whatever was waiting.
-            Event::Interrupted => self.queued = 0,
+            Event::Interrupted => {
+                self.queued = 0;
+                self.judging = None;
+            }
             Event::Approval {
                 id,
                 tool,
@@ -706,7 +712,11 @@ impl App {
             Event::CacheStalled(_) => self.cache_stalled = true,
             Event::RateLimits(limits) => self.rate_limits = Some(limits),
             Event::Mode(mode) => self.mode = mode,
-            Event::TurnEnd => self.working = false,
+            Event::Judging(what) => self.judging = what.clone(),
+            Event::TurnEnd => {
+                self.working = false;
+                self.judging = None;
+            }
             _ => {}
         }
     }

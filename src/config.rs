@@ -29,9 +29,9 @@ pub struct Config {
     pub mcp_servers: BTreeMap<String, McpServer>,
     pub permission_mode: Mode,
     pub permissions: Rules,
-    /// In `auto`, a trusted project writes and edits inside its own root without asking.
+    /// In `auto`, writes and edits inside the project root happen without asking.
     pub auto_project_writes: bool,
-    /// In `auto`, a trusted project runs the built-in build and test commands.
+    /// In `auto`, the built-in build and test commands run without asking.
     pub auto_project_commands: bool,
     /// `judge*`: the auto-approval judge, which only ever runs in `auto`.
     pub judge: crate::judge::Settings,
@@ -51,7 +51,7 @@ impl Default for Config {
             skill_sources: Source::ALL.to_vec(),
             mcp: false,
             mcp_servers: BTreeMap::new(),
-            permission_mode: Mode::Ask,
+            permission_mode: Mode::Auto,
             permissions: Rules::default(),
             auto_project_writes: true,
             auto_project_commands: true,

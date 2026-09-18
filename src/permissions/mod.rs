@@ -146,8 +146,7 @@ impl Offers {
     }
 }
 
-/// What `auto` mode allows on its own in a project the trust store knows, from the
-/// config. An untrusted project gets none of it.
+/// What `auto` mode allows on its own, from the config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Relax {
     /// `auto_project_writes`: writes and edits inside the project root.
@@ -177,7 +176,7 @@ pub struct Policy {
     trust: Option<Trust>,
     /// Whether repo-supplied allow rules apply.
     trusted: AtomicBool,
-    /// What `auto` mode relaxes once the project is trusted.
+    /// What `auto` mode relaxes on its own.
     relax: Relax,
 }
 
@@ -392,17 +391,11 @@ impl Policy {
             .filter(|(on, _)| *on)
             .map(|(_, what)| *what)
             .collect();
-            out.push_str(&match (on.is_empty(), trusted) {
-                (true, _) => "\nno relaxations: both are off in the config".to_string(),
-                (false, true) => format!(
-                    "\nallowed with no rule, this project being trusted: {}",
-                    on.join(", ")
-                ),
-                (false, false) => format!(
-                    "\nwould run with no rule if you /trust this project: {}",
-                    on.join(", ")
-                ),
+            out.push_str(&match on.is_empty() {
+                true => "\nno relaxations: both are off in the config".to_string(),
+                false => format!("\nallowed with no rule, this being auto: {}", on.join(", ")),
             });
+            out.push_str("\nanything else the rules leave open goes to the judge");
         }
         for (name, list) in [
             ("deny", &rules.deny),
@@ -634,10 +627,12 @@ impl Checker<'_> {
         }
     }
 
-    /// Whether a trusted project's relaxations apply at all: only in `auto`, and only
-    /// once the project is trusted.
+    /// Whether `auto` mode's own relaxations apply. Trust is not asked for here: it
+    /// governs the allow rules a repo ships, which these do not come from. Choosing
+    /// `auto` is the consent for writing inside the project, running its build and test
+    /// commands, and sending the rest to the judge.
     fn relaxed(&self) -> bool {
-        self.mode == Mode::Auto && self.trusted
+        self.mode == Mode::Auto
     }
 
     /// A write or edit whose target really is inside the project root.
@@ -708,7 +703,7 @@ fn loose_forms(command: &bash::Command) -> Vec<Vec<String>> {
 }
 
 fn project_reason() -> String {
-    "trusted project".to_string()
+    "auto, inside the project".to_string()
 }
 
 fn rule_reason(rule: &Rule) -> String {
@@ -812,7 +807,12 @@ mod tests {
                 "cargo build && git log",
                 allowed("rule Bash(cargo build), rule Bash(git log:*)"),
             ),
-            (&auto, "git log | npm test", Decision::Ask),
+            (
+                &auto,
+                "git log | npm test",
+                allowed("rule Bash(git log:*), auto, inside the project"),
+            ),
+            (&auto, "curl example.com", Decision::Ask),
             (&auto, "git status; rm -rf ~", deny_rm.clone()),
             (&auto, "timeout 5 /bin/RM x", deny_rm.clone()),
             (&bypass, "env -u FOO rm x", deny_rm.clone()),
@@ -828,7 +828,7 @@ mod tests {
             (&auto, "git log -p", Decision::Ask),
             (&auto, "ls $(rm x)", Decision::Ask),
             (&auto, "cat .env", Decision::Ask),
-            (&auto, "cargo test", Decision::Ask),
+            (&auto, "cargo test", allowed("auto, inside the project")),
             (&ask_mode, "ls", Decision::Ask),
             (&ask_mode, "rm x", deny_rm.clone()),
             (&bypass, "npm test", allowed("bypass mode")),
@@ -1120,8 +1120,13 @@ mod tests {
     fn a_remembered_rule_applies_to_later_calls_and_is_saved() {
         let dir = std::env::temp_dir().join(format!("bhai-policy-{}", uuid::Uuid::new_v4()));
         let store = dir.join(settings::LOCAL);
-        let policy =
-            Policy::new(Mode::Auto, Rules::default(), None, dir.clone()).with_store(store.clone());
+        // Relaxations off, so the call this remembers a rule for is one that asks.
+        let policy = Policy::new(Mode::Auto, Rules::default(), None, dir.clone())
+            .with_store(store.clone())
+            .with_relax(Relax {
+                writes: false,
+                commands: false,
+            });
         assert_eq!(bash(&policy, "cargo test --all"), Decision::Ask);
         let rule = policy
             .offers("bash", &json!({"command": "cargo test"}))
@@ -1153,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn a_trusted_project_relaxes_auto_mode() {
+    fn auto_mode_relaxes_the_project_without_a_trust_step() {
         let dir = std::env::temp_dir().join(format!("bhai-policy-{}", uuid::Uuid::new_v4()));
         let repo = dir.join("repo");
         std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -1171,18 +1176,27 @@ mod tests {
         let inside = repo.join("src/a.rs");
         let inside = inside.to_str().unwrap();
 
-        // Untrusted, a freshly cloned repo gains nothing.
+        // Trust governs the allow rules a repo ships, not these: `auto` is the consent.
         let untrusted = policy(&[]);
-        assert_eq!(bash(&untrusted, "cargo test"), Decision::Ask);
-        assert_eq!(file(&untrusted, "write", inside), Decision::Ask);
+        assert_eq!(
+            bash(&untrusted, "cargo test"),
+            allowed("auto, inside the project")
+        );
+        assert_eq!(
+            file(&untrusted, "write", inside),
+            allowed("auto, inside the project")
+        );
 
         let p = policy(&[]);
         p.trust().unwrap();
-        assert_eq!(file(&p, "write", inside), allowed("trusted project"));
-        assert_eq!(bash(&p, "cargo test"), allowed("trusted project"));
+        assert_eq!(
+            file(&p, "write", inside),
+            allowed("auto, inside the project")
+        );
+        assert_eq!(bash(&p, "cargo test"), allowed("auto, inside the project"));
         assert_eq!(
             bash(&p, "cargo test && npm run build"),
-            allowed("trusted project")
+            allowed("auto, inside the project")
         );
         // `sudo` and anything else the tokenizer refuses never reaches the relaxation.
         assert_eq!(bash(&p, "sudo cargo test"), Decision::Ask);
@@ -1205,7 +1219,6 @@ mod tests {
             writes: false,
             commands: false,
         });
-        off.trust().unwrap();
         assert_eq!(file(&off, "write", inside), Decision::Ask);
         assert_eq!(bash(&off, "cargo test"), Decision::Ask);
 
@@ -1222,19 +1235,14 @@ mod tests {
         );
 
         let described = p.describe();
-        assert!(
-            described.contains("this project being trusted"),
-            "{described}"
-        );
-        assert!(
-            untrusted.describe().contains("if you /trust this project"),
-            "{described}"
-        );
+        assert!(described.contains("this being auto"), "{described}");
+        assert!(described.contains("goes to the judge"), "{described}");
+        assert_eq!(untrusted.describe(), described, "trust changes none of it");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn only_auto_in_a_trusted_project_reaches_the_judge() {
+    fn only_auto_reaches_the_judge() {
         let dir = std::env::temp_dir().join(format!("bhai-judgeable-{}", uuid::Uuid::new_v4()));
         let repo = dir.join("repo");
         std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -1244,8 +1252,8 @@ mod tests {
         let command = |c: &str| p.judgeable("bash", &json!({ "command": c }));
         let path = |tool: &str, path: &PathBuf| p.judgeable(tool, &json!({ "path": path }));
 
-        // An untrusted project never reaches it, however harmless the call.
-        assert!(!command("cargo clippy"));
+        // Trust is not what gates it; `auto` is.
+        assert!(command("cargo clippy"));
         p.trust().unwrap();
         assert!(command("cargo clippy"));
         assert!(path("write", &repo.join("src/a.rs")));
@@ -1258,7 +1266,7 @@ mod tests {
         assert!(!path("edit", &repo.join(".env")), "protected");
         assert!(!p.judgeable("write", &json!({})), "no path");
 
-        // Neither other mode ever asks the judge, trusted or not.
+        // Neither other mode ever asks the judge.
         for mode in [Mode::Ask, Mode::Bypass] {
             p.set_mode(mode);
             assert!(!command("cargo clippy"), "{mode}");
@@ -1287,7 +1295,7 @@ mod tests {
         let root = repo.display().to_string();
 
         // The bash prompts left in the field run, with the run directory substituted.
-        let project = allowed("cd inside the project, trusted project");
+        let project = allowed("cd inside the project, auto, inside the project");
         for command in [
             format!("cd {root} && python -m pytest -q"),
             format!("cd {root} && python3 -m pytest -q"),
@@ -1307,7 +1315,7 @@ mod tests {
         }
         assert_eq!(
             bash(&p, &format!("cargo new {root}/wordcount --bin")),
-            allowed("trusted project")
+            allowed("auto, inside the project")
         );
 
         // A `cd` this cannot follow, or one that leaves the project, decides nothing.

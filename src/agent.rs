@@ -51,6 +51,8 @@ pub enum AgentEvent {
     ToolRejected(String),
     /// A notice for the transcript, such as a call the policy allowed.
     Info(String),
+    /// The auto-approval judge is deciding this call, or `None` once it has.
+    Judging(Option<String>),
     /// History was compacted, so earlier item indexes no longer hold; with a notice.
     Compacted(String),
     /// Token counts for the model call that just finished.
@@ -813,6 +815,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::TurnEnd
                 | AgentEvent::Call(_)
                 | AgentEvent::Item(_)
+                // A child's calls never reach the judge, so this cannot arrive.
+                | AgentEvent::Judging(_)
                 | AgentEvent::Compacted(_) => continue,
                 AgentEvent::Approval {
                     tool,
@@ -952,8 +956,17 @@ not retry it. Try a different approach, or ask the user."
         }
         Decision::Ask => {
             let (target, detail) = judge::target(name, &args, &summary);
+            // Deciding takes a few seconds, so the UI says what it is waiting on.
+            let asking = judge.is_some() && policy.judgeable(name, &args);
+            if asking {
+                let _ = tx.send(AgentEvent::Judging(Some(summary.clone())));
+            }
             // A verdict is final; anything else is not a third verdict, it prompts.
-            match judged(judge, policy, name, &args, &target, &detail).await {
+            let verdict = judged(judge, policy, name, &args, &target, &detail).await;
+            if asking {
+                let _ = tx.send(AgentEvent::Judging(None));
+            }
+            match verdict {
                 Some(Verdict::Approve { reason }) => {
                     // Deciding takes seconds, so an interrupt during it still means stop.
                     if cancel.load(Ordering::Relaxed) {

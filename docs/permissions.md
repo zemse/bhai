@@ -6,19 +6,19 @@ included, since they all share the session's policy.
 
 ## Modes
 
-- `ask`: every call that changes something prompts. The default
+- `ask`: every call that changes something prompts
 - `auto`: allow rules and read-only commands (`ls`, `cat`, `grep`, `sed -n`, `git status`,
-  and friends) run, plus the relaxations below in a trusted project; everything else
-  prompts
+  and friends) run, plus the relaxations below; what is left goes to the judge. The
+  default
 - `bypass`: everything runs, except ask rules and protected paths, which still prompt
 
-Start in one with `bhai --mode auto`, or set `permission_mode` in the global config.
+Start in one with `bhai --mode ask`, or set `permission_mode` in the global config.
 `shift+tab` cycles the mode in the tui, `POST /mode` sets it over the debug server.
 `/permissions` prints the current mode, every rule and the file it came from.
 
-## In a trusted project
+## What `auto` runs by itself
 
-`auto` mode in a project you have trusted also runs, with no rule of its own:
+`auto` mode also runs, with no rule of its own:
 
 - writes and edits whose target is inside the project root, once `..` and symlinks are
   resolved. A protected path, a path outside the root and anything a `deny` or `ask` rule
@@ -28,14 +28,14 @@ Start in one with `bhai --mode auto`, or set `permission_mode` in the global con
   `go build|test`, `make`, `just`. An argument naming a path outside the project, a
   `--config` flag, `sudo` or anything the tokenizer refuses drops back to a prompt
 
-These run the project's code, which is what trusting a project means, so an untrusted
-project gets none of it and `ask` mode gets none of it either. Turn each off with
-`auto_project_writes = false` and `auto_project_commands = false`; a project config file
-may turn them off but never on. `/permissions` prints which of them apply.
+Choosing `auto` is the consent for these: they do not wait on the trust step, which
+governs the allow rules a repo ships and nothing else. `ask` mode gets none of them.
+Turn each off with `auto_project_writes = false` and `auto_project_commands = false`; a
+project config file may turn them off but never on. `/permissions` prints which apply.
 
 ## The judge
 
-What is left in `auto` in a trusted project is every call no rule names: an unknown
+What is left in `auto` is every call no rule names: an unknown
 binary, a write the relaxations do not cover, an MCP tool. Rather than prompt for each,
 a small model call decides whether the call is a reasonable step toward the task you
 actually asked for and whether its blast radius stays inside the project. It answers
@@ -55,8 +55,10 @@ tool calls one line each, and the verdicts given so far. It runs on its own
 apart in `/context` and `GET /state`. A verdict is reused for an identical call for the
 rest of the session, and at most `judge_max_per_turn` calls are judged per turn.
 
-Every decision is appended to `.bhai/debug/judge.jsonl`, and the transcript shows
-`auto-approved: <reason>` or `auto-denied: <reason>`. `/permissions` prints whether the
+It runs on the session's model at `low` effort unless `judge_model` names another, so it
+costs a small fraction of a turn. While it decides, the row above the prompt says `auto
+mode is checking <call>`; every decision is appended to `.bhai/debug/judge.jsonl`, and
+the transcript shows `auto-approved: <reason>` or `auto-denied: <reason>`. `/permissions` prints whether the
 judge is on and what is left of this turn's budget.
 
 ```toml
