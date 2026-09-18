@@ -20,8 +20,11 @@ use crate::tools::BoxFuture;
 const RECENT: usize = 6;
 /// Verdicts the summary carries, newest last.
 const VERDICTS: usize = 10;
-/// Longest a label, command or diff line may be in the summary, in characters.
+/// Longest a label or verdict line may be in the summary, in characters.
 const CLIP: usize = 200;
+/// Longest the judged command or path, and the edit detail, may be, in characters. Well
+/// past any real command, so the judge is never asked to rule on a fragment.
+const TARGET_CLIP: usize = 2000;
 /// Longest the user's task may be in the summary, in characters.
 const TASK_CLIP: usize = 1200;
 /// The cache key suffix of every judge call, so its prefix caches on its own.
@@ -38,6 +41,8 @@ blast radius is confined to the project root.
 Deny anything unrelated to the stated task, anything that reaches outside the project \
 root, anything that sends data to a network endpoint the task did not ask for, and \
 anything destructive beyond what the task implies. When you are unsure, deny.
+
+A field marked truncated means you cannot see the whole command, so deny.
 
 Answer with a strict JSON object and nothing else, no prose and no code fence:
 {\"verdict\":\"approve\",\"reason\":\"<at most 12 words>\"}";
@@ -85,13 +90,13 @@ impl JudgeRequest {
     /// The one message the judge reads.
     pub fn text(&self) -> String {
         let mut out = format!(
-            "task: {}\ntool: {}\ntarget: {}\n",
+            "task: {}\ntool: {}\n",
             clip(&self.task, TASK_CLIP),
-            self.tool,
-            clip(&self.target, CLIP)
+            self.tool
         );
+        out.push_str(&field("target", &self.target, TARGET_CLIP));
         if !self.detail.is_empty() {
-            out.push_str(&format!("detail: {}\n", clip(&self.detail, CLIP)));
+            out.push_str(&field("detail", &self.detail, TARGET_CLIP));
         }
         out.push_str(&format!("cwd: {}\nproject root: {}\n", self.cwd, self.root));
         for (header, list) in [
@@ -415,6 +420,16 @@ pub fn target(tool: &str, args: &Value, summary: &str) -> (String, String) {
     }
 }
 
+/// One `label: value` line, the label saying so when the value had to be cut, so a
+/// truncated command never reads as a whole one.
+fn field(label: &str, text: &str, max: usize) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{label} (truncated at {max} chars): {}\n", &text[..at]),
+        None => format!("{label}: {text}\n"),
+    }
+}
+
 /// `text` cut to `max` characters, with an ellipsis when it was longer.
 fn clip(text: &str, max: usize) -> String {
     let text = text.trim();
@@ -626,14 +641,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_realistic_summary_stays_under_a_thousand_tokens() {
-        let request = JudgeRequest {
+    /// A full summary around `target`: every list at its limit, a real task.
+    fn realistic(target: &str) -> JudgeRequest {
+        JudgeRequest {
             task: "the write tool truncates files over 64k, find out why and add a \
 regression test for it in src/tools/write.rs"
                 .to_string(),
             tool: "bash".to_string(),
-            target: "cargo test --all-features -- --nocapture write".to_string(),
+            target: target.to_string(),
             detail: String::new(),
             cwd: "/home/u/workspace/bhai".to_string(),
             root: "/home/u/workspace/bhai".to_string(),
@@ -643,10 +658,49 @@ regression test for it in src/tools/write.rs"
             verdicts: (0..VERDICTS)
                 .map(|i| format!("approve: reads a project file ({i})"))
                 .collect(),
-        };
+        }
+    }
+
+    fn tokens(request: &JudgeRequest) -> usize {
         let tokenizer = crate::tokens::for_model("gpt-5.5");
-        let count = tokenizer.count(SYSTEM) + tokenizer.count(&request.text());
+        tokenizer.count(SYSTEM) + tokenizer.count(&request.text())
+    }
+
+    #[test]
+    fn a_realistic_summary_stays_under_a_thousand_tokens() {
+        let count = tokens(&realistic("cargo test --all-features -- --nocapture write"));
         assert!(count < 1000, "{count} tokens");
+    }
+
+    #[test]
+    fn the_worst_case_summary_stays_under_two_and_a_half_thousand_tokens() {
+        let mut command = "cd /h/w/bhai/src && grep -n 'fn x' judge.rs && ".repeat(50);
+        command.truncate(TARGET_CLIP);
+        let count = tokens(&realistic(&command));
+        assert!(count < 2500, "{count} tokens");
+    }
+
+    #[test]
+    fn a_long_command_reaches_the_judge_whole() {
+        let prefix = "git clone --depth 1 https://example.test/";
+        let command = format!("{prefix}{}", "a".repeat(500 - prefix.len()));
+        assert_eq!(command.len(), 500);
+        let text = realistic(&command).text();
+        assert!(text.contains(&format!("target: {command}\n")), "{text}");
+        assert!(!text.contains("..."), "{text}");
+        assert!(!text.contains("truncated"), "{text}");
+    }
+
+    #[test]
+    fn a_command_past_the_limit_is_marked_truncated() {
+        let text = realistic(&"a".repeat(3000)).text();
+        assert!(
+            text.contains(&format!(
+                "target (truncated at 2000 chars): {}\n",
+                "a".repeat(2000)
+            )),
+            "{text}"
+        );
     }
 
     #[test]
