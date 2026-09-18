@@ -22,12 +22,16 @@ what was typed, and the next keystroke opens it again.
 
 The session's skills are listed in the same menu after the commands, so `/<skill>
 [input]` is a prompt: it asks the agent to use that skill, which it then loads through
-the `skill` tool. A `/word` that is neither a command nor a skill is refused rather than
-sent; a first word that is not name-shaped, such as `/usr/bin/env is missing`, is a
-prompt like any other.
+the `skill` tool. The transcript shows the line as it was typed, not the sentence it is
+sent as. A `/word` that is neither a command nor a skill is refused rather than sent; a
+first word that is not name-shaped, such as `/usr/bin/env is missing`, is a prompt like
+any other.
 
-The status bar carries only what the moment calls for (the interrupt key while a turn
-runs, the answer keys at an approval). Everything else is in `/help`.
+The top bar carries only session facts (model, token totals, cache and rate-limit
+headroom) plus the answer keys while an approval waits. The spinner, the queue count and
+the interrupt key sit on their own row just above the prompt, where the eye already is,
+and that row is there only while a turn is actually running. The rest of the keys are in
+`/help`.
 
 ## Keys
 

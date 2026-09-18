@@ -55,10 +55,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         rows => rows.min(commands::MAX_ROWS) as u16 + 2,
     };
 
-    let [status_area, transcript_area, menu_area, bottom_area] = Layout::vertical([
+    // The spinner sits just above the prompt, where the eye already is. An approval is
+    // the agent waiting on the user, so nothing spins there.
+    let working_height = u16::from(app.working && app.pending.is_none());
+
+    let [
+        status_area,
+        transcript_area,
+        menu_area,
+        working_area,
+        bottom_area,
+    ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(menu_height),
+        Constraint::Length(working_height),
         Constraint::Length(approval_height),
     ])
     .areas(frame.area());
@@ -77,6 +88,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.transcript_area = None;
         app.scrollbar = None;
         app.input_area = None;
+        // The pane covered the spinner's row, so it goes back on top.
+        render_working(frame, working_area, app);
         if app.pending.is_some() {
             render_approval(frame, bottom_area, app);
         }
@@ -86,6 +99,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if menu_height > 0 {
         render_menu(frame, menu_area, &items, app.menu.unwrap_or(0));
     }
+    render_working(frame, working_area, app);
     if app.pending.is_some() {
         app.input_area = None;
         render_approval(frame, bottom_area, app);
@@ -101,15 +115,6 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
         Span::styled(" bhai ", Style::new().fg(Color::Black).bg(Color::Cyan)),
         Span::styled(format!(" {} ", app.model), dim),
     ];
-    if app.working {
-        spans.push(Span::styled(
-            format!("{} working ", SPINNER[app.spinner % SPINNER.len()]),
-            Style::new().fg(Color::Yellow),
-        ));
-    }
-    if app.queued > 0 {
-        spans.push(Span::styled(format!("{} queued ", app.queued), dim));
-    }
     if app.tokens_in + app.tokens_out > 0 {
         spans.push(Span::styled(
             format!("↑{} ↓{} ", compact(app.tokens_in), compact(app.tokens_out)),
@@ -145,16 +150,31 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
         Rect::new(x, area.y, width, 1).intersection(area)
     });
     spans.push(Span::styled(
-        if app.pending.is_some() {
-            "  y yes · n no · or click a choice"
-        } else if app.working {
-            "  ctrl+c interrupt"
-        } else {
+        match app.pending.is_some() {
+            true => "  y yes · n no · or click a choice",
             // The rest of the keys live in /help rather than across the top bar.
-            "  / for commands"
+            false => "  / for commands",
         },
         dim,
     ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The spinner row above the prompt, drawn only while a turn is actually running.
+fn render_working(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 {
+        return;
+    }
+    let mut spans = vec![Span::styled(
+        format!(" {} working", SPINNER[app.spinner % SPINNER.len()]),
+        Style::new().fg(Color::Yellow),
+    )];
+    let dim = Style::new().fg(Color::DarkGray);
+    if app.queued > 0 {
+        spans.push(Span::styled(format!(" · {} queued", app.queued), dim));
+    }
+    spans.push(Span::styled(" · ctrl+c interrupt", dim));
+    frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -845,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_prompt_shows_dim_with_the_count_in_the_status_bar() {
+    fn the_spinner_and_the_queue_count_sit_above_the_prompt() {
         let mut app = App::detached();
         app.working = true;
         app.on_event(Event::Queued {
@@ -853,11 +873,23 @@ mod tests {
             text: "later".to_string(),
         });
         app.entries().push(Entry::Queued("later".to_string()));
-        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let screen = screen(&terminal);
-        assert!(screen.contains("1 queued"), "{screen}");
-        assert!(screen.contains("queued › later"), "{screen}");
+        let shown = screen(&terminal);
+        assert!(shown.contains("queued › later"), "{shown}");
+
+        let rows: Vec<&str> = shown.lines().collect();
+        let working = rows.iter().position(|r| r.contains("working")).unwrap();
+        assert!(working > 0, "not the top bar: {shown}");
+        assert!(rows[working].contains("1 queued"), "{shown}");
+        assert!(rows[working].contains("ctrl+c interrupt"), "{shown}");
+        let prompt = rows.iter().rposition(|r| r.contains("›")).unwrap();
+        assert!(working < prompt, "{shown}");
+
+        // An approval is the agent waiting on the user, so the spinner goes away.
+        app.pending = Some(approval(None));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("working"), "{shown}");
     }
 
     #[test]

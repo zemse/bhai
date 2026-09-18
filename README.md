@@ -22,7 +22,7 @@ inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/au
 - **sessions**: every turn appended to `.bhai/sessions/<id>.jsonl`, `--resume` to continue one, automatic compaction when the window fills. [docs](docs/sessions.md)
 - **token accounting**: where the context actually goes, per entry, with hover badges in the tui and a full report from `/context`. [docs](docs/context.md)
 - **prompt cache guard**: every request is checked for being an append-only extension of the one before it; `--cache-check` proves the backend serves it, `--strict-cache` refuses to send a request that would break it. [docs](docs/context.md#the-cache-guard)
-- **tui**: markdown rendering, a `/diff` pane, a `/` command menu, mouse, multi-line input, prompt history, collapsible tool output and rate-limit headroom in the status bar. [docs](docs/tui.md)
+- **tui**: markdown rendering, a `/diff` pane, a `/` command menu, mouse, multi-line input, prompt history, collapsible tool output and rate-limit headroom in the status bar. the spinner and the interrupt hint sit above the prompt, not at the top. [docs](docs/tui.md)
 - **debug server**: `--serve` exposes the running session over localhost http, `--headless` runs it without the tui. [docs](docs/server.md)
 
 ## slash commands
