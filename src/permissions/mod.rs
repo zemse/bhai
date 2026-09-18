@@ -560,7 +560,23 @@ impl Checker<'_> {
         }
 
         let mut reasons: Vec<String> = Vec::new();
+        // The rest of the chain runs wherever its `cd`s have left it.
+        let mut cwd = self.base.cwd.to_path_buf();
         for c in &commands {
+            if self.mode != Mode::Ask
+                && let Some(target) = bash::cd_target(&c.words)
+            {
+                // A `cd` out of the project decides nothing about what follows it.
+                let Some(next) = self.cd_into(&cwd, target) else {
+                    return self.fallback(None);
+                };
+                cwd = next;
+                let reason = "cd inside the project".to_string();
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
+                continue;
+            }
             let read_only = self.mode != Mode::Ask && bash::is_read_only(&c.words);
             let reason = self
                 .allow()
@@ -568,7 +584,7 @@ impl Checker<'_> {
                 .find(|r| r.applies_to("bash") && r.matches_words(&c.words, false))
                 .map(rule_reason)
                 .or_else(|| read_only.then(|| "read-only".to_string()))
-                .or_else(|| self.project_command(c).then(project_reason));
+                .or_else(|| self.project_command(c, &cwd).then(project_reason));
             match reason {
                 Some(reason) => {
                     if !reasons.contains(&reason) {
@@ -595,9 +611,15 @@ impl Checker<'_> {
             && rules::is_inside(path, self.base.cwd)
     }
 
-    /// A build or test command the project runs on itself.
-    fn project_command(&self, command: &bash::Command) -> bool {
-        let inside = |arg: &str| rules::is_inside(Path::new(arg), self.base.cwd);
+    /// Where a `cd` leaves the chain, or `None` when it leaves the project root.
+    fn cd_into(&self, cwd: &Path, target: &str) -> Option<PathBuf> {
+        let next = cwd.join(target);
+        (next.is_dir() && rules::is_inside(&next, self.base.cwd)).then_some(next)
+    }
+
+    /// A build or test command the project runs on itself, from `cwd`.
+    fn project_command(&self, command: &bash::Command, cwd: &Path) -> bool {
+        let inside = |arg: &str| rules::is_inside(&cwd.join(arg), self.base.cwd);
         self.relaxed()
             && self.relax.commands
             && command.nested().is_empty()
@@ -1171,6 +1193,80 @@ mod tests {
             untrusted.describe().contains("if you /trust this project"),
             "{described}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_cd_inside_the_project_decides_the_rest_of_the_chain() {
+        let dir = std::env::temp_dir().join(format!("bhai-policy-{}", uuid::Uuid::new_v4()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("wordcount")).unwrap();
+        std::fs::create_dir_all(repo.join("ripgrep")).unwrap();
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        let policy = |deny: &[&str]| {
+            let deny = Rules {
+                deny: rules(deny),
+                ..Rules::default()
+            };
+            let p = Policy::new(Mode::Auto, deny, None, repo.clone())
+                .with_trust(Trust::new(&dir.join("config"), &repo));
+            p.trust().unwrap();
+            p
+        };
+        let p = policy(&[]);
+        let root = repo.display().to_string();
+
+        // The bash prompts left in the field run, with the run directory substituted.
+        let project = allowed("cd inside the project, trusted project");
+        for command in [
+            format!("cd {root} && python -m pytest -q"),
+            format!("cd {root} && python3 -m pytest -q"),
+            format!("cd {root}/wordcount && cargo test"),
+            "cd wordcount && cd .. && cargo build".to_string(),
+            "cd wordcount && python3 run.py".to_string(),
+        ] {
+            assert_eq!(bash(&p, &command), project, "{command}");
+        }
+        let read_only = allowed("cd inside the project, read-only");
+        for command in [
+            format!("cd {root}/ripgrep && find . -type f -name '*.rs' | wc -l"),
+            format!("cd {root}/ripgrep && ls -la"),
+            format!("cd {root}/ripgrep && git ls-files '*.rs' | wc -l"),
+        ] {
+            assert_eq!(bash(&p, &command), read_only, "{command}");
+        }
+        assert_eq!(
+            bash(&p, &format!("cargo new {root}/wordcount --bin")),
+            allowed("trusted project")
+        );
+
+        // A `cd` this cannot follow, or one that leaves the project, decides nothing.
+        for command in [
+            r#"python3 -c "from test_calc import test_add; test_add()""#.to_string(),
+            "cd /etc && rm -rf x".to_string(),
+            "cd ~ && cargo test".to_string(),
+            "cd - && cargo test".to_string(),
+            "cd && cargo test".to_string(),
+            "cd wordcount && python3 -m pip install x".to_string(),
+            "cd missing && cargo test".to_string(),
+            format!("cd {root}/../outside && ls"),
+            format!("cargo new {}/x --bin", dir.join("outside").display()),
+        ] {
+            assert_eq!(bash(&p, &command), Decision::Ask, "{command}");
+        }
+
+        // Deny rules win inside a chain, and `ask` mode gains none of this.
+        let denied = policy(&["Bash(cargo test:*)"]);
+        assert_eq!(
+            bash(&denied, "cd wordcount && cargo test"),
+            Decision::Deny("deny rule Bash(cargo test:*)".to_string())
+        );
+        p.set_mode(Mode::Ask);
+        assert_eq!(
+            bash(&p, &format!("cd {root}/ripgrep && ls -la")),
+            Decision::Ask
+        );
+        assert_eq!(bash(&p, "cd wordcount && cargo test"), Decision::Ask);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

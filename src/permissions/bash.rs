@@ -304,11 +304,16 @@ pub fn is_read_only(words: &[String]) -> bool {
                         | "ls-files"
                         | "blame"
                         | "describe"
+                        | "grep"
                 ) =>
             {
-                !rest
-                    .iter()
-                    .any(|a| a.starts_with("--output") || a == "--ext-diff")
+                // `-O` opens the hits in a pager, which is a program of its own.
+                !rest.iter().any(|a| {
+                    a.starts_with("--output")
+                        || a == "--ext-diff"
+                        || a.starts_with("--open-files-in-pager")
+                        || is_short_flag(a, 'O')
+                })
             }
             _ => false,
         },
@@ -385,6 +390,15 @@ fn awk_reads_only(args: &[String]) -> bool {
     program.is_some_and(|p| !p.contains("system(") && !p.contains(['>', '|']))
 }
 
+/// The directory a `cd` moves to, for the only shape this can follow: one operand, no
+/// flags, and no `~` for the shell to expand. `cd`, `cd -` and `cd a b` are not that.
+pub fn cd_target(words: &[String]) -> Option<&str> {
+    match words {
+        [name, target] if name == "cd" && !target.starts_with(['-', '~']) => Some(target),
+        _ => None,
+    }
+}
+
 /// Build and test commands a trusted project may run without a rule in `auto`. They run
 /// the project's own code, which is what trusting a project means. `inside` says whether
 /// an argument names a path within the project.
@@ -406,7 +420,7 @@ pub fn is_project_command(words: &[String], inside: &dyn Fn(&str) -> bool) -> bo
         ("cargo", [sub, rest @ ..])
             if matches!(
                 sub.as_str(),
-                "build" | "check" | "test" | "fmt" | "clippy" | "run"
+                "build" | "check" | "test" | "fmt" | "clippy" | "run" | "new" | "init"
             ) =>
         {
             // `--config` can set a runner that executes anything.
@@ -416,6 +430,11 @@ pub fn is_project_command(words: &[String], inside: &dyn Fn(&str) -> bool) -> bo
             matches!(sub.as_str(), "run" | "test" | "install")
         }
         ("go", [sub, ..]) => matches!(sub.as_str(), "build" | "test"),
+        // `-m` runs a module: only the test runners, since `-m pip` installs and
+        // `-m http.server` serves the project to the network.
+        ("python" | "python3", [flag, module, ..]) if flag == "-m" => {
+            matches!(module.as_str(), "pytest" | "unittest")
+        }
         ("python3", [file, ..]) => !file.starts_with('-') && inside(file.as_str()),
         ("pytest" | "make" | "just", _) => true,
         _ => false,
@@ -577,6 +596,11 @@ mod tests {
             "go test ./...",
             "make",
             "just fmt",
+            "cargo new wordcount --bin",
+            "cargo init",
+            "python3 -m pytest -q",
+            "python -m pytest",
+            "python3 -m unittest -v",
         ] {
             assert!(project(input), "{input}");
         }
@@ -590,11 +614,41 @@ mod tests {
             "python3 -c print",
             "python3 ../outside.py",
             "python3 ~/evil.py",
+            "python3 -m pip install x",
+            "python -m http.server",
+            "python3 -m venv .venv",
+            "python3 -m",
+            "cargo new /other/x",
             "make -f ~/Makefile",
             "curl example.com",
             "rm -rf x",
         ] {
             assert!(!project(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn cd_targets_this_can_follow() {
+        let target = |input: &str| {
+            let words = parse(input).unwrap()[0].words.clone();
+            cd_target(&words).map(str::to_string)
+        };
+        assert_eq!(target("cd src"), Some("src".to_string()));
+        assert_eq!(
+            target("cd /home/admin/runs/x"),
+            Some("/home/admin/runs/x".to_string())
+        );
+        assert_eq!(target("cd .."), Some("..".to_string()));
+        for input in [
+            "cd",
+            "cd -",
+            "cd -P src",
+            "cd ~",
+            "cd ~/x",
+            "cd a b",
+            "ls src",
+        ] {
+            assert_eq!(target(input), None, "{input}");
         }
     }
 
@@ -625,6 +679,8 @@ mod tests {
             r#"awk '{print $1}' x"#,
             "jq .a x.json",
             "git rev-parse HEAD",
+            "git ls-files '*.rs'",
+            "git grep foo",
             "git remote -v",
             "git config --get user.name",
             "cargo metadata --format-version 1",
@@ -644,6 +700,8 @@ mod tests {
             "git branch -D main",
             "git logx",
             "git diff --output=x",
+            "git grep -O less foo",
+            "git grep --open-files-in-pager foo",
             "tree -o out",
             "file -C -m x",
             "/bin/ls",
