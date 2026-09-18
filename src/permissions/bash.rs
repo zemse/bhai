@@ -262,12 +262,27 @@ pub fn is_read_only(words: &[String]) -> bool {
     let args = &words[1..];
     let has = |f: &dyn Fn(&str) -> bool| args.iter().any(|a| f(a));
     match name.as_str() {
-        "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "grep" | "stat" | "which" | "echo" => true,
+        "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "grep" | "stat" | "which" | "echo"
+        | "uname" | "whoami" | "id" | "uptime" | "df" | "du" | "free" | "basename" | "dirname"
+        | "realpath" | "readlink" | "nl" | "cut" | "tr" | "column" | "cmp" | "diff" | "md5sum"
+        | "sha256sum" | "ps" => true,
         // `--pre` runs a preprocessor program.
         "rg" => !has(&|a| a.starts_with("--pre")),
         // `-C` compiles a magic file, `-o` writes the listing to a file.
         "file" => !has(&|a| is_short_flag(a, 'C')),
         "tree" => !has(&|a| is_short_flag(a, 'o')),
+        // `-s` sets the clock.
+        "date" => !has(&|a| is_short_flag(a, 's') || a.starts_with("--set")),
+        // An argument sets the hostname, and `env cmd` runs cmd.
+        "env" | "hostname" => args.is_empty(),
+        // `-o` writes the sorted output to a file.
+        "sort" => !has(&|a| is_short_flag(a, 'o') || a.starts_with("--output")),
+        // A second operand is the file the output goes to.
+        "uniq" => args.iter().filter(|a| !a.starts_with('-')).count() <= 1,
+        // `-f` runs a filter program this cannot see.
+        "jq" => !has(&|a| is_short_flag(a, 'f') || a.starts_with("--from-file")),
+        "sed" => sed_reads_only(args),
+        "awk" => awk_reads_only(args),
         "find" => !has(&|a| {
             matches!(
                 a,
@@ -275,12 +290,123 @@ pub fn is_read_only(words: &[String]) -> bool {
             ) || a.starts_with("-fprint")
         }),
         "git" => match args {
-            [sub] if sub == "branch" => true,
-            [sub, rest @ ..] if matches!(sub.as_str(), "status" | "diff" | "log" | "show") => !rest
-                .iter()
-                .any(|a| a.starts_with("--output") || a == "--ext-diff"),
+            [sub] if matches!(sub.as_str(), "branch" | "remote") => true,
+            [sub, flag] if sub == "remote" && matches!(flag.as_str(), "-v" | "--verbose") => true,
+            [sub, flag, ..] if sub == "config" && flag.starts_with("--get") => true,
+            [sub, rest @ ..]
+                if matches!(
+                    sub.as_str(),
+                    "status"
+                        | "diff"
+                        | "log"
+                        | "show"
+                        | "rev-parse"
+                        | "ls-files"
+                        | "blame"
+                        | "describe"
+                ) =>
+            {
+                !rest
+                    .iter()
+                    .any(|a| a.starts_with("--output") || a == "--ext-diff")
+            }
             _ => false,
         },
+        // `--config` can set a runner that executes anything.
+        "cargo" => {
+            matches!(args.first().map(String::as_str), Some("metadata" | "tree"))
+                && !has(&|a| a.starts_with("--config"))
+        }
+        _ => false,
+    }
+}
+
+/// `sed` only reads when it edits no file in place, its script is one this can see, and
+/// that script has no `w` or `W` command writing a file.
+fn sed_reads_only(args: &[String]) -> bool {
+    let unseen = |a: &String| {
+        is_short_flag(a, 'i')
+            || is_short_flag(a, 'f')
+            || a.starts_with("--in-place")
+            || a.starts_with("--file")
+    };
+    if args.iter().any(unseen) {
+        return false;
+    }
+    let mut scripts: Vec<&str> = Vec::new();
+    let mut args = args.iter();
+    let mut expressions = false;
+    while let Some(arg) = args.next() {
+        if arg == "-e" || arg == "--expression" {
+            expressions = true;
+            let Some(script) = args.next() else {
+                return false;
+            };
+            scripts.push(script);
+        } else if let Some(script) = arg.strip_prefix("--expression=") {
+            expressions = true;
+            scripts.push(script);
+        } else if !expressions && scripts.is_empty() && !arg.starts_with('-') {
+            // With no `-e`, the first operand is the script.
+            scripts.push(arg);
+        }
+    }
+    // Telling a `w` command from a `w` inside a pattern needs a sed parser, so any is enough.
+    !scripts.is_empty() && scripts.iter().all(|s| !s.contains(['w', 'W']))
+}
+
+/// `awk` only reads when its program is one this can see and that program neither shells
+/// out nor writes.
+fn awk_reads_only(args: &[String]) -> bool {
+    let mut program: Option<&str> = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg.starts_with("-f") || arg.starts_with("--file") || arg.starts_with("--source") {
+            // The program comes from a file this cannot see.
+            return false;
+        }
+        if arg == "-v" || arg == "--assign" {
+            args.next();
+        } else if !arg.starts_with('-') && program.is_none() {
+            program = Some(arg);
+        }
+    }
+    // `system(` runs a shell command, `>` writes a file and `|` pipes into one.
+    program.is_some_and(|p| !p.contains("system(") && !p.contains(['>', '|']))
+}
+
+/// Build and test commands a trusted project may run without a rule in `auto`. They run
+/// the project's own code, which is what trusting a project means. `inside` says whether
+/// an argument names a path within the project.
+pub fn is_project_command(words: &[String], inside: &dyn Fn(&str) -> bool) -> bool {
+    let Some(name) = words.first().map(|w| basename(w)) else {
+        return false;
+    };
+    let args = &words[1..];
+    // An argument naming a path has to stay in the project: `cargo test --manifest-path
+    // /elsewhere/Cargo.toml` builds someone else's code.
+    let escapes = |a: &String| {
+        (a.contains('/') || a.starts_with('~') || a.contains("..")) && !inside(a.as_str())
+    };
+    if args.iter().any(escapes) {
+        return false;
+    }
+    match (name, args) {
+        ("cargo", [sub, rest @ ..])
+            if matches!(
+                sub.as_str(),
+                "build" | "check" | "test" | "fmt" | "clippy" | "run"
+            ) =>
+        {
+            // `--config` can set a runner that executes anything.
+            !rest.iter().any(|a| a.starts_with("--config"))
+        }
+        ("npm" | "pnpm" | "yarn", [sub, ..]) => {
+            matches!(sub.as_str(), "run" | "test" | "install")
+        }
+        ("go", [sub, ..]) => matches!(sub.as_str(), "build" | "test"),
+        ("python3", [file, ..]) => !file.starts_with('-') && inside(file.as_str()),
+        ("pytest" | "make" | "just", _) => true,
         _ => false,
     }
 }
@@ -424,6 +550,42 @@ mod tests {
     }
 
     #[test]
+    fn project_commands_run_the_project_on_itself() {
+        let inside = |arg: &str| !arg.starts_with('/') && !arg.starts_with("../");
+        let project = |input: &str| is_project_command(&parse(input).unwrap()[0].words, &inside);
+        for input in [
+            "cargo test",
+            "cargo clippy --all-targets",
+            "cargo fmt",
+            "npm run build",
+            "yarn install",
+            "pnpm test",
+            "pytest -q",
+            "python3 fizzbuzz.py",
+            "python3 scripts/run.py",
+            "go test ./...",
+            "make",
+            "just fmt",
+        ] {
+            assert!(project(input), "{input}");
+        }
+        for input in [
+            "cargo publish",
+            "cargo test --config x",
+            "cargo test --manifest-path /other/Cargo.toml",
+            "cargo",
+            "npm publish",
+            "go run x",
+            "python3 -c print",
+            "python3 ../outside.py",
+            "curl example.com",
+            "rm -rf x",
+        ] {
+            assert!(!project(input), "{input}");
+        }
+    }
+
+    #[test]
     fn read_only_commands() {
         let read_only = |input: &str| is_read_only(&parse(input).unwrap()[0].words);
         for input in [
@@ -435,6 +597,25 @@ mod tests {
             "git branch",
             "tree -L 2",
             "file x",
+            "date -u",
+            "env",
+            "uname -a",
+            "df -h",
+            "ps aux",
+            "cut -d, -f1 x",
+            "sort x",
+            "uniq x",
+            "sha256sum x",
+            "diff a b",
+            "sed -n 1,5p src/main.rs",
+            "sed -e s/a/b/ x",
+            r#"awk '{print $1}' x"#,
+            "jq .a x.json",
+            "git rev-parse HEAD",
+            "git remote -v",
+            "git config --get user.name",
+            "cargo metadata --format-version 1",
+            "cargo tree -d",
         ] {
             assert!(read_only(input), "{input}");
         }
@@ -453,6 +634,21 @@ mod tests {
             "tree -o out",
             "file -C -m x",
             "/bin/ls",
+            "date -s 12:00",
+            "env cargo test",
+            "hostname other",
+            "sort -o out x",
+            "uniq a b",
+            "sed -i s/a/b/ x",
+            "sed s/a/b/w out x",
+            "sed -f script.sed x",
+            r#"awk '{system("rm x")}' x"#,
+            r#"awk '{print > "out"}' x"#,
+            "awk -f prog.awk x",
+            "jq -f prog.jq x",
+            "git remote add o u",
+            "git config user.name x",
+            "cargo metadata --config x",
         ] {
             assert!(!read_only(input), "{input}");
         }

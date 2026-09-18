@@ -382,7 +382,13 @@ fn permissions(config: Config, home: Option<PathBuf>, cwd: PathBuf) -> (Policy, 
         .as_ref()
         .map(|home| permissions::Trust::new(&home.join(".config/bhai"), &cwd))
         .map(|trust| trust.with_claude(config.import_claude_permissions));
-    let mut policy = Policy::new(config.permission_mode, rules, home, cwd).with_store(store);
+    let relax = permissions::Relax {
+        writes: config.auto_project_writes,
+        commands: config.auto_project_commands,
+    };
+    let mut policy = Policy::new(config.permission_mode, rules, home, cwd)
+        .with_store(store)
+        .with_relax(relax);
     if let Some(trust) = trust {
         policy = policy.with_trust(trust);
     }

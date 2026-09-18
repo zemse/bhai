@@ -29,6 +29,10 @@ pub struct Config {
     pub mcp_servers: BTreeMap<String, McpServer>,
     pub permission_mode: Mode,
     pub permissions: Rules,
+    /// In `auto`, a trusted project writes and edits inside its own root without asking.
+    pub auto_project_writes: bool,
+    /// In `auto`, a trusted project runs the built-in build and test commands.
+    pub auto_project_commands: bool,
     /// Rules from Claude Code's `settings.json` files.
     pub import_claude_permissions: bool,
     /// When history is compacted: `context_window` and `compact_at`.
@@ -47,6 +51,8 @@ impl Default for Config {
             mcp_servers: BTreeMap::new(),
             permission_mode: Mode::Ask,
             permissions: Rules::default(),
+            auto_project_writes: true,
+            auto_project_commands: true,
             import_claude_permissions: true,
             limits: Limits::default(),
         }
@@ -112,6 +118,8 @@ struct Layer {
     skills: Option<SkillsLayer>,
     mcp: Option<McpLayer>,
     permission_mode: Option<Mode>,
+    auto_project_writes: Option<bool>,
+    auto_project_commands: Option<bool>,
     import_claude_permissions: Option<bool>,
     context_window: Option<u64>,
     compact_at: Option<f64>,
@@ -236,10 +244,20 @@ impl Config {
                 self.permission_mode = mode;
             }
         }
-        if let Some(import) = layer.import_claude_permissions
-            && (trusted || !import)
-        {
-            self.import_claude_permissions = import;
+        for (field, value) in [
+            (&mut self.auto_project_writes, layer.auto_project_writes),
+            (&mut self.auto_project_commands, layer.auto_project_commands),
+            (
+                &mut self.import_claude_permissions,
+                layer.import_claude_permissions,
+            ),
+        ] {
+            // A project file may turn one off, never on.
+            if let Some(value) = value
+                && (trusted || !value)
+            {
+                *field = value;
+            }
         }
         if trusted && let Some(McpLayer::Table { servers, .. }) = &layer.mcp {
             self.mcp_servers.extend(servers.clone());
@@ -374,6 +392,25 @@ mod tests {
         write(&project, "import_claude_permissions = false\n");
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert!(!config.import_claude_permissions);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_project_can_only_turn_the_auto_relaxations_off() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        let global = home.join(".config/bhai/config.toml");
+        let project = cwd.join(".bhai/config.toml");
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(config.auto_project_writes && config.auto_project_commands);
+        write(&global, "auto_project_writes = false\n");
+        write(
+            &project,
+            "auto_project_writes = true\nauto_project_commands = false\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(!config.auto_project_writes);
+        assert!(!config.auto_project_commands);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

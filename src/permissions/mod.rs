@@ -146,6 +146,25 @@ impl Offers {
     }
 }
 
+/// What `auto` mode allows on its own in a project the trust store knows, from the
+/// config. An untrusted project gets none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Relax {
+    /// `auto_project_writes`: writes and edits inside the project root.
+    pub writes: bool,
+    /// `auto_project_commands`: the built-in build and test commands.
+    pub commands: bool,
+}
+
+impl Default for Relax {
+    fn default() -> Self {
+        Self {
+            writes: true,
+            commands: true,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Policy {
     mode: AtomicU8,
@@ -158,6 +177,8 @@ pub struct Policy {
     trust: Option<Trust>,
     /// Whether repo-supplied allow rules apply.
     trusted: AtomicBool,
+    /// What `auto` mode relaxes once the project is trusted.
+    relax: Relax,
 }
 
 impl Policy {
@@ -170,6 +191,7 @@ impl Policy {
             store: None,
             trust: None,
             trusted: AtomicBool::new(false),
+            relax: Relax::default(),
         }
     }
 
@@ -178,6 +200,10 @@ impl Policy {
             store: Some(store),
             ..self
         }
+    }
+
+    pub fn with_relax(self, relax: Relax) -> Self {
+        Self { relax, ..self }
     }
 
     pub fn with_trust(self, trust: Trust) -> Self {
@@ -345,6 +371,30 @@ impl Policy {
                 " (only your own and remembered allow rules apply; read-only commands still ask)",
             );
         }
+        if mode == Mode::Auto {
+            let on: Vec<&str> = [
+                (
+                    self.relax.writes,
+                    "writes and edits inside the project root",
+                ),
+                (self.relax.commands, "build and test commands"),
+            ]
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, what)| *what)
+            .collect();
+            out.push_str(&match (on.is_empty(), trusted) {
+                (true, _) => "\nno relaxations: both are off in the config".to_string(),
+                (false, true) => format!(
+                    "\nallowed with no rule, this project being trusted: {}",
+                    on.join(", ")
+                ),
+                (false, false) => format!(
+                    "\nwould run with no rule if you /trust this project: {}",
+                    on.join(", ")
+                ),
+            });
+        }
         for (name, list) in [
             ("deny", &rules.deny),
             ("ask", &rules.ask),
@@ -384,6 +434,7 @@ impl Policy {
             rules,
             mode,
             trusted: self.trusted(),
+            relax: self.relax,
             base: self.base(),
         }
     }
@@ -413,6 +464,7 @@ struct Checker<'a> {
     rules: &'a Rules,
     mode: Mode,
     trusted: bool,
+    relax: Relax,
     base: Base<'a>,
 }
 
@@ -467,7 +519,10 @@ impl Checker<'_> {
         if rules::is_protected(path, base.home) {
             return Decision::Ask;
         }
-        self.fallback(find(&self.allow(), false).map(|r| rule_reason(&r)))
+        let allowed = find(&self.allow(), false)
+            .map(|r| rule_reason(&r))
+            .or_else(|| self.project_write(tool, path).then(project_reason));
+        self.fallback(allowed)
     }
 
     fn check_bash(&self, command: &str) -> Decision {
@@ -512,7 +567,8 @@ impl Checker<'_> {
                 .iter()
                 .find(|r| r.applies_to("bash") && r.matches_words(&c.words, false))
                 .map(rule_reason)
-                .or_else(|| read_only.then(|| "read-only".to_string()));
+                .or_else(|| read_only.then(|| "read-only".to_string()))
+                .or_else(|| self.project_command(c).then(project_reason));
             match reason {
                 Some(reason) => {
                     if !reasons.contains(&reason) {
@@ -523,6 +579,29 @@ impl Checker<'_> {
             }
         }
         self.fallback(Some(reasons.join(", ")))
+    }
+
+    /// Whether a trusted project's relaxations apply at all: only in `auto`, and only
+    /// once the project is trusted.
+    fn relaxed(&self) -> bool {
+        self.mode == Mode::Auto && self.trusted
+    }
+
+    /// A write or edit whose target really is inside the project root.
+    fn project_write(&self, tool: &str, path: &Path) -> bool {
+        self.relaxed()
+            && self.relax.writes
+            && matches!(tool, "write" | "edit")
+            && rules::is_inside(path, self.base.cwd)
+    }
+
+    /// A build or test command the project runs on itself.
+    fn project_command(&self, command: &bash::Command) -> bool {
+        let inside = |arg: &str| rules::is_inside(Path::new(arg), self.base.cwd);
+        self.relaxed()
+            && self.relax.commands
+            && command.nested().is_empty()
+            && bash::is_project_command(&command.words, &inside)
     }
 
     /// The allow rules this mode honours.
@@ -567,6 +646,10 @@ fn loose_forms(command: &bash::Command) -> Vec<Vec<String>> {
         forms.extend(loose_forms(&nested));
     }
     forms
+}
+
+fn project_reason() -> String {
+    "trusted project".to_string()
 }
 
 fn rule_reason(rule: &Rule) -> String {
@@ -1010,13 +1093,99 @@ mod tests {
         assert!(memory.describe().contains("Bash(ls)  (this session)"));
     }
 
+    #[test]
+    fn a_trusted_project_relaxes_auto_mode() {
+        let dir = std::env::temp_dir().join(format!("bhai-policy-{}", uuid::Uuid::new_v4()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("outside"), repo.join("away")).unwrap();
+        let policy = |deny: &[&str]| {
+            let deny = Rules {
+                deny: rules(deny),
+                ..Rules::default()
+            };
+            Policy::new(Mode::Auto, deny, None, repo.clone())
+                .with_trust(Trust::new(&dir.join("config"), &repo))
+        };
+        let inside = repo.join("src/a.rs");
+        let inside = inside.to_str().unwrap();
+
+        // Untrusted, a freshly cloned repo gains nothing.
+        let untrusted = policy(&[]);
+        assert_eq!(bash(&untrusted, "cargo test"), Decision::Ask);
+        assert_eq!(file(&untrusted, "write", inside), Decision::Ask);
+
+        let p = policy(&[]);
+        p.trust().unwrap();
+        assert_eq!(file(&p, "write", inside), allowed("trusted project"));
+        assert_eq!(bash(&p, "cargo test"), allowed("trusted project"));
+        assert_eq!(
+            bash(&p, "cargo test && npm run build"),
+            allowed("trusted project")
+        );
+        // `sudo` and anything else the tokenizer refuses never reaches the relaxation.
+        assert_eq!(bash(&p, "sudo cargo test"), Decision::Ask);
+        assert_eq!(bash(&p, "cargo test > out.txt"), Decision::Ask);
+        assert_eq!(bash(&p, "curl example.com"), Decision::Ask);
+        // A symlink out of the project, a path outside it and a protected path still ask.
+        let away = repo.join("away/x.rs");
+        assert_eq!(file(&p, "edit", away.to_str().unwrap()), Decision::Ask);
+        let outside = dir.join("outside/x.rs");
+        assert_eq!(file(&p, "write", outside.to_str().unwrap()), Decision::Ask);
+        let env = repo.join(".env");
+        assert_eq!(file(&p, "write", env.to_str().unwrap()), Decision::Ask);
+
+        // Only in `auto`, and only what the config leaves on.
+        p.set_mode(Mode::Ask);
+        assert_eq!(file(&p, "write", inside), Decision::Ask);
+        assert_eq!(bash(&p, "cargo test"), Decision::Ask);
+        p.set_mode(Mode::Auto);
+        let off = policy(&[]).with_relax(Relax {
+            writes: false,
+            commands: false,
+        });
+        off.trust().unwrap();
+        assert_eq!(file(&off, "write", inside), Decision::Ask);
+        assert_eq!(bash(&off, "cargo test"), Decision::Ask);
+
+        // Deny rules win over the relaxation.
+        let denied = policy(&["Bash(cargo test:*)", "Edit(/src/**)"]);
+        denied.trust().unwrap();
+        assert_eq!(
+            bash(&denied, "cargo test"),
+            Decision::Deny("deny rule Bash(cargo test:*)".to_string())
+        );
+        assert_eq!(
+            file(&denied, "write", inside),
+            Decision::Deny("deny rule Edit(/src/**)".to_string())
+        );
+
+        let described = p.describe();
+        assert!(
+            described.contains("this project being trusted"),
+            "{described}"
+        );
+        assert!(
+            untrusted.describe().contains("if you /trust this project"),
+            "{described}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A policy for `repo` as `main` builds it, with its trust store under `dir`.
     fn repo_policy(dir: &Path, repo: &Path) -> Policy {
         let store = repo.join(settings::LOCAL);
         let (mut rules, _) = settings::claude(None, repo);
         rules.allow.extend(settings::load_local(&store).0);
+        // Relaxations off, so these tests see what the rules alone decide.
         Policy::new(Mode::Ask, rules, None, repo.to_path_buf())
             .with_store(store)
+            .with_relax(Relax {
+                writes: false,
+                commands: false,
+            })
             .with_trust(Trust::new(&dir.join("config"), repo))
     }
 

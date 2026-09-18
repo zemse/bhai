@@ -395,6 +395,26 @@ fn wildcard(pattern: &str, text: &str, question: bool) -> bool {
     p[pi..].iter().all(|c| *c == '*')
 }
 
+/// Whether `path` is inside `root` once `..` and symlinks are resolved. A path that does
+/// not exist yet resolves through its nearest existing parent, so a new file under a
+/// symlink that leaves the project is seen for what it is.
+pub fn is_inside(path: &Path, root: &Path) -> bool {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let path = follow_links(&root.join(path));
+    components(&path).starts_with(&components(&root))
+}
+
+/// `path` with symlinks resolved as far as it exists, the rest appended as written.
+fn follow_links(path: &Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => follow_links(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Files the agent may never change without asking, whatever the mode or rules say.
 pub fn is_protected(path: &Path, home: Option<&Path>) -> bool {
     let parts: Vec<String> = components(path).iter().map(|p| p.to_lowercase()).collect();
