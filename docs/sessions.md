@@ -5,8 +5,8 @@ id, identity, model, effort, working directory and a fingerprint of the prompt p
 then each history item as the agent stores it. Nothing is rewritten, so a crash loses at
 most the turn in flight.
 
-`bhai sessions` lists them, newest first, with the id, when it started, the identity, how
-many items and the opening prompt.
+`bhai sessions` lists them, newest first, each line starting with the `--resume <id>` that
+continues it, then when it started, the identity, how many items and the opening prompt.
 
 ## Resuming
 
@@ -14,6 +14,10 @@ many items and the opening prompt.
 one by its id or a unique prefix. The identity comes from the header, so `--resume` takes
 no `--as`; if that identity no longer exists the session resumes as `general` with a
 warning.
+
+Leaving an interactive session that saved anything prints its id and the command to pick
+it up, on a clean exit and after a panic. The bare `bhai --resume` is offered while it is
+still the newest session of this directory, otherwise the id comes with it.
 
 Resuming keeps the session's cache key, so the cached prefix is still there if it has not
 expired. When the model, the instruction files or the tool list have changed since, the

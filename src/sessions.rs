@@ -317,7 +317,7 @@ pub fn find(dir: &Path, id: Option<&str>) -> Result<Loaded> {
     }
 }
 
-/// `bhai sessions`: one line per session.
+/// `bhai sessions`: one line per session, each starting with the flag that resumes it.
 pub fn report(sessions: &[Summary]) -> String {
     if sessions.is_empty() {
         return "no saved sessions\n".to_string();
@@ -326,7 +326,7 @@ pub fn report(sessions: &[Summary]) -> String {
         .iter()
         .map(|s| {
             format!(
-                "{}  {}  {:<10} {:>4} items  {}\n",
+                "--resume {}  {}  {:<10} {:>4} items  {}\n",
                 s.header.session,
                 s.header.created.format("%Y-%m-%d %H:%M"),
                 s.header.identity,
@@ -335,6 +335,26 @@ pub fn report(sessions: &[Summary]) -> String {
             )
         })
         .collect()
+}
+
+/// What a finished session prints so it can be picked up again. `newest` drops the id,
+/// since a bare `--resume` continues the latest session of this project.
+pub fn hint(id: &str, items: usize, newest: bool) -> String {
+    let command = match newest {
+        true => "bhai --resume".to_string(),
+        false => format!("bhai --resume {id}"),
+    };
+    format!("bhai: session {id} saved ({items} items)\nbhai: resume it with: {command}\n")
+}
+
+/// [`hint`] for session `id` under `dir`, or `None` when it saved nothing to resume.
+pub fn exit_hint(dir: &Path, id: &str) -> Option<String> {
+    let items = load(&path(dir, id)).ok()?.items.len();
+    if items == 0 {
+        return None;
+    }
+    let newest = list(dir).first().is_some_and(|s| s.header.session == id);
+    Some(hint(id, items, newest))
 }
 
 /// The text of a user message item.
@@ -487,11 +507,40 @@ mod tests {
         assert_eq!(ids, ["bbb222", "aaa111"]);
         assert_eq!(sessions[0].first.as_deref(), Some("hi \u{1F600} \"there\""));
         assert_eq!(sessions[1].items, 5);
+        assert!(report(&sessions).contains("--resume aaa111"));
         assert!(report(&sessions).contains("5 items"));
 
         assert_eq!(find(&dir, None).unwrap().header.session, "bbb222");
         assert_eq!(find(&dir, Some("aaa")).unwrap().header.session, "aaa111");
         assert!(find(&dir, Some("zzz")).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_exit_hint_names_the_session_and_drops_the_id_when_it_is_newest() {
+        assert_eq!(
+            hint("abc", 7, false),
+            "bhai: session abc saved (7 items)\nbhai: resume it with: bhai --resume abc\n"
+        );
+        assert_eq!(
+            hint("abc", 1, true),
+            "bhai: session abc saved (1 items)\nbhai: resume it with: bhai --resume\n"
+        );
+
+        // A session that never wrote an item leaves no file, so there is nothing to say.
+        let dir = temp_dir();
+        assert_eq!(exit_hint(&dir, "s1"), None);
+        let old = write(&dir, "s1", &items());
+        write(&dir, "s2", &items()[..1]);
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        assert_eq!(exit_hint(&dir, "s1").unwrap(), hint("s1", 5, false));
+        assert_eq!(exit_hint(&dir, "s2").unwrap(), hint("s2", 1, true));
         let _ = std::fs::remove_dir_all(dir);
     }
 

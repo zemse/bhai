@@ -207,6 +207,7 @@ async fn main() -> Result<()> {
         .profile
         .then(|| profile::debug_dir().join("usage.jsonl"));
     let history = saved.history.clone();
+    let session_id = saved.writer.header.session.clone();
     let (session, events) = start(client, prompt, policy, usage_log, delegation, saved, limits);
     // `--workflow` is a run of its own: no TUI, no turn, just the steps and their report.
     if let Some((name, input)) = args.workflow.clone() {
@@ -244,11 +245,16 @@ async fn main() -> Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )
         .is_ok();
-    // ratatui's own panic hook only leaves raw mode and the alternate screen.
+    // ratatui's own panic hook only leaves raw mode and the alternate screen. A crash is
+    // exactly when the id is wanted, so the hint goes out after the panic message.
     let hook = std::panic::take_hook();
+    let crashed = (dir.clone(), session_id.clone());
     std::panic::set_hook(Box::new(move |info| {
         release_modes(mouse, paste, keyboard);
         hook(info);
+        if let Some(hint) = sessions::exit_hint(&crashed.0, &crashed.1) {
+            eprint!("{hint}");
+        }
     }));
     let prompts = input::History::load(
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/bhai/history.jsonl")),
@@ -270,6 +276,9 @@ async fn main() -> Result<()> {
     release_modes(mouse, paste, keyboard);
     ratatui::restore();
     shutdown(hub).await;
+    if let Some(hint) = sessions::exit_hint(&dir, &session_id) {
+        eprint!("{hint}");
+    }
     result
 }
 
