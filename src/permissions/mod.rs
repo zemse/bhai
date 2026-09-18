@@ -36,10 +36,6 @@ pub enum Mode {
 impl Mode {
     const ALL: [Mode; 3] = [Mode::Ask, Mode::Auto, Mode::Bypass];
 
-    pub fn next(self) -> Self {
-        Self::ALL[(self as usize + 1) % Self::ALL.len()]
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Mode::Ask => "ask",
@@ -146,7 +142,8 @@ impl Offers {
     }
 }
 
-/// What `auto` mode allows on its own, from the config.
+/// What `auto` mode allows on its own in a project the trust store knows, from the
+/// config. An untrusted project gets none of it, and cannot be in `auto` anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Relax {
     /// `auto_project_writes`: writes and edits inside the project root.
@@ -167,6 +164,8 @@ impl Default for Relax {
 #[derive(Debug, Default)]
 pub struct Policy {
     mode: AtomicU8,
+    /// The mode asked for by the config or `--mode`, which trust may not allow yet.
+    wanted: AtomicU8,
     /// Allow rules grow as approvals are remembered.
     rules: RwLock<Rules>,
     home: Option<PathBuf>,
@@ -176,7 +175,7 @@ pub struct Policy {
     trust: Option<Trust>,
     /// Whether repo-supplied allow rules apply.
     trusted: AtomicBool,
-    /// What `auto` mode relaxes on its own.
+    /// What `auto` mode relaxes once the project is trusted.
     relax: Relax,
 }
 
@@ -184,6 +183,7 @@ impl Policy {
     pub fn new(mode: Mode, rules: Rules, home: Option<PathBuf>, cwd: PathBuf) -> Self {
         Self {
             mode: AtomicU8::new(mode as u8),
+            wanted: AtomicU8::new(mode as u8),
             rules: RwLock::new(rules),
             home,
             cwd,
@@ -215,6 +215,8 @@ impl Policy {
         if trusted {
             policy.set_trusted(&snapshot);
         }
+        // An untrusted project cannot be in the mode the config asked for.
+        policy.set_mode(policy.wanted());
         policy
     }
 
@@ -222,8 +224,49 @@ impl Policy {
         Mode::ALL[self.mode.load(Ordering::Relaxed) as usize]
     }
 
-    pub fn set_mode(&self, mode: Mode) {
+    /// Set the mode, as far as trust allows. Returns the mode actually in force; the one
+    /// asked for is remembered, so trusting the project later puts it there.
+    pub fn set_mode(&self, mode: Mode) -> Mode {
+        self.wanted.store(mode as u8, Ordering::Relaxed);
+        let mode = match self.offers_mode(mode) {
+            true => mode,
+            false => Mode::Ask,
+        };
         self.mode.store(mode as u8, Ordering::Relaxed);
+        mode
+    }
+
+    /// The mode asked for, which is the one in force unless trust held it back.
+    pub fn wanted(&self) -> Mode {
+        Mode::ALL[self.wanted.load(Ordering::Relaxed) as usize]
+    }
+
+    /// The allow rules this project's own settings files ship, which trust would honour.
+    pub fn repo_rules(&self) -> usize {
+        self.trust
+            .as_ref()
+            .map_or(0, |trust| trust.snapshot().allow_rules().len())
+    }
+
+    /// The modes the user may choose right now. An untrusted project only has `ask`:
+    /// `auto` and `bypass` run code the project supplies, which is the thing trust is
+    /// about, so offering them before the question is answered would be theatre.
+    pub fn modes(&self) -> &'static [Mode] {
+        match self.trusted() {
+            true => &Mode::ALL,
+            false => &[Mode::Ask],
+        }
+    }
+
+    pub fn offers_mode(&self, mode: Mode) -> bool {
+        self.modes().contains(&mode)
+    }
+
+    /// The next mode the user may choose, wrapping round what `modes` offers.
+    pub fn next_mode(&self) -> Mode {
+        let modes = self.modes();
+        let at = modes.iter().position(|m| *m == self.mode()).unwrap_or(0);
+        modes[(at + 1) % modes.len()]
     }
 
     /// Decide a call to `tool`. Tools that skip approval only answer to deny and ask
@@ -324,8 +367,16 @@ impl Policy {
         let trust = self.trust.as_ref().context("no trust store")?;
         let snapshot = trust.trust()?;
         self.set_trusted(&snapshot);
+        // The mode the config asked for was held back while this was untrusted.
+        self.set_mode(self.wanted());
         let rules = snapshot.allow_rules();
-        let mut out = format!("trusted {} repo-supplied allow rules", rules.len());
+        let mut out = match rules.len() {
+            0 => format!("trusted this project; mode: {}", self.mode()),
+            n => format!(
+                "trusted this project and the {n} allow rules it ships; mode: {}",
+                self.mode()
+            ),
+        };
         for (source, rule) in rules {
             out.push_str(&format!("\n  {rule}  ({source})"));
         }
@@ -336,6 +387,7 @@ impl Policy {
     pub fn untrust(&self) -> anyhow::Result<String> {
         let trust = self.trust.as_ref().context("no trust store")?;
         self.trusted.store(false, Ordering::Relaxed);
+        self.set_mode(self.wanted());
         Ok(match trust.untrust()? {
             true => "untrusted this project's allow rules".to_string(),
             false => "this project was not trusted".to_string(),
@@ -364,8 +416,11 @@ impl Policy {
         self.trusted.store(true, Ordering::Relaxed);
     }
 
-    fn trusted(&self) -> bool {
-        self.trusted.load(Ordering::Relaxed)
+    /// Whether this project's own files are trusted. With no trust store there is
+    /// nowhere to record an answer and no repo-supplied rules to honour, so the question
+    /// does not arise and nothing is held back.
+    pub fn trusted(&self) -> bool {
+        self.trust.is_none() || self.trusted.load(Ordering::Relaxed)
     }
 
     /// What `/permissions` prints: the mode, then each rule, where it came from and
@@ -391,9 +446,16 @@ impl Policy {
             .filter(|(on, _)| *on)
             .map(|(_, what)| *what)
             .collect();
-            out.push_str(&match on.is_empty() {
-                true => "\nno relaxations: both are off in the config".to_string(),
-                false => format!("\nallowed with no rule, this being auto: {}", on.join(", ")),
+            out.push_str(&match (on.is_empty(), trusted) {
+                (true, _) => "\nno relaxations: both are off in the config".to_string(),
+                (false, true) => format!(
+                    "\nallowed with no rule, this project being trusted: {}",
+                    on.join(", ")
+                ),
+                (false, false) => format!(
+                    "\nwould run with no rule if you trust this project: {}",
+                    on.join(", ")
+                ),
             });
             out.push_str("\nanything else the rules leave open goes to the judge");
         }
@@ -627,12 +689,11 @@ impl Checker<'_> {
         }
     }
 
-    /// Whether `auto` mode's own relaxations apply. Trust is not asked for here: it
-    /// governs the allow rules a repo ships, which these do not come from. Choosing
-    /// `auto` is the consent for writing inside the project, running its build and test
-    /// commands, and sending the rest to the judge.
+    /// Whether `auto` mode's relaxations apply. They run the project's own code, so they
+    /// wait on trust; an untrusted project cannot be in `auto` in the first place, and
+    /// this keeps that true even if something sets the mode behind the policy's back.
     fn relaxed(&self) -> bool {
-        self.mode == Mode::Auto
+        self.mode == Mode::Auto && self.trusted
     }
 
     /// A write or edit whose target really is inside the project root.
@@ -779,14 +840,20 @@ mod tests {
     #[test]
     fn modes_cycle_and_parse() {
         assert_eq!(Mode::default(), Mode::Ask);
-        assert_eq!(Mode::Ask.next(), Mode::Auto);
-        assert_eq!(Mode::Auto.next(), Mode::Bypass);
-        assert_eq!(Mode::Bypass.next(), Mode::Ask);
+        // With nothing to trust, the cycle is the whole set.
+        let cycle = |mode: Mode| {
+            let policy = Policy::default();
+            policy.set_mode(mode);
+            policy.next_mode()
+        };
+        assert_eq!(cycle(Mode::Ask), Mode::Auto);
+        assert_eq!(cycle(Mode::Auto), Mode::Bypass);
+        assert_eq!(cycle(Mode::Bypass), Mode::Ask);
         assert_eq!("bypass".parse(), Ok(Mode::Bypass));
         assert!("yolo".parse::<Mode>().is_err());
         assert_eq!(serde_json::to_value(Mode::Auto).unwrap(), json!("auto"));
         let policy = Policy::default();
-        policy.set_mode(policy.mode().next());
+        policy.set_mode(policy.next_mode());
         assert_eq!(policy.mode(), Mode::Auto);
     }
 
@@ -1158,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_relaxes_the_project_without_a_trust_step() {
+    fn a_trusted_project_relaxes_auto_mode() {
         let dir = std::env::temp_dir().join(format!("bhai-policy-{}", uuid::Uuid::new_v4()));
         let repo = dir.join("repo");
         std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -1176,19 +1243,21 @@ mod tests {
         let inside = repo.join("src/a.rs");
         let inside = inside.to_str().unwrap();
 
-        // Trust governs the allow rules a repo ships, not these: `auto` is the consent.
+        // These run the project's own code, so an untrusted checkout gains nothing, and
+        // cannot even be in `auto`: the mode falls back until the question is answered.
         let untrusted = policy(&[]);
-        assert_eq!(
-            bash(&untrusted, "cargo test"),
-            allowed("auto, inside the project")
-        );
-        assert_eq!(
-            file(&untrusted, "write", inside),
-            allowed("auto, inside the project")
-        );
+        assert_eq!(untrusted.mode(), Mode::Ask);
+        assert_eq!(untrusted.modes(), [Mode::Ask]);
+        assert_eq!(untrusted.set_mode(Mode::Auto), Mode::Ask);
+        assert_eq!(untrusted.next_mode(), Mode::Ask);
+        assert_eq!(bash(&untrusted, "cargo test"), Decision::Ask);
+        assert_eq!(file(&untrusted, "write", inside), Decision::Ask);
 
+        // Trusting it puts the project in the mode the config asked for.
         let p = policy(&[]);
         p.trust().unwrap();
+        assert_eq!(p.mode(), Mode::Auto);
+        assert_eq!(p.modes(), Mode::ALL);
         assert_eq!(
             file(&p, "write", inside),
             allowed("auto, inside the project")
@@ -1219,11 +1288,13 @@ mod tests {
             writes: false,
             commands: false,
         });
+        off.trust().unwrap();
         assert_eq!(file(&off, "write", inside), Decision::Ask);
         assert_eq!(bash(&off, "cargo test"), Decision::Ask);
 
         // Deny rules win over the relaxation.
         let denied = policy(&["Bash(cargo test:*)", "Edit(/src/**)"]);
+        denied.trust().unwrap();
         denied.trust().unwrap();
         assert_eq!(
             bash(&denied, "cargo test"),
@@ -1235,14 +1306,18 @@ mod tests {
         );
 
         let described = p.describe();
-        assert!(described.contains("this being auto"), "{described}");
+        assert!(
+            described.contains("this project being trusted"),
+            "{described}"
+        );
         assert!(described.contains("goes to the judge"), "{described}");
-        assert_eq!(untrusted.describe(), described, "trust changes none of it");
+        let untrusted = untrusted.describe();
+        assert!(untrusted.starts_with("permission mode: ask"), "{untrusted}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn only_auto_reaches_the_judge() {
+    fn only_auto_in_a_trusted_project_reaches_the_judge() {
         let dir = std::env::temp_dir().join(format!("bhai-judgeable-{}", uuid::Uuid::new_v4()));
         let repo = dir.join("repo");
         std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -1252,8 +1327,8 @@ mod tests {
         let command = |c: &str| p.judgeable("bash", &json!({ "command": c }));
         let path = |tool: &str, path: &PathBuf| p.judgeable(tool, &json!({ "path": path }));
 
-        // Trust is not what gates it; `auto` is.
-        assert!(command("cargo clippy"));
+        // An untrusted project never reaches it, however harmless the call.
+        assert!(!command("cargo clippy"));
         p.trust().unwrap();
         assert!(command("cargo clippy"));
         assert!(path("write", &repo.join("src/a.rs")));
@@ -1266,7 +1341,7 @@ mod tests {
         assert!(!path("edit", &repo.join(".env")), "protected");
         assert!(!p.judgeable("write", &json!({})), "no path");
 
-        // Neither other mode ever asks the judge.
+        // Neither other mode ever asks the judge, trusted or not.
         for mode in [Mode::Ask, Mode::Bypass] {
             p.set_mode(mode);
             assert!(!command("cargo clippy"), "{mode}");
@@ -1441,7 +1516,8 @@ mod tests {
         write_settings(&repo.join(settings::CLAUDE_LOCAL), json!({}));
 
         let trusted = policy.trust().unwrap();
-        assert!(trusted.starts_with("trusted 1 "), "{trusted}");
+        assert!(trusted.contains("the 1 allow rules it ships"), "{trusted}");
+        assert!(trusted.contains("mode: auto"), "{trusted}");
         assert_eq!(bash(&policy, "make all"), Decision::Ask);
         assert_eq!(bash(&policy, "npm test"), Decision::Ask);
         assert_eq!(bash(&policy, "cargo fmt"), allowed("rule Bash(cargo fmt)"));

@@ -195,7 +195,28 @@ async fn main() -> Result<()> {
     if args.trust {
         notices.push(policy.trust()?);
     }
-    notices.extend(policy.trust_notice());
+    // The trust question, put to the user in the tui when the store does not know this
+    // project. Until it is answered the session is in `ask`, whatever the config asked
+    // for, since `auto` and `bypass` run code the project supplies.
+    let held_back = policy.mode() != policy.wanted();
+    let interactive = !args.headless && args.workflow.is_none();
+    let trust_gate = (held_back && interactive).then(|| app::TrustGate {
+        root: cwd.display().to_string(),
+        rules: policy.repo_rules(),
+        mode: policy.wanted(),
+    });
+    if trust_gate.is_none() {
+        notices.extend(policy.trust_notice());
+    }
+    // Nothing will ask, so say why the mode is not the one that was asked for.
+    if held_back && !interactive {
+        notices.push(format!(
+            "{} mode needs this project trusted; running in {}. Start with --trust to \
+allow it.",
+            policy.wanted(),
+            policy.mode()
+        ));
+    }
     if identity.name != identity::DEFAULT {
         notices.insert(
             0,
@@ -287,6 +308,7 @@ async fn main() -> Result<()> {
         &history,
         prompts,
         workflows,
+        trust_gate,
     )
     .await;
     release_modes(mouse, paste, keyboard);
@@ -860,6 +882,7 @@ async fn run(
     history: &[serde_json::Value],
     prompts: input::History,
     workflows: workflow::Found,
+    trust_gate: Option<app::TrustGate>,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -904,6 +927,7 @@ async fn run(
     app.mcp = hub;
     app.workflows = workflows;
     app.history = prompts;
+    app.trust_gate = trust_gate;
     {
         let mut entries = app.entries();
         entries.restore(history);

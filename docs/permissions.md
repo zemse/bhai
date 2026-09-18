@@ -6,19 +6,42 @@ included, since they all share the session's policy.
 
 ## Modes
 
-- `ask`: every call that changes something prompts
+- `ask`: every call that changes something prompts. The only mode an untrusted project
+  has
 - `auto`: allow rules and read-only commands (`ls`, `cat`, `grep`, `sed -n`, `git status`,
   and friends) run, plus the relaxations below; what is left goes to the judge. The
-  default
+  default, once the project is trusted
 - `bypass`: everything runs, except ask rules and protected paths, which still prompt
 
 Start in one with `bhai --mode ask`, or set `permission_mode` in the global config.
 `shift+tab` cycles the mode in the tui, `POST /mode` sets it over the debug server.
 `/permissions` prints the current mode, every rule and the file it came from.
 
+## Trusting a project
+
+Opening bhai in a project the trust store does not know asks, before anything else runs:
+
+```
+┌ do you trust this folder? ───────────────────────────────────┐
+│/Users/z/code/ripgrep                                         │
+│auto mode writes inside this project and runs its build and   │
+│test commands without asking, and the judge decides the rest. │
+│That runs code this project supplies.                         │
+│                                                              │
+│[y] trust it, use auto mode   [n]o, stay in ask mode          │
+└──────────────────────────────────────────────────────────────┘
+```
+
+`y` records the project in `trust.json` and puts the session in the mode the config asked
+for. `n` leaves it in `ask`, where every change prompts; `/trust` can still change that
+once you have looked at the code. Until the answer is yes, `auto` and `bypass` are not on
+offer at all: `shift+tab` stays on `ask`, `POST /mode` reports back the mode actually in
+force, and `--mode auto` without `--trust` starts in `ask` with a notice. The answer is
+remembered per project and asked again whenever its settings files change.
+
 ## What `auto` runs by itself
 
-`auto` mode also runs, with no rule of its own:
+`auto` mode in a trusted project also runs, with no rule of its own:
 
 - writes and edits whose target is inside the project root, once `..` and symlinks are
   resolved. A protected path, a path outside the root and anything a `deny` or `ask` rule
@@ -28,14 +51,15 @@ Start in one with `bhai --mode ask`, or set `permission_mode` in the global conf
   `go build|test`, `make`, `just`. An argument naming a path outside the project, a
   `--config` flag, `sudo` or anything the tokenizer refuses drops back to a prompt
 
-Choosing `auto` is the consent for these: they do not wait on the trust step, which
-governs the allow rules a repo ships and nothing else. `ask` mode gets none of them.
-Turn each off with `auto_project_writes = false` and `auto_project_commands = false`; a
-project config file may turn them off but never on. `/permissions` prints which apply.
+These run the project's own code, which is what trusting a project means, so an untrusted
+project gets none of them and cannot be in `auto` in the first place. `ask` mode gets none
+of them either. Turn each off with `auto_project_writes = false` and
+`auto_project_commands = false`; a project config file may turn them off but never on.
+`/permissions` prints which apply.
 
 ## The judge
 
-What is left in `auto` is every call no rule names: an unknown
+What is left in `auto` in a trusted project is every call no rule names: an unknown
 binary, a write the relaxations do not cover, an MCP tool. Rather than prompt for each,
 a small model call decides whether the call is a reasonable step toward the task you
 actually asked for and whether its blast radius stays inside the project. It answers

@@ -157,8 +157,10 @@ async fn interrupt(State(session): State<Arc<Session>>) -> Response {
 }
 
 async fn mode(State(session): State<Arc<Session>>, Json(body): Json<ModeBody>) -> Response {
-    session.set_mode(body.mode);
-    Json(json!({ "ok": true, "mode": body.mode })).into_response()
+    // An untrusted project only has `ask`, so the mode in force may not be the one asked
+    // for. The reply says which it is rather than pretending.
+    let mode = session.set_mode(body.mode);
+    Json(json!({ "ok": true, "mode": mode })).into_response()
 }
 
 async fn context(State(session): State<Arc<Session>>) -> Response {

@@ -350,17 +350,19 @@ impl Session {
     }
 
     /// Switch the permission mode. The prompt and tools stay as they are.
-    pub fn set_mode(&self, mode: Mode) {
+    /// Set the mode, as far as trust allows, and return the mode now in force.
+    pub fn set_mode(&self, mode: Mode) -> Mode {
         let _inner = self.lock();
-        self.policy.set_mode(mode);
+        let mode = self.policy.set_mode(mode);
         self.publish(Event::Mode(mode));
+        mode
     }
 
-    /// Move to the next permission mode and return it.
+    /// Move to the next permission mode the project may be in, and return it. In an
+    /// untrusted project that is `ask` and stays `ask`.
     pub fn cycle_mode(&self) -> Mode {
         let _inner = self.lock();
-        let mode = self.policy.mode().next();
-        self.policy.set_mode(mode);
+        let mode = self.policy.set_mode(self.policy.next_mode());
         self.publish(Event::Mode(mode));
         mode
     }
@@ -379,12 +381,17 @@ impl Session {
 
     /// Honour the repo-supplied allow rules, for `/trust`.
     pub fn trust(&self) -> anyhow::Result<String> {
-        self.policy.trust()
+        let notice = self.policy.trust()?;
+        // Trusting the project lets it into the mode the config asked for.
+        self.publish(Event::Mode(self.policy.mode()));
+        Ok(notice)
     }
 
     /// Stop honouring the repo-supplied allow rules, for `/untrust`.
     pub fn untrust(&self) -> anyhow::Result<String> {
-        self.policy.untrust()
+        let notice = self.policy.untrust()?;
+        self.publish(Event::Mode(self.policy.mode()));
+        Ok(notice)
     }
 
     /// Summarise the history now, as a turn of its own, unless one is already running.

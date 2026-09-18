@@ -1968,7 +1968,7 @@ mod tests {
 
         // The mode is not in the request, so cycling through all of them appends as usual.
         assert_eq!(policy.mode(), Mode::Ask);
-        policy.set_mode(policy.mode().next());
+        policy.set_mode(policy.next_mode());
         assert_eq!(policy.mode(), Mode::Auto);
 
         let events = turn("delegate", &[]).await;
@@ -1984,12 +1984,12 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("not connected")))
         );
 
-        policy.set_mode(policy.mode().next());
+        policy.set_mode(policy.next_mode());
         assert_eq!(policy.mode(), Mode::Bypass);
         // `touch` is not read-only, so bypass runs it and ask prompts for it.
         turn("write one", &[]).await;
         assert!(bypassed.exists());
-        policy.set_mode(policy.mode().next());
+        policy.set_mode(policy.next_mode());
         assert_eq!(policy.mode(), Mode::Ask);
         turn("write another", &[accept]).await;
         assert!(asked.exists());

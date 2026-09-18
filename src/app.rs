@@ -92,6 +92,19 @@ impl Selection {
     }
 }
 
+/// The question asked on opening a project the trust store does not know. Until it is
+/// answered the session is in `ask` mode, since `auto` and `bypass` run code this
+/// project supplies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrustGate {
+    /// The project root, as the store keys it.
+    pub root: String,
+    /// Allow rules this project's own settings files ship.
+    pub rules: usize,
+    /// The mode answering yes puts the session in.
+    pub mode: Mode,
+}
+
 /// Word, whitespace or punctuation: a double click takes the run of one class.
 fn class(c: char) -> u8 {
     match c {
@@ -150,6 +163,8 @@ pub struct App {
     pub judging: Option<String>,
     /// The tool call waiting for approval.
     pub pending: Option<Approval>,
+    /// The trust question, until it is answered.
+    pub trust_gate: Option<TrustGate>,
     pub scroll: usize,
     pub max_scroll: usize,
     /// Transcript viewport height, filled in by the renderer so page keys match the view.
@@ -188,7 +203,7 @@ pub struct App {
 impl App {
     pub fn new(session: Arc<Session>) -> Self {
         session.entries().push(Entry::Info(
-            "bhai · bash, read, write and edit. Auto mode: reads, project writes and build commands run, the judge decides the rest, anything risky asks. shift+tab changes that. Type a task and hit enter."
+            "bhai · bash, read, write and edit. The mode on the prompt's border says what runs without asking; shift+tab changes it, / lists the commands. Type a task and hit enter."
                 .to_string(),
         ));
         Self {
@@ -218,6 +233,7 @@ impl App {
             queued: 0,
             judging: None,
             pending: None,
+            trust_gate: None,
             scroll: 0,
             max_scroll: 0,
             page: 10,
@@ -250,6 +266,18 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        // The trust question is modal and comes first: the mode it decides governs every
+        // approval after it.
+        if self.trust_gate.is_some() {
+            match key.code {
+                KeyCode::Char('y') => self.answer_trust(true),
+                KeyCode::Char('n') | KeyCode::Esc => self.answer_trust(false),
+                KeyCode::Char('c') | KeyCode::Char('d') if ctrl => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
 
         // An approval is modal: nothing else happens until it is answered.
         if self.pending.is_some() {
@@ -313,7 +341,18 @@ impl App {
             KeyCode::Char('y') if ctrl => self.copy(),
             KeyCode::Char('v') if ctrl => self.paste(),
             KeyCode::Char('a') if ctrl && !self.input.is_empty() => self.input.select_all(),
-            KeyCode::BackTab => self.mode = self.session.cycle_mode(),
+            KeyCode::BackTab => {
+                let mode = self.session.cycle_mode();
+                // The only mode on offer in an untrusted project is `ask`, so say why.
+                if mode == self.mode && mode == Mode::Ask {
+                    self.follow = true;
+                    self.note(Entry::Info(
+                        "ask is the only mode here until you trust this project: /trust"
+                            .to_string(),
+                    ));
+                }
+                self.mode = mode;
+            }
             // Most terminals cannot report shift+enter, so alt+enter and ctrl+j also work.
             KeyCode::Enter if !key.modifiers.is_empty() => self.input.newline(),
             KeyCode::Char('j') if ctrl => self.input.newline(),
@@ -934,6 +973,26 @@ impl App {
         self.session.entries().push(entry);
     }
 
+    /// Answer the trust question. Yes records the project and lets it into the mode the
+    /// config asked for; no leaves it in `ask`, and `/trust` can still change that later.
+    fn answer_trust(&mut self, trust: bool) {
+        let Some(gate) = self.trust_gate.take() else {
+            return;
+        };
+        if !trust {
+            self.note(Entry::Info(format!(
+                "not trusted: {} stays in ask mode. /trust when you have looked at it.",
+                gate.root
+            )));
+            return;
+        }
+        match self.session.trust() {
+            // `Event::Mode` follows and sets the mode; this only says what happened.
+            Ok(text) => self.note(Entry::Info(text)),
+            Err(e) => self.note(Entry::Error(format!("{e:#}"))),
+        }
+    }
+
     /// A remember key does nothing unless the prompt offers that rule.
     fn answer(&mut self, answer: Answer) {
         let Some(pending) = &self.pending else {
@@ -1444,6 +1503,45 @@ mod tests {
             source: "~/.claude/skills".to_string(),
         }];
         app
+    }
+
+    #[test]
+    fn the_trust_question_is_modal_and_answered_with_one_key() {
+        let gate = || {
+            Some(TrustGate {
+                root: "/repo".to_string(),
+                rules: 0,
+                mode: Mode::Auto,
+            })
+        };
+        let mut app = App::detached();
+        app.trust_gate = gate();
+        // Nothing else reaches the app while it is up.
+        type_text(&mut app, "hello");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.input.is_empty());
+        assert!(app.trust_gate.is_some());
+
+        app.on_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(app.trust_gate, None);
+        assert!(
+            matches!(app.entries().list.last(), Some(Entry::Info(t)) if t.starts_with("not trusted: /repo")),
+            "{:?}",
+            app.entries().list.last()
+        );
+        // Answered: the prompt takes keys again.
+        type_text(&mut app, "hi");
+        assert_eq!(app.input.value(), "hi");
+
+        // Esc is a no, and ctrl+c still leaves.
+        let mut app = App::detached();
+        app.trust_gate = gate();
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.trust_gate, None);
+        let mut app = App::detached();
+        app.trust_gate = gate();
+        app.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
     }
 
     #[test]

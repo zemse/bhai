@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
 use std::ops::Range;
 use std::time::Duration;
 
-use crate::app::{App, Entry};
+use crate::app::{App, Entry, TrustGate};
 use crate::client::Usage;
 use crate::commands::{self, Item};
 use crate::input::Row;
@@ -33,6 +33,25 @@ const COPIED_FOR: Duration = Duration::from_secs(3);
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    // The trust question takes the bottom area before anything else can, sized to what
+    // it has to say.
+    if let Some(gate) = app.trust_gate.clone() {
+        let width = frame.area().width.saturating_sub(4).max(10) as usize;
+        let body = wrap(&trust_text(&gate), width).len() as u16;
+        let height = (body + 5).min(frame.area().height.saturating_sub(2)).max(4);
+        let [status_area, transcript_area, bottom_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(height),
+        ])
+        .areas(frame.area());
+        render_status(frame, status_area, app);
+        render_transcript(frame, transcript_area, app);
+        app.input_area = None;
+        app.buttons.clear();
+        render_trust(frame, bottom_area, &gate);
+        return;
+    }
     let approval_height = app
         .pending
         .as_ref()
@@ -683,6 +702,53 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|(spot, k)| (spot.intersection(inner), KeyCode::Char(k)))
         .filter(|(spot, _)| !spot.is_empty())
         .collect();
+}
+
+/// What trusting this project would let it do.
+fn trust_text(gate: &TrustGate) -> String {
+    let mut out = format!(
+        "{} mode writes inside this project and runs its build and test commands \
+without asking, and the judge decides the rest. That runs code this project supplies.",
+        gate.mode
+    );
+    if gate.rules > 0 {
+        out.push_str(&format!(
+            " It also honours the {} allow rules the project's own settings files ship.",
+            gate.rules
+        ));
+    }
+    out
+}
+
+/// The question asked on opening a project the trust store does not know.
+fn render_trust(frame: &mut Frame, area: Rect, gate: &TrustGate) {
+    let block = Block::bordered()
+        .title(" do you trust this folder? ")
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let what = trust_text(gate);
+    let key = |k: &'static str, color| Span::styled(k, Style::new().fg(color).bold());
+    let mut lines = vec![Line::from(Span::styled(
+        gate.root.clone(),
+        Style::new().fg(Color::Yellow),
+    ))];
+    lines.extend(
+        wrap(&what, inner.width.max(4) as usize)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::DarkGray)))),
+    );
+    lines.truncate(inner.height.saturating_sub(2) as usize);
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        key("[y]", Color::Green),
+        Span::raw(format!(" trust it, use {} mode   ", gate.mode)),
+        key("[n]", Color::Red),
+        Span::raw("o, stay in ask mode"),
+    ]));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Greedy word wrap that keeps existing newlines and never loses characters.
@@ -1445,5 +1511,38 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(2, y)].bg, Color::Reset);
         assert_eq!(buffer[(2, y + 1)].bg, Color::Cyan);
+    }
+
+    #[test]
+    fn the_trust_question_takes_the_prompt_until_it_is_answered() {
+        let mut app = App::detached();
+        app.trust_gate = Some(TrustGate {
+            root: "/Users/z/code/ripgrep".to_string(),
+            rules: 2,
+            mode: Mode::Auto,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        for part in [
+            "do you trust this folder?",
+            "/Users/z/code/ripgrep",
+            "writes inside this project",
+            "2 allow rules",
+            "[y] trust it, use auto mode",
+            "[n]o, stay in ask mode",
+        ] {
+            assert!(shown.contains(part), "{part} missing from {shown}");
+        }
+        // No prompt to type into while the question is up.
+        assert!(app.input_area.is_none());
+        assert!(!shown.contains("\u{203a} "), "{shown}");
+
+        // The whole sentence fits, however narrow the terminal.
+        let mut narrow = Terminal::new(TestBackend::new(34, 24)).unwrap();
+        narrow.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&narrow);
+        assert!(shown.contains("ship."), "{shown}");
+        assert!(shown.contains("[y] trust"), "{shown}");
     }
 }
