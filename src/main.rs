@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event as TermEvent, KeyEvent, KeyboardEnhancementFlags, MouseEvent,
@@ -105,11 +105,22 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // `bhai --judge-eval [file]` scores the judge against a file of cases.
+    if args.first().is_some_and(|a| a == "--judge-eval") {
+        let (prompt, .., settings) = load(Flags::default(), identity::DEFAULT).await?;
+        let hub = prompt.mcp.clone();
+        let result = judge_eval(prompt, settings, args.get(1).cloned()).await;
+        shutdown(hub).await;
+        if !result? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let args = match parse_args(&args) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
@@ -799,6 +810,31 @@ fn cache_table(rows: &[CacheRow]) -> String {
         ));
     }
     table
+}
+
+/// The cases `--judge-eval` reads when it is given no file.
+const JUDGE_CASES: &str = "tests/fixtures/judge-cases.jsonl";
+
+/// Run a file of cases through the real judge, exactly as the approval path decides on
+/// it, and score every verdict against what the case expected. `false` when any case
+/// came back wrong, so the command's exit status is the score.
+async fn judge_eval(
+    system: SystemPrompt,
+    settings: judge::Settings,
+    path: Option<String>,
+) -> Result<bool> {
+    let path = PathBuf::from(path.unwrap_or_else(|| JUDGE_CASES.to_string()));
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let cases = judge::cases(&text)?;
+    let client = client::Client::new()?.with_overrides(
+        system.identity.model.clone(),
+        system.identity.effort.clone(),
+    );
+    let backend = ModelJudge::new(client, &settings);
+    let outcomes = judge::eval(&backend, &cases, settings.timeout).await;
+    print!("{}", judge::report(&outcomes));
+    Ok(outcomes.iter().all(judge::Outcome::correct))
 }
 
 fn cache_check_passed(rows: &[CacheRow]) -> bool {
