@@ -13,6 +13,7 @@ use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::client::Usage;
+use crate::clipboard;
 use crate::diff::DiffView;
 use crate::entries::Entries;
 pub use crate::entries::Entry;
@@ -45,6 +46,8 @@ pub struct App {
     pub scrollbar: Option<Rect>,
     /// A left drag that started on the scrollbar is in progress.
     dragging: bool,
+    /// A left drag that started in the input is selecting text.
+    selecting: bool,
     pub input: Editor,
     /// Submitted prompts, for `ctrl+p` and `ctrl+n`.
     pub history: History,
@@ -101,6 +104,7 @@ impl App {
             input_area: None,
             scrollbar: None,
             dragging: false,
+            selecting: false,
             input: Editor::default(),
             history: History::default(),
             working: false,
@@ -135,6 +139,7 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         // An approval is modal: nothing else happens until it is answered.
         if self.pending.is_some() {
@@ -171,6 +176,9 @@ impl App {
             KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
             KeyCode::Esc if self.working => self.interrupt(),
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
+            KeyCode::Char('y') if ctrl => self.copy(),
+            KeyCode::Char('v') if ctrl => self.paste(),
+            KeyCode::Char('a') if ctrl && !self.input.is_empty() => self.input.select_all(),
             KeyCode::BackTab => self.mode = self.session.cycle_mode(),
             // Most terminals cannot report shift+enter, so alt+enter and ctrl+j also work.
             KeyCode::Enter if !key.modifiers.is_empty() => self.input.newline(),
@@ -192,16 +200,18 @@ impl App {
             // unless the input has lines to move between.
             // Up and down move within the input whenever it draws on more than one row.
             KeyCode::Up if self.input_rows() > 1 => {
+                self.input.selecting(shift);
                 self.input.move_line(-1, self.input_width());
             }
             KeyCode::Down if self.input_rows() > 1 => {
+                self.input.selecting(shift);
                 self.input.move_line(1, self.input_width());
             }
             KeyCode::Up => self.scroll_by(-1),
             KeyCode::Down => self.scroll_by(1),
             _ => {
                 if let Some(request) = input_request(key) {
-                    self.input.handle(request);
+                    self.input.handle(request, shift);
                 }
             }
         }
@@ -235,8 +245,12 @@ impl App {
                 return self.click(mouse.column, mouse.row);
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging => self.drag_to(mouse.row),
+            MouseEventKind::Drag(MouseButton::Left) if self.selecting => {
+                return self.select_to(mouse.column, mouse.row);
+            }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.dragging = false;
+                self.selecting = false;
                 return false;
             }
             _ => return false,
@@ -263,8 +277,10 @@ impl App {
             if self.input.is_empty() {
                 return false;
             }
+            self.input.selecting(false);
             let row = top + (y - area.y) as usize;
             self.input.place(row, (x - area.x) as usize, width);
+            self.selecting = true;
             return true;
         }
         let Some(entry) = self.entry_at(y) else {
@@ -282,6 +298,51 @@ impl App {
             set.insert(entry);
         }
         true
+    }
+
+    /// Extend the input's selection to the char under the pointer. The anchor lands on
+    /// the char the drag started at, since the cursor is still there.
+    /// Returns whether the screen needs a redraw.
+    fn select_to(&mut self, x: u16, y: u16) -> bool {
+        let Some((area, top, width)) = self.input_area else {
+            return false;
+        };
+        self.input.selecting(true);
+        let row = top + y.saturating_sub(area.y) as usize;
+        self.input
+            .place(row, x.saturating_sub(area.x) as usize, width);
+        true
+    }
+
+    /// What `ctrl+y` copies: the selection, or the whole input when there is none.
+    fn copy_text(&self) -> String {
+        self.input
+            .selected()
+            .unwrap_or_else(|| self.input.value().to_string())
+    }
+
+    /// `ctrl+y`: copy the selection, or the whole input when nothing is selected.
+    fn copy(&mut self) {
+        let text = self.copy_text();
+        if text.is_empty() {
+            return;
+        }
+        let chars = text.chars().count();
+        match clipboard::copy(&text) {
+            Ok(()) => self.note(Entry::Info(format!("copied {chars} chars"))),
+            Err(err) => self.note(Entry::Error(format!("copy failed: {err}"))),
+        }
+    }
+
+    /// `ctrl+v`: insert what a clipboard command reads back. The terminal's own paste
+    /// arrives as a bracketed paste instead, which needs no clipboard command.
+    fn paste(&mut self) {
+        match clipboard::paste() {
+            Some(text) => self.input.insert(&text),
+            None => self.note(Entry::Info(
+                "no clipboard reader here; use the terminal's own paste".to_string(),
+            )),
+        }
     }
 
     /// Scroll in proportion to where row `y` sits on the scrollbar.
@@ -585,13 +646,15 @@ fn diff_mouse(diff: &mut DiffView, mouse: MouseEvent) -> bool {
     true
 }
 
-/// tui-input's crossterm mapping covers readline keys and `ctrl+arrow`, but not the
-/// escape sequences macOS terminals send for `option+arrow` and `cmd+arrow`. Those are
-/// mapped here first; everything else falls through to tui-input.
+/// tui-input's crossterm mapping covers readline keys and `ctrl+arrow`, but it matches
+/// the modifiers exactly, so it has nothing for the escape sequences macOS terminals
+/// send for `option+arrow` and `cmd+arrow`, nor for a cursor key held with shift. Those
+/// are mapped here first; everything else falls through to tui-input.
 fn input_request(key: KeyEvent) -> Option<InputRequest> {
     let alt =
         key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::META);
     let cmd = key.modifiers.contains(KeyModifiers::SUPER);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     let mapped = match key.code {
         // option+arrow: `\e[1;3D` in most terminals, `\eb` when option is sent as meta.
@@ -603,6 +666,11 @@ fn input_request(key: KeyEvent) -> Option<InputRequest> {
         KeyCode::Left if cmd => Some(InputRequest::GoToStart),
         KeyCode::Right if cmd => Some(InputRequest::GoToEnd),
         KeyCode::Backspace if cmd => Some(InputRequest::DeleteLine),
+        // shift+cursor key: the same move, with the caller extending the selection.
+        KeyCode::Left if shift => Some(InputRequest::GoToPrevChar),
+        KeyCode::Right if shift => Some(InputRequest::GoToNextChar),
+        KeyCode::Home if shift => Some(InputRequest::GoToStart),
+        KeyCode::End if shift => Some(InputRequest::GoToEnd),
         _ => None,
     };
     mapped.or_else(|| to_input_request(&TermEvent::Key(key)))
@@ -695,6 +763,18 @@ mod tests {
     }
 
     #[test]
+    fn shift_maps_the_cursor_keys_tui_input_skips() {
+        for (code, want) in [
+            (KeyCode::Left, InputRequest::GoToPrevChar),
+            (KeyCode::Right, InputRequest::GoToNextChar),
+            (KeyCode::Home, InputRequest::GoToStart),
+            (KeyCode::End, InputRequest::GoToEnd),
+        ] {
+            assert_eq!(input_request(key(code, KeyModifiers::SHIFT)), Some(want));
+        }
+    }
+
+    #[test]
     fn readline_keys_still_work() {
         assert_eq!(
             input_request(key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
@@ -761,6 +841,27 @@ mod tests {
         app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
         app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.input.cursor_position(80), (1, 0));
+    }
+
+    #[test]
+    fn shift_arrows_select_and_ctrl_y_picks_what_to_copy() {
+        let mut app = App::detached();
+        app.on_key(key(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.on_key(key(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(app.copy_text(), "hi");
+        app.on_key(key(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(app.input.selected().as_deref(), Some("i"));
+        assert_eq!(app.copy_text(), "i");
+        // A move without shift drops the selection, so ctrl+y copies it all again.
+        app.on_key(key(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.input.selection(), None);
+        assert_eq!(app.copy_text(), "hi");
+        // ctrl+a takes the lot, and the next char typed replaces it.
+        app.on_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.copy_text(), "hi");
+        app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.input.value(), "x");
+        assert_eq!(app.input.selection(), None);
     }
 
     #[test]

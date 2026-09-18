@@ -10,6 +10,7 @@ use std::ops::Range;
 
 use crate::app::{App, Entry};
 use crate::client::Usage;
+use crate::input::Row;
 use crate::limits::{self, RateLimits};
 use crate::markdown;
 use crate::permissions::Mode;
@@ -386,17 +387,39 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
     let top = app.input.top(text_area.height.max(1) as usize, width);
     let (row, column) = app.input.cursor_position(width);
     app.input_area = Some((text_area, top, width));
+    let selection = app.input.selection();
     let rows: Vec<Line> = app
         .input
         .rows(width)
         .into_iter()
-        .map(|r| Line::raw(r.text))
+        .map(|r| input_row(r, selection.as_ref()))
         .collect();
     frame.render_widget(Paragraph::new(rows).scroll((top as u16, 0)), text_area);
     frame.set_cursor_position((
         (text_area.x + column as u16).min(text_area.right().saturating_sub(1)),
         text_area.y + (row - top) as u16,
     ));
+}
+
+/// One row of the input, with the part inside `selection` drawn reversed.
+fn input_row(row: Row, selection: Option<&Range<usize>>) -> Line<'static> {
+    let len = row.text.chars().count();
+    let Some(range) = selection else {
+        return Line::raw(row.text);
+    };
+    let start = range.start.saturating_sub(row.start).min(len);
+    let end = range.end.saturating_sub(row.start).min(len);
+    if start >= end {
+        return Line::raw(row.text);
+    }
+    let part = |from: usize, to: usize| -> String {
+        row.text.chars().skip(from).take(to - from).collect()
+    };
+    Line::from(vec![
+        Span::raw(part(0, start)),
+        Span::styled(part(start, end), Style::new().reversed()),
+        Span::raw(part(end, len)),
+    ])
 }
 
 /// The approval prompt. Each `[k]` choice is recorded in `app.buttons` so a click on
@@ -515,6 +538,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::style::Modifier;
 
     fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
         Usage {
@@ -670,6 +694,29 @@ mod tests {
                 row.trim_end().to_string() + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn the_selected_part_of_the_input_is_reversed() {
+        let mut app = App::detached();
+        app.input.set("hello".to_string());
+        app.input
+            .handle(tui_input::InputRequest::SetCursor(1), false);
+        app.input
+            .handle(tui_input::InputRequest::GoToNextChar, true);
+        app.input
+            .handle(tui_input::InputRequest::GoToNextChar, true);
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let selected: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(selected, "el");
     }
 
     fn approval(exact: Option<&str>) -> Approval {

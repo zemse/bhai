@@ -6,6 +6,7 @@ mod app;
 mod auth;
 mod cache;
 mod client;
+mod clipboard;
 mod compact;
 mod config;
 mod diff;

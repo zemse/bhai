@@ -1,6 +1,7 @@
 //! The prompt editor: multi-line text on top of tui-input, and the prompt history.
 
 use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -18,6 +19,8 @@ pub struct Editor {
     input: Input,
     /// The first line shown, kept between frames so the view only moves when it must.
     top: usize,
+    /// Where a selection started, as a char index; the cursor is its other end.
+    anchor: Option<usize>,
 }
 
 /// One row of the wrapped text: the char index it starts at, and what it shows.
@@ -61,15 +64,62 @@ impl Editor {
     pub fn set(&mut self, text: String) {
         self.input = Input::new(text);
         self.top = 0;
+        self.anchor = None;
     }
 
     /// Take the text, leaving the editor empty.
     pub fn take(&mut self) -> String {
         self.top = 0;
+        self.anchor = None;
         self.input.value_and_reset()
     }
 
-    pub fn handle(&mut self, request: InputRequest) {
+    /// The selected chars, when the anchor is set somewhere other than the cursor.
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let anchor = self.anchor?;
+        let cursor = self.cursor();
+        (anchor != cursor).then(|| anchor.min(cursor)..anchor.max(cursor))
+    }
+
+    /// The selected text.
+    pub fn selected(&self) -> Option<String> {
+        let range = self.selection()?;
+        Some(
+            self.value()
+                .chars()
+                .skip(range.start)
+                .take(range.len())
+                .collect(),
+        )
+    }
+
+    /// Anchor a selection at the cursor, or drop it, before a cursor move.
+    pub fn selecting(&mut self, on: bool) {
+        match on {
+            true => {
+                self.anchor.get_or_insert(self.cursor());
+            }
+            false => self.anchor = None,
+        }
+    }
+
+    /// Select the whole text, with the cursor at its end.
+    pub fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.move_to(self.value().chars().count());
+    }
+
+    /// Apply `request`; while `selecting`, a cursor move extends the selection rather
+    /// than dropping it. Typing or deleting over a selection replaces it.
+    pub fn handle(&mut self, request: InputRequest, selecting: bool) {
+        if moves(request) {
+            self.selecting(selecting);
+        } else if let Some(range) = self.take_selection() {
+            self.replace(range.start..range.end, "", range.start);
+            if !matches!(request, InputRequest::InsertChar(_)) {
+                return;
+            }
+        }
         let (start, end) = self.line_bounds();
         match request {
             InputRequest::GoToStart => self.move_to(start),
@@ -89,11 +139,15 @@ impl Editor {
         }
     }
 
-    /// Insert `text` at the cursor. Pasted line endings arrive as `\r` or `\r\n`.
+    /// Insert `text` at the cursor, over the selection when there is one. Pasted line
+    /// endings arrive as `\r` or `\r\n`.
     pub fn insert(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let cursor = self.cursor();
-        self.replace(cursor..cursor, &text, cursor + text.chars().count());
+        let range = self.take_selection().unwrap_or_else(|| {
+            let cursor = self.cursor();
+            cursor..cursor
+        });
+        self.replace(range.clone(), &text, range.start + text.chars().count());
     }
 
     pub fn newline(&mut self) {
@@ -200,12 +254,19 @@ impl Editor {
         (start, end)
     }
 
+    /// The selection, if any, dropping the anchor either way.
+    fn take_selection(&mut self) -> Option<Range<usize>> {
+        let range = self.selection();
+        self.anchor = None;
+        range
+    }
+
     fn move_to(&mut self, cursor: usize) {
         self.input.handle(InputRequest::SetCursor(cursor));
     }
 
     /// Replace the chars in `range` with `text` and put the cursor at `cursor`.
-    fn replace(&mut self, range: std::ops::Range<usize>, text: &str, cursor: usize) {
+    fn replace(&mut self, range: Range<usize>, text: &str, cursor: usize) {
         let value = self.value();
         let byte = |chars: usize| {
             value
@@ -217,6 +278,20 @@ impl Editor {
         let edited = format!("{}{text}{}", &value[..start], &value[end..]);
         self.input = Input::new(edited).with_cursor(cursor);
     }
+}
+
+/// Requests that only move the cursor, so they can extend a selection.
+fn moves(request: InputRequest) -> bool {
+    matches!(
+        request,
+        InputRequest::SetCursor(_)
+            | InputRequest::GoToPrevChar
+            | InputRequest::GoToNextChar
+            | InputRequest::GoToPrevWord
+            | InputRequest::GoToNextWord
+            | InputRequest::GoToStart
+            | InputRequest::GoToEnd
+    )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -342,11 +417,11 @@ mod tests {
     #[test]
     fn newline_splits_the_line_at_the_cursor() {
         let mut editor = editor("ab");
-        editor.handle(InputRequest::GoToPrevChar);
+        editor.handle(InputRequest::GoToPrevChar, false);
         editor.newline();
         assert_eq!(editor.value(), "a\nb");
         assert_eq!(editor.cursor_position(WIDE), (1, 0));
-        editor.handle(InputRequest::InsertChar('x'));
+        editor.handle(InputRequest::InsertChar('x'), false);
         assert_eq!(editor.value(), "a\nxb");
     }
 
@@ -393,10 +468,10 @@ mod tests {
         let mut editor = editor("the quick brown fox");
         assert_eq!(editor.cursor_position(10), (1, 9));
         // The space a row broke at belongs to the row before it.
-        editor.handle(InputRequest::SetCursor(9));
+        editor.handle(InputRequest::SetCursor(9), false);
         assert_eq!(editor.cursor_position(10), (0, 9));
         // Up moves between wrapped rows, not just between typed lines.
-        editor.handle(InputRequest::GoToEnd);
+        editor.handle(InputRequest::GoToEnd, false);
         assert!(editor.move_line(-1, 10));
         assert_eq!(editor.cursor(), 9);
         editor.place(1, 5, 10);
@@ -404,15 +479,56 @@ mod tests {
     }
 
     #[test]
+    fn shift_extends_the_selection_and_a_plain_move_drops_it() {
+        let mut editor = editor("hello");
+        editor.handle(InputRequest::GoToStart, false);
+        assert_eq!(editor.selection(), None);
+        editor.handle(InputRequest::GoToNextChar, true);
+        editor.handle(InputRequest::GoToNextChar, true);
+        assert_eq!(editor.selection(), Some(0..2));
+        assert_eq!(editor.selected().as_deref(), Some("he"));
+        // Back onto the anchor leaves nothing selected, but keeps the anchor.
+        editor.handle(InputRequest::GoToPrevChar, true);
+        editor.handle(InputRequest::GoToPrevChar, true);
+        assert_eq!(editor.selection(), None);
+        editor.handle(InputRequest::GoToEnd, true);
+        assert_eq!(editor.selected().as_deref(), Some("hello"));
+        editor.handle(InputRequest::GoToStart, false);
+        assert_eq!(editor.selection(), None);
+    }
+
+    #[test]
+    fn typing_and_pasting_replace_the_selection() {
+        let mut editor = editor("one two");
+        editor.select_all();
+        assert_eq!(editor.selected().as_deref(), Some("one two"));
+        editor.handle(InputRequest::InsertChar('x'), false);
+        assert_eq!((editor.value(), editor.cursor()), ("x", 1));
+        assert_eq!(editor.selection(), None);
+
+        // Backspace over a selection deletes just the selection.
+        editor.set("one two".to_string());
+        editor.handle(InputRequest::SetCursor(4), false);
+        editor.handle(InputRequest::GoToEnd, true);
+        editor.handle(InputRequest::DeletePrevChar, false);
+        assert_eq!((editor.value(), editor.cursor()), ("one ", 4));
+
+        editor.set("one two".to_string());
+        editor.select_all();
+        editor.insert("three");
+        assert_eq!((editor.value(), editor.cursor()), ("three", 5));
+    }
+
+    #[test]
     fn line_keys_act_on_the_cursor_line() {
         let mut editor = editor("one\ntwo");
-        editor.handle(InputRequest::GoToStart);
+        editor.handle(InputRequest::GoToStart, false);
         assert_eq!(editor.cursor(), 4);
-        editor.handle(InputRequest::GoToPrevChar);
-        editor.handle(InputRequest::DeleteTillEnd);
+        editor.handle(InputRequest::GoToPrevChar, false);
+        editor.handle(InputRequest::DeleteTillEnd, false);
         assert_eq!(editor.value(), "onetwo");
         editor.set("one\ntwo".to_string());
-        editor.handle(InputRequest::DeleteLine);
+        editor.handle(InputRequest::DeleteLine, false);
         assert_eq!((editor.value(), editor.cursor()), ("one\n", 4));
     }
 
