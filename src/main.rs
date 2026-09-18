@@ -7,6 +7,7 @@ mod auth;
 mod cache;
 mod client;
 mod clipboard;
+mod commands;
 mod compact;
 mod config;
 mod diff;

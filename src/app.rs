@@ -15,6 +15,7 @@ use tui_input::backend::crossterm::to_input_request;
 
 use crate::client::Usage;
 use crate::clipboard;
+use crate::commands::{self, Item};
 use crate::diff::DiffView;
 use crate::entries::Entries;
 pub use crate::entries::Entry;
@@ -135,6 +136,8 @@ pub struct App {
     /// Mouse capture is on; `/mouse` turns it off for the terminal's own selection.
     pub mouse: bool,
     pub input: Editor,
+    /// The `/` menu's highlighted row, while the menu is open.
+    pub menu: Option<usize>,
     /// Submitted prompts, for `ctrl+p` and `ctrl+n`.
     pub history: History,
     pub working: bool,
@@ -203,6 +206,7 @@ impl App {
             clicks: None,
             mouse: true,
             input: Editor::default(),
+            menu: None,
             history: History::default(),
             working: false,
             queued: 0,
@@ -264,6 +268,29 @@ impl App {
             return;
         }
 
+        // The `/` menu takes the keys that move and accept a row; everything else goes
+        // on editing the prompt, which reopens the menu on the next keystroke.
+        if let Some(selected) = self.menu {
+            let rows = self.menu_items().len();
+            match key.code {
+                KeyCode::Up => {
+                    self.menu = Some((selected + rows - 1) % rows);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.menu = Some((selected + 1) % rows);
+                    return;
+                }
+                KeyCode::Tab => return self.accept_menu(false),
+                KeyCode::Enter if key.modifiers.is_empty() => return self.accept_menu(true),
+                KeyCode::Esc => {
+                    self.menu = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('c') if ctrl => {
                 if self.working {
@@ -315,12 +342,44 @@ impl App {
                 }
             }
         }
+        self.refresh_menu();
     }
 
     /// Bracketed paste: the text goes into the input as typed, newlines and all.
     pub fn on_paste(&mut self, text: &str) {
         if self.pending.is_none() && self.diff.is_none() {
             self.input.insert(text);
+            self.refresh_menu();
+        }
+    }
+
+    /// The menu rows for what is typed; empty whenever the menu is shut.
+    pub fn menu_items(&self) -> Vec<Item> {
+        match self.menu {
+            Some(_) => commands::matches(self.input.value(), &self.skills),
+            None => Vec::new(),
+        }
+    }
+
+    /// Open the menu on anything that matches, keeping the highlighted row in range.
+    /// An edit that matches nothing shuts it, and the next one can open it again.
+    fn refresh_menu(&mut self) {
+        let rows = commands::matches(self.input.value(), &self.skills).len();
+        self.menu = (rows > 0).then(|| self.menu.unwrap_or(0).min(rows - 1));
+    }
+
+    /// Enter or tab on a menu row: the command goes into the input, and one that takes
+    /// no further input runs straight away.
+    fn accept_menu(&mut self, run: bool) {
+        let items = self.menu_items();
+        let Some(item) = self.menu.and_then(|row| items.get(row)) else {
+            return;
+        };
+        let more = item.takes_input();
+        self.input.set(item.label() + if more { " " } else { "" });
+        self.menu = None;
+        if run && !more {
+            self.submit();
         }
     }
 
@@ -637,8 +696,27 @@ impl App {
         }
         let message = self.input.take().trim().to_string();
         self.selection = None;
+        self.menu = None;
         if let Err(e) = self.history.push(&message) {
             self.note(Entry::Error(format!("could not save prompt history: {e}")));
+        }
+        if message == "/help" {
+            self.follow = true;
+            self.note(Entry::Info(commands::help()));
+            return;
+        }
+        if message == "/quit" || message == "/exit" {
+            self.quit = true;
+            return;
+        }
+        if message == "/tokens" {
+            self.all_badges = !self.all_badges;
+            return;
+        }
+        if message == "/copy" {
+            self.follow = true;
+            self.copy();
+            return;
         }
         if message == "/diff" {
             let dir = std::env::current_dir().unwrap_or_default();
@@ -717,6 +795,21 @@ impl App {
             self.queue(rest.trim());
             return;
         }
+        // `/<skill>` is the one slash form that reaches the model: it asks for the skill
+        // by name, and the agent loads it through the `skill` tool.
+        let message = match command(&message) {
+            Some((name, input)) if commands::skill(name, &self.skills).is_some() => {
+                commands::skill_prompt(name, input)
+            }
+            Some((name, _)) => {
+                self.follow = true;
+                self.note(Entry::Error(format!(
+                    "no command or skill called /{name}. Type / to see what there is."
+                )));
+                return;
+            }
+            None => message,
+        };
         // The transcript entry arrives back as `Event::User` once the session accepts it.
         if let Err(e) = self.session.submit(message) {
             self.note(Entry::Error(e.to_string()));
@@ -830,6 +923,19 @@ impl App {
         self.follow = self.scroll >= self.max_scroll;
     }
 }
+/// A message the prompt box should read as `/<name> [input]` rather than send. A first
+/// word holding anything but a name's characters is left alone, so a prompt that opens
+/// with a path like `/usr/bin/env is missing` still reaches the model.
+fn command(message: &str) -> Option<(&str, &str)> {
+    let rest = message.strip_prefix('/')?;
+    let (name, input) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || "-_".contains(c));
+    plain.then(|| (name, input.trim()))
+}
+
 /// What `/as` prints. The identity is fixed for the session, so switching needs a new one.
 fn switch_notice(current: &str, name: &str) -> String {
     if name.is_empty() {
@@ -1266,5 +1372,103 @@ mod tests {
         assert_eq!(app.input.value(), "/permissions");
         app.on_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert_eq!(app.input.value(), "draft");
+    }
+
+    fn with_skill(name: &str) -> App {
+        let mut app = App::detached();
+        app.skills = vec![Skill {
+            name: name.to_string(),
+            description: "Does a thing.".to_string(),
+            dir: std::path::PathBuf::from("/s"),
+            source: "~/.claude/skills".to_string(),
+        }];
+        app
+    }
+
+    #[test]
+    fn the_slash_menu_opens_on_what_is_typed_and_closes_on_esc() {
+        let mut app = App::detached();
+        type_text(&mut app, "hi");
+        assert_eq!(app.menu, None);
+        type_text(&mut app, " /diff");
+        assert_eq!(app.menu, None, "a slash mid-prompt is just text");
+
+        let mut app = App::detached();
+        type_text(&mut app, "/qu");
+        assert_eq!(app.menu, Some(0));
+        let names: Vec<_> = app.menu_items().iter().map(|i| i.name.clone()).collect();
+        assert_eq!(names, ["queue", "quit"]);
+        app.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.menu, Some(1));
+        app.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.menu, Some(0), "it wraps round");
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.menu, None);
+        assert_eq!(app.input.value(), "/qu", "esc keeps what was typed");
+        type_text(&mut app, "e");
+        assert_eq!(app.menu, Some(0), "the next keystroke opens it again");
+    }
+
+    #[test]
+    fn enter_runs_the_highlighted_command_and_tab_only_completes_it() {
+        let mut app = App::detached();
+        type_text(&mut app, "/tok");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.all_badges, "/tokens ran");
+        assert!(app.input.is_empty());
+        assert_eq!(app.menu, None);
+
+        type_text(&mut app, "/wor");
+        app.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.value(), "/workflows");
+        assert_eq!(app.menu, None, "a completed name does not reopen the menu");
+
+        let mut app = App::detached();
+        type_text(&mut app, "/queu");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input.value(), "/queue ", "one that takes input waits");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(app.entries().list.last(), Some(Entry::Info(t)) if t.starts_with("queue:"))
+        );
+    }
+
+    #[test]
+    fn a_skill_is_offered_after_the_commands_and_sent_as_a_prompt() {
+        let mut app = with_skill("commit-helper");
+        type_text(&mut app, "/co");
+        let names: Vec<_> = app.menu_items().iter().map(|i| i.name.clone()).collect();
+        assert_eq!(names, ["compact", "context", "copy", "commit-helper"]);
+
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input.value(), "/commit-helper ");
+        type_text(&mut app, "only the staged files");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        // The detached session has no agent, so the prompt gets as far as the channel.
+        assert!(
+            !matches!(app.entries().list.last(), Some(Entry::Error(t)) if t.starts_with("no command")),
+            "the skill was recognised"
+        );
+    }
+
+    #[test]
+    fn an_unknown_slash_word_is_refused_but_a_path_is_not() {
+        let mut app = App::detached();
+        type_text(&mut app, "/nope");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(app.entries().list.last(), Some(Entry::Error(t)) if t.starts_with("no command or skill called /nope")),
+            "{:?}",
+            app.entries().list.last()
+        );
+
+        type_text(&mut app, "/usr/bin/env is missing");
+        assert_eq!(app.menu, None);
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            !matches!(app.entries().list.last(), Some(Entry::Error(t)) if t.starts_with("no command")),
+            "a path is a prompt, not a command"
+        );
     }
 }

@@ -13,6 +13,22 @@ dim in the transcript, the status bar counts what is waiting, and each one runs 
 of its own in the order it was typed. `/queue` lists them and `/queue clear` drops them;
 an interrupt drops them too, because stop means stop.
 
+## The command menu
+
+Typing `/` as the first character opens a menu above the prompt. It filters as the name
+is typed, `up`/`down` pick a row, `tab` completes the name and `enter` runs it, or leaves
+a trailing space when the command takes more input. `esc` shuts the menu without clearing
+what was typed, and the next keystroke opens it again.
+
+The session's skills are listed in the same menu after the commands, so `/<skill>
+[input]` is a prompt: it asks the agent to use that skill, which it then loads through
+the `skill` tool. A `/word` that is neither a command nor a skill is refused rather than
+sent; a first word that is not name-shaped, such as `/usr/bin/env is missing`, is a
+prompt like any other.
+
+The status bar carries only what the moment calls for (the interrupt key while a turn
+runs, the answer keys at an approval). Everything else is in `/help`.
+
 ## Keys
 
 | key | what it does |
@@ -20,7 +36,7 @@ an interrupt drops them too, because stop means stop.
 | `enter` | send |
 | `shift+enter`, `alt+enter`, `ctrl+j` | newline (most terminals cannot report shift+enter) |
 | `ctrl+p`, `ctrl+n` | previous and next prompt from the history |
-| `up`, `down` | scroll the transcript, or move between lines while the input is multi-line |
+| `up`, `down` | pick a row in the `/` menu, else scroll the transcript or move between the input's lines |
 | `pgup`, `pgdn` | scroll a page |
 | `shift+tab` | cycle the permission mode |
 | `ctrl+t` | show every token badge |
@@ -29,6 +45,7 @@ an interrupt drops them too, because stop means stop.
 | `esc` | interrupt the turn |
 | `ctrl+c` | interrupt the turn, or quit when idle |
 | `ctrl+d` | quit on an empty input |
+| `tab` | complete the highlighted command, while the `/` menu is open |
 
 At an approval prompt: `y` runs it once, `a` remembers that exact call, `p` remembers its
 prefix, and `n`, `r` or `esc` rejects.

@@ -10,6 +10,7 @@ use std::ops::Range;
 
 use crate::app::{App, Entry};
 use crate::client::Usage;
+use crate::commands::{self, Item};
 use crate::input::Row;
 use crate::limits::{self, RateLimits};
 use crate::markdown;
@@ -43,9 +44,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             app.input.rows(width).len().min(MAX_INPUT_LINES) as u16 + 2
         });
 
-    let [status_area, transcript_area, bottom_area] = Layout::vertical([
+    // The `/` menu stands between the transcript and the prompt, and only while the
+    // prompt is what the user is looking at.
+    let items = match app.pending.is_some() || app.diff.is_some() {
+        true => Vec::new(),
+        false => app.menu_items(),
+    };
+    let menu_height = match items.len() {
+        0 => 0,
+        rows => rows.min(commands::MAX_ROWS) as u16 + 2,
+    };
+
+    let [status_area, transcript_area, menu_area, bottom_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(menu_height),
         Constraint::Length(approval_height),
     ])
     .areas(frame.area());
@@ -70,6 +83,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
     render_transcript(frame, transcript_area, app);
+    if menu_height > 0 {
+        render_menu(frame, menu_area, &items, app.menu.unwrap_or(0));
+    }
     if app.pending.is_some() {
         app.input_area = None;
         render_approval(frame, bottom_area, app);
@@ -134,7 +150,8 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
         } else if app.working {
             "  ctrl+c interrupt"
         } else {
-            "  enter send · wheel/pgup scroll · drag to select · ctrl+y copy · click expands output · ctrl+t tokens · ctrl+c quit"
+            // The rest of the keys live in /help rather than across the top bar.
+            "  / for commands"
         },
         dim,
     ));
@@ -429,6 +446,63 @@ fn mode_chip(mode: Mode) -> Line<'static> {
         Mode::Bypass => Style::new().fg(Color::Red),
     };
     Line::styled(format!(" {mode} · shift+tab "), style).right_aligned()
+}
+
+/// The `/` menu: one row per command or skill, the highlighted one reversed, scrolled
+/// so the highlighted row stays in view.
+fn render_menu(frame: &mut Frame, area: Rect, items: &[Item], selected: usize) {
+    let block = Block::bordered()
+        .border_style(Style::new().fg(Color::DarkGray))
+        .title_bottom(
+            Line::styled(
+                " ↑↓ pick · tab complete · esc close ",
+                Style::new().fg(Color::DarkGray),
+            )
+            .right_aligned(),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let rows = inner.height as usize;
+    let top = selected
+        .saturating_sub(rows.saturating_sub(1))
+        .min(items.len().saturating_sub(rows));
+    let width = inner.width as usize;
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(rows)
+        .map(|(i, item)| menu_row(item, width, i == selected))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One menu row: `/name args` padded out, then the help text.
+fn menu_row(item: &Item, width: usize, selected: bool) -> Line<'static> {
+    let name = format!("{}{}", item.label(), item.args);
+    let mut text = format!(" {name:<22} {}", item.help);
+    text.truncate(
+        text.char_indices()
+            .nth(width)
+            .map_or(text.len(), |(at, _)| at),
+    );
+    let style = match selected {
+        true => Style::new().fg(Color::Black).bg(Color::Cyan),
+        false => Style::new().fg(Color::DarkGray),
+    };
+    // The name keeps its colour on an unselected row; the help stays dim.
+    if selected {
+        return Line::styled(format!("{text:<width$}"), style);
+    }
+    let cut = name.chars().count() + 1;
+    let head: String = text.chars().take(cut).collect();
+    let tail: String = text.chars().skip(cut).collect();
+    Line::from(vec![
+        Span::styled(head, Style::new().fg(Color::Cyan)),
+        Span::styled(tail, style),
+    ])
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1238,5 +1312,47 @@ mod tests {
         assert!(app.on_mouse(left(MouseEventKind::Moved, 0, 0)));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!screen(&terminal).contains("resets"));
+    }
+
+    #[test]
+    fn the_slash_menu_sits_between_the_transcript_and_the_prompt() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("/compact"));
+
+        for c in "/co".chars() {
+            app.on_key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            ));
+        }
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        for name in ["/compact", "/context", "/copy"] {
+            assert!(shown.contains(name), "{shown}");
+        }
+        assert!(shown.contains("tab complete"), "{shown}");
+        // The prompt keeps the bottom rows, with what was typed still in it.
+        let rows: Vec<&str> = shown.lines().collect();
+        let menu = rows.iter().position(|r| r.contains("/compact")).unwrap();
+        let prompt = rows
+            .iter()
+            .position(|r| r.contains("\u{203a} /co"))
+            .unwrap();
+        assert!(menu < prompt, "{shown}");
+
+        // The highlighted row is the first, and it moves with the arrow keys.
+        let buffer = terminal.backend().buffer();
+        let y = menu as u16;
+        assert_eq!(buffer[(2, y)].bg, Color::Cyan);
+        app.on_key(ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(2, y)].bg, Color::Reset);
+        assert_eq!(buffer[(2, y + 1)].bg, Color::Cyan);
     }
 }

@@ -22,13 +22,16 @@ inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/au
 - **sessions**: every turn appended to `.bhai/sessions/<id>.jsonl`, `--resume` to continue one, automatic compaction when the window fills. [docs](docs/sessions.md)
 - **token accounting**: where the context actually goes, per entry, with hover badges in the tui and a full report from `/context`. [docs](docs/context.md)
 - **prompt cache guard**: every request is checked for being an append-only extension of the one before it; `--cache-check` proves the backend serves it, `--strict-cache` refuses to send a request that would break it. [docs](docs/context.md#the-cache-guard)
-- **tui**: markdown rendering, a `/diff` pane, mouse, multi-line input, prompt history, collapsible tool output and rate-limit headroom in the status bar. [docs](docs/tui.md)
+- **tui**: markdown rendering, a `/diff` pane, a `/` command menu, mouse, multi-line input, prompt history, collapsible tool output and rate-limit headroom in the status bar. [docs](docs/tui.md)
 - **debug server**: `--serve` exposes the running session over localhost http, `--headless` runs it without the tui. [docs](docs/server.md)
 
 ## slash commands
 
+type `/` in the prompt box for the menu: it filters as you type, arrows pick a row, tab completes and enter runs it. skills appear in the same menu, so `/<skill> [input]` hands the skill to the agent.
+
 | command | what it does |
 | --- | --- |
+| `/help` | the commands and the keys |
 | `/context` | write the token profile and transcript to `.bhai/debug/` |
 | `/compact` | summarise the history now |
 | `/diff` | open the working tree diff pane |
@@ -41,6 +44,9 @@ inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/au
 | `/workflow <name> [input]` | run one |
 | `/queue` | list the prompts waiting behind the running turn; `/queue clear` drops them |
 | `/mouse` | turn mouse capture off and on, for the terminal's own selection |
+| `/tokens` | show every entry's token badge, not just the hovered one |
+| `/copy` | copy the selection to the clipboard |
+| `/quit` | leave bhai |
 
 ## flags
 
