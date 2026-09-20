@@ -37,6 +37,10 @@ const MAX_CHILD_ROWS: usize = 4;
 /// How long the note about a drag's copy stays on screen.
 const COPIED_FOR: Duration = Duration::from_secs(3);
 
+/// The ground the user's own words sit on: a shade up from the terminal's own, so a
+/// prompt reads as a prompt rather than as something said in a colour of its own.
+const USER_BG: Color = Color::Indexed(236);
+
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -465,10 +469,13 @@ fn render_badges(frame: &mut Frame, area: Rect, app: &App) {
         let Some(text) = entries.tokens.get(entry).filter(|_| shown).and_then(badge) else {
             continue;
         };
-        let line = Line::from(Span::styled(
-            format!(" {text}"),
-            Style::new().fg(Color::DarkGray),
-        ));
+        // A badge on an entry with a ground of its own keeps that ground, so it does not
+        // punch a hole in the block.
+        let style = match entries.list.get(*entry) {
+            Some(Entry::User(_)) => Style::new().fg(Color::DarkGray).bg(USER_BG),
+            _ => Style::new().fg(Color::DarkGray),
+        };
+        let line = Line::from(Span::styled(format!(" {text}"), style));
         let width = (line.width() as u16).min(area.width);
         let spot = Rect::new(area.right() - width, rows.end - 1, width, 1);
         frame.render_widget(Clear, spot);
@@ -577,7 +584,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Rows {
         };
     }
     let (prefix, text, style): (&str, &str, Style) = match entry {
-        Entry::User(t) => ("› ", t, Style::new().fg(Color::Cyan).bold()),
+        Entry::User(t) => ("› ", t, Style::new().bg(USER_BG)),
         Entry::Queued(t) => ("queued › ", t, Style::new().fg(Color::DarkGray)),
         Entry::Assistant(t) => ("", t, Style::new()),
         Entry::Reasoning(t) => ("✻ ", t, Style::new().fg(Color::DarkGray).italic()),
@@ -615,13 +622,21 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Rows {
         let room = width.saturating_sub(lead + note.chars().count()).max(1);
         *first = format!("{}{note}", clip(first, room));
     }
+    // A ground of its own is only a block if it runs the width of the transcript, so the
+    // rows under one are filled out rather than ending where the text does.
+    let ground = matches!(entry, Entry::User(_));
     for (i, (wrapped, join)) in wrapped_lines.into_iter().enumerate() {
         let lead = if i == 0 {
             prefix.to_string()
         } else {
             indent.clone()
         };
-        lines.push(Line::from(Span::styled(format!("{lead}{wrapped}"), style)));
+        let mut row = format!("{lead}{wrapped}");
+        if ground {
+            let pad = width.saturating_sub(row.chars().count());
+            row.push_str(&" ".repeat(pad));
+        }
+        lines.push(Line::from(Span::styled(row, style)));
         // The entry starts under the one before it, whatever the wrap made of the rest.
         joins.push(match i {
             0 => Join::Newline,
@@ -1552,6 +1567,27 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(app.max_scroll > 0);
         assert_eq!(app.selected_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn the_user_s_own_words_sit_on_a_ground_of_their_own() {
+        let mut app = App::detached();
+        app.entries()
+            .push(Entry::User("a prompt that wraps around".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
+        assert!(rows.len() > 1, "the prompt wraps");
+        let area = app.transcript_area.unwrap();
+        let buffer = terminal.backend().buffer();
+        // Every row of it is filled out to the width, so the ground reads as a block.
+        for y in rows.clone() {
+            for x in area.x..area.right() {
+                assert_eq!(buffer[(x, y)].bg, USER_BG, "{x},{y}");
+            }
+        }
+        // The blank line below it is not part of the prompt.
+        assert_eq!(buffer[(0, rows.end)].bg, Color::Reset);
     }
 
     #[test]

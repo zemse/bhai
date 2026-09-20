@@ -6,6 +6,8 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- The user's own words sit on a ground of their own, the width of the transcript, rather
+  than in a colour of their own.
 - Copying a selection undoes the wrapping: a line the terminal broke comes back on one
   line and only the newlines the text really has survive. The note a drag leaves lands
   beside where the drag ended, on a background of its own, rather than on the prompt's
