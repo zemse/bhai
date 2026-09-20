@@ -895,11 +895,11 @@ needs: [a]\n    prompt: two\n---\n",
 
     #[test]
     fn the_shipped_example_loads() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/workflows/review.md");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/workflows/review.md");
         let Ok(text) = std::fs::read_to_string(path) else {
             return;
         };
-        let workflow = parse(&text, "./docs/workflows").unwrap();
+        let workflow = parse(&text, "./examples/workflows").unwrap();
         assert_eq!(workflow.name, "review");
         assert_eq!(workflow.max_parallel, 2);
         assert_eq!(workflow.steps[1].on_fail, OnFail::Continue);

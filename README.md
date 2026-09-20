@@ -8,23 +8,23 @@ cargo install bhai
 
 inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/auth.json`), so log in with codex first, then run `bhai` in the directory you want to work in. or point it at a model on your own machine with `bhai --model ollama:<name>`.
 
-> wip, a hobby project. everything under "what it does" is built; the wishlist at the bottom is not.
+> wip, a hobby project. everything under "what it does" is built; the wishlist at the bottom is not. [CHANGELOG.md](CHANGELOG.md) says what landed when.
 
 ## what it does
 
 - **tools**: bash, read, write, edit, skill and agent, plus any mcp tool. running commands stream their output into the transcript while they run.
-- **permissions**: three modes (auto by default, plus ask and bypass), claude code rule syntax with `*` wildcards, approvals bhai remembers, and a trust question on opening a project, which is what auto and bypass wait on. [docs](docs/permissions.md)
-- **models**: `--model` picks what the session talks to, the chatgpt subscription or a local model through ollama, and `/model` changes it mid-session from the list each backend answers with; the same items go to both, so tools, subagents and sessions work either way. [docs](docs/models.md)
-- **identities**: `bhai --as <name>` narrows the skills, tools, instructions and model a session carries. fixed for the session, so the prompt cache holds. [docs](docs/identities.md)
-- **subagents**: the agent delegates a task to a child with a fresh context, under any identity, up to three at a time; each one gets a row above the prompt you can step inside and talk to. [docs](docs/subagents.md)
-- **workflows**: a handful of child steps in dependency order under one token budget, started only by you. [docs](docs/workflows.md)
-- **skills**: `SKILL.md` directories listed in the prompt, bodies loaded on demand. [docs](docs/skills.md)
-- **mcp**: stdio and streamable http servers, read from claude code's config as well as bhai's. schemas stay out of the tool list; the model finds tools with `mcp_search` and runs them with `mcp_call`. [docs](docs/mcp.md)
-- **sessions**: every turn appended to `.bhai/sessions/<id>.jsonl`, `--resume` to continue one, automatic compaction when the window fills. [docs](docs/sessions.md)
-- **token accounting**: where the context actually goes, per entry, with hover badges in the tui and a full report from `/context`. [docs](docs/context.md)
-- **prompt cache guard**: every request is checked for being an append-only extension of the one before it; `--cache-check` proves the backend serves it, `--strict-cache` refuses to send a request that would break it. [docs](docs/context.md#the-cache-guard)
-- **tui**: markdown rendering, a `/diff` pane, a `/` command menu, mouse (a drag selects and copies as it ends), multi-line input, prompt history, collapsible tool output and rate-limit headroom in the status bar. the spinner, the tokens a second the model is answering at and the interrupt hint sit above the prompt, not at the top. [docs](docs/tui.md)
-- **debug server**: `--serve` exposes the running session over localhost http, `--headless` runs it without the tui. [docs](docs/server.md)
+- **permissions**: three modes (auto by default, plus ask and bypass), claude code rule syntax with `*` wildcards, approvals bhai remembers, and a trust question on opening a project, which is what auto and bypass wait on.
+- **models**: `--model` picks what the session talks to, the chatgpt subscription or a local model through ollama, and `/model` changes it mid-session from the list each backend answers with; the same items go to both, so tools, subagents and sessions work either way.
+- **identities**: `bhai --as <name>` narrows the skills, tools, instructions and model a session carries. fixed for the session, so the prompt cache holds.
+- **subagents**: the agent delegates a task to a child with a fresh context, under any identity, up to three at a time; each one gets a row above the prompt you can step inside and talk to.
+- **workflows**: a handful of child steps in dependency order under one token budget, started only by you.
+- **skills**: `SKILL.md` directories listed in the prompt, bodies loaded on demand.
+- **mcp**: stdio and streamable http servers, read from claude code's config as well as bhai's. schemas stay out of the tool list; the model finds tools with `mcp_search` and runs them with `mcp_call`.
+- **sessions**: every turn appended to `.bhai/sessions/<id>.jsonl`, `--resume` to continue one, automatic compaction when the window fills.
+- **token accounting**: where the context actually goes, per entry, with hover badges in the tui and a full report from `/context`.
+- **prompt cache guard**: every request is checked for being an append-only extension of the one before it; `--cache-check` proves the backend serves it, `--strict-cache` refuses to send a request that would break it.
+- **tui**: markdown rendering, a `/diff` pane, a `/` command menu, mouse (a drag selects and copies as it ends), multi-line input, prompt history, collapsible tool output and rate-limit headroom in the status bar. the spinner, the tokens a second the model is answering at and the interrupt hint sit above the prompt, not at the top.
+- **debug server**: `--serve` exposes the running session over localhost http, `--headless` runs it without the tui.
 
 ## slash commands
 
