@@ -66,9 +66,15 @@ pub fn user_message(text: &str) -> Value {
     })
 }
 
-/// The request appended to history for the summary call.
-pub fn request() -> Value {
-    user_message(REQUEST)
+/// The request appended to history for the summary call. What the user asked for goes
+/// last, so it steers a summary that still has to carry the conversation.
+pub fn request(asked: Option<&str>) -> Value {
+    match asked.map(str::trim).filter(|asked| !asked.is_empty()) {
+        Some(asked) => user_message(&format!(
+            "{REQUEST}\n\nThe user asked the summary to keep this in particular: {asked}"
+        )),
+        None => user_message(REQUEST),
+    }
 }
 
 /// Tokens the model reads in `items`, encrypted reasoning not counted.

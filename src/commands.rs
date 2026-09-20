@@ -26,10 +26,12 @@ pub const COMMANDS: &[Command] = &[
         args: "",
         help: "what has changed in the working tree",
     },
+    // No args hint, though it takes `[prompt]`: compacting on its own is the usual way
+    // in, and a hint would make enter fill the prompt rather than run it.
     Command {
         name: "compact",
         args: "",
-        help: "summarise the conversation so far",
+        help: "summarise the conversation, /compact <prompt> to steer it",
     },
     Command {
         name: "context",

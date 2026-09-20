@@ -951,9 +951,13 @@ impl App {
             self.export_context();
             return;
         }
-        if message == "/compact" {
+        if let Some(rest) = message.strip_prefix("/compact") {
+            let asked = rest.trim();
             self.follow = true;
-            match self.session.compact() {
+            match self
+                .session
+                .compact(Some(asked.to_string()).filter(|a| !a.is_empty()))
+            {
                 Ok(()) => self.working = true,
                 Err(e) => self.note(Entry::Error(e.to_string())),
             }

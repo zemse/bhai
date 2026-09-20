@@ -6,6 +6,8 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- `/compact <prompt>` steers the summary: what the user asks for rides along with the
+  request, so the summary keeps what the next turns need.
 - The user's own words sit on a ground of their own, the width of the transcript, rather
   than in a colour of their own.
 - Copying a selection undoes the wrapping: a line the terminal broke comes back on one

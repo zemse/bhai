@@ -108,8 +108,9 @@ pub enum AgentEvent {
 pub enum Control {
     /// A token breakdown of the context the next request would send.
     Context(oneshot::Sender<Profile>),
-    /// Summarise the history now, as a turn of its own.
-    Compact,
+    /// Summarise the history now, as a turn of its own, with what the user asked the
+    /// summary to keep, if anything.
+    Compact(Option<String>),
     /// Run a workflow now, as a turn of its own. Only the user starts one.
     Workflow {
         workflow: Arc<Workflow>,
@@ -394,6 +395,8 @@ pub(crate) async fn run_with(
     let mut monitor = CacheMonitor::default();
 
     let mut compact_next = false;
+    // What the user asked the next summary to keep, from `/compact <prompt>`.
+    let mut asked: Option<String> = None;
 
     loop {
         let message = tokio::select! {
@@ -461,7 +464,10 @@ pub(crate) async fn run_with(
                         }
                         continue;
                     }
-                    Control::Compact => None,
+                    Control::Compact(prompt) => {
+                        asked = prompt;
+                        None
+                    }
                 }
             }
             message = rx_user.recv() => match message {
@@ -478,6 +484,7 @@ pub(crate) async fn run_with(
                 limits,
                 tx: &tx,
                 cancel: &cancel,
+                asked: asked.take(),
             };
             if let Err(e) = pass.run(&mut history, None, &mut sink).await {
                 let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
@@ -528,7 +535,10 @@ pub(crate) async fn run_with(
                             let _ = reply.send(report(&before, &calls_before, tokenizer));
                         }
                         // Never while a tool call may be pending: once the turn is over.
-                        Control::Compact => compact_next = true,
+                        Control::Compact(prompt) => {
+                            compact_next = true;
+                            asked = prompt;
+                        }
                         // The session refuses either while a turn runs, so neither can
                         // happen; a switch mid-call would answer with the wrong model.
                         Control::Workflow { .. } => {
@@ -560,6 +570,7 @@ pub(crate) async fn run_with(
                 limits,
                 tx: &tx,
                 cancel: &cancel,
+                asked: asked.take(),
             };
             let size = if compact_next { None } else { size };
             if let Err(e) = pass.run(&mut history, size, &mut sink).await {
@@ -764,6 +775,8 @@ struct Compaction<'a> {
     limits: Limits,
     tx: &'a mpsc::UnboundedSender<AgentEvent>,
     cancel: &'a Arc<AtomicBool>,
+    /// What the user asked this summary to keep, from `/compact <prompt>`.
+    asked: Option<String>,
 }
 
 impl Compaction<'_> {
@@ -818,7 +831,7 @@ impl Compaction<'_> {
     /// One model call on `history` with a request for a summary appended.
     async fn summarize(&self, history: &[Value]) -> anyhow::Result<String> {
         let mut input = history.to_vec();
-        input.push(compact::request());
+        input.push(compact::request(self.asked.as_deref()));
         let tx = self.tx;
         let mut on_delta = |delta: Delta| match delta {
             Delta::Usage(usage) => {
@@ -2312,7 +2325,7 @@ mod tests {
         assert!(asked.exists());
 
         // A compaction rewrites history, which is a reset the guard is told about.
-        tx_control.send(Control::Compact).await.unwrap();
+        tx_control.send(Control::Compact(None)).await.unwrap();
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
             match event {
@@ -2571,7 +2584,7 @@ mod tests {
         let asked = bodies[3].as_array().unwrap();
         assert_eq!(asked.len(), input.len() + 2);
         assert!(asked[..input.len()] == input[..]);
-        assert_eq!(asked[input.len()..], [say("two"), compact::request()]);
+        assert_eq!(asked[input.len()..], [say("two"), compact::request(None)]);
         let summary = compact::user_message("Summary of earlier conversation:\nthe summary");
         let text = |t: &str| compact::user_message(t);
         assert_eq!(
@@ -2652,8 +2665,11 @@ mod tests {
             None,
             Limits::default(),
         ));
-        let compact = async |rx: &mut mpsc::UnboundedReceiver<AgentEvent>| {
-            tx_control.send(Control::Compact).await.unwrap();
+        let compact = async |rx: &mut mpsc::UnboundedReceiver<AgentEvent>, asked: Option<&str>| {
+            tx_control
+                .send(Control::Compact(asked.map(str::to_string)))
+                .await
+                .unwrap();
             let mut events = Vec::new();
             while let Some(event) = rx.recv().await {
                 match event {
@@ -2665,11 +2681,11 @@ mod tests {
         };
 
         drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
-        let events = compact(&mut rx).await;
+        let events = compact(&mut rx, None).await;
         assert!(events.iter().any(|e| matches!(e,
             AgentEvent::Info(m) if m.starts_with("nothing to compact"))));
         drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
-        let events = compact(&mut rx).await;
+        let events = compact(&mut rx, Some("the file paths")).await;
         assert!(events.iter().any(|e| matches!(e, AgentEvent::Compacted(_))));
         drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
 
@@ -2683,6 +2699,13 @@ mod tests {
             "Summary of earlier conversation:\nshort"
         );
         assert_eq!(input.len(), 5);
+        // What the user asked for rode along with the request for the summary.
+        let request = bodies[2].1["input"].as_array().unwrap().last().unwrap();
+        let text = request["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.ends_with("keep this in particular: the file paths"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

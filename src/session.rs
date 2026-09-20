@@ -494,17 +494,22 @@ impl Session {
     }
 
     /// Summarise the history now, as a turn of its own, unless one is already running.
-    pub fn compact(&self) -> Result<(), SubmitError> {
+    /// `asked` is what the user wants the summary to keep, from `/compact <prompt>`.
+    pub fn compact(&self, asked: Option<String>) -> Result<(), SubmitError> {
         let mut inner = self.lock();
         if inner.working {
             return Err(SubmitError::Busy);
         }
         self.cancel.store(false, Ordering::Relaxed);
+        let notice = match &asked {
+            Some(asked) => format!("compacting history, keeping {asked}"),
+            None => "compacting history".to_string(),
+        };
         self.tx_control
-            .try_send(Control::Compact)
+            .try_send(Control::Compact(asked))
             .map_err(|_| SubmitError::Closed)?;
         inner.working = true;
-        self.publish(Event::Info("compacting history".to_string()));
+        self.publish(Event::Info(notice));
         Ok(())
     }
 
