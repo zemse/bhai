@@ -54,6 +54,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_transcript(frame, transcript_area, app);
         app.input_area = None;
         app.buttons.clear();
+        app.child_rows.clear();
         render_trust(frame, bottom_area, &gate);
         return;
     }
@@ -70,6 +71,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_transcript(frame, transcript_area, app);
         app.input_area = None;
         app.buttons.clear();
+        app.child_rows.clear();
         if let Some(picker) = &mut app.picker {
             picker.render(frame, bottom_area);
         }
@@ -1137,6 +1139,25 @@ mod tests {
         let long = clip(&"x".repeat(200), JUDGING_CLIP);
         assert_eq!(long, "x".repeat(47) + "\u{2026}");
         assert_eq!(clip("one\ntwo", JUDGING_CLIP), "one two");
+    }
+
+    #[test]
+    fn a_modal_view_takes_the_subagent_rows_with_it() {
+        let mut app = App::detached();
+        app.session().publish(Event::ChildStarted {
+            id: "a1".to_string(),
+            identity: "worker".to_string(),
+            description: "read the docs".to_string(),
+            task: "go".to_string(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.child_rows.len(), 1);
+
+        // The picker covers the panel, so nothing is left there to click on.
+        app.picker = Some(Picker::new("m", "medium"));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.child_rows.is_empty(), "{:?}", app.child_rows);
     }
 
     #[test]
