@@ -6,6 +6,10 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- The judge asks again when its answer is not the agreed object, up to ten times and
+  never past its timeout, since a model is sampled and the next answer may well parse. An
+  error or a timeout is not asked again, and a model that never takes shape is put once
+  for the rest of the session.
 - `auto` mode never prompts: a call the judge cannot decide, or one it never sees, is
   denied with the reason rather than put to the user. The agent is told to ask in what it
   writes, or the user can switch to `ask` mode.

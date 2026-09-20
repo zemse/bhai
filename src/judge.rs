@@ -2,9 +2,10 @@
 //! trusted project, a small model call decides whether it is a reasonable step toward the
 //! task the user asked for. There are exactly two verdicts, approve and deny; an error, a
 //! timeout, a malformed reply or a spent budget is not a third one, it is no verdict at
-//! all, and `auto` mode, which never prompts, denies the call. The judge never sees what
-//! the rules already decided, and its request is its own: a separate cache key, no tools,
-//! and nothing appended to the conversation.
+//! all, and `auto` mode, which never prompts, denies the call. A model is sampled, so an
+//! answer that is not the agreed object is asked again before it counts as no verdict.
+//! The judge never sees what the rules already decided, and its request is its own: a
+//! separate cache key, no tools, and nothing appended to the conversation.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -36,6 +37,12 @@ const TARGET_CLIP: usize = 2000;
 const TASK_CLIP: usize = 1200;
 /// The cache key suffix of every judge call, so its prefix caches on its own.
 const CACHE_KEY: &str = "judge";
+/// Times one call is put to the judge before it counts as undecided. Only an answer that
+/// is not the agreed object is asked again: the model is sampled, so the next answer may
+/// well parse, while a call that failed or timed out would fail the same way. The
+/// retries are bounded by the timeout as well, so a model that is slow and malformed
+/// does not hold the turn for ten of them.
+const TRIES: usize = 10;
 
 /// Fixed for the life of the session, so the judge's prefix caches.
 pub const SYSTEM: &str = "\
@@ -126,9 +133,40 @@ impl JudgeRequest {
     }
 }
 
+/// Why a call to the judge came back with no verdict.
+#[derive(Debug)]
+pub enum Failed {
+    /// The model answered, but not as the agreed object. This is the one failure worth
+    /// asking again for, and its tokens were still spent.
+    Shape { error: String, usage: Usage },
+    /// The call itself failed or never answered.
+    Call(String),
+}
+
+impl Failed {
+    /// Tokens the attempt spent, which a malformed answer still costs.
+    fn usage(&self) -> Usage {
+        match self {
+            Failed::Shape { usage, .. } => *usage,
+            Failed::Call(_) => Usage::default(),
+        }
+    }
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failed::Shape { error, .. } | Failed::Call(error) => f.write_str(error),
+        }
+    }
+}
+
 /// The model call behind the judge, so tests inject one that never talks to the model.
 pub trait Decide: Send + Sync {
-    fn decide<'a>(&'a self, request: &'a JudgeRequest) -> BoxFuture<'a, Result<(Verdict, Usage)>>;
+    fn decide<'a>(
+        &'a self,
+        request: &'a JudgeRequest,
+    ) -> BoxFuture<'a, Result<(Verdict, Usage), Failed>>;
 }
 
 /// The `judge*` config keys.
@@ -180,6 +218,10 @@ struct State {
     cache: HashMap<String, Verdict>,
     /// Calls judged in the running turn.
     spent: usize,
+    /// A decision has already used every try without one answer that parses. A model
+    /// that cannot produce the object is not going to start, so the rest of the session
+    /// puts each call once rather than ten times.
+    shapeless: bool,
     total: Usage,
 }
 
@@ -293,20 +335,57 @@ impl Judge {
             }
         };
 
-        let started = Instant::now();
-        let answered = tokio::time::timeout(self.settings.timeout, self.backend.decide(&request))
-            .await
-            .unwrap_or_else(|_| bail!("the judge did not answer in time"));
-        let elapsed = started.elapsed();
-
-        let (verdict, usage) = match answered {
-            Ok(answered) => answered,
-            // Fail closed: an error is not a third verdict, so the call gets none.
-            Err(e) => {
-                self.record(&request, None, &format!("{e:#}"), Usage::default(), elapsed);
-                return None;
-            }
+        // Asked again while the answer is not the agreed object, since the model is
+        // sampled: the same question may well parse next time. Every attempt is logged
+        // and its tokens counted, whether it parsed or not.
+        let clock = Instant::now();
+        let mut spent = Usage::default();
+        let mut verdict = None;
+        let tries = match self.lock().shapeless {
+            true => 1,
+            false => TRIES,
         };
+        let mut misshapen = 0;
+        for _ in 0..tries {
+            let started = Instant::now();
+            let answered =
+                tokio::time::timeout(self.settings.timeout, self.backend.decide(&request))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Failed::Call("the judge did not answer in time".to_string()))
+                    });
+            let elapsed = started.elapsed();
+            match answered {
+                Ok((answer, usage)) => {
+                    add(&mut spent, usage);
+                    self.record(&request, Some(&answer), "", usage, elapsed);
+                    verdict = Some(answer);
+                    break;
+                }
+                Err(e) => {
+                    add(&mut spent, e.usage());
+                    self.record(&request, None, &e.to_string(), e.usage(), elapsed);
+                    misshapen += usize::from(matches!(e, Failed::Shape { .. }));
+                    // Fail closed: only a misshapen answer is worth asking again for, and
+                    // only while there is time left in this decision to ask.
+                    let again = matches!(e, Failed::Shape { .. })
+                        && clock.elapsed() < self.settings.timeout;
+                    if !again {
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(verdict) = verdict else {
+            let mut state = self.lock();
+            // The attempts cost tokens even though they decided nothing.
+            add(&mut state.total, spent);
+            // Every try spent on an answer that never took shape: stop paying for the
+            // retries for the rest of the session.
+            state.shapeless |= misshapen == TRIES;
+            return None;
+        };
+        let usage = spent;
         {
             let mut state = self.lock();
             add(&mut state.total, usage);
@@ -317,7 +396,6 @@ impl Judge {
                 verdict.reason()
             ));
         }
-        self.record(&request, Some(&verdict), "", usage, elapsed);
         Some(verdict)
     }
 
@@ -386,7 +464,10 @@ impl ModelJudge {
 }
 
 impl Decide for ModelJudge {
-    fn decide<'a>(&'a self, request: &'a JudgeRequest) -> BoxFuture<'a, Result<(Verdict, Usage)>> {
+    fn decide<'a>(
+        &'a self,
+        request: &'a JudgeRequest,
+    ) -> BoxFuture<'a, Result<(Verdict, Usage), Failed>> {
         Box::pin(async move {
             let (reply, usage) = self
                 .client
@@ -397,8 +478,17 @@ impl Decide for ModelJudge {
                     SYSTEM,
                     &request.text(),
                 )
-                .await?;
-            Ok((parse_verdict(&reply)?, usage))
+                .await
+                .map_err(|e| Failed::Call(format!("{e:#}")))?;
+            // The tokens are spent whether or not the answer is the agreed object, so an
+            // answer that is not says so with them.
+            match parse_verdict(&reply) {
+                Ok(verdict) => Ok((verdict, usage)),
+                Err(e) => Err(Failed::Shape {
+                    error: format!("{e:#}"),
+                    usage,
+                }),
+            }
         })
     }
 }
@@ -539,7 +629,7 @@ pub async fn eval(backend: &dyn Decide, cases: &[Case], timeout: Duration) -> Ve
         let started = Instant::now();
         let answered = tokio::time::timeout(timeout, backend.decide(&request))
             .await
-            .unwrap_or_else(|_| bail!("the judge did not answer in time"));
+            .unwrap_or_else(|_| Err(Failed::Call("the judge did not answer in time".to_string())));
         let latency = started.elapsed();
         let (actual, reason, usage) = match answered {
             Ok((verdict, usage)) => (
@@ -547,7 +637,9 @@ pub async fn eval(backend: &dyn Decide, cases: &[Case], timeout: Duration) -> Ve
                 verdict.reason().to_string(),
                 usage,
             ),
-            Err(e) => ("error".to_string(), format!("{e:#}"), Usage::default()),
+            // One attempt each: what is scored here is the answer the model gives, not
+            // the answer it gives when asked again.
+            Err(e) => ("error".to_string(), e.to_string(), e.usage()),
         };
         outcomes.push(Outcome {
             name: case.name.clone(),
@@ -635,6 +727,11 @@ pub mod fake {
         Verdict(Verdict),
         /// A reply text, parsed exactly as the real one is.
         Reply(String),
+        /// One reply an attempt, the last one repeating: for what the judge does when an
+        /// answer does not parse and it asks again.
+        Replies(Vec<String>),
+        /// A reply that takes its time, for the clock that bounds those retries.
+        Slow(Duration, String),
         Error(String),
         /// Never answers, so the judge's timeout fires.
         Hang,
@@ -660,22 +757,37 @@ pub mod fake {
         fn decide<'a>(
             &'a self,
             request: &'a JudgeRequest,
-        ) -> BoxFuture<'a, Result<(Verdict, Usage)>> {
+        ) -> BoxFuture<'a, Result<(Verdict, Usage), Failed>> {
             Box::pin(async move {
-                self.calls
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(request.clone());
+                let attempt = {
+                    let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+                    calls.push(request.clone());
+                    calls.len() - 1
+                };
                 let usage = Usage {
                     input: 700,
                     cached: 600,
                     output: 12,
                     reasoning: 0,
                 };
+                let parsed = |reply: &str| match parse_verdict(reply) {
+                    Ok(verdict) => Ok((verdict, usage)),
+                    Err(e) => Err(Failed::Shape {
+                        error: format!("{e:#}"),
+                        usage,
+                    }),
+                };
                 match &self.answers {
                     Answers::Verdict(verdict) => Ok((verdict.clone(), usage)),
-                    Answers::Reply(reply) => Ok((parse_verdict(reply)?, usage)),
-                    Answers::Error(e) => bail!("{e}"),
+                    Answers::Reply(reply) => parsed(reply),
+                    Answers::Replies(replies) => {
+                        parsed(replies.get(attempt).or_else(|| replies.last()).unwrap())
+                    }
+                    Answers::Slow(delay, reply) => {
+                        tokio::time::sleep(*delay).await;
+                        parsed(reply)
+                    }
+                    Answers::Error(e) => Err(Failed::Call(e.clone())),
                     Answers::Hang => {
                         std::future::pending::<()>().await;
                         unreachable!()
@@ -791,17 +903,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_error_a_timeout_and_a_malformed_reply_all_fall_back_to_asking() {
-        for answers in [
-            Answers::Error("429".to_string()),
-            Answers::Hang,
-            Answers::Reply("sure, go ahead".to_string()),
-            Answers::Reply(r#"{"verdict":"maybe","reason":"x"}"#.to_string()),
-        ] {
-            let (judge, _) = judge(answers, Path::new("/p"));
+    async fn an_error_or_a_timeout_decides_nothing_and_is_not_asked_again() {
+        // Asking again would fail the same way, so each is put once and costs nothing.
+        for answers in [Answers::Error("429".to_string()), Answers::Hang] {
+            let (judge, backend) = judge(answers, Path::new("/p"));
             assert_eq!(judge.decide("bash", "cargo test", "").await, None);
             assert_eq!(judge.total(), Usage::default());
+            assert_eq!(backend.calls.lock().unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_the_agreed_object_is_asked_again() {
+        // The model is sampled, so the next answer may be the object even though this
+        // one is not; the verdict is the first that parses.
+        let (judge, backend) = judge(
+            Answers::Replies(vec![
+                "sure, go ahead".to_string(),
+                r#"{"verdict":"maybe","reason":"x"}"#.to_string(),
+                r#"{"verdict":"approve","reason":"fine"}"#.to_string(),
+            ]),
+            Path::new("/p"),
+        );
+        assert_eq!(
+            judge.decide("bash", "cargo test", "").await,
+            Some(approve("fine"))
+        );
+        assert_eq!(backend.calls.lock().unwrap().len(), 3);
+        // Every attempt cost tokens, whether or not it parsed.
+        assert_eq!(judge.total().input, 2100);
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_never_takes_shape_gives_up_after_ten_tries() {
+        let backend = super::fake::Backend::new(Answers::Reply("sure, go ahead".to_string()));
+        // A timeout long enough that it is the count of tries that ends this, not the
+        // clock: the two bounds are tested apart.
+        let judge = Judge::new(backend.clone(), "/p".into(), Settings::default());
+        judge.start_turn("add a unit test for the parser");
+        assert_eq!(judge.decide("bash", "cargo test", "").await, None);
+        assert_eq!(backend.calls.lock().unwrap().len(), TRIES);
+        assert_eq!(judge.total().input, 700 * TRIES as u64);
+
+        // Having proved it cannot produce the object, it is put once from here on.
+        assert_eq!(judge.decide("bash", "cargo doc", "").await, None);
+        assert_eq!(backend.calls.lock().unwrap().len(), TRIES + 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_answer_that_never_takes_shape_runs_out_of_time_before_tries() {
+        // Each attempt takes a good part of the fake judge's 50ms timeout, so the clock
+        // ends the retrying long before the count of tries would.
+        let (judge, backend) = judge(
+            Answers::Slow(Duration::from_millis(20), "sure, go ahead".to_string()),
+            Path::new("/p"),
+        );
+        assert_eq!(judge.decide("bash", "cargo test", "").await, None);
+        let tries = backend.calls.lock().unwrap().len();
+        assert!((2..TRIES).contains(&tries), "{tries} tries");
     }
 
     #[tokio::test]

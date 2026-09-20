@@ -2075,6 +2075,9 @@ mod tests {
             Answers::Hang,
             Answers::Reply("looks fine to me".to_string()),
         ] {
+            // A malformed answer is asked again before it counts as no verdict, so this
+            // is the one of the three that costs anything.
+            let shaped = matches!(answers, Answers::Reply(_));
             let run = judged(answers, &[], &[]).await;
             assert!(!asked(&run.events));
             assert!(
@@ -2082,7 +2085,7 @@ mod tests {
                 "{}",
                 run.outputs[0]
             );
-            assert_eq!(run.cost, Usage::default());
+            assert_eq!(run.cost == Usage::default(), !shaped, "{:?}", run.cost);
         }
     }
 
