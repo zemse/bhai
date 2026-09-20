@@ -739,6 +739,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             AgentEvent::Info(message) | AgentEvent::Compacted(message) => {
                 println!("[info] {message}")
             }
+            AgentEvent::Cleared => println!("[info] history cleared"),
             AgentEvent::Usage(u) => println!(
                 "\n[usage] input={} cached={} output={} reasoning={}",
                 u.input, u.cached, u.output, u.reasoning

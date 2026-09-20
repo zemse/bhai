@@ -61,6 +61,8 @@ pub enum AgentEvent {
     Judging(Option<String>),
     /// History was compacted, so earlier item indexes no longer hold; with a notice.
     Compacted(String),
+    /// History was dropped: the conversation starts again from nothing.
+    Cleared,
     /// Token counts for the model call that just finished.
     Usage(Usage),
     /// Token counts for a model call a child agent just finished.
@@ -111,6 +113,8 @@ pub enum Control {
     /// Summarise the history now, as a turn of its own, with what the user asked the
     /// summary to keep, if anything.
     Compact(Option<String>),
+    /// Drop the history, so the next turn starts from nothing.
+    Clear,
     /// Run a workflow now, as a turn of its own. Only the user starts one.
     Workflow {
         workflow: Arc<Workflow>,
@@ -409,6 +413,21 @@ pub(crate) async fn run_with(
                         let _ = reply.send(report(&history, &calls, tokenizer));
                         continue;
                     }
+                    // Nothing is summarised: the conversation is over, so the history
+                    // goes, and the session file records that it did so a resume agrees.
+                    Control::Clear => {
+                        let before = compact::estimate(&history, tokenizer);
+                        history.clear();
+                        (calls, monitor) = (Vec::new(), CacheMonitor::default());
+                        model.reset("cleared");
+                        if let Some(writer) = &mut writer
+                            && let Err(e) = writer.compact("clear", before, 0, &history)
+                        {
+                            let _ = tx.send(AgentEvent::Error(format!("transcript: {e:#}")));
+                        }
+                        let _ = tx.send(AgentEvent::Cleared);
+                        continue;
+                    }
                     Control::Workflow { workflow, input } => {
                         match &delegation {
                             Some(delegation) => {
@@ -549,6 +568,12 @@ pub(crate) async fn run_with(
                         Control::Model { .. } => {
                             let _ = tx.send(AgentEvent::Error(
                                 "the model cannot change while a turn is running".to_string(),
+                            ));
+                        }
+                        Control::Clear => {
+                            let _ = tx.send(AgentEvent::Error(
+                                "the history cannot be dropped while a turn is running"
+                                    .to_string(),
                             ));
                         }
                     },
@@ -1024,7 +1049,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::Item(_)
                 // A child's calls never reach the judge, so this cannot arrive.
                 | AgentEvent::Judging(_)
-                | AgentEvent::Compacted(_) => continue,
+                | AgentEvent::Compacted(_)
+                | AgentEvent::Cleared => continue,
                 // An approval is modal, so it is answered where every other one is,
                 // with the tag saying which child is asking.
                 AgentEvent::Approval {

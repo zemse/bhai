@@ -34,6 +34,11 @@ pub const COMMANDS: &[Command] = &[
         help: "summarise the conversation, /compact <prompt> to steer it",
     },
     Command {
+        name: "clear",
+        args: "",
+        help: "drop the conversation and start over",
+    },
+    Command {
         name: "context",
         args: "",
         help: "write the context to .bhai/debug",
@@ -269,9 +274,12 @@ mod tests {
 
         let c = matches("/c", &skills());
         let names: Vec<_> = c.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["compact", "context", "copy", "commit-helper"]);
-        assert_eq!(c[3].help, "Does a thing.");
-        assert!(c[3].takes_input(), "a skill takes free text");
+        assert_eq!(
+            names,
+            ["compact", "clear", "context", "copy", "commit-helper"]
+        );
+        assert_eq!(c[4].help, "Does a thing.");
+        assert!(c[4].takes_input(), "a skill takes free text");
         assert!(!c[0].takes_input(), "/compact takes nothing");
         assert!(matches("/zzz", &skills()).is_empty());
         assert!(matches("hello", &skills()).is_empty());
@@ -300,7 +308,7 @@ mod tests {
         };
         assert_eq!(tail("/pd"), ["f"]);
         assert_eq!(tail("/pdf"), [""]);
-        assert_eq!(tail("/c")[3], "ommit-helper");
+        assert_eq!(tail("/c")[4], "ommit-helper");
         // The menu matches whatever the case, but completing would rewrite the text.
         assert_eq!(tail("/PD"), [""]);
         assert!(tail("/pdf x").is_empty());

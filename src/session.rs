@@ -98,6 +98,8 @@ pub enum Event {
     Judging(Option<String>),
     /// History was compacted; earlier history indexes no longer hold.
     Compacted(String),
+    /// History was dropped, so the transcript that showed it goes too.
+    Cleared,
     /// The permission mode changed.
     Mode(Mode),
     /// `/model` switched the session to this model and reasoning effort.
@@ -513,6 +515,19 @@ impl Session {
         Ok(())
     }
 
+    /// Drop the conversation: the agent's history and the transcript that showed it.
+    /// Refused while a turn runs, since the turn holds the history it would drop.
+    pub fn clear(&self) -> Result<(), SubmitError> {
+        let inner = self.lock();
+        if inner.working {
+            return Err(SubmitError::Busy);
+        }
+        self.tx_control
+            .try_send(Control::Clear)
+            .map_err(|_| SubmitError::Closed)?;
+        Ok(())
+    }
+
     /// Run `workflow` now, as a turn of its own, unless one is already running. The
     /// agent asks for confirmation before it launches anything.
     pub fn workflow(&self, workflow: Arc<Workflow>, input: String) -> Result<(), SubmitError> {
@@ -615,6 +630,7 @@ impl Session {
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Judging(what) => Event::Judging(what),
             AgentEvent::Compacted(s) => Event::Compacted(s),
+            AgentEvent::Cleared => Event::Cleared,
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnEnd => {
                 // The session keeps working while queued prompts wait behind the turn.

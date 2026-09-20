@@ -123,6 +123,13 @@ impl Entries {
                 self.attribution.items.clear();
                 self.push(Entry::Info(message.clone()));
             }
+            // The conversation is gone, so the transcript of it goes with it.
+            Event::Cleared => {
+                self.list.clear();
+                self.tokens.clear();
+                self.attribution = Attribution::default();
+                self.push(Entry::Info("conversation cleared".to_string()));
+            }
             Event::Error(message) => self.push(Entry::Error(message.clone())),
             Event::Interrupted => self.push(Entry::Info("interrupted".to_string())),
             _ => {}
@@ -423,6 +430,25 @@ mod tests {
         let mut entries = Entries::default();
         entries.push(Entry::Info("intro".to_string()));
         entries
+    }
+
+    #[test]
+    fn clearing_takes_the_transcript_with_the_conversation() {
+        let mut app = intro();
+        app.apply(&Event::User("hi".to_string()));
+        app.apply(&Event::Item(0));
+        app.apply(&Event::Text("hello".to_string()));
+        app.apply(&Event::Cleared);
+        assert!(
+            matches!(app.list.as_slice(), [Entry::Info(t)] if t == "conversation cleared"),
+            "{:?}",
+            app.list
+        );
+        assert!(app.tokens.is_empty());
+        // The next turn's items index the history that starts here.
+        app.apply(&Event::User("again".to_string()));
+        app.apply(&Event::Item(0));
+        assert_eq!(app.attribution.items.get(&0), Some(&1));
     }
 
     #[test]

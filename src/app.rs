@@ -951,6 +951,10 @@ impl App {
             self.export_context();
             return;
         }
+        if message == "/clear" {
+            self.clear();
+            return;
+        }
         if let Some(rest) = message.strip_prefix("/compact") {
             let asked = rest.trim();
             self.follow = true;
@@ -1079,6 +1083,22 @@ impl App {
             Ok(()) => self.note(Entry::Info(notice)),
             Err(e) => self.note(Entry::Error(format!("cannot switch models: {e}"))),
         }
+    }
+
+    /// `/clear`: the conversation goes, and with it everything the transcript's indexes
+    /// stood for, so the view starts again at the bottom of an empty screen.
+    fn clear(&mut self) {
+        if let Err(e) = self.session.clear() {
+            self.note(Entry::Error(e.to_string()));
+            return;
+        }
+        self.expanded.clear();
+        self.pinned.clear();
+        self.folds.clear();
+        self.selection = None;
+        self.hover = None;
+        self.scroll = 0;
+        self.follow = true;
     }
 
     /// `/queue` lists the prompts waiting behind the turn; `/queue clear` drops them.
@@ -1626,6 +1646,34 @@ mod tests {
         );
         assert!(
             model_notice("gpt-5.5", "high").starts_with("model: gpt-5.5 (high effort) on codex.")
+        );
+    }
+
+    #[test]
+    fn clear_drops_the_conversation_and_what_the_view_held_of_it() {
+        let (mut app, _user, mut control) = connected();
+        app.entries().push(Entry::Output("old output".to_string()));
+        app.expanded.insert(1);
+        app.pinned.insert(1);
+        app.scroll = 7;
+        app.follow = false;
+
+        app.input.set("/clear".to_string());
+        app.submit();
+        assert!(matches!(
+            control.try_recv(),
+            Ok(crate::agent::Control::Clear)
+        ));
+        assert!(app.expanded.is_empty() && app.pinned.is_empty());
+        assert_eq!(app.scroll, 0);
+        assert!(app.follow);
+        // The agent answers once the history is gone, and the transcript goes with it.
+        app.session.publish(Event::Cleared);
+        let entries = app.entries();
+        assert!(
+            matches!(entries.list.as_slice(), [Entry::Info(t)] if t == "conversation cleared"),
+            "{:?}",
+            entries.list
         );
     }
 

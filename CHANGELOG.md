@@ -6,6 +6,8 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- `/clear` drops the conversation: the agent's history goes, the transcript goes with it
+  and the session file records it, so a resume starts from nothing too.
 - `/compact <prompt>` steers the summary: what the user asks for rides along with the
   request, so the summary keeps what the next turns need.
 - The user's own words sit on a ground of their own, the width of the transcript, rather
