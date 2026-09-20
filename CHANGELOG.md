@@ -6,6 +6,9 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- `auto` mode never prompts: a call the judge cannot decide, or one it never sees, is
+  denied with the reason rather than put to the user. The agent is told to ask in what it
+  writes, or the user can switch to `ask` mode.
 - `/clear` drops the conversation: the agent's history goes, the transcript goes with it
   and the session file records it, so a resume starts from nothing too.
 - `/compact <prompt>` steers the summary: what the user asks for rides along with the

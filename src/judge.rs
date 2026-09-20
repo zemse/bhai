@@ -1,9 +1,10 @@
 //! The auto-approval judge: when the rules leave a call at `Ask` in `auto` mode in a
 //! trusted project, a small model call decides whether it is a reasonable step toward the
 //! task the user asked for. There are exactly two verdicts, approve and deny; an error, a
-//! timeout, a malformed reply or a spent budget is not a third one, it falls back to
-//! asking the user. The judge never sees what the rules already decided, and its request
-//! is its own: a separate cache key, no tools, and nothing appended to the conversation.
+//! timeout, a malformed reply or a spent budget is not a third one, it is no verdict at
+//! all, and `auto` mode, which never prompts, denies the call. The judge never sees what
+//! the rules already decided, and its request is its own: a separate cache key, no tools,
+//! and nothing appended to the conversation.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -260,13 +261,14 @@ impl Judge {
         )
     }
 
-    /// Decide one call. `None` means the user must be asked, exactly as today.
+    /// Decide one call. `None` is no verdict: the caller denies it in `auto` mode and
+    /// asks the user in any other.
     pub async fn decide(&self, tool: &str, target: &str, detail: &str) -> Option<Verdict> {
         if !self.settings.on {
             return None;
         }
         // A target the summary would cut short is not judgeable: the judge would be ruling
-        // on a fragment, and a deny is cached for the session. Ask the user instead.
+        // on a fragment, and a deny is cached for the session. No verdict instead.
         if target.chars().count() > TARGET_CLIP {
             return None;
         }
@@ -299,7 +301,7 @@ impl Judge {
 
         let (verdict, usage) = match answered {
             Ok(answered) => answered,
-            // Fail closed: an error is not a third verdict, the user is asked.
+            // Fail closed: an error is not a third verdict, so the call gets none.
             Err(e) => {
                 self.record(&request, None, &format!("{e:#}"), Usage::default(), elapsed);
                 return None;

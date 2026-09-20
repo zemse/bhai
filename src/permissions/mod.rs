@@ -278,9 +278,10 @@ impl Policy {
     }
 
     /// Whether a call the rules left at `Ask` may go to the auto-approval judge. Only in
-    /// `auto` mode in a trusted project, and never for what must always reach the user: a
-    /// protected path, a write or edit outside the project, or a command the tokenizer
-    /// refuses, which is how `sudo` and everything it cannot read are kept out.
+    /// `auto` mode in a trusted project, and never for what the user must decide
+    /// themselves: a protected path, a write or edit outside the project, or a command
+    /// the tokenizer refuses, which is how `sudo` and everything it cannot read are kept
+    /// out. `auto` never prompts, so in that mode those are denied rather than asked.
     pub fn judgeable(&self, tool: &str, args: &Value) -> bool {
         let rules = self.rules();
         self.checker(&rules, self.mode()).judgeable(tool, args)

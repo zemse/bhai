@@ -19,7 +19,7 @@ use crate::compact::{self, Limits};
 use crate::identity::Identity;
 use crate::judge::{self, Judge, Verdict};
 use crate::limits::RateLimits;
-use crate::permissions::{Answer, Decision, Offers, Policy};
+use crate::permissions::{Answer, Decision, Mode, Offers, Policy};
 use crate::profile::{self, Call, CallTokens, Profile};
 use crate::prompt::SystemPrompt;
 use crate::sessions::{self, Writer};
@@ -1245,6 +1245,26 @@ as-is. Try a different approach, or ask the user."
                         false,
                     );
                 }
+                // `auto` mode is a promise not to interrupt, so a call it cannot have a
+                // verdict on is denied rather than put to the user. The agent is told to
+                // ask in what it writes, which is the one way through that does not stop
+                // the turn on a modal.
+                None if policy.mode() == Mode::Auto => {
+                    let why = match (judge.is_some(), asking) {
+                        (_, true) => "the judge could not decide it",
+                        (true, false) => "this call always needs the user's own approval",
+                        (false, false) => "no judge is running in this session",
+                    };
+                    let _ = tx.send(AgentEvent::ToolRejected(format!(
+                        "auto-denied: {summary} ({why})"
+                    )));
+                    return (
+                        format!(
+                            "denied by auto policy: {why}, and auto mode never prompts. It did not run. Try a different approach, or ask the user to run it or to switch to ask mode."
+                        ),
+                        false,
+                    );
+                }
                 None => {
                     let offers = policy.offers(name, &args);
                     if let Some(result) = ask(name, &summary, &offers, policy, tx).await {
@@ -2044,8 +2064,10 @@ mod tests {
         );
     }
 
+    /// `auto` mode never prompts, so a judge that answers with an error, nothing at all
+    /// or nonsense denies the call rather than putting it to the user.
     #[tokio::test]
-    async fn a_judge_that_cannot_decide_falls_back_to_the_user() {
+    async fn a_judge_that_cannot_decide_denies_rather_than_asking() {
         use crate::judge::fake::Answers;
 
         for answers in [
@@ -2053,10 +2075,10 @@ mod tests {
             Answers::Hang,
             Answers::Reply("looks fine to me".to_string()),
         ] {
-            let run = judged(answers, &[], &[Answer::Reject]).await;
-            assert!(asked(&run.events));
+            let run = judged(answers, &[], &[]).await;
+            assert!(!asked(&run.events));
             assert!(
-                run.outputs[0].starts_with("The user rejected this call"),
+                run.outputs[0].starts_with("denied by auto policy: the judge could not decide it"),
                 "{}",
                 run.outputs[0]
             );
@@ -2333,12 +2355,11 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("child done")))
         );
-        let events = turn("look it up", &[accept]).await;
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("not connected")))
-        );
+        // No judge runs here, and `auto` never prompts, so the call is denied outright.
+        let events = turn("look it up", &[]).await;
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::ToolRejected(m) if m.contains("no judge is running"))
+        ));
 
         policy.set_mode(policy.next_mode());
         assert_eq!(policy.mode(), Mode::Bypass);
