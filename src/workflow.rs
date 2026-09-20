@@ -581,6 +581,7 @@ async fn step(run: &Run<'_>, step: &Step, identity: &Identity, prompt: &str) -> 
         run.workflow.name, step.id, identity.name
     )));
     let model = run.model.child(identity);
+    let (_mailbox, steer) = agent::Mailbox::open(&run.delegation.mailboxes, &id);
     let finished = agent::run_child(Child {
         id: &id,
         description: &step.id,
@@ -592,6 +593,7 @@ async fn step(run: &Run<'_>, step: &Step, identity: &Identity, prompt: &str) -> 
         cancel: run.cancel,
         transcript: Some(&run.transcripts.join(format!("child-{id}.jsonl"))),
         children: run.children,
+        steer: Some(steer),
     })
     .await;
     let output = match &finished.result {
@@ -633,6 +635,7 @@ mod tests {
                 ..SystemPrompt::default()
             }),
             sessions: PathBuf::new(),
+            mailboxes: Default::default(),
         }
     }
 

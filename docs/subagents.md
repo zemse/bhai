@@ -9,11 +9,24 @@ A child has no `agent` tool of its own, so the tree is one level deep, and at mo
 children run at once. Each one writes its own transcript beside the parent's, in
 `.bhai/sessions/<session id>/child-<id>.jsonl`.
 
+## Watching one, and talking to it
+
+A running child is a row in the panel above the prompt, and `ctrl+o` or a click goes
+inside it. What the child says lands there rather than in the parent's transcript, which
+keeps the call and its result and nothing else. Inside the pane the prompt types into
+that child: the message joins its history before its next model call and is written to
+its transcript like any other, so it is there in the context of every call after it. One
+typed while the child is writing its final answer keeps it going rather than being
+answered too late. See [the tui](tui.md) for the keys.
+
+`GET /children` on the debug server lists the same rows with each child's transcript, and
+`POST /steer` posts a message to one, which is how the flow is tested without a terminal.
+
 ## Permissions and tokens
 
 The call itself needs no approval; every tool call the child makes goes through the
 session's policy, so an approval prompt from a child is answered in the same place as any
-other.
+other, tagged with the child it belongs to rather than hidden inside its pane.
 
 Children of one identity share a cache key of their own (`<session>-<identity>`), so a
 second child under the same identity reuses the cached prefix of the first. Their usage

@@ -16,7 +16,7 @@ inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/au
 - **permissions**: three modes (auto by default, plus ask and bypass), claude code rule syntax with `*` wildcards, approvals bhai remembers, and a trust question on opening a project, which is what auto and bypass wait on. [docs](docs/permissions.md)
 - **models**: `--model` picks what the session talks to, the chatgpt subscription or a local model through ollama; the same items go to both, so tools, subagents and sessions work either way. [docs](docs/models.md)
 - **identities**: `bhai --as <name>` narrows the skills, tools, instructions and model a session carries. fixed for the session, so the prompt cache holds. [docs](docs/identities.md)
-- **subagents**: the agent delegates a task to a child with a fresh context, under any identity, up to three at a time. [docs](docs/subagents.md)
+- **subagents**: the agent delegates a task to a child with a fresh context, under any identity, up to three at a time; each one gets a row above the prompt you can step inside and talk to. [docs](docs/subagents.md)
 - **workflows**: a handful of child steps in dependency order under one token budget, started only by you. [docs](docs/workflows.md)
 - **skills**: `SKILL.md` directories listed in the prompt, bodies loaded on demand. [docs](docs/skills.md)
 - **mcp**: stdio and streamable http servers, read from claude code's config as well as bhai's. schemas stay out of the tool list; the model finds tools with `mcp_search` and runs them with `mcp_call`. [docs](docs/mcp.md)

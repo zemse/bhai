@@ -14,6 +14,8 @@ a session from a script.
 | `POST /reject` | reject the pending approval |
 | `POST /interrupt` | stop the running turn |
 | `POST /mode` | `{"mode": "ask"}`, `"auto"` or `"bypass"` |
+| `GET /children` | the turn's child agents, each with its own transcript |
+| `POST /steer` | `{"id": "...", "text": "..."}`; posts a message to a running child, as typing into its pane does. 404 once that child has finished |
 
 The tui and the server share one session, so either can answer an approval and exactly
 one of them does.

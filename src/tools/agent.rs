@@ -107,6 +107,7 @@ impl Tool for Agent {
             let id = uuid::Uuid::new_v4().simple().to_string()[..6].to_string();
             let transcript = self.transcripts.join(format!("child-{id}.jsonl"));
             let model = self.model.child(&identity);
+            let (_mailbox, steer) = agent::Mailbox::open(&self.delegation.mailboxes, &id);
             let finished = agent::run_child(Child {
                 id: &id,
                 description,
@@ -118,6 +119,7 @@ impl Tool for Agent {
                 cancel: &self.cancel,
                 transcript: Some(&transcript),
                 children: &self.children,
+                steer: Some(steer),
             })
             .await;
             let name = &identity.name;
@@ -220,6 +222,7 @@ mod tests {
                     ..SystemPrompt::default()
                 }),
                 sessions: PathBuf::new(),
+                mailboxes: Default::default(),
             },
             model: Arc::new(fake.clone()),
             policy: Arc::new(Policy::default()),

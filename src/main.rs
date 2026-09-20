@@ -412,6 +412,8 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let delegation = Delegation {
         identities,
         sessions: roots.cwd.join(".bhai").join("sessions"),
+        // Replaced with the session's own once there is a session to type into.
+        mailboxes: agent::Mailboxes::default(),
         // Children reuse the session's MCP connections, narrowed to their identity.
         prompt: {
             let (config, roots) = (config.clone(), roots.clone());
@@ -609,6 +611,12 @@ fn start(
         judge.clone(),
     );
     let events = session.subscribe();
+    // The session hands out the mailboxes, so a message typed into a child's pane
+    // reaches the child the agent is running.
+    let delegation = Delegation {
+        mailboxes: session.mailboxes(),
+        ..delegation
+    };
     tokio::spawn(agent::run(
         client,
         prompt,
@@ -734,6 +742,19 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             AgentEvent::ChildUsage(u) => {
                 println!("\n[child usage] input={} output={}", u.input, u.output)
             }
+            AgentEvent::ChildStarted {
+                id, description, ..
+            } => println!("\n[child {id}] {description}"),
+            AgentEvent::ChildEnded { id, ok } => {
+                println!("[child {id}] {}", if ok { "done" } else { "failed" })
+            }
+            // A probe has no panes, so what a child says is flattened under its id.
+            AgentEvent::Child { id, event } => match *event {
+                AgentEvent::ToolStart(command) => println!("[child {id}] $ {command}"),
+                AgentEvent::ToolOutput(output) => println!("[child {id}] {output}"),
+                AgentEvent::Error(message) => println!("[child {id}] [error] {message}"),
+                _ => {}
+            },
             AgentEvent::Cache(Some(found)) => {
                 println!("\n[cache break] {}: {}", found.field, found.detail)
             }

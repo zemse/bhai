@@ -47,6 +47,24 @@ real output count lands when it finishes, which is how reasoning the stream only
 summarised gets in; until then the reading is what has been streamed, so a model that
 thinks for a while before writing starts low and catches up.
 
+## Subagents
+
+Every child agent the turn starts gets a row in a panel above the prompt, with a spinner
+while it runs and a tick or a cross once it is done. The transcript itself shows only the
+`agent` call and what came back, so a child's reading and building never crowds out the
+conversation.
+
+`ctrl+o` goes inside the next child's row, and past the last one it comes back out;
+clicking a row opens that one, and `esc` leaves. Inside, the transcript is that child's
+own, from the task it was given to whatever it has done since, and the prompt types into
+it: what is sent joins that child's history before its next model call, and the border
+says which child it is going to. A message typed while the child is writing its answer is
+not lost, since it goes in and the child carries on rather than stopping on the answer
+before it. A child that has already finished has nothing listening, and says so.
+
+The panel lists the current turn's children, so the next prompt starts it empty. See
+[subagents](subagents.md) for what a child is and what it costs.
+
 ## Keys
 
 | key | what it does |
@@ -61,7 +79,8 @@ thinks for a while before writing starts low and catches up.
 | `ctrl+t` | show every token badge |
 | `ctrl+y` | copy the selection, or the whole input when nothing is selected |
 | `ctrl+v` | insert what the clipboard reads back |
-| `esc` | interrupt the turn |
+| `ctrl+o` | go inside the next subagent's pane, and out again past the last one |
+| `esc` | leave the subagent's pane, else interrupt the turn |
 | `ctrl+c` | interrupt the turn, or quit when idle |
 | `ctrl+d` | quit on an empty input |
 | `tab` | fill in the grey completion, while the `/` menu is open |

@@ -17,6 +17,7 @@ use crate::limits::{self, RateLimits};
 use crate::markdown;
 use crate::permissions::Mode;
 use crate::profile::{Method, Tokens};
+use crate::session::{ChildRow, ChildState};
 
 /// Rows a tool output shows until it is clicked open.
 const COLLAPSED_LINES: usize = 3;
@@ -26,6 +27,9 @@ const MAX_INPUT_LINES: usize = 8;
 
 /// Characters of the judged call the working row shows.
 const JUDGING_CLIP: usize = 48;
+
+/// Subagents the panel lists before it shows only the most recent ones.
+const MAX_CHILD_ROWS: usize = 4;
 
 /// How long the note about a drag's copy stays on the input's border.
 const COPIED_FOR: Duration = Duration::from_secs(3);
@@ -85,15 +89,25 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // the agent waiting on the user, so nothing spins there.
     let working_height = u16::from(app.working && app.pending.is_none());
 
+    // The turn's subagents sit above all of that, so the panel does not move as the
+    // menu opens or the spinner comes and goes.
+    let children = app.children();
+    let children_height = match children.len() {
+        0 => 0,
+        rows => rows.min(MAX_CHILD_ROWS) as u16 + 2,
+    };
+
     let [
         status_area,
         transcript_area,
+        children_area,
         menu_area,
         working_area,
         bottom_area,
     ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(children_height),
         Constraint::Length(menu_height),
         Constraint::Length(working_height),
         Constraint::Length(approval_height),
@@ -114,7 +128,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.transcript_area = None;
         app.scrollbar = None;
         app.input_area = None;
-        // The pane covered the spinner's row, so it goes back on top.
+        // The pane covered those rows, so they go back on top.
+        render_children(frame, children_area, app, &children);
         render_working(frame, working_area, app);
         if app.pending.is_some() {
             render_approval(frame, bottom_area, app);
@@ -122,6 +137,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
     render_transcript(frame, transcript_area, app);
+    render_children(frame, children_area, app, &children);
     if menu_height > 0 {
         render_menu(frame, menu_area, &items, app.menu.unwrap_or(0));
     }
@@ -514,6 +530,69 @@ fn mode_chip(mode: Mode) -> Line<'static> {
 
 /// The `/` menu: one row per command or skill, the highlighted one reversed, scrolled
 /// so the highlighted row stays in view.
+/// The turn's subagents, one row each, above the prompt. Each row's area is recorded in
+/// `app.child_rows` so a click on it opens that child's pane.
+fn render_children(frame: &mut Frame, area: Rect, app: &mut App, children: &[ChildRow]) {
+    app.child_rows.clear();
+    if area.height == 0 {
+        return;
+    }
+    let dim = Style::new().fg(Color::DarkGray);
+    let block = Block::bordered()
+        .border_style(dim)
+        .title(Line::styled(" subagents ", dim))
+        .title_bottom(Line::styled(" ctrl+o opens one · esc leaves ", dim).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let rows = inner.height as usize;
+    // The running ones are the newest, so it is the tail that is worth the room.
+    let top = children.len().saturating_sub(rows);
+    let open = app.inside.as_ref().map(|inside| inside.id.as_str());
+    let width = inner.width as usize;
+    let lines: Vec<Line> = children
+        .iter()
+        .enumerate()
+        .skip(top)
+        .map(|(at, child)| {
+            let row = Rect {
+                y: inner.y + (at - top) as u16,
+                height: 1,
+                ..inner
+            };
+            app.child_rows.push((row, child.id.clone()));
+            child_row(child, width, app.spinner, open == Some(&child.id))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One subagent row: how it is doing, its id, who it runs as and what it was sent for.
+fn child_row(child: &ChildRow, width: usize, spinner: usize, open: bool) -> Line<'static> {
+    let (mark, colour) = match child.state {
+        ChildState::Running => (SPINNER[spinner % SPINNER.len()], Color::Yellow),
+        ChildState::Done => ("✓", Color::Green),
+        ChildState::Failed => ("✗", Color::Red),
+    };
+    let head = format!(" {mark} {} ", child.id);
+    let mut tail = format!("{} · {}", child.identity, child.description);
+    let room = width.saturating_sub(head.chars().count());
+    tail = clip(&tail, room);
+    let pad = room.saturating_sub(tail.chars().count());
+    if open {
+        // The open pane's row is the transcript's title, so it reads as selected.
+        return Line::styled(
+            format!("{head}{tail}{}", " ".repeat(pad)),
+            Style::new().fg(Color::Black).bg(Color::Cyan),
+        );
+    }
+    Line::from(vec![
+        Span::styled(head, Style::new().fg(colour)),
+        Span::styled(tail, Style::new().fg(Color::DarkGray)),
+    ])
+}
+
 fn render_menu(frame: &mut Frame, area: Rect, items: &[Item], selected: usize) {
     let block = Block::bordered()
         .border_style(Style::new().fg(Color::DarkGray))
@@ -573,6 +652,13 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut block = Block::bordered()
         .border_style(Style::new().fg(Color::DarkGray))
         .title_bottom(mode_chip(app.mode));
+    // Inside a pane the prompt goes to that child, so it says so where the eye lands.
+    if let Some(inside) = &app.inside {
+        block = block.title(Line::styled(
+            format!(" to {} · {} ", inside.identity, inside.description),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
     // A drag copies as it ends, and says so here rather than in the transcript.
     if let Some(chars) = app
         .copied
@@ -1025,6 +1111,40 @@ mod tests {
         let long = clip(&"x".repeat(200), JUDGING_CLIP);
         assert_eq!(long, "x".repeat(47) + "\u{2026}");
         assert_eq!(clip("one\ntwo", JUDGING_CLIP), "one two");
+    }
+
+    #[test]
+    fn the_panel_lists_the_turns_subagents_and_the_prompt_says_which_one_is_open() {
+        let mut app = App::detached();
+        let started = |id: &str, description: &str| Event::ChildStarted {
+            id: id.to_string(),
+            identity: "worker".to_string(),
+            description: description.to_string(),
+            task: "go".to_string(),
+        };
+        app.session().publish(started("a1", "read the docs"));
+        app.session().publish(started("b2", "count the files"));
+        app.session().publish(Event::ChildEnded {
+            id: "a1".to_string(),
+            ok: true,
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("subagents"), "{shown}");
+        assert!(shown.contains("✓ a1 worker · read the docs"), "{shown}");
+        assert!(shown.contains("b2 worker · count the files"), "{shown}");
+
+        // Going inside one says so on the prompt, since that is where it now types.
+        app.open_child("b2");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("to worker · count the files"), "{shown}");
+
+        app.leave_child();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("to worker"));
     }
 
     #[test]

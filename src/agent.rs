@@ -1,6 +1,7 @@
 //! The agent loop: call the model, run the tools it asks for, feed the results back,
 //! repeat until it stops asking for tools.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +60,24 @@ pub enum AgentEvent {
     Usage(Usage),
     /// Token counts for a model call a child agent just finished.
     ChildUsage(Usage),
+    /// A child agent started, with who it runs as and what it was asked.
+    ChildStarted {
+        id: String,
+        identity: String,
+        description: String,
+        task: String,
+    },
+    /// A child agent ended, and whether it got where it was going.
+    ChildEnded {
+        id: String,
+        ok: bool,
+    },
+    /// Something a child agent said. It belongs in that child's own pane, not in the
+    /// parent's transcript, which only ever shows the call and what came back.
+    Child {
+        id: String,
+        event: Box<AgentEvent>,
+    },
     /// The model call that just finished, split for the transcript.
     Call(CallTokens),
     /// The user message or tool result just shown is history item `index`.
@@ -168,6 +187,42 @@ impl Model for Client {
     }
 }
 
+/// Where a message typed into a running child's pane is posted, by child id. A child
+/// that has finished is no longer in it, so nothing is posted into the void.
+pub type Mailboxes = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>;
+
+/// A running child's mailbox, taken out of the map again when the child ends, so a
+/// message is only ever posted to something that can still read it.
+pub struct Mailbox {
+    mailboxes: Mailboxes,
+    id: String,
+}
+
+impl Mailbox {
+    /// Open the mailbox for child `id`, with the end its loop reads from.
+    pub fn open(mailboxes: &Mailboxes, id: &str) -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        mailboxes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), tx);
+        let mailbox = Self {
+            mailboxes: Arc::clone(mailboxes),
+            id: id.to_string(),
+        };
+        (mailbox, rx)
+    }
+}
+
+impl Drop for Mailbox {
+    fn drop(&mut self) {
+        self.mailboxes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
 /// What a session needs to run child agents: the identities and how to build a
 /// child's system prompt.
 #[derive(Clone)]
@@ -176,6 +231,8 @@ pub struct Delegation {
     pub prompt: Arc<dyn Fn(&Identity) -> SystemPrompt + Send + Sync>,
     /// Child transcripts go to `<sessions>/<session id>/child-<id>.jsonl`.
     pub sessions: PathBuf,
+    /// Shared with the session, so what is typed into a pane reaches that child.
+    pub mailboxes: Mailboxes,
 }
 
 /// One child agent's usage, as the profiler reports it.
@@ -397,6 +454,7 @@ pub(crate) async fn run_with(
                 &mut monitor,
                 usage_log.as_deref(),
                 &mut sink,
+                None,
             );
             tokio::pin!(turn);
             loop {
@@ -462,10 +520,19 @@ async fn turn(
     monitor: &mut CacheMonitor,
     usage_log: Option<&Path>,
     sink: &mut Sink<'_>,
+    mut steer: Option<&mut mpsc::UnboundedReceiver<String>>,
 ) -> (usize, anyhow::Result<()>) {
     let mut error_rounds = 0usize;
 
     for step in 1..=MAX_STEPS {
+        // Whatever was typed into this agent's pane joins the history before the call,
+        // so the next answer has it.
+        let typed = steered(steer.as_deref_mut());
+        if !typed.is_empty() {
+            let from = history.len();
+            history.extend(typed);
+            record(sink, &history[from..], tx);
+        }
         if monitor.tripped() {
             // Only strict mode stops for it; a normal run is told and carries on.
             if model.strict_cache() {
@@ -550,7 +617,16 @@ async fn turn(
         if calls.is_empty() {
             history.extend(items.iter().cloned());
             record(sink, &history[sent..], tx);
-            return (step, Ok(()));
+            // A message typed while that answer was being written is not lost: it goes
+            // in and the agent keeps going rather than ending on the answer before it.
+            let typed = steered(steer.as_deref_mut());
+            if typed.is_empty() {
+                return (step, Ok(()));
+            }
+            let from = history.len();
+            history.extend(typed);
+            record(sink, &history[from..], tx);
+            continue;
         }
 
         let mut results = Vec::with_capacity(calls.len());
@@ -593,6 +669,22 @@ async fn turn(
         "stopped after {MAX_STEPS} steps without finishing"
     )));
     (MAX_STEPS, Ok(()))
+}
+
+/// The messages posted to an agent's mailbox since the last look, as history items.
+fn steered(steer: Option<&mut mpsc::UnboundedReceiver<String>>) -> Vec<Value> {
+    let Some(steer) = steer else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    while let Ok(text) = steer.try_recv() {
+        items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": text }],
+        }));
+    }
+    items
 }
 
 /// One compaction of a conversation's history.
@@ -752,6 +844,8 @@ pub struct Child<'a> {
     pub cancel: &'a Arc<AtomicBool>,
     pub transcript: Option<&'a Path>,
     pub children: &'a Children,
+    /// Messages typed into this child's pane while it runs.
+    pub steer: Option<mpsc::UnboundedReceiver<String>>,
 }
 
 /// How a child agent ended.
@@ -779,6 +873,12 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             description: child.description.to_string(),
             ..ChildUsage::default()
         });
+    let _ = child.tx.send(AgentEvent::ChildStarted {
+        id: child.id.to_string(),
+        identity: identity.clone(),
+        description: child.description.to_string(),
+        task: child.task.to_string(),
+    });
 
     let (tx_child, mut rx_child) = mpsc::unbounded_channel();
     let work = async move {
@@ -791,6 +891,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
         record(&mut sink, &history, &tx_child);
         let mut ledger = Vec::new();
         let mut monitor = CacheMonitor::default();
+        let mut steer = child.steer;
         let result = turn(
             child.model,
             &registry,
@@ -806,11 +907,16 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             &mut monitor,
             None,
             &mut sink,
+            steer.as_mut(),
         )
         .await;
         (result, history)
     };
     let tag = format!("[child {} {identity}]", child.id);
+    let inside = |event: AgentEvent| AgentEvent::Child {
+        id: child.id.to_string(),
+        event: Box::new(event),
+    };
     let forward = async {
         let mut usage = Usage::default();
         let mut failure = None;
@@ -828,18 +934,17 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     detail: format!("{tag} {}", found.detail),
                     ..found
                 })),
-                // The parent reads the final text; streaming it would interleave. Calls
-                // and items index the child's history, not the parent's.
-                AgentEvent::Reasoning(_)
-                | AgentEvent::Text(_)
-                // The parent's own calls are what the speed readout times.
-                | AgentEvent::Streaming(_)
+                // The parent's own calls are what the speed readout times, and a child's
+                // turn ends inside this call. Calls and items index its own history.
+                AgentEvent::Streaming(_)
                 | AgentEvent::TurnEnd
                 | AgentEvent::Call(_)
                 | AgentEvent::Item(_)
                 // A child's calls never reach the judge, so this cannot arrive.
                 | AgentEvent::Judging(_)
                 | AgentEvent::Compacted(_) => continue,
+                // An approval is modal, so it is answered where every other one is,
+                // with the tag saying which child is asking.
                 AgentEvent::Approval {
                     tool,
                     command,
@@ -851,20 +956,29 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     offers,
                     reply,
                 },
-                AgentEvent::ToolStart(s) => AgentEvent::ToolStart(format!("{tag} {s}")),
-                AgentEvent::ToolOutput(s) => AgentEvent::ToolOutput(format!("{tag} {s}")),
-                // Untagged: it extends the child's own running command.
-                other @ AgentEvent::ToolProgress(_) => other,
-                AgentEvent::ToolRejected(s) => AgentEvent::ToolRejected(format!("{tag} {s}")),
-                AgentEvent::Info(s) => AgentEvent::Info(format!("{tag} {s}")),
+                // An error is what the parent reports when the child ends without an
+                // answer, so it is kept here as well as shown in the child's pane.
                 AgentEvent::Error(s) => {
                     failure = Some(s.clone());
-                    AgentEvent::Error(format!("{tag} {s}"))
+                    inside(AgentEvent::Error(s))
                 }
+                // Everything the child says goes to its own pane.
+                said @ (AgentEvent::Reasoning(_)
+                | AgentEvent::Text(_)
+                | AgentEvent::ToolStart(_)
+                | AgentEvent::ToolProgress(_)
+                | AgentEvent::ToolOutput(_)
+                | AgentEvent::ToolRejected(_)
+                | AgentEvent::Info(_)) => inside(said),
                 other @ (AgentEvent::ChildUsage(_)
                 | AgentEvent::CacheHit(_)
                 | AgentEvent::CacheStalled(_)
-                | AgentEvent::RateLimits(_)) => other,
+                | AgentEvent::RateLimits(_)
+                // A child has no `agent` tool, so these are only ever its own, passed
+                // along as they are.
+                | AgentEvent::ChildStarted { .. }
+                | AgentEvent::ChildEnded { .. }
+                | AgentEvent::Child { .. }) => other,
             };
             let _ = child.tx.send(event);
         }
@@ -880,6 +994,10 @@ pub async fn run_child(child: Child<'_>) -> Finished {
         }),
         Err(e) => Err(e),
     };
+    let _ = child.tx.send(AgentEvent::ChildEnded {
+        id: child.id.to_string(),
+        ok: result.is_ok(),
+    });
     Finished {
         steps,
         usage,
@@ -909,7 +1027,13 @@ fn final_text(history: &[Value]) -> Option<String> {
     let answer = history
         .iter()
         .rev()
-        .take_while(|item| matches!(kind(item).as_deref(), Some("message" | "reasoning")))
+        .take_while(|item| match kind(item).as_deref() {
+            Some("reasoning") => true,
+            // A user message ends it: anything before that is an earlier answer, and
+            // one gets in whenever a message is typed into a running agent's pane.
+            Some("message") => item.get("role").and_then(Value::as_str) != Some("user"),
+            _ => false,
+        })
         .filter(|item| item.get("role").and_then(Value::as_str) == Some("assistant"))
         .collect::<Vec<_>>();
     if answer.is_empty() {
@@ -1140,6 +1264,9 @@ pub mod fake {
         guard: Arc<Mutex<CacheGuard>>,
         children: Arc<Mutex<usize>>,
         usage: Usage,
+        /// Run as each call goes out, with the number of calls made before it, for a
+        /// test that has to do something while the model is answering.
+        during: Option<Arc<dyn Fn(usize) + Send + Sync>>,
     }
 
     impl Fake {
@@ -1155,6 +1282,15 @@ pub mod fake {
                 guard: Arc::new(Mutex::new(CacheGuard::new("parent", None, false))),
                 children: Arc::default(),
                 usage: USAGE,
+                during: None,
+            }
+        }
+
+        /// Run `during` as each call goes out.
+        pub fn during(self, during: impl Fn(usize) + Send + Sync + 'static) -> Self {
+            Self {
+                during: Some(Arc::new(during)),
+                ..self
             }
         }
 
@@ -1241,10 +1377,14 @@ pub mod fake {
                 );
                 let found = self.guard.lock().unwrap().check(&body)?;
                 self.breaks.lock().unwrap().extend(found.clone());
-                self.bodies
-                    .lock()
-                    .unwrap()
-                    .push((self.conversation.clone(), body));
+                let before = {
+                    let mut bodies = self.bodies.lock().unwrap();
+                    bodies.push((self.conversation.clone(), body));
+                    bodies.len() - 1
+                };
+                if let Some(during) = &self.during {
+                    during(before);
+                }
                 on_delta(Delta::Cache(found));
 
                 let next = self.script.lock().unwrap().pop_front();
@@ -1354,6 +1494,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_message_typed_into_a_child_joins_its_history() {
+        use fake::{Fake, say};
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (post, steer) = mpsc::unbounded_channel();
+        // Typed while the child is writing its first answer, so it only lands after it.
+        let fake = Fake::new(vec![vec![say("first")], vec![say("second")]]).during(move |call| {
+            if call == 0 {
+                post.send("look again".to_string()).unwrap();
+            }
+        });
+        let policy = Policy::default();
+        let finished = run_child(Child {
+            id: "c1",
+            description: "look around",
+            task: "go",
+            prompt: crate::prompt::system_prompt(&[], Vec::new()),
+            model: &fake,
+            policy: &policy,
+            tx: &tx,
+            cancel: &Arc::new(AtomicBool::new(false)),
+            transcript: None,
+            children: &Children::default(),
+            steer: Some(steer),
+        })
+        .await;
+
+        // The answer it had already written is not the end of it: the message goes in
+        // and the child answers again.
+        assert_eq!(finished.steps, 2);
+        assert_eq!(finished.result.unwrap(), "second");
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let input = bodies.last().unwrap().1["input"].to_string();
+        assert!(input.contains("look again"), "{input}");
+    }
+
+    #[tokio::test]
     async fn a_child_runs_narrowed_under_the_policy_and_is_accounted_for() {
         use crate::permissions::{Rule, Rules};
         use fake::{Fake, call, say};
@@ -1380,6 +1557,7 @@ mod tests {
                 ..crate::prompt::system_prompt(&[], Vec::new())
             }),
             sessions: dir.clone(),
+            mailboxes: Default::default(),
         };
         let rules = Rules {
             deny: vec![Rule::parse("Bash(rm:*)").unwrap()],
@@ -1421,13 +1599,40 @@ mod tests {
         assert_eq!(offered[2], ["bash", "read"]);
         assert!(offered[3].contains(&"agent".to_string()));
 
+        // What the child does goes to the child's own pane, not the parent transcript.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolRejected(_))),
+            "the parent's transcript holds none of the child's calls"
+        );
         let rejected = events.iter().find_map(|e| match e {
-            AgentEvent::ToolRejected(s) => Some(s.clone()),
+            AgentEvent::Child { id, event } => match &**event {
+                AgentEvent::ToolRejected(s) => Some((id.clone(), s.clone())),
+                _ => None,
+            },
             _ => None,
         });
-        let rejected = rejected.expect("the policy denied the child's call");
-        assert!(rejected.starts_with("[child "), "{rejected}");
-        assert!(rejected.contains(" worker] rm -rf /tmp/nope"), "{rejected}");
+        let (id, rejected) = rejected.expect("the policy denied the child's call");
+        assert_eq!(
+            rejected, "rm -rf /tmp/nope (deny rule Bash(rm:*))",
+            "untagged, inside its own pane"
+        );
+        let started = events.iter().find_map(|e| match e {
+            AgentEvent::ChildStarted {
+                id, identity, task, ..
+            } => Some((id.clone(), identity.clone(), task.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            started,
+            Some((id.clone(), "worker".to_string(), "rm it".to_string()))
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::ChildEnded { id: ended, ok } if *ended == id && *ok)
+            )
+        );
         let child_usage = events
             .iter()
             .filter(|e| matches!(e, AgentEvent::ChildUsage(u) if *u == fake::USAGE))
@@ -1931,6 +2136,7 @@ mod tests {
                 ..crate::prompt::system_prompt(&[], Vec::new())
             }),
             sessions: dir.clone(),
+            mailboxes: Default::default(),
         };
         let policy = Arc::new(Policy::new(Mode::Ask, Rules::default(), None, dir.clone()));
         let cancel = Arc::new(AtomicBool::new(false));

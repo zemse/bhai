@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tui_input::InputRequest;
@@ -23,7 +23,7 @@ use crate::input::{Editor, History};
 use crate::limits::RateLimits;
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
-use crate::session::{Approval, Event, Prompt, Session};
+use crate::session::{Approval, ChildRow, Event, Prompt, Session};
 use crate::skills::Skill;
 use crate::speed::Speed;
 use crate::workflow::{self, Found};
@@ -104,6 +104,15 @@ pub struct TrustGate {
     pub rules: usize,
     /// The mode answering yes puts the session in.
     pub mode: Mode,
+}
+
+/// The child agent whose pane is open: the transcript shows its work and the prompt
+/// types into it rather than into the session.
+pub struct Inside {
+    pub id: String,
+    pub identity: String,
+    pub description: String,
+    entries: Arc<Mutex<Entries>>,
 }
 
 /// Word, whitespace or punctuation: a double click takes the run of one class.
@@ -200,6 +209,10 @@ pub struct App {
     pub workflows: Found,
     /// The `/diff` pane, shown instead of the transcript while open.
     pub diff: Option<DiffView>,
+    /// The child agent whose pane is open, while one is.
+    pub inside: Option<Inside>,
+    /// Each subagent row's area and id, filled in by the renderer so a click opens it.
+    pub child_rows: Vec<(Rect, String)>,
     pub quit: bool,
     session: Arc<Session>,
 }
@@ -261,6 +274,8 @@ impl App {
             mcp: None,
             workflows: Found::default(),
             diff: None,
+            inside: None,
+            child_rows: Vec::new(),
             quit: false,
             session,
         }
@@ -341,6 +356,9 @@ impl App {
                 }
             }
             KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
+            // The panel's rows, in order, and then back out to the transcript.
+            KeyCode::Char('o') if ctrl => self.cycle_child(),
+            KeyCode::Esc if self.inside.is_some() => self.leave_child(),
             KeyCode::Esc if self.working => self.interrupt(),
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
@@ -513,6 +531,16 @@ impl App {
         if self.scrollbar.is_some_and(|bar| bar.contains(at)) {
             self.dragging = true;
             self.drag_to(y);
+            return true;
+        }
+        // A click on a subagent row goes inside it, and on the open one comes back out.
+        if let Some(id) = self
+            .child_rows
+            .iter()
+            .find(|(area, _)| area.contains(at))
+            .map(|(_, id)| id.clone())
+        {
+            self.open_child(&id);
             return true;
         }
         if let Some((area, top, width)) = self.input_area.filter(|(area, ..)| area.contains(at)) {
@@ -815,6 +843,17 @@ impl App {
         if let Err(e) = self.history.push(&message) {
             self.note(Entry::Error(format!("could not save prompt history: {e}")));
         }
+        // Inside a child's pane the prompt types into that child, not the session, so
+        // none of the commands below apply.
+        if let Some(id) = self.inside.as_ref().map(|inside| inside.id.clone()) {
+            self.follow = true;
+            if self.session.steer(&id, message).is_err() {
+                self.entries().push(Entry::Error(
+                    "that subagent has finished, so there is nothing to tell it".to_string(),
+                ));
+            }
+            return;
+        }
         if message == "/help" {
             self.follow = true;
             self.note(Entry::Info(commands::help()));
@@ -1007,9 +1046,84 @@ impl App {
         }
     }
 
-    /// The transcript, shared with the session.
+    /// The transcript on screen: the open child's while inside one, the session's
+    /// otherwise.
     pub fn entries(&self) -> MutexGuard<'_, Entries> {
-        self.session.entries()
+        match &self.inside {
+            Some(inside) => inside.entries.lock().unwrap_or_else(|e| e.into_inner()),
+            None => self.session.entries(),
+        }
+    }
+
+    /// The child agents of the running turn, for the panel.
+    pub fn children(&self) -> Vec<ChildRow> {
+        self.session.children()
+    }
+
+    #[cfg(test)]
+    pub fn session(&self) -> &Arc<Session> {
+        &self.session
+    }
+
+    /// Open child `id`'s pane, or close the one already open on it. A child whose pane
+    /// has gone (a new turn cleared it) leaves the transcript where it was.
+    pub fn open_child(&mut self, id: &str) {
+        if self.inside.as_ref().is_some_and(|open| open.id == id) {
+            return self.leave_child();
+        }
+        let rows = self.children();
+        let Some(row) = rows.iter().find(|row| row.id == id) else {
+            return;
+        };
+        let Some(entries) = self.session.child_entries(id) else {
+            return;
+        };
+        self.inside = Some(Inside {
+            id: row.id.clone(),
+            identity: row.identity.clone(),
+            description: row.description.clone(),
+            entries,
+        });
+        self.enter_pane();
+    }
+
+    /// Step to the next child's pane, and out again past the last one.
+    fn cycle_child(&mut self) {
+        let rows = self.children();
+        if rows.is_empty() {
+            return;
+        }
+        let next = match &self.inside {
+            None => Some(0),
+            Some(open) => rows
+                .iter()
+                .position(|row| row.id == open.id)
+                .map_or(Some(0), |at| Some(at + 1).filter(|at| *at < rows.len())),
+        };
+        match next.and_then(|at| rows.get(at)) {
+            Some(row) => {
+                let id = row.id.clone();
+                self.inside = None;
+                self.open_child(&id);
+            }
+            None => self.leave_child(),
+        }
+    }
+
+    /// Go back to the session's transcript.
+    pub fn leave_child(&mut self) {
+        self.inside = None;
+        self.enter_pane();
+    }
+
+    /// A pane swap shows the foot of whatever is now on screen, with nothing selected
+    /// from the pane that was.
+    fn enter_pane(&mut self) {
+        self.selection = None;
+        self.expanded.clear();
+        self.pinned.clear();
+        self.follow = true;
+        self.scroll = 0;
     }
 
     /// Show a notice that only this TUI produced.
@@ -1258,6 +1372,64 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn ctrl_o_walks_the_subagents_and_the_prompt_types_into_the_open_one() {
+        let mut app = App::detached();
+        let started = |id: &str| Event::ChildStarted {
+            id: id.to_string(),
+            identity: "worker".to_string(),
+            description: "read the docs".to_string(),
+            task: "go".to_string(),
+        };
+        app.session().publish(started("a1"));
+        app.session().publish(started("b2"));
+        let (_mailbox, mut posted) = crate::agent::Mailbox::open(&app.session().mailboxes(), "b2");
+
+        let ctrl_o = || key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_o());
+        assert_eq!(app.inside.as_ref().map(|i| i.id.as_str()), Some("a1"));
+        app.on_key(ctrl_o());
+        assert_eq!(app.inside.as_ref().map(|i| i.id.as_str()), Some("b2"));
+
+        // A prompt typed inside goes to that child, not to the session.
+        app.input.set("look at the tests too".to_string());
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(posted.try_recv().unwrap(), "look at the tests too");
+        assert!(
+            app.session().entries().list.len() == 1,
+            "the session's transcript keeps only its opening notice"
+        );
+        assert!(matches!(
+            app.entries().list.last(),
+            Some(Entry::User(t)) if t == "look at the tests too"
+        ));
+
+        // Past the last one it comes back out, and so does esc.
+        app.on_key(ctrl_o());
+        assert!(app.inside.is_none());
+        app.on_key(ctrl_o());
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.inside.is_none());
+    }
+
+    #[test]
+    fn a_prompt_for_a_subagent_that_has_ended_says_so() {
+        let mut app = App::detached();
+        app.session().publish(Event::ChildStarted {
+            id: "a1".to_string(),
+            identity: "worker".to_string(),
+            description: "read the docs".to_string(),
+            task: "go".to_string(),
+        });
+        app.open_child("a1");
+        app.input.set("anything".to_string());
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.entries().list.last(),
+            Some(Entry::Error(t)) if t.contains("that subagent has finished")
+        ));
     }
 
     #[test]

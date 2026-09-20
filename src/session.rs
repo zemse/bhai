@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::agent::{AgentEvent, Control};
+use crate::agent::{AgentEvent, Control, Mailboxes};
 use crate::cache::{CacheBreak, Hit};
 use crate::client::Usage;
-use crate::entries::Entries;
+use crate::entries::{Entries, Entry};
 use crate::judge::Judge;
 use crate::limits::RateLimits;
 use crate::permissions::{Answer, Mode, Offers, Policy, Remember};
@@ -57,6 +57,23 @@ pub enum Event {
     Usage(Usage),
     /// Usage of a child agent's model call.
     ChildUsage(Usage),
+    /// A child agent started, with who it runs as and what it was asked.
+    ChildStarted {
+        id: String,
+        identity: String,
+        description: String,
+        task: String,
+    },
+    /// A child agent ended, and whether it got where it was going.
+    ChildEnded {
+        id: String,
+        ok: bool,
+    },
+    /// Something a child agent said, for that child's own pane.
+    Child {
+        id: String,
+        event: Box<Event>,
+    },
     /// A finished model call, split for per-entry token badges.
     Call(CallTokens),
     /// The user message or tool result just shown is history item `index`.
@@ -82,6 +99,32 @@ pub enum Event {
     Error(String),
     Interrupted,
     TurnEnd,
+}
+
+/// How far a child agent got.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildState {
+    Running,
+    Done,
+    Failed,
+}
+
+/// One child agent as the panel lists it: what it is and how it is doing.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChildRow {
+    pub id: String,
+    pub identity: String,
+    pub description: String,
+    pub state: ChildState,
+}
+
+/// A child agent's own transcript, which the panel opens and a message can be typed
+/// into. Its entries are behind their own lock so a pane can be read while the session
+/// goes on publishing.
+struct Pane {
+    row: ChildRow,
+    entries: Arc<Mutex<Entries>>,
 }
 
 /// A tool call waiting for approval.
@@ -200,6 +243,11 @@ pub struct Session {
     events: broadcast::Sender<Event>,
     inner: Mutex<Inner>,
     entries: Mutex<Entries>,
+    /// The child agents of the running turn, oldest first.
+    children: Mutex<Vec<Pane>>,
+    /// Where a message typed into a child's pane is posted; the agent fills it in as
+    /// each child starts.
+    mailboxes: Mailboxes,
     tx_user: mpsc::Sender<String>,
     tx_control: mpsc::Sender<Control>,
     cancel: Arc<AtomicBool>,
@@ -227,6 +275,8 @@ impl Session {
             events: broadcast::channel(EVENT_BUFFER).0,
             inner: Mutex::default(),
             entries: Mutex::default(),
+            children: Mutex::default(),
+            mailboxes: Mailboxes::default(),
             tx_user,
             tx_control,
             cancel,
@@ -479,6 +529,26 @@ impl Session {
                 add(&mut inner.children, usage);
                 Event::ChildUsage(usage)
             }
+            AgentEvent::ChildStarted {
+                id,
+                identity,
+                description,
+                task,
+            } => Event::ChildStarted {
+                id,
+                identity,
+                description,
+                task,
+            },
+            AgentEvent::ChildEnded { id, ok } => Event::ChildEnded { id, ok },
+            AgentEvent::Child { id, event } => match said(*event) {
+                Some(event) => Event::Child {
+                    id,
+                    event: Box::new(event),
+                },
+                // Nothing a pane can show, so nothing is published.
+                None => return,
+            },
             AgentEvent::Cache(found) => {
                 if let Some(found) = &found {
                     inner.last_cache_break = Some(found.clone());
@@ -516,9 +586,102 @@ impl Session {
     }
 
     pub fn publish(&self, event: Event) {
+        self.route(&event);
         self.entries().apply(&event);
         // No subscribers is fine; the event is simply dropped.
         let _ = self.events.send(event);
+    }
+
+    /// Keep the child panes up with the event, before the transcript sees it.
+    fn route(&self, event: &Event) {
+        let mut children = self.panes();
+        match event {
+            // The panel lists the running turn's children, so a new turn starts empty.
+            Event::User(_) => children.clear(),
+            Event::ChildStarted {
+                id,
+                identity,
+                description,
+                task,
+            } => {
+                let entries = Entries::default();
+                let entries = Arc::new(Mutex::new(entries));
+                entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(Entry::User(task.clone()));
+                children.push(Pane {
+                    row: ChildRow {
+                        id: id.clone(),
+                        identity: identity.clone(),
+                        description: description.clone(),
+                        state: ChildState::Running,
+                    },
+                    entries,
+                });
+            }
+            Event::ChildEnded { id, ok } => {
+                if let Some(pane) = children.iter_mut().find(|p| p.row.id == *id) {
+                    pane.row.state = match ok {
+                        true => ChildState::Done,
+                        false => ChildState::Failed,
+                    };
+                }
+            }
+            Event::Child { id, event } => {
+                if let Some(pane) = children.iter().find(|p| p.row.id == *id) {
+                    let entries = Arc::clone(&pane.entries);
+                    drop(children);
+                    entries
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .apply(event);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The mailboxes to hand the agent, so what is typed into a pane reaches its child.
+    pub fn mailboxes(&self) -> Mailboxes {
+        Arc::clone(&self.mailboxes)
+    }
+
+    /// Post `text` to a running child agent. It joins that child's history before its
+    /// next model call, and shows in its pane straight away.
+    pub fn steer(&self, id: &str, text: String) -> Result<(), SubmitError> {
+        let posted = self
+            .mailboxes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|tx| tx.send(text.clone()).is_ok())
+            .unwrap_or_default();
+        if !posted {
+            return Err(SubmitError::Closed);
+        }
+        self.publish(Event::Child {
+            id: id.to_string(),
+            event: Box::new(Event::User(text)),
+        });
+        Ok(())
+    }
+
+    /// The child agents of the running turn, for the panel.
+    pub fn children(&self) -> Vec<ChildRow> {
+        self.panes().iter().map(|pane| pane.row.clone()).collect()
+    }
+
+    /// One child agent's transcript, which the pane renders and reads live.
+    pub fn child_entries(&self, id: &str) -> Option<Arc<Mutex<Entries>>> {
+        self.panes()
+            .iter()
+            .find(|pane| pane.row.id == id)
+            .map(|pane| Arc::clone(&pane.entries))
+    }
+
+    fn panes(&self) -> MutexGuard<'_, Vec<Pane>> {
+        self.children.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The transcript. Never lock the session state while holding it.
@@ -529,6 +692,22 @@ impl Session {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// What a child said, as an event for its own pane. Only what `run_child` wraps can
+/// get here; anything else has no place in a pane and is dropped.
+fn said(event: AgentEvent) -> Option<Event> {
+    Some(match event {
+        AgentEvent::Reasoning(s) => Event::Reasoning(s),
+        AgentEvent::Text(s) => Event::Text(s),
+        AgentEvent::ToolStart(s) => Event::ToolStart(s),
+        AgentEvent::ToolProgress(s) => Event::ToolProgress(s),
+        AgentEvent::ToolOutput(s) => Event::ToolOutput(s),
+        AgentEvent::ToolRejected(s) => Event::ToolRejected(s),
+        AgentEvent::Info(s) => Event::Info(s),
+        AgentEvent::Error(s) => Event::Error(s),
+        _ => return None,
+    })
 }
 
 fn add(total: &mut Usage, usage: Usage) {
@@ -582,6 +761,77 @@ mod tests {
             reply,
         });
         wait
+    }
+
+    /// Start child `id` and have it say something, as `run_child` does.
+    fn child(session: &Session, id: &str, task: &str) {
+        session.on_agent(AgentEvent::ChildStarted {
+            id: id.to_string(),
+            identity: "worker".to_string(),
+            description: "look around".to_string(),
+            task: task.to_string(),
+        });
+    }
+
+    #[test]
+    fn a_childs_work_lands_in_its_own_pane_not_the_transcript() {
+        let (session, _rx) = session();
+        child(&session, "a1", "count the files");
+        child(&session, "b2", "read the docs");
+        session.on_agent(AgentEvent::Child {
+            id: "a1".to_string(),
+            event: Box::new(AgentEvent::ToolStart("ls".to_string())),
+        });
+        session.on_agent(AgentEvent::ChildEnded {
+            id: "a1".to_string(),
+            ok: false,
+        });
+
+        let rows = session.children();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].identity, "worker");
+        assert_eq!(rows[0].state, ChildState::Failed);
+        assert_eq!(rows[1].state, ChildState::Running);
+        // The transcript shows the `agent` call and what comes back, nothing from inside.
+        assert!(session.entries().list.is_empty());
+
+        let pane = session.child_entries("a1").unwrap();
+        let pane = pane.lock().unwrap();
+        assert!(matches!(&pane.list[0], Entry::User(t) if t == "count the files"));
+        assert!(matches!(&pane.list[1], Entry::Command(t) if t == "ls"));
+        assert!(session.child_entries("nope").is_none());
+    }
+
+    #[test]
+    fn the_panel_lists_the_running_turns_children() {
+        let (session, _rx) = session();
+        child(&session, "a1", "count the files");
+        session.publish(Event::User("something else".to_string()));
+        assert!(
+            session.children().is_empty(),
+            "a new turn starts with an empty panel"
+        );
+    }
+
+    #[test]
+    fn a_message_reaches_a_running_child_and_shows_in_its_pane() {
+        let (session, _rx) = session();
+        child(&session, "a1", "count the files");
+        // Nothing is listening until the agent opens the child's mailbox.
+        assert!(session.steer("a1", "and the tests".to_string()).is_err());
+
+        let (_mailbox, mut rx) = crate::agent::Mailbox::open(&session.mailboxes(), "a1");
+        session.steer("a1", "and the tests".to_string()).unwrap();
+        assert_eq!(rx.try_recv().unwrap(), "and the tests");
+        let pane = session.child_entries("a1").unwrap();
+        let pane = pane.lock().unwrap();
+        assert!(matches!(&pane.list[1], Entry::User(t) if t == "and the tests"));
+
+        drop(_mailbox);
+        assert!(
+            session.steer("a1", "too late".to_string()).is_err(),
+            "a child that has ended has no mailbox"
+        );
     }
 
     #[tokio::test]

@@ -41,6 +41,8 @@ fn router(session: Arc<Session>) -> Router {
         .route("/interrupt", post(interrupt))
         .route("/mode", post(mode))
         .route("/context", get(context))
+        .route("/children", get(children))
+        .route("/steer", post(steer))
         .layer(middleware::from_fn(local_only))
         .with_state(session)
 }
@@ -73,6 +75,13 @@ struct ModeBody {
     mode: Mode,
 }
 
+#[derive(Deserialize)]
+struct Steer {
+    /// The child agent to tell, as `/children` lists it.
+    id: String,
+    text: String,
+}
+
 async fn state(State(session): State<Arc<Session>>) -> Response {
     Json(session.state()).into_response()
 }
@@ -92,6 +101,47 @@ async fn events(
         }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// The child agents of the running turn, with each one's transcript.
+async fn children(State(session): State<Arc<Session>>) -> Response {
+    let children: Vec<_> = session
+        .children()
+        .into_iter()
+        .map(|row| {
+            // The child's own transcript in full: nothing here is attributed, since a
+            // child's calls index its own history rather than the session's.
+            let entries: Vec<_> = session
+                .child_entries(&row.id)
+                .map(|entries| {
+                    entries
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .list
+                        .iter()
+                        .map(|entry| json!({ "kind": entry.kind(), "text": entry.text() }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            json!({ "child": row, "entries": entries })
+        })
+        .collect();
+    Json(json!({ "children": children })).into_response()
+}
+
+/// Post a message to a running child agent, as typing into its pane does.
+async fn steer(State(session): State<Arc<Session>>, Json(body): Json<Steer>) -> Response {
+    let text = body.text.trim().to_string();
+    if text.is_empty() {
+        return error(StatusCode::BAD_REQUEST, "text is empty");
+    }
+    match session.steer(&body.id, text) {
+        Ok(()) => ok(),
+        Err(_) => error(
+            StatusCode::NOT_FOUND,
+            "no child agent of that id is running",
+        ),
+    }
 }
 
 async fn prompt(State(session): State<Arc<Session>>, Json(body): Json<Prompt>) -> Response {
