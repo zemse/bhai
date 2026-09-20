@@ -123,6 +123,9 @@ struct Tokenizer {
     word: String,
     in_word: bool,
     glob: bool,
+    /// Heredocs opened on the line being read, each with whether `<<-` strips the tabs
+    /// off its terminator. Their bodies start after the newline, not after the `<<`.
+    heredocs: Vec<(String, bool)>,
 }
 
 impl Tokenizer {
@@ -131,7 +134,12 @@ impl Tokenizer {
         while let Some(c) = chars.next() {
             match c {
                 ' ' | '\t' => self.end_word(),
-                '\n' | ';' => self.end_command(),
+                ';' => self.end_command(),
+                '\n' => {
+                    self.end_command();
+                    // Whatever a heredoc opened on this line holds is data, not shell.
+                    self.skip_heredocs(&mut chars)?;
+                }
                 '&' => match chars.next() {
                     Some('&') => self.end_command(),
                     // `&>file` redirects both streams.
@@ -187,6 +195,15 @@ impl Tokenizer {
                         self.word.push(c);
                     }
                 },
+                '<' => {
+                    if self.in_word && self.word.chars().all(|c| c.is_ascii_digit()) {
+                        // A file descriptor such as the `2` in `2< f`.
+                        self.word.clear();
+                        self.in_word = false;
+                    }
+                    self.end_word();
+                    self.read_from(&mut chars)?;
+                }
                 // A lone `$` is literal; anything after it is an expansion.
                 '$' if chars.peek().is_none_or(|c| c.is_whitespace()) => {
                     self.in_word = true;
@@ -207,7 +224,7 @@ impl Tokenizer {
                     self.in_word = true;
                     self.word.push_str("{}");
                 }
-                '$' | '`' | '(' | ')' | '<' | '{' | '}' => return None,
+                '$' | '`' | '(' | ')' | '{' | '}' => return None,
                 '#' if !self.in_word => while chars.next_if(|c| *c != '\n').is_some() {},
                 c => {
                     self.glob |= matches!(c, '*' | '?' | '[');
@@ -218,6 +235,68 @@ impl Tokenizer {
         }
         self.end_command();
         Some(self.commands)
+    }
+
+    /// The rest of a `<`: a heredoc to remember, or a file the command only reads.
+    fn read_from(&mut self, chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<()> {
+        // `<>` opens the file for writing too, and `<<<` is a string that may expand.
+        if chars.peek() == Some(&'>') {
+            return None;
+        }
+        if chars.next_if_eq(&'<').is_none() {
+            // Reading a file changes nothing, so only the name has to be readable.
+            redirect_target(chars)?;
+            return Some(());
+        }
+        if chars.peek() == Some(&'<') {
+            return None;
+        }
+        let strip = chars.next_if_eq(&'-').is_some();
+        while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+        // Only a quoted delimiter keeps the body literal. An unquoted one lets the shell
+        // expand it, and an expansion there runs whatever it names.
+        let quote = chars.next_if(|c| matches!(c, '\'' | '"'))?;
+        let mut delimiter = String::new();
+        loop {
+            match chars.next()? {
+                c if c == quote => break,
+                c => delimiter.push(c),
+            }
+        }
+        if delimiter.is_empty() {
+            return None;
+        }
+        self.heredocs.push((delimiter, strip));
+        Some(())
+    }
+
+    /// Skip the body of every heredoc opened on the line just ended, up to the line that
+    /// closes it. A body that never closes is not something this parser has read.
+    fn skip_heredocs(&mut self, chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<()> {
+        for (delimiter, strip) in std::mem::take(&mut self.heredocs) {
+            loop {
+                let mut line = String::new();
+                let mut end = true;
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        end = false;
+                        break;
+                    }
+                    line.push(c);
+                }
+                let text = match strip {
+                    true => line.trim_start_matches('\t'),
+                    false => line.as_str(),
+                };
+                if text == delimiter {
+                    break;
+                }
+                if end {
+                    return None;
+                }
+            }
+        }
+        Some(())
     }
 
     /// Read a redirection and remember what it writes, if anything.
@@ -565,9 +644,14 @@ mod tests {
             "sh -c 'rm x'",
             "/bin/bash -lc ls",
             "xargs zsh -c ls",
+            // An unquoted delimiter lets the shell expand the body, and a here string
+            // is a word like any other.
             "cat <<EOF\nx\nEOF",
-            "cat < file",
+            "cat <<<\"$(rm x)\"",
+            // A body that never reaches its terminator has not been read.
+            "cat <<'EOF'\nx\n",
             "ls >&out",
+            "ls <> file",
             // A target this parser would write down as something it is not.
             "ls > $HOME/out",
             "ls > >(tee out)",
@@ -615,6 +699,37 @@ mod tests {
             words("echo hi > out.txt"),
             Some(vec![vec!["echo".to_string(), "hi".to_string()]])
         );
+    }
+
+    #[test]
+    fn a_quoted_heredoc_is_data_rather_than_shell() {
+        // The body is skipped whole: what looks like shell inside it is not.
+        assert_eq!(
+            words("python3 - <<'PY'\nimport os; os.system('rm -rf /')\nPY"),
+            Some(vec![vec!["python3".to_string(), "-".to_string()]])
+        );
+        // The rest of the line is still the command's, and the body starts after it.
+        assert_eq!(
+            words("cat <<'EOF' | wc -l\na | b\nEOF"),
+            Some(vec![
+                vec!["cat".to_string()],
+                vec!["wc".to_string(), "-l".to_string()]
+            ])
+        );
+        // `<<-` strips the tabs off its terminator, and what follows is read as usual.
+        assert_eq!(
+            words("cat <<-\"END\"\n\tx\n\tEND\nrm x"),
+            Some(vec![
+                vec!["cat".to_string()],
+                vec!["rm".to_string(), "x".to_string()]
+            ])
+        );
+        // Reading a file writes nothing, so it only has to be a name this can read.
+        assert_eq!(
+            words("wc -l < notes.txt"),
+            Some(vec![vec!["wc".to_string(), "-l".to_string()]])
+        );
+        assert_eq!(parse("wc -l < $(ls)"), None);
     }
 
     #[test]

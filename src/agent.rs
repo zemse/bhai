@@ -1252,17 +1252,22 @@ as-is. Try a different approach, or ask the user."
                 // ask in what it writes, which is the one way through that does not stop
                 // the turn on a modal.
                 None if policy.mode() == Mode::Auto => {
-                    let why = match (judge.is_some(), asking) {
-                        (_, true) => "the judge could not decide it",
-                        (true, false) => "this call always needs the user's own approval",
-                        (false, false) => "no judge is running in this session",
+                    let (why, how) = match (judge.is_some(), asking) {
+                        (_, true) => ("the judge could not decide it", ""),
+                        // Saying which of the three it is would take the checker apart
+                        // for the model; naming all three lets it see which it tripped.
+                        (true, false) => (
+                            "only the user may approve this one",
+                            " It names a protected path, writes outside the project and its scratch directories, or is a command the permission checker cannot read, such as one holding an expansion, a subshell or an unquoted heredoc. Written plainer it may go through.",
+                        ),
+                        (false, false) => ("no judge is running in this session", ""),
                     };
                     let _ = tx.send(AgentEvent::ToolRejected(format!(
                         "auto-denied: {summary} ({why})"
                     )));
                     return (
                         format!(
-                            "denied by auto policy: {why}, and auto mode never prompts. It did not run. Try a different approach, or ask the user to run it or to switch to ask mode."
+                            "denied by auto policy: {why}, and auto mode never prompts. It did not run.{how} Try a different approach, or ask the user to run it or to switch to ask mode."
                         ),
                         false,
                     );

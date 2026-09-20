@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- The permission tokenizer reads a quoted heredoc as the data it is, so `python3 - <<'PY'`
+  is the command `python3 -` rather than something unreadable, and reads `< file` too. An
+  unquoted delimiter, a here string and `<>` still refuse the command. A denial in `auto`
+  now says what kind of thing the checker would not pass, so the agent can write it
+  plainer.
 - The judge rules on a scratch file and on reading outside the project, which used to be
   held for the user: `/tmp` and the system temp directory are scratch, not the machine.
   A protected path, and a write anywhere else outside the project, still are the user's
