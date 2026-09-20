@@ -20,6 +20,7 @@ mod judge;
 mod limits;
 mod markdown;
 mod mcp;
+mod ollama;
 mod permissions;
 mod profile;
 mod prompt;
@@ -79,27 +80,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Fail before taking over the terminal if there is nothing to authenticate with.
-    let http = reqwest::Client::new();
-    if let Err(e) = auth::load(&http).await {
-        eprintln!("bhai: {e:#}");
-        std::process::exit(1);
-    }
-
     // `bhai --probe [prompt]` does one non-interactive model call, for checking that
     // auth and the wire format still work without entering the TUI.
     if args.first().is_some_and(|a| a == "--probe") {
-        let (prompt, ..) = load(Flags::default(), identity::DEFAULT).await?;
-        let hub = prompt.mcp.clone();
-        let result = probe(prompt, args.get(1).cloned()).await;
+        let setup = load(Flags::default(), identity::DEFAULT).await?;
+        let hub = setup.prompt.mcp.clone();
+        let result = probe(setup, args.get(1).cloned()).await;
         shutdown(hub).await;
         return result;
     }
     // `bhai --cache-check` sends a few calls on one prefix and checks the cache served it.
     if args.first().is_some_and(|a| a == "--cache-check") {
-        let (prompt, policy, delegation, ..) = load(Flags::default(), identity::DEFAULT).await?;
-        let hub = prompt.mcp.clone();
-        let result = cache_check(prompt, policy, delegation).await;
+        let setup = load(Flags::default(), identity::DEFAULT).await?;
+        let hub = setup.prompt.mcp.clone();
+        let result = cache_check(setup).await;
         shutdown(hub).await;
         if !result? {
             std::process::exit(1);
@@ -108,9 +102,9 @@ async fn main() -> Result<()> {
     }
     // `bhai --judge-eval [file]` scores the judge against a file of cases.
     if args.first().is_some_and(|a| a == "--judge-eval") {
-        let (prompt, .., settings) = load(Flags::default(), identity::DEFAULT).await?;
-        let hub = prompt.mcp.clone();
-        let result = judge_eval(prompt, settings, args.get(1).cloned()).await;
+        let setup = load(Flags::default(), identity::DEFAULT).await?;
+        let hub = setup.prompt.mcp.clone();
+        let result = judge_eval(setup, args.get(1).cloned()).await;
         shutdown(hub).await;
         if !result? {
             std::process::exit(1);
@@ -121,7 +115,7 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
@@ -140,11 +134,19 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| identity::DEFAULT.to_string()),
     };
-    let (prompt, policy, delegation, limits, judge) = load(args.flags, &name).await?;
+    let Setup {
+        prompt,
+        policy,
+        delegation,
+        limits,
+        judge,
+        choice,
+    } = load(args.flags, &name).await?;
     let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
-    let mut client =
-        client::Client::new()?.with_overrides(identity.model.clone(), identity.effort.clone());
+    let mut client = client::Client::new(&choice)?
+        .with_overrides(identity.model.clone(), identity.effort.clone())
+        .with_overrides(args.model.clone(), args.effort.clone());
     if let Some(loaded) = &resumed {
         client = client.with_session(&loaded.header.session);
     }
@@ -152,6 +154,12 @@ async fn main() -> Result<()> {
         args.profile
             .then(|| profile::debug_dir().join("headers.jsonl")),
     );
+    // Fail before taking over the terminal if the backend cannot serve the model.
+    if let Err(e) = client.preflight().await {
+        shutdown(hub.clone()).await;
+        eprintln!("bhai: {e:#}");
+        std::process::exit(1);
+    }
     let saved = match resumed {
         Some(loaded) => {
             let header = &loaded.header;
@@ -362,6 +370,10 @@ struct Args {
     strict_cache: bool,
     /// `--as`: the identity to run as.
     identity: Option<String>,
+    /// `--model`: the model this session talks to, over the config and the identity.
+    model: Option<String>,
+    /// `--effort`: the reasoning effort, likewise.
+    effort: Option<String>,
     /// Honour the repo-supplied allow rules as they are now.
     trust: bool,
     /// `--resume [id]`: continue a saved session, the latest when no id is given.
@@ -373,13 +385,22 @@ struct Args {
     flags: Flags,
 }
 
+/// Everything a session is built from once the config, the identity and the project's
+/// instructions have been read.
+struct Setup {
+    prompt: SystemPrompt,
+    policy: Policy,
+    delegation: Delegation,
+    limits: Limits,
+    judge: judge::Settings,
+    /// The model the config asks for, before the identity and the flags have their say.
+    choice: client::Choice,
+}
+
 /// Config and instruction files for the working directory, as the system prompt for
 /// the identity called `name`, the permission policy, and what child agents need.
 /// Starts the MCP servers.
-async fn load(
-    flags: Flags,
-    name: &str,
-) -> Result<(SystemPrompt, Policy, Delegation, Limits, judge::Settings)> {
+async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
@@ -400,10 +421,18 @@ async fn load(
         },
     };
     let limits = config.limits;
-    let settings = config.judge.clone();
+    let judge = config.judge.clone();
+    let choice = config.choice.clone();
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
-    Ok((prompt, policy, delegation, limits, settings))
+    Ok(Setup {
+        prompt,
+        policy,
+        delegation,
+        limits,
+        judge,
+        choice,
+    })
 }
 
 /// The policy from the config, Claude Code's settings and remembered approvals, plus
@@ -494,6 +523,18 @@ fn parse_args(args: &[String]) -> Result<Args> {
                     .ok_or_else(|| anyhow::anyhow!("--mode needs a value"))?;
                 parsed.flags.mode = Some(mode.parse().map_err(anyhow::Error::msg)?);
             }
+            "--model" => {
+                let name = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--model needs a model name"))?;
+                parsed.model = Some(name.clone());
+            }
+            "--effort" => {
+                let level = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--effort needs a level"))?;
+                parsed.effort = Some(level.clone());
+            }
             "--as" => {
                 let name = args
                     .next()
@@ -558,6 +599,7 @@ fn start(
     });
     let session = Session::new(
         client.model().to_string(),
+        client.effort().to_string(),
         prompt.identity.name.clone(),
         tx_user,
         tx_control,
@@ -637,15 +679,17 @@ async fn headless_workflow(
 /// Drive the real agent loop without the TUI, rejecting every command. Checks auth,
 /// the wire format and the tool-result replay path without executing anything, so it
 /// runs in `ask` mode with no rules whatever the config says.
-async fn probe(system: SystemPrompt, prompt: Option<String>) -> Result<()> {
+async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
+    let system = setup.prompt;
     let (tx_user, rx_user) = mpsc::channel::<String>(1);
     let (_tx_control, rx_control) = mpsc::channel::<Control>(1);
     let (tx_agent, mut rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
-    let client = client::Client::new()?.with_overrides(
+    let client = client::Client::new(&setup.choice)?.with_overrides(
         system.identity.model.clone(),
         system.identity.effort.clone(),
     );
+    client.preflight().await?;
     tokio::spawn(agent::run(
         client,
         system,
@@ -733,11 +777,22 @@ struct CacheRow {
 /// Send a few tiny calls with the session's real instructions and tools through the
 /// real client, and report how much of each the cache served. `false` when call 2 or
 /// later got nothing from the cache.
-async fn cache_check(system: SystemPrompt, policy: Policy, delegation: Delegation) -> Result<bool> {
-    let client = client::Client::new()?.with_overrides(
+async fn cache_check(setup: Setup) -> Result<bool> {
+    let (system, policy, delegation) = (setup.prompt, setup.policy, setup.delegation);
+    let client = client::Client::new(&setup.choice)?.with_overrides(
         system.identity.model.clone(),
         system.identity.effort.clone(),
     );
+    client.preflight().await?;
+    // Only the Codex backend reports how much of the input its cache served, so on any
+    // other one there is nothing to measure and three live calls would prove nothing.
+    if client.provider() != client::Provider::Codex {
+        println!(
+            "cache-check: nothing to check, the {} backend reports no cached count.",
+            client.provider().name()
+        );
+        return Ok(true);
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     // The same tool list a session offers, the agent tool included; it is never run.
     let mut registry = tools::Registry::for_prompt(&system);
@@ -843,11 +898,8 @@ const JUDGE_CASES: &str = "tests/fixtures/judge-cases.jsonl";
 /// Run a file of cases through the real judge, exactly as the approval path decides on
 /// it, and score every verdict against what the case expected. `false` when any case
 /// came back wrong, so the command's exit status is the score.
-async fn judge_eval(
-    system: SystemPrompt,
-    settings: judge::Settings,
-    path: Option<String>,
-) -> Result<bool> {
+async fn judge_eval(setup: Setup, path: Option<String>) -> Result<bool> {
+    let (system, settings) = (setup.prompt, setup.judge);
     let path = PathBuf::from(path.unwrap_or_else(|| JUDGE_CASES.to_string()));
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -855,10 +907,11 @@ async fn judge_eval(
     if cases.is_empty() {
         bail!("no cases in {}", path.display());
     }
-    let client = client::Client::new()?.with_overrides(
+    let client = client::Client::new(&setup.choice)?.with_overrides(
         system.identity.model.clone(),
         system.identity.effort.clone(),
     );
+    client.preflight().await?;
     let backend = ModelJudge::new(client, &settings);
     let outcomes = judge::eval(&backend, &cases, settings.timeout).await;
     print!("{}", judge::report(&outcomes));
@@ -1076,6 +1129,24 @@ mod tests {
         assert!(flags(&["--no-project"]).no_project);
         let bare = flags(&["--bare", "--profile"]);
         assert!(bare.bare && !bare.no_global);
+    }
+
+    #[test]
+    fn model_flags() {
+        let picked = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse_args(&args).map(|a| (a.model, a.effort))
+        };
+        assert_eq!(picked(&[]).unwrap(), (None, None));
+        assert_eq!(
+            picked(&["--model", "ollama:gemma4:e2b", "--effort", "low"]).unwrap(),
+            (
+                Some("ollama:gemma4:e2b".to_string()),
+                Some("low".to_string())
+            )
+        );
+        assert!(picked(&["--model"]).is_err());
+        assert!(picked(&["--effort"]).is_err());
     }
 
     #[test]

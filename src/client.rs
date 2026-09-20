@@ -3,6 +3,9 @@
 //! Endpoint, headers and request shape mirror openai/codex (`codex-rs/core/src/client.rs`
 //! and `codex-rs/model-provider-info`): `POST https://chatgpt.com/backend-api/codex/responses`
 //! with the ChatGPT access token as a bearer and the workspace id in `ChatGPT-Account-ID`.
+//!
+//! A model id prefixed `ollama:` is served by Ollama on this machine instead; the body
+//! and the stream are then [`crate::ollama`]'s, and everything else here is the same.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,14 +20,50 @@ use serde_json::{Value, json};
 use crate::auth::{self, Auth};
 use crate::cache::{self, CacheBreak, CacheGuard};
 use crate::limits::{self, RateLimits};
+use crate::ollama;
 
 const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const ORIGINATOR: &str = "codex_cli_rs";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const DEFAULT_EFFORT: &str = "medium";
 /// Give up on a stream that has produced nothing for this long.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ATTEMPTS: usize = 3;
+
+/// Where a session's inference runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    /// The Responses API behind the ChatGPT/Codex subscription.
+    Codex,
+    /// A model served by Ollama on this machine.
+    Ollama,
+}
+
+impl Provider {
+    /// The backend a model id names: `ollama:<name>` is local, anything else is Codex.
+    pub fn of(model: &str) -> Self {
+        match model.starts_with(ollama::PREFIX) {
+            true => Provider::Ollama,
+            false => Provider::Codex,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Provider::Codex => "codex",
+            Provider::Ollama => "ollama",
+        }
+    }
+}
+
+/// What the config asks for, under the environment and above the Codex CLI's own file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Choice {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// Where the Ollama server is, when the model is one of its own.
+    pub ollama_url: Option<String>,
+}
 
 /// What the UI is told while a turn streams.
 #[derive(Debug, Clone)]
@@ -80,6 +119,8 @@ pub struct Client {
     cache_key: String,
     model: String,
     effort: String,
+    /// Where the Ollama server is, for a model served by one.
+    ollama_url: String,
     /// The conversation's cache guard; shared by clones, fresh for each child.
     guard: Arc<Mutex<CacheGuard>>,
     /// `--profile`: where the rate-limit response headers are logged.
@@ -87,12 +128,12 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new() -> Result<Self> {
+    pub fn new(choice: &Choice) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
             .build()
             .context("could not build HTTP client")?;
-        let (model, effort) = model_settings();
+        let (model, effort) = model_settings(choice);
         let session_id = uuid::Uuid::new_v4().to_string();
         Ok(Self {
             http,
@@ -101,8 +142,27 @@ impl Client {
             session_id,
             model,
             effort,
+            ollama_url: choice
+                .ollama_url
+                .clone()
+                .or_else(|| env("BHAI_OLLAMA_URL"))
+                .unwrap_or_else(|| ollama::DEFAULT_URL.to_string()),
             header_log: None,
         })
+    }
+
+    /// Which backend this client's model is served by.
+    pub fn provider(&self) -> Provider {
+        Provider::of(&self.model)
+    }
+
+    /// Fail before the terminal is taken over when the backend cannot serve the model:
+    /// no ChatGPT credentials, or an Ollama server that is not running it.
+    pub async fn preflight(&self) -> Result<()> {
+        match self.provider() {
+            Provider::Codex => auth::load(&self.http).await.map(|_| ()),
+            Provider::Ollama => ollama::preflight(&self.http, &self.ollama_url, &self.model).await,
+        }
     }
 
     /// `--strict-cache`: refuse to send a request that breaks the prompt cache.
@@ -151,14 +211,10 @@ impl Client {
 
     /// Take `input` as already sent with these instructions and tools.
     pub fn seed(&self, instructions: &str, tools: &[Value], input: &[Value]) {
-        let body = request_body(
-            &self.model,
-            &self.effort,
-            &self.cache_key,
-            instructions,
-            tools,
-            input,
-        );
+        if self.provider() != Provider::Codex {
+            return; // no other backend has a prompt cache to keep
+        }
+        let body = self.body(instructions, tools, input);
         self.guard
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -204,36 +260,33 @@ impl Client {
         on_delta: &mut impl FnMut(Delta),
         cancel: &Arc<AtomicBool>,
     ) -> Result<Vec<Value>> {
-        let body = request_body(
-            &self.model,
-            &self.effort,
-            &self.cache_key,
-            instructions,
-            tools,
-            input,
-        );
-        // Checked once per call, so retries of the same body are not compared.
-        let checked = self
-            .guard
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .check(&body);
-        let found = match checked {
-            Ok(found) => found,
-            // Strict mode refuses the call, but the break still belongs in the status bar.
-            Err(e) => {
-                if let Some(found) = cache::refused(&e) {
-                    on_delta(Delta::Cache(Some(found.clone())));
+        let body = self.body(instructions, tools, input);
+        // Only the Codex backend has a prompt cache, and the guard reads a Responses
+        // body, so an Ollama call is neither checked nor reported.
+        if self.provider() == Provider::Codex {
+            // Checked once per call, so retries of the same body are not compared.
+            let checked = self
+                .guard
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .check(&body);
+            let found = match checked {
+                Ok(found) => found,
+                // Strict mode refuses the call, but the break still belongs in the status bar.
+                Err(e) => {
+                    if let Some(found) = cache::refused(&e) {
+                        on_delta(Delta::Cache(Some(found.clone())));
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
-        on_delta(Delta::Cache(found));
+            };
+            on_delta(Delta::Cache(found));
+        }
 
         let mut backoff = Duration::from_millis(500);
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {
-            match self.attempt(&body, on_delta, cancel).await {
+            match self.attempt(self.provider(), &body, on_delta, cancel).await {
                 Ok(items) => return Ok(items),
                 Err(Error::Interrupted) => bail!("interrupted"),
                 Err(Error::Fatal(e)) => return Err(e),
@@ -266,14 +319,18 @@ impl Client {
             "role": "user",
             "content": [{ "type": "input_text", "text": text }],
         })];
-        let body = request_body(
-            model,
-            effort,
-            &format!("{}-{key}", self.session_id),
-            instructions,
-            &[],
-            &input,
-        );
+        let provider = Provider::of(model);
+        let body = match provider {
+            Provider::Codex => request_body(
+                model,
+                effort,
+                &format!("{}-{key}", self.session_id),
+                instructions,
+                &[],
+                &input,
+            ),
+            Provider::Ollama => ollama::request_body(model, instructions, &[], &input),
+        };
         let mut usage = Usage::default();
         let mut on_delta = |delta: Delta| {
             if let Delta::Usage(found) = delta {
@@ -281,7 +338,12 @@ impl Client {
             }
         };
         let items = match self
-            .attempt(&body, &mut on_delta, &Arc::new(AtomicBool::new(false)))
+            .attempt(
+                provider,
+                &body,
+                &mut on_delta,
+                &Arc::new(AtomicBool::new(false)),
+            )
             .await
         {
             Ok(items) => items,
@@ -291,12 +353,33 @@ impl Client {
         Ok((output_text(&items), usage))
     }
 
+    /// The request body for one call, in whichever shape this client's backend reads.
+    fn body(&self, instructions: &str, tools: &[Value], input: &[Value]) -> Value {
+        match self.provider() {
+            Provider::Codex => request_body(
+                &self.model,
+                &self.effort,
+                &self.cache_key,
+                instructions,
+                tools,
+                input,
+            ),
+            Provider::Ollama => ollama::request_body(&self.model, instructions, tools, input),
+        }
+    }
+
+    /// One call. `provider` is passed rather than read off the client, since `aside`
+    /// may run its model on the other backend.
     async fn attempt(
         &self,
+        provider: Provider,
         body: &Value,
         on_delta: &mut impl FnMut(Delta),
         cancel: &Arc<AtomicBool>,
     ) -> std::result::Result<Vec<Value>, Error> {
+        if provider == Provider::Ollama {
+            return ollama::attempt(&self.http, &self.ollama_url, body, on_delta, cancel).await;
+        }
         let auth = auth::load(&self.http).await.map_err(Error::Fatal)?;
 
         let resp = self
@@ -491,7 +574,7 @@ fn output_text(items: &[Value]) -> String {
         .collect()
 }
 
-enum Error {
+pub(crate) enum Error {
     Retryable(anyhow::Error),
     Fatal(anyhow::Error),
     Interrupted,
@@ -521,11 +604,12 @@ fn api_error_message(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Model and reasoning effort: env overrides first, then whatever `~/.codex/config.toml`
-/// has at top level. Deliberately a line scan rather than a TOML dependency.
-fn model_settings() -> (String, String) {
-    let mut model = std::env::var("BHAI_MODEL").ok().filter(|s| !s.is_empty());
-    let mut effort = std::env::var("BHAI_EFFORT").ok().filter(|s| !s.is_empty());
+/// Model and reasoning effort: the environment first, then bhai's own config, then
+/// whatever `~/.codex/config.toml` has at top level. The last of those is deliberately
+/// a line scan rather than a TOML dependency.
+fn model_settings(choice: &Choice) -> (String, String) {
+    let mut model = env("BHAI_MODEL").or_else(|| choice.model.clone());
+    let mut effort = env("BHAI_EFFORT").or_else(|| choice.effort.clone());
 
     if model.is_none() || effort.is_none() {
         let config = auth::codex_home()
@@ -549,6 +633,11 @@ fn model_settings() -> (String, String) {
         model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
         effort.unwrap_or_else(|| DEFAULT_EFFORT.to_string()),
     )
+}
+
+/// An environment variable, where it is set to something.
+fn env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
 
 fn toml_string(line: &str, key: &str) -> Option<String> {
@@ -585,7 +674,7 @@ mod tests {
 
     #[test]
     fn a_child_has_its_own_cache_key_and_guard() {
-        let parent = Client::new().unwrap().strict_cache(true);
+        let parent = Client::new(&Choice::default()).unwrap().strict_cache(true);
         let identity = crate::identity::Identity {
             name: "reader".to_string(),
             ..crate::identity::Identity::default()

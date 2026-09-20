@@ -113,6 +113,12 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Whether the backend says how much of the input its prompt cache served, so the
+    /// monitor has something to judge.
+    fn reports_cache(&self) -> bool {
+        true
+    }
+
     /// Take `input` as already sent, for a conversation resumed from disk.
     fn seed(&self, _instructions: &str, _tools: &[Value], _input: &[Value]) {}
 
@@ -144,6 +150,10 @@ impl Model for Client {
 
     fn strict_cache(&self) -> bool {
         Client::strict(self)
+    }
+
+    fn reports_cache(&self) -> bool {
+        self.provider() == crate::client::Provider::Codex
     }
 
     fn seed(&self, instructions: &str, tools: &[Value], input: &[Value]) {
@@ -479,7 +489,12 @@ async fn turn(
                 Delta::Text(s) => AgentEvent::Text(s),
                 Delta::Usage(usage) => {
                     finished = Some(usage);
-                    let hit = monitor.observe(&usage, Instant::now());
+                    // A backend that never reports a cached count would look like an
+                    // unbroken run of misses, so it is not judged at all.
+                    let hit = match model.reports_cache() {
+                        true => monitor.observe(&usage, Instant::now()),
+                        false => cache::Hit::default(),
+                    };
                     if let Some(path) = usage_log
                         && let Err(e) = profile::log_usage(path, &usage, &hit, sent)
                     {
@@ -1307,7 +1322,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
         tokio::spawn(run(
-            Client::new().unwrap(),
+            Client::new(&crate::client::Choice::default()).unwrap(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(Policy::default()),
             None,
@@ -1785,6 +1800,7 @@ mod tests {
         let policy = Arc::new(Policy::default());
         let session = Session::new(
             "fake".to_string(),
+            "medium".to_string(),
             "general".to_string(),
             tx_user,
             tx_control,

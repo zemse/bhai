@@ -72,6 +72,11 @@ pub const COMMANDS: &[Command] = &[
         help: "prompts waiting behind the turn",
     },
     Command {
+        name: "model",
+        args: "",
+        help: "the model this session talks to",
+    },
+    Command {
         name: "mcp",
         args: "",
         help: "the MCP servers and their tools",

@@ -39,6 +39,8 @@ pub struct Config {
     pub import_claude_permissions: bool,
     /// When history is compacted: `context_window` and `compact_at`.
     pub limits: Limits,
+    /// `model`, `effort` and `ollama_url`: which backend the session talks to.
+    pub choice: crate::client::Choice,
 }
 
 impl Default for Config {
@@ -58,6 +60,7 @@ impl Default for Config {
             judge: crate::judge::Settings::default(),
             import_claude_permissions: true,
             limits: Limits::default(),
+            choice: crate::client::Choice::default(),
         }
     }
 }
@@ -129,6 +132,9 @@ struct Layer {
     judge_timeout_ms: Option<u64>,
     judge_max_per_turn: Option<usize>,
     import_claude_permissions: Option<bool>,
+    model: Option<String>,
+    effort: Option<String>,
+    ollama_url: Option<String>,
     context_window: Option<u64>,
     compact_at: Option<f64>,
     #[serde(default)]
@@ -271,6 +277,18 @@ impl Config {
         if trusted && let Some(McpLayer::Table { servers, .. }) = &layer.mcp {
             self.mcp_servers.extend(servers.clone());
         }
+        // Where inference runs is the user's call, never a cloned repo's.
+        if trusted {
+            for (field, value) in [
+                (&mut self.choice.model, &layer.model),
+                (&mut self.choice.effort, &layer.effort),
+                (&mut self.choice.ollama_url, &layer.ollama_url),
+            ] {
+                if value.is_some() {
+                    *field = value.clone();
+                }
+            }
+        }
         self.apply(layer);
         Ok(())
     }
@@ -370,6 +388,31 @@ mod tests {
                 skills: true,
                 mcp: true,
                 ..Config::default()
+            }
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_the_global_file_picks_the_model() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &home.join(".config/bhai/config.toml"),
+            "model = \"ollama:gemma4:e2b\"\neffort = \"low\"\nollama_url = \"http://box:11434\"\n",
+        );
+        // A cloned repo must not redirect inference, least of all to a URL of its own.
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "model = \"gpt-5.5\"\nollama_url = \"http://elsewhere\"\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert_eq!(
+            config.choice,
+            crate::client::Choice {
+                model: Some("ollama:gemma4:e2b".to_string()),
+                effort: Some("low".to_string()),
+                ollama_url: Some("http://box:11434".to_string()),
             }
         );
         std::fs::remove_dir_all(dir).unwrap();

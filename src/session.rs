@@ -97,6 +97,8 @@ pub struct Approval {
 #[derive(Debug, Clone, Serialize)]
 pub struct State {
     pub model: String,
+    /// The reasoning effort the model runs at.
+    pub effort: String,
     pub identity: String,
     pub mode: Mode,
     pub working: bool,
@@ -191,6 +193,7 @@ struct Inner {
 
 pub struct Session {
     model: String,
+    effort: String,
     identity: String,
     events: broadcast::Sender<Event>,
     inner: Mutex<Inner>,
@@ -204,8 +207,10 @@ pub struct Session {
 }
 
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: String,
+        effort: String,
         identity: String,
         tx_user: mpsc::Sender<String>,
         tx_control: mpsc::Sender<Control>,
@@ -215,6 +220,7 @@ impl Session {
     ) -> Arc<Self> {
         Arc::new(Self {
             model,
+            effort,
             identity,
             events: broadcast::channel(EVENT_BUFFER).0,
             inner: Mutex::default(),
@@ -235,6 +241,7 @@ impl Session {
         let inner = self.lock();
         State {
             model: self.model.clone(),
+            effort: self.effort.clone(),
             identity: self.identity.clone(),
             mode: self.policy.mode(),
             working: inner.working,
@@ -548,6 +555,7 @@ mod tests {
         (
             Session::new(
                 "m".to_string(),
+                "medium".to_string(),
                 "general".to_string(),
                 tx_user,
                 tx_control,

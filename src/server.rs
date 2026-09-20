@@ -206,6 +206,7 @@ mod tests {
         let (tx_decision, rx_decision) = oneshot::channel();
         let session = Session::new(
             "test-model".to_string(),
+            "medium".to_string(),
             "router".to_string(),
             tx_user,
             tx_control,
@@ -386,6 +387,7 @@ mod tests {
         let policy = Arc::new(Policy::default());
         let session = Session::new(
             "fake".to_string(),
+            "medium".to_string(),
             "general".to_string(),
             tx_user,
             tx_control,

@@ -172,6 +172,7 @@ pub struct App {
     pub follow: bool,
     pub spinner: usize,
     pub model: String,
+    pub effort: String,
     pub identity: String,
     pub mode: Mode,
     pub tokens_in: u64,
@@ -240,6 +241,7 @@ impl App {
             follow: true,
             spinner: 0,
             model: session.state().model,
+            effort: session.state().effort,
             identity: session.state().identity,
             mode: session.state().mode,
             tokens_in: 0,
@@ -843,6 +845,11 @@ impl App {
             self.note(Entry::Info(switch_notice(&self.identity, rest.trim())));
             return;
         }
+        if message.starts_with("/model") {
+            self.follow = true;
+            self.note(Entry::Info(model_notice(&self.model, &self.effort)));
+            return;
+        }
         if message.starts_with("/mcp") {
             self.follow = true;
             self.note(Entry::Info(crate::mcp::report(self.mcp.as_deref())));
@@ -1051,6 +1058,21 @@ fn switch_notice(current: &str, name: &str) -> String {
     )
 }
 
+/// What `/model` prints. The model is fixed for the session, since changing it mid-way
+/// would throw away the cached prefix the whole conversation is sitting on.
+fn model_notice(model: &str, effort: &str) -> String {
+    let provider = crate::client::Provider::of(model);
+    let mut notice = format!("model: {model} ({effort} effort) on {}", provider.name());
+    if provider == crate::client::Provider::Ollama {
+        notice.push_str(", served locally");
+    }
+    notice.push_str(
+        ". The model is fixed for the session; to change it, quit and run: bhai --model <name>. \
+A local model is named `ollama:<name>`, as `ollama list` shows it.",
+    );
+    notice
+}
+
 /// What `/mouse` prints. Capture is what turns the wheel into scroll events and drags
 /// into transcript selection, so turning it off hands both back to the terminal.
 fn mouse_notice(on: bool) -> String {
@@ -1146,6 +1168,7 @@ impl App {
         let (tx_control, _) = tokio::sync::mpsc::channel(1);
         App::new(Session::new(
             "m".to_string(),
+            "medium".to_string(),
             "general".to_string(),
             tx_user,
             tx_control,
@@ -1257,6 +1280,18 @@ mod tests {
         assert_eq!(
             input_request(key(KeyCode::Left, KeyModifiers::CONTROL)),
             Some(InputRequest::GoToPrevWord)
+        );
+    }
+
+    #[test]
+    fn model_notice_names_the_backend() {
+        let local = model_notice("ollama:gemma4:e2b", "medium");
+        assert!(
+            local.starts_with("model: ollama:gemma4:e2b (medium effort) on ollama, served locally")
+        );
+        assert!(local.contains("bhai --model <name>"));
+        assert!(
+            model_notice("gpt-5.5", "high").starts_with("model: gpt-5.5 (high effort) on codex.")
         );
     }
 
