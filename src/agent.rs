@@ -45,7 +45,12 @@ pub enum AgentEvent {
         offers: Offers,
         reply: oneshot::Sender<Answer>,
     },
-    ToolStart(String),
+    /// A tool call started: which tool, and the one-line summary of the call. The tool
+    /// is what the transcript draws it as, since only `bash` is a shell command.
+    ToolStart {
+        tool: String,
+        summary: String,
+    },
     /// Output of the running call so far, for the UI only.
     ToolProgress(String),
     ToolOutput(String),
@@ -1029,7 +1034,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 // Everything the child says goes to its own pane.
                 said @ (AgentEvent::Reasoning(_)
                 | AgentEvent::Text(_)
-                | AgentEvent::ToolStart(_)
+                | AgentEvent::ToolStart { .. }
                 | AgentEvent::ToolProgress(_)
                 | AgentEvent::ToolOutput(_)
                 | AgentEvent::ToolRejected(_)
@@ -1211,7 +1216,10 @@ as-is. Try a different approach, or ask the user."
         }
     }
 
-    let _ = tx.send(AgentEvent::ToolStart(summary.clone()));
+    let _ = tx.send(AgentEvent::ToolStart {
+        tool: name.to_string(),
+        summary: summary.clone(),
+    });
     let progress = |chunk: String| {
         let _ = tx.send(AgentEvent::ToolProgress(chunk));
     };

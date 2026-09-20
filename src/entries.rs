@@ -21,7 +21,12 @@ pub enum Entry {
     Queued(String),
     Assistant(String),
     Reasoning(String),
-    Command(String),
+    /// A tool call, kept with the tool that ran it so the transcript can draw a shell
+    /// command as one and everything else as what it is.
+    Command {
+        tool: String,
+        summary: String,
+    },
     /// Output of a command still running: its latest bytes and its complete lines so far.
     Running {
         tail: String,
@@ -81,7 +86,10 @@ impl Entries {
             Event::Queued { text, .. } => self.push(Entry::Queued(text.clone())),
             Event::Text(delta) => self.append(delta, Stream::Assistant),
             Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
-            Event::ToolStart(command) => self.push(Entry::Command(command.clone())),
+            Event::ToolStart { tool, summary } => self.push(Entry::Command {
+                tool: tool.clone(),
+                summary: summary.clone(),
+            }),
             Event::ToolProgress(chunk) => self.progress(chunk),
             Event::ToolOutput(output) => {
                 let entry = Entry::Output(output.trim_end().to_string());
@@ -139,11 +147,14 @@ impl Entries {
                 Some("reasoning") if !text("summary").is_empty() => {
                     Entry::Reasoning(text("summary"))
                 }
-                Some("function_call") => Entry::Command(format!(
-                    "{} {}",
-                    item["name"].as_str().unwrap_or_default(),
-                    item["arguments"].as_str().unwrap_or_default()
-                )),
+                Some("function_call") => Entry::Command {
+                    tool: item["name"].as_str().unwrap_or_default().to_string(),
+                    summary: format!(
+                        "{} {}",
+                        item["name"].as_str().unwrap_or_default(),
+                        item["arguments"].as_str().unwrap_or_default()
+                    ),
+                },
                 Some("function_call_output") => Entry::Output(
                     item["output"]
                         .as_str()
@@ -246,7 +257,7 @@ impl Entries {
                 // A child's commands come after the parent's own, and its results before.
                 let command = fresh
                     .clone()
-                    .find(|&i| matches!(self.list[i], Entry::Command(_)));
+                    .find(|&i| matches!(self.list[i], Entry::Command { .. }));
                 let result = last(|e| matches!(e, Entry::Output(_) | Entry::Rejected(_)));
                 if let Some(entry) = command.or(result) {
                     let tokens = self.tokens.entry(entry).or_default();
@@ -346,7 +357,7 @@ impl Entry {
             | Entry::Queued(t)
             | Entry::Assistant(t)
             | Entry::Reasoning(t)
-            | Entry::Command(t)
+            | Entry::Command { summary: t, .. }
             | Entry::Running { tail: t, .. }
             | Entry::Output(t)
             | Entry::Rejected(t)
@@ -361,7 +372,7 @@ impl Entry {
             Entry::Queued(_) => "queued",
             Entry::Assistant(_) => "assistant",
             Entry::Reasoning(_) => "thinking",
-            Entry::Command(_) => "command",
+            Entry::Command { .. } => "command",
             Entry::Running { .. } => "running",
             Entry::Output(_) => "output",
             Entry::Rejected(_) => "rejected",
@@ -400,6 +411,13 @@ mod tests {
         }
     }
 
+    fn start(tool: &str, summary: &str) -> Event {
+        Event::ToolStart {
+            tool: tool.to_string(),
+            summary: summary.to_string(),
+        }
+    }
+
     /// Entries that start with the TUI's intro, as the app shows them.
     fn intro() -> Entries {
         let mut entries = Entries::default();
@@ -424,9 +442,9 @@ mod tests {
             text: 12,
             calls: vec![8],
         }));
-        app.apply(&Event::ToolStart(text("agent worker: go")));
+        app.apply(&start("agent", "agent worker: go"));
         app.apply(&Event::ChildUsage(usage(7, 2, 1, 0)));
-        app.apply(&Event::ToolStart(text("[child a worker] ls")));
+        app.apply(&start("bash", "[child a worker] ls"));
         app.apply(&Event::ToolOutput(text("[child a worker] x")));
         app.apply(&Event::ToolOutput(text("child done")));
         app.apply(&Event::Item(4));
@@ -507,7 +525,7 @@ mod tests {
             calls: vec![3],
             ..CallTokens::default()
         }));
-        app.apply(&Event::ToolStart("yes".to_string()));
+        app.apply(&start("bash", "yes"));
         for _ in 0..LIVE_BYTES {
             app.apply(&Event::ToolProgress("é\n".to_string()));
         }

@@ -6,6 +6,15 @@ carries the shape of what is there.
 
 ## 2026-09-20
 
+- The transcript draws a tool call as the tool it is. A shell command keeps the `$`, and
+  a skill, read, write, edit or subagent call gets its own mark instead of looking like
+  one. A long shell command folds to its first rows the way output does.
+- Thinking comes down to the one line that says what it is thinking about, with the rows
+  it holds back named on the end of it. A click opens it and `[collapse]` closes it, as
+  it now does for tool output too.
+- The tokens a second readout stops decaying while the model is quiet: the window ends at
+  the last token rather than at now, so thinking time and retries no longer drag it to
+  zero.
 - Documentation moved here. `docs/` is gone and `CLAUDE.md` holds the orientation; the
   example workflow it shipped now lives in `examples/workflows/`.
 - Subagent panes: every child of the running turn gets a row above the prompt, `ctrl+o` or

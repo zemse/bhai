@@ -678,7 +678,7 @@ async fn headless_workflow(
                 );
             }
             session::Event::Info(message) => println!("{message}"),
-            session::Event::ToolStart(command) => println!("$ {command}"),
+            session::Event::ToolStart { summary, .. } => println!("$ {summary}"),
             session::Event::ToolOutput(output) => println!("{output}"),
             session::Event::Error(message) => eprintln!("[error] {message}"),
             session::Event::TurnEnd => break,
@@ -732,7 +732,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
                 println!("\n[would run] {command}\n[probe rejects it]");
                 let _ = reply.send(permissions::Answer::Reject);
             }
-            AgentEvent::ToolStart(command) => println!("\n$ {command}"),
+            AgentEvent::ToolStart { summary, .. } => println!("\n$ {summary}"),
             AgentEvent::ToolOutput(output) => println!("{output}"),
             AgentEvent::ToolRejected(command) => println!("[rejected] {command}"),
             AgentEvent::Info(message) | AgentEvent::Compacted(message) => {
@@ -753,7 +753,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             }
             // A probe has no panes, so what a child says is flattened under its id.
             AgentEvent::Child { id, event } => match *event {
-                AgentEvent::ToolStart(command) => println!("[child {id}] $ {command}"),
+                AgentEvent::ToolStart { summary, .. } => println!("[child {id}] $ {summary}"),
                 AgentEvent::ToolOutput(output) => println!("[child {id}] {output}"),
                 AgentEvent::Error(message) => println!("[child {id}] [error] {message}"),
                 _ => {}

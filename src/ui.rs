@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::time::Duration;
 
@@ -309,13 +310,19 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
     let entries = app.entries();
     let mut spans = Vec::with_capacity(entries.list.len());
+    let mut folds = HashSet::new();
     for (index, entry) in entries.list.iter().enumerate() {
         let start = lines.len();
-        lines.extend(entry_lines(entry, width, app.expanded.contains(&index)));
+        let (rows, folded) = entry_lines(entry, width, app.expanded.contains(&index));
+        lines.extend(rows);
+        if folded {
+            folds.insert(index);
+        }
         // The blank separator line belongs to no entry.
         spans.push((start..lines.len() - 1, index));
     }
     drop(entries);
+    app.folds = folds;
 
     let height = area.height as usize;
     app.page = height.saturating_sub(1).max(1);
@@ -476,23 +483,54 @@ fn usage_badge(usage: Usage) -> String {
     parts.join(" · ")
 }
 
-/// An entry's rows plus a blank separator; long tool output shows only its head
-/// unless `expanded`.
-fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>> {
+/// The sigil a tool call is drawn with, and its colour. Only `bash` runs a shell
+/// command, so only `bash` gets a shell prompt; yellow is for the tools that change the
+/// machine, cyan for the ones that only bring something in.
+fn tool_mark(tool: &str) -> (&'static str, Color) {
+    use crate::tools::{agent, bash, edit, read, skill, write};
+    match tool {
+        bash::NAME => ("$ ", Color::Yellow),
+        write::NAME | edit::NAME => ("✎ ", Color::Yellow),
+        read::NAME => ("▸ ", Color::Cyan),
+        skill::NAME => ("✦ ", Color::Magenta),
+        agent::NAME => ("⇢ ", Color::Magenta),
+        // The MCP tools, and whatever else an identity was given.
+        _ => ("⚙ ", Color::Cyan),
+    }
+}
+
+/// Rows an entry shows while it is closed, or `None` when it is never folded. Thinking
+/// comes down to the one line that says it is thinking; output and a shell command to
+/// their first rows.
+fn collapsed_rows(entry: &Entry) -> Option<usize> {
+    match entry {
+        Entry::Reasoning(_) => Some(1),
+        Entry::Output(_) | Entry::Running { .. } => Some(COLLAPSED_LINES),
+        Entry::Command { tool, .. } if tool == crate::tools::bash::NAME => Some(COLLAPSED_LINES),
+        _ => None,
+    }
+}
+
+/// An entry's rows plus a blank separator, and whether it has rows a click folds away.
+/// Thinking and long tool output show only a little of themselves unless `expanded`.
+fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> (Vec<Line<'static>>, bool) {
     if let Entry::Assistant(text) = entry {
         let mut lines = markdown::render(text, width);
         if lines.is_empty() {
             lines.push(Line::from(""));
         }
         lines.push(Line::from(""));
-        return lines;
+        return (lines, false);
     }
     let (prefix, text, style): (&str, &str, Style) = match entry {
         Entry::User(t) => ("› ", t, Style::new().fg(Color::Cyan).bold()),
         Entry::Queued(t) => ("queued › ", t, Style::new().fg(Color::DarkGray)),
         Entry::Assistant(t) => ("", t, Style::new()),
-        Entry::Reasoning(t) => ("", t, Style::new().fg(Color::DarkGray).italic()),
-        Entry::Command(t) => ("$ ", t, Style::new().fg(Color::Yellow)),
+        Entry::Reasoning(t) => ("✻ ", t, Style::new().fg(Color::DarkGray).italic()),
+        Entry::Command { tool, summary } => {
+            let (prefix, colour) = tool_mark(tool);
+            (prefix, summary.as_str(), Style::new().fg(colour))
+        }
         Entry::Output(t) => ("", t, Style::new().fg(Color::Gray)),
         Entry::Running { tail, .. } => ("", tail.trim_end(), Style::new().fg(Color::Gray)),
         Entry::Rejected(t) => ("✗ ", t, Style::new().fg(Color::Red)),
@@ -500,20 +538,27 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>
         Entry::Info(t) => ("", t, Style::new().fg(Color::DarkGray)),
     };
 
-    let indent = " ".repeat(prefix.chars().count());
+    let lead = prefix.chars().count();
+    let indent = " ".repeat(lead);
     let mut lines: Vec<Line> = Vec::new();
-    let mut wrapped_lines = wrap(text, width.saturating_sub(prefix.len()).max(4));
-    let hidden = match entry {
-        Entry::Output(_) if !expanded => wrapped_lines.len().saturating_sub(COLLAPSED_LINES),
-        _ => 0,
-    };
-    wrapped_lines.truncate(wrapped_lines.len() - hidden);
-    // A running command shows its latest lines instead.
-    if let Entry::Running { .. } = entry
-        && !expanded
-    {
-        let skip = wrapped_lines.len().saturating_sub(COLLAPSED_LINES);
-        wrapped_lines.drain(..skip);
+    let mut wrapped_lines = wrap(text, width.saturating_sub(lead).max(4));
+    let hidden = collapsed_rows(entry).map_or(0, |rows| wrapped_lines.len().saturating_sub(rows));
+    if hidden > 0 && !expanded {
+        match entry {
+            // A running command shows its latest lines; everything else its first.
+            Entry::Running { .. } => {
+                wrapped_lines.drain(..hidden);
+            }
+            _ => wrapped_lines.truncate(wrapped_lines.len() - hidden),
+        }
+    }
+    // Thinking stays on its one line, so what it hides is said at the end of it rather
+    // than on a row of its own.
+    let inline = hidden > 0 && !expanded && matches!(entry, Entry::Reasoning(_));
+    if inline && let Some(first) = wrapped_lines.first_mut() {
+        let note = format!(" [+{hidden} lines]");
+        let room = width.saturating_sub(lead + note.chars().count()).max(1);
+        *first = format!("{}{note}", clip(first, room));
     }
     for (i, wrapped) in wrapped_lines.into_iter().enumerate() {
         let lead = if i == 0 {
@@ -523,9 +568,13 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>
         };
         lines.push(Line::from(Span::styled(format!("{lead}{wrapped}"), style)));
     }
-    if hidden > 0 {
+    // A running command says how far it has got instead, on the row below.
+    if hidden > 0 && !inline && !matches!(entry, Entry::Running { .. }) {
         lines.push(Line::from(Span::styled(
-            format!("[+{hidden} lines]"),
+            match expanded {
+                true => format!("{indent}[collapse]"),
+                false => format!("{indent}[+{hidden} lines]"),
+            },
             Style::new().fg(Color::DarkGray),
         )));
     }
@@ -537,7 +586,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Vec<Line<'static>
         )));
     }
     lines.push(Line::from(""));
-    lines
+    (lines, hidden > 0)
 }
 
 /// The width the input text wraps at: the text area less the cursor's own column.
@@ -920,9 +969,9 @@ mod tests {
     use crate::session::{Approval, Event};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use std::time::Instant;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::style::Modifier;
+    use std::time::Instant;
 
     fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
         Usage {
@@ -1306,7 +1355,10 @@ mod tests {
     #[test]
     fn a_running_command_shows_its_latest_lines() {
         let mut app = App::detached();
-        app.entries().apply(&Event::ToolStart("seq 5".to_string()));
+        app.entries().apply(&Event::ToolStart {
+            tool: "bash".to_string(),
+            summary: "seq 5".to_string(),
+        });
         app.entries()
             .apply(&Event::ToolProgress("one\ntwo\nthree\n".to_string()));
         app.entries()
@@ -1347,7 +1399,7 @@ mod tests {
         assert!(app.pinned.is_empty(), "a click on output does not pin");
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
-        assert!(text.contains("three\nfour\nfive\n"), "{text}");
+        assert!(text.contains("three\nfour\nfive\n[collapse]\n"), "{text}");
         assert!(!text.contains("[+2 lines]"));
 
         // A second click on the same cell in a row would be a double click, which
@@ -1363,6 +1415,86 @@ mod tests {
         assert!(app.on_mouse(up(4, rows.start)));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(screen(&terminal).contains("[+2 lines]"), "still collapsed");
+    }
+
+    #[test]
+    fn thinking_comes_down_to_one_line_until_it_is_clicked() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Reasoning(
+            "Choosing the layout\n\nThe panel goes above the prompt.\nIt stays there.".to_string(),
+        ));
+        app.entries().push(Entry::Reasoning("brief".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("✻ Choosing the layout [+3 lines]\n"),
+            "{text}"
+        );
+        assert!(!text.contains("stays there"), "{text}");
+        // A thought that already fits says nothing about lines it is not hiding.
+        assert!(text.contains("✻ brief\n"), "{text}");
+
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one line, and no row of its own to expand by"
+        );
+        assert!(click(&mut app, 2, rows.start));
+        assert!(app.pinned.is_empty(), "a click on a thought does not pin");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("  It stays there.\n  [collapse]\n"), "{text}");
+        assert!(!text.contains("[+3 lines]"), "{text}");
+
+        // The short one has nothing to fold, so clicking it pins its badge instead.
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 2).cloned().unwrap();
+        assert!(click(&mut app, 2, rows.start));
+        assert_eq!(app.pinned.iter().copied().collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn a_tool_call_is_drawn_as_the_tool_it_is() {
+        let mut app = App::detached();
+        let call = |tool: &str, summary: &str| Entry::Command {
+            tool: tool.to_string(),
+            summary: summary.to_string(),
+        };
+        app.entries().push(call("bash", "git status"));
+        app.entries().push(call("skill", "skill chrome"));
+        app.entries().push(call("read", "read /tmp/x.rs"));
+        app.entries().push(call("agent", "agent worker: check it"));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("$ git status\n"), "{text}");
+        // Only the shell gets the shell's prompt.
+        assert!(!text.contains("$ skill"), "{text}");
+        assert!(text.contains("✦ skill chrome\n"), "{text}");
+        assert!(text.contains("▸ read /tmp/x.rs\n"), "{text}");
+        assert!(text.contains("⇢ agent worker: check it\n"), "{text}");
+    }
+
+    #[test]
+    fn a_long_shell_command_folds_like_its_output() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Command {
+            tool: "bash".to_string(),
+            summary: "one \\\ntwo \\\nthree \\\nfour".to_string(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("$ one \\\n  two \\\n  three \\\n  [+1 lines]\n"),
+            "{text}"
+        );
+
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
+        assert!(click(&mut app, 2, rows.start));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("  four\n  [collapse]\n"));
     }
 
     #[test]

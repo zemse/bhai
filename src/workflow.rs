@@ -576,10 +576,13 @@ fn next_wave(steps: &[Step], status: &[Option<Status>]) -> Option<Wave> {
 /// Run one step as a child agent, with its own transcript entry.
 async fn step(run: &Run<'_>, step: &Step, identity: &Identity, prompt: &str) -> agent::Finished {
     let id = uuid::Uuid::new_v4().simple().to_string()[..6].to_string();
-    let _ = run.tx.send(AgentEvent::ToolStart(format!(
-        "workflow {} step {} ({})",
-        run.workflow.name, step.id, identity.name
-    )));
+    let _ = run.tx.send(AgentEvent::ToolStart {
+        tool: crate::tools::agent::NAME.to_string(),
+        summary: format!(
+            "workflow {} step {} ({})",
+            run.workflow.name, step.id, identity.name
+        ),
+    });
     let model = run.model.child(identity);
     let (_mailbox, steer) = agent::Mailbox::open(&run.delegation.mailboxes, &id);
     let finished = agent::run_child(Child {
@@ -648,7 +651,7 @@ mod tests {
                     seen.push(format!("approval: {command}"));
                     let _ = reply.send(Answer::Accept(None));
                 }
-                AgentEvent::ToolStart(s) => seen.push(format!("start: {s}")),
+                AgentEvent::ToolStart { summary, .. } => seen.push(format!("start: {summary}")),
                 AgentEvent::ToolOutput(s) => seen.push(format!("output: {s}")),
                 AgentEvent::Info(s) => seen.push(format!("info: {s}")),
                 _ => {}

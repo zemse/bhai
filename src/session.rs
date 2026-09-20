@@ -49,7 +49,11 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         remember: Option<Remember>,
     },
-    ToolStart(String),
+    /// A tool call started: which tool, and the one-line summary of the call.
+    ToolStart {
+        tool: String,
+        summary: String,
+    },
     /// Output of the running call so far; never part of history.
     ToolProgress(String),
     ToolOutput(String),
@@ -552,7 +556,7 @@ impl Session {
                     offers,
                 }
             }
-            AgentEvent::ToolStart(s) => Event::ToolStart(s),
+            AgentEvent::ToolStart { tool, summary } => Event::ToolStart { tool, summary },
             AgentEvent::ToolProgress(s) => Event::ToolProgress(s),
             AgentEvent::ToolOutput(s) => Event::ToolOutput(s),
             AgentEvent::ToolRejected(s) => Event::ToolRejected(s),
@@ -736,7 +740,7 @@ fn said(event: AgentEvent) -> Option<Event> {
     Some(match event {
         AgentEvent::Reasoning(s) => Event::Reasoning(s),
         AgentEvent::Text(s) => Event::Text(s),
-        AgentEvent::ToolStart(s) => Event::ToolStart(s),
+        AgentEvent::ToolStart { tool, summary } => Event::ToolStart { tool, summary },
         AgentEvent::ToolProgress(s) => Event::ToolProgress(s),
         AgentEvent::ToolOutput(s) => Event::ToolOutput(s),
         AgentEvent::ToolRejected(s) => Event::ToolRejected(s),
@@ -816,7 +820,10 @@ mod tests {
         child(&session, "b2", "read the docs");
         session.on_agent(AgentEvent::Child {
             id: "a1".to_string(),
-            event: Box::new(AgentEvent::ToolStart("ls".to_string())),
+            event: Box::new(AgentEvent::ToolStart {
+                tool: "bash".to_string(),
+                summary: "ls".to_string(),
+            }),
         });
         session.on_agent(AgentEvent::ChildEnded {
             id: "a1".to_string(),
@@ -834,7 +841,7 @@ mod tests {
         let pane = session.child_entries("a1").unwrap();
         let pane = pane.lock().unwrap();
         assert!(matches!(&pane.list[0], Entry::User(t) if t == "count the files"));
-        assert!(matches!(&pane.list[1], Entry::Command(t) if t == "ls"));
+        assert!(matches!(&pane.list[1], Entry::Command { summary, .. } if summary == "ls"));
         assert!(session.child_entries("nope").is_none());
     }
 

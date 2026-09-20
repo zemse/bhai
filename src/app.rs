@@ -134,6 +134,9 @@ pub struct App {
     pub pinned: HashSet<usize>,
     /// Tool output entries shown in full rather than collapsed.
     pub expanded: HashSet<usize>,
+    /// Entries with rows folded away right now, filled in by the renderer. A click on
+    /// one of these opens or closes it; a click anywhere else pins the badge.
+    pub folds: HashSet<usize>,
     pub all_badges: bool,
     /// Clickable approval choices and the key each stands for, filled in by the renderer.
     pub buttons: Vec<(Rect, KeyCode)>,
@@ -234,6 +237,7 @@ impl App {
             mouse_row: None,
             pinned: HashSet::new(),
             expanded: HashSet::new(),
+            folds: HashSet::new(),
             all_badges: false,
             buttons: Vec::new(),
             input_area: None,
@@ -598,16 +602,14 @@ impl App {
         true
     }
 
-    /// The release of a click that never moved: tool output expands or collapses and
-    /// any other entry pins its badge. Returns whether the screen needs a redraw.
+    /// The release of a click that never moved: an entry with rows folded away expands
+    /// or collapses and any other pins its badge. Returns whether the screen needs a
+    /// redraw.
     fn click_entry(&mut self, y: u16) -> bool {
         let Some(entry) = self.entry_at(y) else {
             return false;
         };
-        let set = if matches!(
-            self.entries().list.get(entry),
-            Some(Entry::Output(_) | Entry::Running { .. })
-        ) {
+        let set = if self.folds.contains(&entry) {
             &mut self.expanded
         } else {
             &mut self.pinned
