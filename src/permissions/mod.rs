@@ -645,7 +645,9 @@ impl Checker<'_> {
                 }
                 continue;
             }
-            let read_only = self.mode != Mode::Ask && bash::is_read_only(&c.words);
+            // A redirect writes a file, whatever the program on its left does.
+            let read_only =
+                self.mode != Mode::Ask && c.writes.is_empty() && bash::is_read_only(&c.words);
             let reason = self
                 .allow()
                 .iter()
@@ -718,6 +720,17 @@ impl Checker<'_> {
             && self.relax.commands
             && command.nested().is_empty()
             && bash::is_project_command(&command.words, &inside)
+            && self.redirects_inside(command, cwd)
+    }
+
+    /// Whether every file the command redirects into is one a write would be allowed to
+    /// make: a redirect is a write, so `auto` relaxes it on the same terms. A command
+    /// that writes nowhere passes.
+    fn redirects_inside(&self, command: &bash::Command, cwd: &Path) -> bool {
+        command
+            .writes
+            .iter()
+            .all(|target| self.project_write("write", &cwd.join(target)))
     }
 
     /// The allow rules this mode honours.
@@ -903,7 +916,10 @@ mod tests {
             (&bypass, "ls", allowed("read-only")),
             (&bypass, "rm x", deny_rm),
             (&bypass, "cat ~/.ssh/id_rsa", Decision::Ask),
-            (&bypass, "echo x > out", Decision::Ask),
+            // A redirect is a write, so the program on its left is not read-only.
+            (&bypass, "echo x > out", allowed("bypass mode")),
+            (&auto, "echo x > out", Decision::Ask),
+            (&auto, "echo x > ~/.ssh/authorized_keys", Decision::Ask),
         ];
         for (policy, command, want) in cases {
             assert_eq!(
@@ -1270,8 +1286,16 @@ mod tests {
         );
         // `sudo` and anything else the tokenizer refuses never reaches the relaxation.
         assert_eq!(bash(&p, "sudo cargo test"), Decision::Ask);
-        assert_eq!(bash(&p, "cargo test > out.txt"), Decision::Ask);
         assert_eq!(bash(&p, "curl example.com"), Decision::Ask);
+        // A redirect is a write, so it is relaxed on a write's terms: inside the
+        // project yes, anywhere else no, whatever the command on its left is.
+        assert_eq!(
+            bash(&p, "cargo test > out.txt"),
+            allowed("auto, inside the project")
+        );
+        assert_eq!(bash(&p, "cargo test > /tmp/out.txt"), Decision::Ask);
+        assert_eq!(bash(&p, "cargo test > ../out.txt"), Decision::Ask);
+        assert_eq!(bash(&p, "cargo test > .env"), Decision::Ask);
         // A symlink out of the project, a path outside it and a protected path still ask.
         let away = repo.join("away/x.rs");
         assert_eq!(file(&p, "edit", away.to_str().unwrap()), Decision::Ask);

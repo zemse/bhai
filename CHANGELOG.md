@@ -6,6 +6,10 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- The permission tokenizer reads a redirection instead of refusing the command it is on:
+  `> f`, `>> f` and `2> f` are writes, checked where a write is checked. A redirect into
+  the project is relaxed in `auto` like any write there; one into a protected path asks;
+  one this parser cannot read as a plain filename still refuses the command.
 - `--resume` comes back on the model the session was last on, since that is what its
   cached prefix and its encrypted reasoning belong to. A `/model` switch is recorded in
   the session file, so a session that changed model mid-way resumes where it ended;

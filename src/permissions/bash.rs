@@ -5,6 +5,10 @@
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Command {
     pub words: Vec<String>,
+    /// Files a redirection would write, as written: the `f` of `> f`, `>> f` or `2> f`.
+    /// A redirect is a write, so these are checked like one. Fd duplication and
+    /// `/dev/null` write no file and are not here.
+    pub writes: Vec<String>,
     /// A word globs a dot name (`.e*`), so it may expand to a protected path.
     pub dot_glob: bool,
     /// The command is one element of a pipeline, so it runs in a subshell of its own.
@@ -24,7 +28,7 @@ const WRAPPERS: &[&str] = &[
 const EXEC_FLAGS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
 
 /// Split `input` into simple commands, or `None` for anything this parser does not
-/// fully understand (substitutions, subshells, redirection to files, `eval`, ...).
+/// fully understand (substitutions, subshells, `eval`, ...).
 pub fn parse(input: &str) -> Option<Vec<Command>> {
     let commands = Tokenizer::default().run(input)?;
     commands.iter().all(allowed).then_some(commands)
@@ -67,8 +71,7 @@ impl Command {
             if !command.is_empty() {
                 nested.push(Command {
                     words: command.to_vec(),
-                    dot_glob: false,
-                    piped: false,
+                    ..Command::default()
                 });
             }
             rest = tail;
@@ -132,7 +135,7 @@ impl Tokenizer {
                 '&' => match chars.next() {
                     Some('&') => self.end_command(),
                     // `&>file` redirects both streams.
-                    Some('>') if !self.in_word => redirect(&mut chars)?,
+                    Some('>') if !self.in_word => self.redirect(&mut chars)?,
                     // A lone `&` backgrounds the command.
                     _ => return None,
                 },
@@ -196,7 +199,7 @@ impl Tokenizer {
                         self.in_word = false;
                     }
                     self.end_word();
-                    redirect(&mut chars)?;
+                    self.redirect(&mut chars)?;
                 }
                 // An empty pair of braces is literal in bash: the `{}` of `find -exec`.
                 '{' if chars.peek() == Some(&'}') => {
@@ -215,6 +218,14 @@ impl Tokenizer {
         }
         self.end_command();
         Some(self.commands)
+    }
+
+    /// Read a redirection and remember what it writes, if anything.
+    fn redirect(&mut self, chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<()> {
+        if let Some(target) = redirect_target(chars)? {
+            self.current.writes.push(target);
+        }
+        Some(())
     }
 
     fn end_word(&mut self) {
@@ -240,9 +251,11 @@ impl Tokenizer {
     }
 }
 
-/// The rest of a redirection after its `>`. Only fd duplication (`2>&1`) and
-/// `/dev/null` are accepted; writing to any other file is refused.
-fn redirect(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<()> {
+/// The file a redirection would write, or nothing when it writes none: fd duplication
+/// (`2>&1`) and `/dev/null`. A target this parser cannot read as one plain filename,
+/// such as a process substitution or anything it would have to expand, refuses the
+/// whole command rather than being written down as a name it is not.
+fn redirect_target(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Option<String>> {
     chars.next_if(|c| matches!(c, '>' | '|'));
     if chars.next_if_eq(&'&').is_some() {
         let mut digits = 0;
@@ -252,7 +265,7 @@ fn redirect(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<()> {
         let ends = chars
             .peek()
             .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|'));
-        return (digits > 0 && ends).then_some(());
+        return (digits > 0 && ends).then_some(None);
     }
     while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
     let mut target = String::new();
@@ -261,7 +274,13 @@ fn redirect(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<()> {
     {
         target.push(c);
     }
-    (target == "/dev/null").then_some(())
+    // A quoted name may hold the space this stopped at, so it would be written down
+    // shorter than it is; anything else here is an expansion or a nested command.
+    let unreadable = |c: char| "$`()*?[]{}'\"\\".contains(c);
+    if target.is_empty() || target.chars().any(unreadable) {
+        return None;
+    }
+    Some((target != "/dev/null").then_some(target))
 }
 
 /// Commands that only read, allowed without a rule in `auto` and `bypass`.
@@ -455,10 +474,11 @@ fn is_short_flag(arg: &str, flag: char) -> bool {
     arg.starts_with('-') && !arg.starts_with("--") && arg.contains(flag)
 }
 
-/// Whether any word names a protected path, or may glob into one.
+/// Whether any word, or anything a redirection would write, names a protected path or
+/// may glob into one.
 pub fn mentions_protected(command: &Command) -> bool {
     command.dot_glob
-        || command.words.iter().any(|word| {
+        || command.words.iter().chain(&command.writes).any(|word| {
             let lower = word.to_lowercase();
             let parts: Vec<&str> = lower.split(['/', '=', ':', ',']).collect();
             parts.iter().any(|p| {
@@ -547,12 +567,13 @@ mod tests {
             "xargs zsh -c ls",
             "cat <<EOF\nx\nEOF",
             "cat < file",
-            "echo x > out.txt",
-            "echo x >> out.txt",
-            "echo x>out.txt",
-            "ls &> out",
-            "ls 2>&1>out",
             "ls >&out",
+            // A target this parser would write down as something it is not.
+            "ls > $HOME/out",
+            "ls > >(tee out)",
+            "ls > 'a b'",
+            "ls > *.txt",
+            "ls >",
             "FOO=1 ls",
             "sudo ls",
             "ls & rm x",
@@ -565,6 +586,44 @@ mod tests {
         ] {
             assert_eq!(parse(input), None, "{input}");
         }
+    }
+
+    #[test]
+    fn a_redirect_is_read_as_the_write_it_is() {
+        let writes = |input: &str| -> Vec<Vec<String>> {
+            parse(input)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.writes)
+                .collect()
+        };
+        assert_eq!(writes("echo x > out.txt"), [["out.txt"]]);
+        assert_eq!(writes("echo x >> out.txt"), [["out.txt"]]);
+        assert_eq!(writes("echo x>out.txt"), [["out.txt"]]);
+        assert_eq!(writes("ls &> out"), [["out"]]);
+        assert_eq!(writes("ls 2> err > out"), [["err", "out"]]);
+        // Writing nothing: a descriptor and the bin.
+        assert_eq!(writes("ls 2>&1"), [Vec::<String>::new()]);
+        assert_eq!(writes("ls > /dev/null 2>&1"), [Vec::<String>::new()]);
+        // The redirect belongs to the command it is written on.
+        assert_eq!(
+            writes("ls > a && wc -l x > b"),
+            [vec!["a".to_string()], vec!["b".to_string()]]
+        );
+        // The words themselves are the command, without the file it writes.
+        assert_eq!(
+            words("echo hi > out.txt"),
+            Some(vec![vec!["echo".to_string(), "hi".to_string()]])
+        );
+    }
+
+    #[test]
+    fn a_redirect_into_a_protected_path_is_a_protected_mention() {
+        let protected = |input: &str| parse(input).unwrap().iter().any(mentions_protected);
+        assert!(protected("echo x > ~/.ssh/authorized_keys"));
+        assert!(protected("echo x >> .env.local"));
+        assert!(protected("cargo test 2> .git/hooks/pre-commit"));
+        assert!(!protected("cargo test > /tmp/out.json"));
     }
 
     #[test]
