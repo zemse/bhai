@@ -148,11 +148,15 @@ async fn main() -> Result<()> {
     let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
     let mut client = client::Client::new(&choice)?
-        .with_overrides(identity.model.clone(), identity.effort.clone())
-        .with_overrides(args.model.clone(), args.effort.clone());
+        .with_overrides(identity.model.clone(), identity.effort.clone());
+    // A resumed session goes back on the model it was last on: that is what its cached
+    // prefix and its encrypted reasoning belong to. `--model` still wins over both.
     if let Some(loaded) = &resumed {
-        client = client.with_session(&loaded.header.session);
+        client = client
+            .with_overrides(Some(loaded.model.clone()), Some(loaded.effort.clone()))
+            .with_session(&loaded.header.session);
     }
+    let client = client.with_overrides(args.model.clone(), args.effort.clone());
     let client = client.strict_cache(args.strict_cache).log_headers(
         args.profile
             .then(|| profile::debug_dir().join("headers.jsonl")),
@@ -165,21 +169,24 @@ async fn main() -> Result<()> {
     }
     let saved = match resumed {
         Some(loaded) => {
-            let header = &loaded.header;
-            if (header.model.as_str(), header.effort.as_str()) != (client.model(), client.effort())
+            // Only `--model` can put a resumed session on another model now, so this is
+            // the user being told what they asked for.
+            if (loaded.model.as_str(), loaded.effort.as_str()) != (client.model(), client.effort())
             {
                 warnings.push(format!(
                     "warning: the session ran on {} ({}), now {} ({}), so the cached prefix will differ",
-                    header.model,
-                    header.effort,
+                    loaded.model,
+                    loaded.effort,
                     client.model(),
                     client.effort()
                 ));
             }
             warnings.push(format!(
-                "resumed session {} ({} items)",
-                header.session,
-                loaded.items.len()
+                "resumed session {} ({} items) on {} ({})",
+                loaded.header.session,
+                loaded.items.len(),
+                client.model(),
+                client.effort()
             ));
             warnings.extend(loaded.warnings.iter().map(|w| format!("warning: {w}")));
             Saved {

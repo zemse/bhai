@@ -6,6 +6,10 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- `--resume` comes back on the model the session was last on, since that is what its
+  cached prefix and its encrypted reasoning belong to. A `/model` switch is recorded in
+  the session file, so a session that changed model mid-way resumes where it ended;
+  `--model` still wins over both.
 - The judge asks again when its answer is not the agreed object, up to ten times and
   never past its timeout, since a model is sampled and the next answer may well parse. An
   error or a timeout is not asked again, and a model that never takes shape is put once

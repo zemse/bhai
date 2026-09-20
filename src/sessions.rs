@@ -116,6 +116,24 @@ impl Writer {
         self.write(record)
     }
 
+    /// Record a `/model` switch, so a resume comes back on the model the session was
+    /// last on. Before the header has gone out there is nothing to follow it with, so
+    /// the header itself is what changes.
+    pub fn model(&mut self, model: &str, effort: &str, prefix: &str) -> Result<()> {
+        self.header.model = model.to_string();
+        self.header.effort = effort.to_string();
+        self.header.prefix = prefix.to_string();
+        if !self.started {
+            return Ok(());
+        }
+        self.write(json!({
+            "type": "model",
+            "model": model,
+            "effort": effort,
+            "prefix": prefix,
+        }))
+    }
+
     /// Record a compaction: `items` replace the history so far on load.
     pub fn compact(&mut self, stage: &str, before: u64, after: u64, items: &[Value]) -> Result<()> {
         self.write(json!({
@@ -167,7 +185,13 @@ impl Writer {
 /// A session read back from disk.
 #[derive(Debug)]
 pub struct Loaded {
+    /// The header as it was written, which is the model the session opened on.
     pub header: Header,
+    /// The model and effort the session was last on, which is what its cached prefix
+    /// and its encrypted reasoning belong to. The header's until a `/model` switch was
+    /// recorded after it.
+    pub model: String,
+    pub effort: String,
     pub items: Vec<Value>,
     /// The id of the last record kept.
     pub last: Option<String>,
@@ -191,6 +215,8 @@ pub fn load(path: &Path) -> Result<Loaded> {
     let mut items: Vec<(Value, usize)> = Vec::new();
     let mut len = first.len() as u64;
     let mut warnings = Vec::new();
+    // The model the session ends on, which a `/model` record later in the file moves.
+    let (mut model, mut effort) = (header.model.clone(), header.effort.clone());
     while let Some(line) = lines.next() {
         let record = serde_json::from_str::<Value>(line)
             .ok()
@@ -211,11 +237,18 @@ pub fn load(path: &Path) -> Result<Loaded> {
             );
         }
         let index = records.len();
-        if record.get("type").and_then(Value::as_str) == Some("compaction") {
+        let kind = record.get("type").and_then(Value::as_str);
+        if kind == Some("compaction") {
             let Some(compacted) = record.get("items").and_then(Value::as_array) else {
                 bail!("{}: compaction {id} has no items", path.display());
             };
             items = compacted.iter().map(|item| (item.clone(), index)).collect();
+        } else if kind == Some("model") {
+            let text = |key| record.get(key).and_then(Value::as_str).map(str::to_string);
+            let (Some(switched), Some(to)) = (text("model"), text("effort")) else {
+                bail!("{}: model record {id} names no model", path.display());
+            };
+            (model, effort) = (switched, to);
         } else {
             let Some(item) = record.get("item") else {
                 bail!("{}: record {id} has no item", path.display());
@@ -238,6 +271,8 @@ pub fn load(path: &Path) -> Result<Loaded> {
     }
     Ok(Loaded {
         header,
+        model,
+        effort,
         last: records.last().map(|(id, _)| id.clone()),
         items: items.into_iter().map(|(item, _)| item).collect(),
         len,
@@ -450,6 +485,44 @@ mod tests {
         let reloaded = load(&path).unwrap();
         assert_eq!(reloaded.items.len(), 2);
         assert!(reloaded.warnings.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_switch_is_recorded_so_a_resume_comes_back_on_that_model() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            (loaded.model.as_str(), loaded.effort.as_str()),
+            ("gpt-5", "high")
+        );
+
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        writer.model("ollama:gemma4:e4b", "low", "abc").unwrap();
+        writer.append(&items()[0]).unwrap();
+        let loaded = load(&path).unwrap();
+        // The header still says what the session opened on; the session ends elsewhere.
+        assert_eq!(loaded.header.model, "gpt-5");
+        assert_eq!(
+            (loaded.model.as_str(), loaded.effort.as_str()),
+            ("ollama:gemma4:e4b", "low")
+        );
+        assert_eq!(loaded.items.len(), 6, "a switch is not an item");
+        assert!(loaded.warnings.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_switch_before_the_first_item_is_the_header_itself() {
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("s1"));
+        writer.model("gpt-5.5", "xhigh", "abc").unwrap();
+        writer.append(&items()[0]).unwrap();
+        let loaded = load(&path(&dir, "s1")).unwrap();
+        assert_eq!(loaded.header.model, "gpt-5.5");
+        assert_eq!(loaded.model, "gpt-5.5");
+        assert_eq!(loaded.items.len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

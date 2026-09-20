@@ -466,13 +466,15 @@ pub(crate) async fn run_with(
                                 history.retain(|item| {
                                     item.get("type").and_then(Value::as_str) != Some("reasoning")
                                 });
-                                // The header goes out with the first item, so a session
-                                // switched before it has said anything is saved as this.
+                                // Recorded, so a resume comes back on this model rather
+                                // than the one the session opened on.
                                 if let Some(writer) = &mut writer {
-                                    writer.header.model = model.name().to_string();
-                                    writer.header.effort = effort;
-                                    writer.header.prefix =
+                                    let prefix =
                                         sessions::prefix(model.name(), &prompt.text, &tools);
+                                    if let Err(e) = writer.model(model.name(), &effort, &prefix) {
+                                        let _ = tx
+                                            .send(AgentEvent::Error(format!("transcript: {e:#}")));
+                                    }
                                 }
                             }
                             None => {
