@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- The `/` menu completes a name wherever it is typed, not only at the start of the
+  prompt: it opens on the `/word` at the cursor, tab writes the name in place and leaves
+  the rest of the prompt alone. A `/` that starts no word, in a path, a url or a date,
+  still keeps it shut, and mid-sentence enter sends the prompt rather than taking the
+  highlighted row.
 - The permission tokenizer reads a quoted heredoc as the data it is, so `python3 - <<'PY'`
   is the command `python3 -` rather than something unreadable, and reads `< file` too. An
   unquoted delimiter, a here string and `<>` still refuse the command. A denial in `auto`

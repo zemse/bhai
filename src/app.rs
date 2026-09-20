@@ -380,7 +380,12 @@ impl App {
                     return;
                 }
                 KeyCode::Tab => return self.accept_menu(false),
-                KeyCode::Enter if key.modifiers.is_empty() => return self.accept_menu(true),
+                // Enter belongs to the menu only where the whole prompt is the command
+                // it is offering. Mid-sentence it sends what was typed, as it would with
+                // no menu open, and tab is what completes the name.
+                KeyCode::Enter if key.modifiers.is_empty() && self.menu_alone() => {
+                    return self.accept_menu(true);
+                }
                 KeyCode::Esc => {
                     self.menu = None;
                     return;
@@ -475,7 +480,7 @@ impl App {
     /// The menu rows for what is typed; empty whenever the menu is shut.
     pub fn menu_items(&self) -> Vec<Item> {
         match self.menu {
-            Some(_) => commands::matches(self.input.value(), &self.skills),
+            Some(_) => commands::matches(self.input.before(), &self.skills),
             None => Vec::new(),
         }
     }
@@ -490,28 +495,44 @@ impl App {
         let items = self.menu_items();
         self.menu
             .and_then(|row| items.get(row))
-            .map(|item| item.completion(self.input.value()))
+            .map(|item| item.completion(self.input.before()))
             .unwrap_or_default()
     }
 
     /// Open the menu on anything that matches, keeping the highlighted row in range.
     /// An edit that matches nothing shuts it, and the next one can open it again.
     fn refresh_menu(&mut self) {
-        let rows = commands::matches(self.input.value(), &self.skills).len();
+        let rows = commands::matches(self.input.before(), &self.skills).len();
         self.menu = (rows > 0).then(|| self.menu.unwrap_or(0).min(rows - 1));
     }
 
-    /// Enter or tab on a menu row: the command goes into the input, and one that takes
-    /// no further input runs straight away.
+    /// Whether the `/word` the menu is offering for is the whole prompt, which is what
+    /// makes it a command about to run rather than a name being written into a sentence.
+    fn menu_alone(&self) -> bool {
+        let value = self.input.value();
+        commands::typing(self.input.before())
+            .is_some_and(|typed| typed.chars().count() + 1 == value.chars().count())
+    }
+
+    /// Enter or tab on a menu row: the name replaces the `/word` being typed, wherever
+    /// in the prompt that is. A command typed on its own, and only then, runs straight
+    /// away; one in the middle of a sentence is a name being completed, not a command.
     fn accept_menu(&mut self, run: bool) {
         let items = self.menu_items();
         let Some(item) = self.menu.and_then(|row| items.get(row)) else {
             return;
         };
+        let Some(typed) = commands::typing(self.input.before()) else {
+            return;
+        };
         let more = item.takes_input();
-        self.input.set(item.label() + if more { " " } else { "" });
+        let alone = self.menu_alone();
+        let end = self.input.cursor();
+        let start = end - typed.chars().count() - 1;
+        self.input
+            .splice(start..end, &(item.label() + if more { " " } else { "" }));
         self.menu = None;
-        if run && !more {
+        if run && !more && alone {
             self.submit();
         }
     }
@@ -2099,8 +2120,28 @@ mod tests {
         let mut app = App::detached();
         type_text(&mut app, "hi");
         assert_eq!(app.menu, None);
-        type_text(&mut app, " /diff");
-        assert_eq!(app.menu, None, "a slash mid-prompt is just text");
+        // A name is completed wherever it is typed, but only a path-free `/word`.
+        type_text(&mut app, " /dif");
+        assert_eq!(app.menu, Some(0));
+        assert_eq!(
+            app.menu_items().first().map(|i| i.name.clone()),
+            Some("diff".to_string())
+        );
+        // Tab takes the name and leaves the rest of the prompt alone; enter does not
+        // run a command written in the middle of a sentence.
+        app.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.value(), "hi /diff");
+        assert_eq!(app.menu, None);
+        type_text(&mut app, " and src/ma");
+        assert_eq!(app.menu, None, "a path is not a command");
+
+        // Enter mid-sentence sends the prompt rather than taking the highlighted row.
+        let mut app = App::detached();
+        type_text(&mut app, "look at /dif");
+        assert_eq!(app.menu, Some(0));
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input.value(), "", "it was sent");
+        assert_eq!(app.menu, None);
 
         let mut app = App::detached();
         type_text(&mut app, "/qu");

@@ -52,6 +52,22 @@ impl Editor {
         self.input.cursor()
     }
 
+    /// The text before the cursor, which is what a completion is offered on.
+    pub fn before(&self) -> &str {
+        let value = self.value();
+        let end = value
+            .char_indices()
+            .nth(self.cursor())
+            .map_or(value.len(), |(at, _)| at);
+        &value[..end]
+    }
+
+    /// Replace the chars in `range` with `text`, the cursor landing after it.
+    pub fn splice(&mut self, range: Range<usize>, text: &str) {
+        let cursor = range.start + text.chars().count();
+        self.replace(range, text, cursor);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.value().is_empty()
     }

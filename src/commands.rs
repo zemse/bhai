@@ -136,8 +136,8 @@ impl Item {
     /// What completing this row would add to what has been typed, for the grey tail
     /// drawn past the cursor. Empty once the name is there in full, and when the case
     /// differs, since tab would rewrite what is already on screen.
-    pub fn completion(&self, value: &str) -> String {
-        let Some(typed) = typing(value) else {
+    pub fn completion(&self, before: &str) -> String {
+        let Some(typed) = typing(before) else {
             return String::new();
         };
         self.name
@@ -152,18 +152,20 @@ impl Item {
     }
 }
 
-/// The name being typed, while the whole input is one `/word`. `None` once it holds a
-/// space or a newline, so a prompt that merely mentions a path keeps the menu shut.
-pub fn typing(value: &str) -> Option<&str> {
-    let name = value.strip_prefix('/')?;
+/// The name being typed at the cursor, given the text before it: that text has to end
+/// in a `/word` which starts a word of its own, so a name can be completed mid-sentence
+/// while a path, a url or a date in the prompt keeps the menu shut.
+pub fn typing(before: &str) -> Option<&str> {
+    let (head, name) = before.rsplit_once('/')?;
+    let opens = head.is_empty() || head.ends_with(char::is_whitespace);
     let plain = !name.contains(|c: char| c.is_whitespace() || c == '/');
-    plain.then_some(name)
+    (opens && plain).then_some(name)
 }
 
-/// The commands and skills whose name starts with what has been typed. Empty unless
-/// the input is a bare `/word`.
-pub fn matches(value: &str, skills: &[Skill]) -> Vec<Item> {
-    let Some(typed) = typing(value) else {
+/// The commands and skills whose name starts with the `/word` at the cursor. Empty when
+/// there is no such word.
+pub fn matches(before: &str, skills: &[Skill]) -> Vec<Item> {
+    let Some(typed) = typing(before) else {
         return Vec::new();
     };
     let typed = typed.to_lowercase();
@@ -256,13 +258,22 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_opens_only_on_a_bare_slash_word() {
+    fn the_menu_opens_on_a_slash_word_wherever_it_is_typed() {
         assert_eq!(typing("/"), Some(""));
         assert_eq!(typing("/di"), Some("di"));
+        // Mid-sentence, on the word the cursor is in.
+        assert_eq!(typing("have a look with /di"), Some("di"));
+        assert_eq!(typing("what is /"), Some(""));
+        assert_eq!(typing("run it\n/di"), Some("di"));
+        // The word has ended, so there is nothing to complete.
         assert_eq!(typing("/workflow x"), None);
-        assert_eq!(typing("/usr/bin/env is missing"), None);
-        assert_eq!(typing("what is /"), None);
         assert_eq!(typing("/a\nb"), None);
+        // A `/` that starts no word: a path, a url, a date, a fraction.
+        assert_eq!(typing("/usr/bin/env is missing"), None);
+        assert_eq!(typing("look in src/ma"), None);
+        assert_eq!(typing("see https://ex"), None);
+        assert_eq!(typing("due 12/09"), None);
+        assert_eq!(typing("and/or"), None);
     }
 
     #[test]
