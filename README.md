@@ -28,7 +28,7 @@ inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/au
 
 ## slash commands
 
-type `/` in the prompt box for the menu: it filters as you type, arrows pick a row, tab completes and enter runs it. skills appear in the same menu, so `/<skill> [input]` hands the skill to the agent.
+type `/` in the prompt box for the menu: it filters as you type, arrows pick a row, the rest of the highlighted name shows grey in the prompt, tab fills it in and enter runs it. skills appear in the same menu, so `/<skill> [input]` hands the skill to the agent.
 
 | command | what it does |
 | --- | --- |

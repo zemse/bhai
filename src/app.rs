@@ -416,6 +416,20 @@ impl App {
         }
     }
 
+    /// The tail of the highlighted row, drawn grey from the cursor on and filled in by
+    /// `tab`. Only with the cursor at the end of what is typed, so grey text never sits
+    /// in the middle of the prompt.
+    pub fn suggestion(&self) -> String {
+        if self.input.cursor() != self.input.value().chars().count() {
+            return String::new();
+        }
+        let items = self.menu_items();
+        self.menu
+            .and_then(|row| items.get(row))
+            .map(|item| item.completion(self.input.value()))
+            .unwrap_or_default()
+    }
+
     /// Open the menu on anything that matches, keeping the highlighted row in range.
     /// An edit that matches nothing shuts it, and the next one can open it again.
     fn refresh_menu(&mut self) {
@@ -1690,6 +1704,30 @@ mod tests {
         assert!(
             matches!(app.entries().list.last(), Some(Entry::Info(t)) if t.starts_with("queue:"))
         );
+    }
+
+    #[test]
+    fn the_grey_suggestion_is_what_tab_would_fill_in() {
+        let mut app = with_skill("commit-helper");
+        assert_eq!(app.suggestion(), "", "nothing typed, nothing offered");
+        type_text(&mut app, "/co");
+        assert_eq!(app.suggestion(), "mpact");
+        // It follows the highlighted row, and tab fills in exactly what was grey.
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.suggestion(), "mmit-helper");
+        app.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.value(), "/commit-helper ");
+        assert_eq!(app.suggestion(), "", "the menu is shut");
+
+        // Nothing grey mid-prompt, where it would read as text.
+        let mut app = App::detached();
+        type_text(&mut app, "/qu");
+        assert_eq!(app.suggestion(), "eue");
+        app.on_key(key(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.suggestion(), "");
+        app.on_key(key(KeyCode::Right, KeyModifiers::NONE));
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.suggestion(), "", "esc shuts it");
     }
 
     #[test]

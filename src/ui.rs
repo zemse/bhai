@@ -598,12 +598,20 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
     let (row, column) = app.input.cursor_position(width);
     app.input_area = Some((text_area, top, width));
     let selection = app.input.selection();
-    let rows: Vec<Line> = app
+    let mut rows: Vec<Line> = app
         .input
         .rows(width)
         .into_iter()
         .map(|r| input_row(r, selection.as_ref()))
         .collect();
+    // What tab would complete, grey from the cursor on. The cursor is at the end of the
+    // text for it to show at all, so it belongs on the last row.
+    let suggestion = app.suggestion();
+    if !suggestion.is_empty()
+        && let Some(last) = rows.last_mut()
+    {
+        last.push_span(Span::styled(suggestion, Style::new().fg(Color::DarkGray)));
+    }
     frame.render_widget(Paragraph::new(rows).scroll((top as u16, 0)), text_area);
     frame.set_cursor_position((
         (text_area.x + column as u16).min(text_area.right().saturating_sub(1)),
@@ -1511,6 +1519,34 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(2, y)].bg, Color::Reset);
         assert_eq!(buffer[(2, y + 1)].bg, Color::Cyan);
+    }
+
+    #[test]
+    fn the_completion_is_drawn_grey_past_the_cursor() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        for c in "/com".chars() {
+            app.on_key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            ));
+        }
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        let rows: Vec<&str> = shown.lines().collect();
+        let y = rows
+            .iter()
+            .position(|r| r.contains("\u{203a} /compact"))
+            .unwrap() as u16;
+
+        // What was typed is drawn plain, the rest of the name grey after it.
+        let x = app.input_area.unwrap().0.x;
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(x + 3, y)].symbol(), "m");
+        assert_eq!(buffer[(x + 3, y)].fg, Color::Reset);
+        assert_eq!(buffer[(x + 4, y)].symbol(), "p");
+        assert_eq!(buffer[(x + 4, y)].fg, Color::DarkGray);
+        assert_eq!(buffer[(x + 7, y)].fg, Color::DarkGray);
     }
 
     #[test]

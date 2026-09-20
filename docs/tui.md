@@ -20,6 +20,11 @@ is typed, `up`/`down` pick a row, `tab` completes the name and `enter` runs it, 
 a trailing space when the command takes more input. `esc` shuts the menu without clearing
 what was typed, and the next keystroke opens it again.
 
+The highlighted row is also offered in the prompt itself: the rest of its name is drawn
+grey just past the cursor, so `/co` reads as `/compact` with `mpact` dim, and `tab` fills
+it in. Picking another row with the arrows changes what is offered. It shows only with
+the cursor at the end of what is typed, so grey text never sits mid-prompt.
+
 The session's skills are listed in the same menu after the commands, so `/<skill>
 [input]` is a prompt: it asks the agent to use that skill, which it then loads through
 the `skill` tool. The transcript shows the line as it was typed, not the sentence it is
@@ -50,7 +55,7 @@ and that row is there only while a turn is actually running. The rest of the key
 | `esc` | interrupt the turn |
 | `ctrl+c` | interrupt the turn, or quit when idle |
 | `ctrl+d` | quit on an empty input |
-| `tab` | complete the highlighted command, while the `/` menu is open |
+| `tab` | fill in the grey completion, while the `/` menu is open |
 
 At an approval prompt: `y` runs it once, `a` remembers that exact call, `p` remembers its
 prefix, and `n`, `r` or `esc` rejects.

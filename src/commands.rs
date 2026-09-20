@@ -124,6 +124,19 @@ impl Item {
         format!("/{}", self.name)
     }
 
+    /// What completing this row would add to what has been typed, for the grey tail
+    /// drawn past the cursor. Empty once the name is there in full, and when the case
+    /// differs, since tab would rewrite what is already on screen.
+    pub fn completion(&self, value: &str) -> String {
+        let Some(typed) = typing(value) else {
+            return String::new();
+        };
+        self.name
+            .strip_prefix(typed)
+            .unwrap_or_default()
+            .to_string()
+    }
+
     /// Whether accepting the row should leave the input open for more typing.
     pub fn takes_input(&self) -> bool {
         self.skill || !self.args.is_empty()
@@ -200,7 +213,7 @@ pub fn help() -> String {
         "\nkeys",
         "\n  enter send · alt+enter or ctrl+j newline · shift+tab permission mode",
         "\n  ctrl+c interrupt, then quit · ctrl+d quit on an empty prompt",
-        "\n  up and down walk the prompt history · tab completes a command",
+        "\n  up and down walk the prompt history · tab takes the grey completion",
         "\n  wheel, pgup/pgdn or ctrl+up/down scroll · click a tool output to expand it",
         "\n  drag selects · ctrl+y copies · ctrl+v pastes · ctrl+t shows every badge",
     ));
@@ -271,6 +284,22 @@ mod tests {
         assert_eq!(names("/workflow"), ["workflow", "workflows"]);
         assert_eq!(names("/workf"), ["workflows", "workflow"]);
         assert_eq!(names("/pdf"), ["pdf"]);
+    }
+
+    #[test]
+    fn the_completion_is_the_untyped_tail_of_the_name() {
+        let tail = |value: &str| -> Vec<String> {
+            matches(value, &skills())
+                .iter()
+                .map(|item| item.completion(value))
+                .collect()
+        };
+        assert_eq!(tail("/pd"), ["f"]);
+        assert_eq!(tail("/pdf"), [""]);
+        assert_eq!(tail("/c")[3], "ommit-helper");
+        // The menu matches whatever the case, but completing would rewrite the text.
+        assert_eq!(tail("/PD"), [""]);
+        assert!(tail("/pdf x").is_empty());
     }
 
     #[test]
