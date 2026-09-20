@@ -7,10 +7,30 @@ Inference runs on one of two backends, and the model id picks which:
 - `ollama:<name>` is **Ollama** on this machine, e.g. `ollama:gemma4:e2b`. Name the model
   exactly as `ollama list` shows it.
 
-`/model` says which one a session is on. The model is fixed for the session, so the
-cached prefix holds for the whole conversation.
+## Picking one while it runs
 
-## Choosing one
+`/model` opens a picker. It asks both backends what they will serve (the Codex backend its
+own list, falling back to the one the Codex CLI cached in `~/.codex/models_cache.json`;
+Ollama whatever `/api/tags` says is pulled) and shows them in one list, the running model
+marked. A backend that cannot be reached is a note under the list rather than an empty
+picker.
+
+Picking a model that takes a reasoning effort asks for one next, listing only the efforts
+**that model** supports, with its own default marked; `esc` there goes back to the models.
+An Ollama model is switched to in one step: nothing in its request body carries an effort,
+so there is no second question to ask.
+
+`/model <name> [effort]` skips both lists, for a model already known by name. Either way
+the switch is refused while a turn is running: it takes effect between turns, never
+mid-call.
+
+A switch costs the prompt cache, since a different model reads a different cached prefix,
+and drops the thinking of the model before it, since encrypted reasoning cannot be replayed
+to another model. Everything else, the conversation included, carries over. The context
+window comes with the new model where its backend reports one, so compaction still knows
+when to run; a `context_window` in `config.toml` still wins.
+
+## Choosing one to start on
 
 Highest precedence first:
 

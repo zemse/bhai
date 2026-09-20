@@ -96,6 +96,11 @@ pub enum Event {
     Compacted(String),
     /// The permission mode changed.
     Mode(Mode),
+    /// `/model` switched the session to this model and reasoning effort.
+    Model {
+        model: String,
+        effort: String,
+    },
     Error(String),
     Interrupted,
     TurnEnd,
@@ -237,8 +242,8 @@ struct Inner {
 }
 
 pub struct Session {
-    model: String,
-    effort: String,
+    /// The model and the reasoning effort it runs at; `/model` changes both.
+    model: Mutex<(String, String)>,
     identity: String,
     events: broadcast::Sender<Event>,
     inner: Mutex<Inner>,
@@ -269,8 +274,7 @@ impl Session {
         judge: Option<Arc<Judge>>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            model,
-            effort,
+            model: Mutex::new((model, effort)),
             identity,
             events: broadcast::channel(EVENT_BUFFER).0,
             inner: Mutex::default(),
@@ -291,9 +295,10 @@ impl Session {
 
     pub fn state(&self) -> State {
         let inner = self.lock();
+        let (model, effort) = self.model();
         State {
-            model: self.model.clone(),
-            effort: self.effort.clone(),
+            model,
+            effort,
             identity: self.identity.clone(),
             mode: self.policy.mode(),
             working: inner.working,
@@ -406,6 +411,37 @@ impl Session {
         // Stop means stop, so nothing that was waiting behind the turn runs.
         self.clear_queue();
         true
+    }
+
+    /// The model the session talks to and the effort it runs at.
+    pub fn model(&self) -> (String, String) {
+        self.model.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Talk to `model` at `effort` from the next turn on, for `/model`. `window` is that
+    /// model's context window where its backend says, so compaction keeps its bearings.
+    /// Refused while a turn runs, since a switch mid-call would answer with one model
+    /// what another was asked.
+    pub fn set_model(
+        &self,
+        model: String,
+        effort: String,
+        window: Option<u64>,
+    ) -> Result<(), SubmitError> {
+        let inner = self.lock();
+        if inner.working {
+            return Err(SubmitError::Busy);
+        }
+        self.tx_control
+            .try_send(Control::Model {
+                model: model.clone(),
+                effort: effort.clone(),
+                window,
+            })
+            .map_err(|_| SubmitError::Closed)?;
+        *self.model.lock().unwrap_or_else(|e| e.into_inner()) = (model.clone(), effort.clone());
+        self.publish(Event::Model { model, effort });
+        Ok(())
     }
 
     /// Switch the permission mode. The prompt and tools stay as they are.

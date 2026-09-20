@@ -14,7 +14,7 @@ inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/au
 
 - **tools**: bash, read, write, edit, skill and agent, plus any mcp tool. running commands stream their output into the transcript while they run.
 - **permissions**: three modes (auto by default, plus ask and bypass), claude code rule syntax with `*` wildcards, approvals bhai remembers, and a trust question on opening a project, which is what auto and bypass wait on. [docs](docs/permissions.md)
-- **models**: `--model` picks what the session talks to, the chatgpt subscription or a local model through ollama; the same items go to both, so tools, subagents and sessions work either way. [docs](docs/models.md)
+- **models**: `--model` picks what the session talks to, the chatgpt subscription or a local model through ollama, and `/model` changes it mid-session from the list each backend answers with; the same items go to both, so tools, subagents and sessions work either way. [docs](docs/models.md)
 - **identities**: `bhai --as <name>` narrows the skills, tools, instructions and model a session carries. fixed for the session, so the prompt cache holds. [docs](docs/identities.md)
 - **subagents**: the agent delegates a task to a child with a fresh context, under any identity, up to three at a time; each one gets a row above the prompt you can step inside and talk to. [docs](docs/subagents.md)
 - **workflows**: a handful of child steps in dependency order under one token budget, started only by you. [docs](docs/workflows.md)
@@ -40,7 +40,7 @@ type `/` in the prompt box for the menu: it filters as you type, arrows pick a r
 | `/trust`, `/untrust` | honour, or stop honouring, the repo's own allow rules |
 | `/as [name]` | show the session's identity and how to switch |
 | `/skills` | list the loaded skills and what each costs |
-| `/model` | the model this session talks to, and how to change it |
+| `/model` | pick the model mid-session, and its reasoning effort when it takes one; `/model <name> [effort]` skips the lists |
 | `/mcp` | list the mcp servers, their tools and any that failed |
 | `/workflows` | list the workflow definitions |
 | `/workflow <name> [input]` | run one |

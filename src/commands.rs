@@ -71,10 +71,12 @@ pub const COMMANDS: &[Command] = &[
         args: " [clear]",
         help: "prompts waiting behind the turn",
     },
+    // No args hint, though it takes `<name> [effort]`: the picker is the usual way in,
+    // and a hint would make enter fill the prompt rather than open it.
     Command {
         name: "model",
         args: "",
-        help: "the model this session talks to",
+        help: "pick the model this session talks to",
     },
     Command {
         name: "mcp",

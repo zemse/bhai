@@ -20,6 +20,7 @@ mod judge;
 mod limits;
 mod markdown;
 mod mcp;
+mod models;
 mod ollama;
 mod permissions;
 mod profile;
@@ -252,6 +253,7 @@ allow it.",
         .then(|| profile::debug_dir().join("usage.jsonl"));
     let history = saved.history.clone();
     let session_id = saved.writer.header.session.clone();
+    let ollama_url = client.ollama_url().to_string();
     let (session, events) = start(
         client, prompt, policy, judge, usage_log, delegation, saved, limits,
     );
@@ -318,6 +320,7 @@ allow it.",
         prompts,
         workflows,
         trust_gate,
+        ollama_url,
     )
     .await;
     release_modes(mouse, paste, keyboard);
@@ -959,6 +962,7 @@ async fn run(
     prompts: input::History,
     workflows: workflow::Found,
     trust_gate: Option<app::TrustGate>,
+    ollama_url: String,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -1004,6 +1008,7 @@ async fn run(
     app.workflows = workflows;
     app.history = prompts;
     app.trust_gate = trust_gate;
+    app.ollama_url = ollama_url;
     {
         let mut entries = app.entries();
         entries.restore(history);

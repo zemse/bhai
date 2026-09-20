@@ -22,8 +22,8 @@ use crate::cache::{self, CacheBreak, CacheGuard};
 use crate::limits::{self, RateLimits};
 use crate::ollama;
 
-const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const ORIGINATOR: &str = "codex_cli_rs";
+pub(crate) const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub(crate) const ORIGINATOR: &str = "codex_cli_rs";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const DEFAULT_EFFORT: &str = "medium";
 /// Give up on a stream that has produced nothing for this long.
@@ -190,6 +190,22 @@ impl Client {
         self.model = model.unwrap_or(self.model);
         self.effort = effort.unwrap_or(self.effort);
         self
+    }
+
+    /// The same session on another model, for `/model`. The guard is shared with the
+    /// client this came from, and a different model reads a different cached prefix, so
+    /// the switch forgets the last request rather than reporting it as a break.
+    pub fn switch(&self, model: &str, effort: &str) -> Self {
+        let switched = self
+            .clone()
+            .with_overrides(Some(model.to_string()), Some(effort.to_string()));
+        switched.reset_cache("the model changed");
+        switched
+    }
+
+    /// Where this client's Ollama server is, for asking it what it has pulled.
+    pub fn ollama_url(&self) -> &str {
+        &self.ollama_url
     }
 
     pub fn model(&self) -> &str {

@@ -21,6 +21,7 @@ use crate::entries::Entries;
 pub use crate::entries::Entry;
 use crate::input::{Editor, History};
 use crate::limits::RateLimits;
+use crate::models::{Choice, Picker};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
 use crate::session::{Approval, ChildRow, Event, Prompt, Session};
@@ -213,6 +214,10 @@ pub struct App {
     pub inside: Option<Inside>,
     /// Each subagent row's area and id, filled in by the renderer so a click opens it.
     pub child_rows: Vec<(Rect, String)>,
+    /// The `/model` picker, shown instead of the prompt while open.
+    pub picker: Option<Picker>,
+    /// Where the Ollama server is, for asking it what it has pulled.
+    pub ollama_url: String,
     pub quit: bool,
     session: Arc<Session>,
 }
@@ -276,6 +281,8 @@ impl App {
             diff: None,
             inside: None,
             child_rows: Vec::new(),
+            picker: None,
+            ollama_url: crate::ollama::DEFAULT_URL.to_string(),
             quit: false,
             session,
         }
@@ -320,6 +327,25 @@ impl App {
         {
             if !diff.on_key(key.code) {
                 self.diff = None;
+            }
+            return;
+        }
+
+        // The `/model` picker takes the prompt's keys until it is answered or closed.
+        if let Some(picker) = &mut self.picker
+            && !(ctrl && key.code == KeyCode::Char('c'))
+        {
+            match picker.on_key(key.code) {
+                Choice::Waiting => {}
+                Choice::Closed => self.picker = None,
+                Choice::Picked {
+                    model,
+                    effort,
+                    window,
+                } => {
+                    self.picker = None;
+                    self.switch_model(model, effort, window);
+                }
             }
             return;
         }
@@ -818,6 +844,10 @@ impl App {
             Event::CacheStalled(_) => self.cache_stalled = true,
             Event::RateLimits(limits) => self.rate_limits = Some(limits),
             Event::Mode(mode) => self.mode = mode,
+            Event::Model { model, effort } => {
+                self.model = model;
+                self.effort = effort;
+            }
             Event::Judging(what) => self.judging = what.clone(),
             Event::TurnEnd => {
                 self.working = false;
@@ -830,6 +860,10 @@ impl App {
     pub fn tick(&mut self) {
         if self.working {
             self.spinner = self.spinner.wrapping_add(1);
+        }
+        // The backends answer on a task of their own; this is where the picker hears.
+        if let Some(picker) = &mut self.picker {
+            picker.poll();
         }
     }
 
@@ -913,9 +947,11 @@ impl App {
             self.note(Entry::Info(switch_notice(&self.identity, rest.trim())));
             return;
         }
-        if message.starts_with("/model") {
+        if let Some(rest) = message.strip_prefix("/model")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
             self.follow = true;
-            self.note(Entry::Info(model_notice(&self.model, &self.effort)));
+            self.model_command(rest.trim());
             return;
         }
         if message.starts_with("/mcp") {
@@ -973,6 +1009,35 @@ impl App {
         // The transcript entry arrives back as `Event::User` once the session accepts it.
         if let Err(e) = self.session.submit(prompt) {
             self.note(Entry::Error(e.to_string()));
+        }
+    }
+
+    /// `/model` on its own opens the picker, which asks each backend what it will serve
+    /// and then, for a model that takes one, which effort to run it at. `/model <name>
+    /// [effort]` skips both questions, for a model already known by name.
+    fn model_command(&mut self, rest: &str) {
+        if rest.is_empty() {
+            let picker = Picker::new(&self.model, &self.effort);
+            picker.ask(&self.ollama_url);
+            self.picker = Some(picker);
+            return;
+        }
+        let (name, effort) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let effort = match effort.trim() {
+            "" => self.effort.clone(),
+            given => given.to_string(),
+        };
+        // The window is the picker's to pass on, since only the backend's list says what
+        // it is; named by hand, the model keeps whatever the config asked for.
+        self.switch_model(name.to_string(), effort, None);
+    }
+
+    /// Put the session on `model`, and say so.
+    fn switch_model(&mut self, model: String, effort: String, window: Option<u64>) {
+        let notice = model_notice(&model, &effort);
+        match self.session.set_model(model, effort, window) {
+            Ok(()) => self.note(Entry::Info(notice)),
+            Err(e) => self.note(Entry::Error(format!("cannot switch models: {e}"))),
         }
     }
 
@@ -1201,19 +1266,22 @@ fn switch_notice(current: &str, name: &str) -> String {
     )
 }
 
-/// What `/model` prints. The model is fixed for the session, since changing it mid-way
-/// would throw away the cached prefix the whole conversation is sitting on.
+/// What a switch prints. A model that takes no effort is not said to run at one, since
+/// nothing on that backend is sent it.
 fn model_notice(model: &str, effort: &str) -> String {
     let provider = crate::client::Provider::of(model);
-    let mut notice = format!("model: {model} ({effort} effort) on {}", provider.name());
-    if provider == crate::client::Provider::Ollama {
-        notice.push_str(", served locally");
+    match provider {
+        crate::client::Provider::Codex => {
+            format!(
+                "model: {model} ({effort} effort) on codex. The switch starts the prompt cache again, and the thinking of the model before it is dropped: it cannot be replayed to another one."
+            )
+        }
+        crate::client::Provider::Ollama => {
+            format!(
+                "model: {model} on ollama, served locally. It takes no reasoning effort, so none is sent."
+            )
+        }
     }
-    notice.push_str(
-        ". The model is fixed for the session; to change it, quit and run: bhai --model <name>. \
-A local model is named `ollama:<name>`, as `ollama list` shows it.",
-    );
-    notice
 }
 
 /// What `/mouse` prints. Capture is what turns the wheel into scroll events and drags
@@ -1325,6 +1393,30 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app whose session still has an agent listening, so a switch reaches it. The
+    /// receivers come back with it: dropped, the channels close and nothing is accepted.
+    type Listening = (
+        App,
+        tokio::sync::mpsc::Receiver<String>,
+        tokio::sync::mpsc::Receiver<crate::agent::Control>,
+    );
+
+    fn connected() -> Listening {
+        let (tx_user, user) = tokio::sync::mpsc::channel(4);
+        let (tx_control, control) = tokio::sync::mpsc::channel(4);
+        let app = App::new(Session::new(
+            "gpt-5.5".to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            Arc::default(),
+            Arc::default(),
+            None,
+        ));
+        (app, user, control)
+    }
 
     fn moved(row: u16) -> MouseEvent {
         MouseEvent {
@@ -1487,12 +1579,81 @@ mod tests {
     #[test]
     fn model_notice_names_the_backend() {
         let local = model_notice("ollama:gemma4:e2b", "medium");
+        assert!(local.starts_with("model: ollama:gemma4:e2b on ollama, served locally"));
         assert!(
-            local.starts_with("model: ollama:gemma4:e2b (medium effort) on ollama, served locally")
+            !local.contains("medium"),
+            "no effort reaches Ollama, so none is claimed: {local}"
         );
-        assert!(local.contains("bhai --model <name>"));
         assert!(
             model_notice("gpt-5.5", "high").starts_with("model: gpt-5.5 (high effort) on codex.")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_on_its_own_opens_the_picker() {
+        let (mut app, _user, _control) = connected();
+        app.input.set("/model".to_string());
+        app.submit();
+        let picker = app.picker.as_ref().expect("the picker is up");
+        assert!(
+            picker.catalogue.is_none(),
+            "the lists are still being asked for"
+        );
+        // Escape closes it without touching the session.
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.picker.is_none());
+        assert_eq!(app.model, "gpt-5.5");
+    }
+
+    #[test]
+    fn model_with_a_name_switches_without_asking() {
+        let (mut app, _user, _control) = connected();
+        app.input.set("/model ollama:gemma4:e2b".to_string());
+        app.submit();
+        assert!(app.picker.is_none(), "a named model asks nothing");
+        let state = app.session.state();
+        assert_eq!(state.model, "ollama:gemma4:e2b");
+        assert_eq!(state.effort, "medium", "the effort is left as it was");
+
+        app.input.set("/model gpt-5.5 xhigh".to_string());
+        app.submit();
+        let state = app.session.state();
+        assert_eq!(
+            (state.model.as_str(), state.effort.as_str()),
+            ("gpt-5.5", "xhigh")
+        );
+    }
+
+    #[test]
+    fn the_status_bar_follows_the_switch() {
+        let (mut app, _user, _control) = connected();
+        app.input.set("/model gpt-5.5 low".to_string());
+        app.submit();
+        // The session publishes the switch; the bar reads what the event carries.
+        app.on_event(Event::Model {
+            model: "gpt-5.5".to_string(),
+            effort: "low".to_string(),
+        });
+        assert_eq!(
+            (app.model.as_str(), app.effort.as_str()),
+            ("gpt-5.5", "low")
+        );
+    }
+
+    #[test]
+    fn a_switch_is_refused_while_a_turn_runs() {
+        let (mut app, _user, _control) = connected();
+        app.input.set("hello".to_string());
+        app.submit();
+        app.on_event(Event::User("hello".to_string()));
+        app.input.set("/model gpt-5.5 low".to_string());
+        app.submit();
+        assert_eq!(app.session.state().model, "gpt-5.5");
+        let entries = app.entries();
+        let last = entries.list.last().unwrap();
+        assert!(
+            matches!(last, Entry::Error(text) if text.contains("a turn is already running")),
+            "{last:?}"
         );
     }
 

@@ -15,6 +15,7 @@ use crate::commands::{self, Item};
 use crate::input::Row;
 use crate::limits::{self, RateLimits};
 use crate::markdown;
+use crate::models::Picker;
 use crate::permissions::Mode;
 use crate::profile::{Method, Tokens};
 use crate::session::{ChildRow, ChildState};
@@ -54,6 +55,24 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.input_area = None;
         app.buttons.clear();
         render_trust(frame, bottom_area, &gate);
+        return;
+    }
+    // The `/model` picker takes the prompt's place, sized to the list it is showing.
+    if let Some(height) = app.picker.as_ref().map(Picker::height) {
+        let height = height.min(frame.area().height.saturating_sub(2));
+        let [status_area, transcript_area, bottom_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(height),
+        ])
+        .areas(frame.area());
+        render_status(frame, status_area, app);
+        render_transcript(frame, transcript_area, app);
+        app.input_area = None;
+        app.buttons.clear();
+        if let Some(picker) = &mut app.picker {
+            picker.render(frame, bottom_area);
+        }
         return;
     }
     let approval_height = app
@@ -155,7 +174,14 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
     let dim = Style::new().fg(Color::DarkGray);
     let mut spans = vec![
         Span::styled(" bhai ", Style::new().fg(Color::Black).bg(Color::Cyan)),
-        Span::styled(format!(" {} ", app.model), dim),
+        // The effort rides along with the model, since `/model` can change either.
+        Span::styled(
+            match crate::client::Provider::of(&app.model) {
+                crate::client::Provider::Codex => format!(" {} {} ", app.model, app.effort),
+                crate::client::Provider::Ollama => format!(" {} ", app.model),
+            },
+            dim,
+        ),
     ];
     if app.tokens_in + app.tokens_out > 0 {
         spans.push(Span::styled(
@@ -1696,6 +1722,65 @@ mod tests {
         assert_eq!(buffer[(x + 4, y)].symbol(), "p");
         assert_eq!(buffer[(x + 4, y)].fg, Color::DarkGray);
         assert_eq!(buffer[(x + 7, y)].fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn the_model_picker_takes_the_prompt_and_shows_both_lists() {
+        use crate::models::{Catalogue, Effort, Picker};
+
+        let model = |id: &str, label: &str, efforts: &[&str]| crate::models::Model {
+            id: id.to_string(),
+            label: label.to_string(),
+            detail: "does things".to_string(),
+            efforts: efforts
+                .iter()
+                .map(|name| Effort {
+                    name: name.to_string(),
+                    detail: String::new(),
+                })
+                .collect(),
+            default_effort: Some("medium".to_string()),
+            window: None,
+        };
+        let mut app = App::detached();
+        app.model = "gpt-5.5".to_string();
+        app.effort = "high".to_string();
+        let mut picker = Picker::new("gpt-5.5", "high");
+        picker.fill(Catalogue {
+            models: vec![
+                model("gpt-5.5", "GPT-5.5", &["low", "medium", "high"]),
+                model("ollama:gemma4:e2b", "gemma4:e2b", &[]),
+            ],
+            notes: vec!["ollama: no server at http://localhost:11434".to_string()],
+        });
+        app.picker = Some(picker);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        for part in [
+            "pick a model",
+            "GPT-5.5",
+            "gemma4:e2b",
+            "no server at",
+            "enter choose",
+        ] {
+            assert!(shown.contains(part), "{part} missing from {shown}");
+        }
+        // No prompt to type into while the picker is up.
+        assert!(app.input_area.is_none());
+
+        // Enter on a model that takes an effort asks which one before switching.
+        app.on_key(ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("GPT-5.5 · pick an effort"), "{shown}");
+        assert!(shown.contains("medium"), "{shown}");
+        assert!(shown.contains("enter switch"), "{shown}");
+        assert!(app.picker.is_some(), "still asking, nothing switched yet");
     }
 
     #[test]

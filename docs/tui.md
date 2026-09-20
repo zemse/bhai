@@ -32,11 +32,11 @@ sent as. A `/word` that is neither a command nor a skill is refused rather than 
 first word that is not name-shaped, such as `/usr/bin/env is missing`, is a prompt like
 any other.
 
-The top bar carries only session facts (model, token totals, cache and rate-limit
-headroom) plus the answer keys while an approval waits. The spinner, the speed, the queue
-count and the interrupt key sit on their own row just above the prompt, where the eye
-already is, and that row is there only while a turn is actually running. The rest of the
-keys are in `/help`.
+The top bar carries only session facts (model and its reasoning effort, token totals,
+cache and rate-limit headroom) plus the answer keys while an approval waits. The spinner,
+the speed, the queue count and the interrupt key sit on their own row just above the
+prompt, where the eye already is, and that row is there only while a turn is actually
+running. The rest of the keys are in `/help`.
 
 The speed is output tokens a second over the last ten seconds the model was actually
 streaming. Time spent running a tool, waiting for an approval or waiting for the next
@@ -112,6 +112,14 @@ new prompt clears it.
 Capture takes click-drag away from the terminal, so the terminal's own selection needs
 shift (or option) held; `/mouse` turns capture off and on for the times that is what you
 want.
+
+## The model picker
+
+`/model` takes the prompt's place with the models both backends will serve, the running
+one marked. The arrows or `j`/`k` move, `enter` chooses and `esc` closes. A model that
+takes a reasoning effort asks for one next, listing only the efforts that model supports;
+`esc` there goes back to the models rather than out of the picker. See
+[models](models.md).
 
 ## The diff pane
 

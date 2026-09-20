@@ -110,6 +110,13 @@ pub enum Control {
         workflow: Arc<Workflow>,
         input: String,
     },
+    /// Talk to this model from the next call on, for `/model`. `window` is the model's
+    /// context window where the backend says, so compaction still knows when to run.
+    Model {
+        model: String,
+        effort: String,
+        window: Option<u64>,
+    },
 }
 
 /// A model backend. `Client` is the real one; tests drive the loop with a fake.
@@ -126,6 +133,11 @@ pub trait Model: Send + Sync {
 
     /// The model a child running as `identity` talks to.
     fn child(&self, identity: &Identity) -> Arc<dyn Model>;
+
+    /// The same backend on another model, for `/model`; `None` when it cannot switch.
+    fn switch(&self, _model: &str, _effort: &str) -> Option<Arc<dyn Model>> {
+        None
+    }
 
     /// The model's name, which picks its tokenizer.
     fn name(&self) -> &str;
@@ -164,6 +176,10 @@ impl Model for Client {
 
     fn child(&self, identity: &Identity) -> Arc<dyn Model> {
         Arc::new(self.for_child(identity))
+    }
+
+    fn switch(&self, model: &str, effort: &str) -> Option<Arc<dyn Model>> {
+        Some(Arc::new(Client::switch(self, model, effort)))
     }
 
     fn name(&self) -> &str {
@@ -299,7 +315,7 @@ pub async fn run(
 /// `run` with the model given.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with(
-    model: Arc<dyn Model>,
+    mut model: Arc<dyn Model>,
     session_id: String,
     prompt: SystemPrompt,
     policy: Arc<Policy>,
@@ -311,32 +327,41 @@ pub(crate) async fn run_with(
     usage_log: Option<PathBuf>,
     delegation: Option<Delegation>,
     saved: Option<Saved>,
-    limits: Limits,
+    mut limits: Limits,
 ) {
     let children = Children::default();
-    let mut registry = Registry::for_prompt(&prompt);
     // Kept past the `agent` tool: workflows run children whatever the identity's tools are.
     let transcripts = delegation
         .as_ref()
         .map(|d| d.sessions.join(&session_id))
         .unwrap_or_default();
-    if let Some(delegation) = delegation.clone()
-        && prompt.identity.allows_tool(tools::agent::NAME)
-    {
-        registry = registry.with_agent(tools::agent::Agent {
-            transcripts: transcripts.clone(),
-            delegation,
-            model: Arc::clone(&model),
-            policy: Arc::clone(&policy),
-            tx: tx.clone(),
-            cancel: Arc::clone(&cancel),
-            children: Arc::clone(&children),
-            slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
-        });
-    }
+    // Built again when `/model` switches, so a child starts on the model its parent is
+    // on. What tools there are does not depend on the model, so the schemas hold.
+    let build = |model: &Arc<dyn Model>| {
+        let mut registry = Registry::for_prompt(&prompt);
+        if let Some(delegation) = delegation.clone()
+            && prompt.identity.allows_tool(tools::agent::NAME)
+        {
+            registry = registry.with_agent(tools::agent::Agent {
+                transcripts: transcripts.clone(),
+                delegation,
+                model: Arc::clone(model),
+                policy: Arc::clone(&policy),
+                tx: tx.clone(),
+                cancel: Arc::clone(&cancel),
+                children: Arc::clone(&children),
+                slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
+            });
+        }
+        registry
+    };
+    let mut registry = build(&model);
     let tools = registry.schemas();
-    let tokenizer = tokens::for_model(model.name());
-    let report = |history: &[Value], calls: &[Call]| {
+    // Both follow the model, so a switch takes them with it. A window the config asked
+    // for still wins over the one the new model's backend reports.
+    let configured_window = limits.window;
+    let mut tokenizer = tokens::for_model(model.name());
+    let report = |history: &[Value], calls: &[Call], tokenizer| {
         let mut profile = profile::build(&prompt, &tools, history, calls, tokenizer);
         profile.children = children.lock().unwrap_or_else(|e| e.into_inner()).clone();
         profile.judge = judge.as_ref().map_or_else(Usage::default, |j| j.total());
@@ -367,10 +392,13 @@ pub(crate) async fn run_with(
 
     loop {
         let message = tokio::select! {
+            // Control first, so a `/model` switch is in force for the message typed
+            // right after it rather than one turn late.
+            biased;
             Some(control) = rx_control.recv() => {
                 match control {
                     Control::Context(reply) => {
-                        let _ = reply.send(report(&history, &calls));
+                        let _ = reply.send(report(&history, &calls, tokenizer));
                         continue;
                     }
                     Control::Workflow { workflow, input } => {
@@ -396,6 +424,36 @@ pub(crate) async fn run_with(
                             }
                         }
                         let _ = tx.send(AgentEvent::TurnEnd);
+                        continue;
+                    }
+                    // Between turns, so the switch never lands mid-call. What the old
+                    // model thought is dropped: encrypted reasoning belongs to the model
+                    // that produced it and cannot be replayed to another one.
+                    Control::Model { model: name, effort, window } => {
+                        match model.switch(&name, &effort) {
+                            Some(switched) => {
+                                model = switched;
+                                registry = build(&model);
+                                tokenizer = tokens::for_model(model.name());
+                                limits.window = configured_window.or(window);
+                                history.retain(|item| {
+                                    item.get("type").and_then(Value::as_str) != Some("reasoning")
+                                });
+                                // The header goes out with the first item, so a session
+                                // switched before it has said anything is saved as this.
+                                if let Some(writer) = &mut writer {
+                                    writer.header.model = model.name().to_string();
+                                    writer.header.effort = effort;
+                                    writer.header.prefix =
+                                        sessions::prefix(model.name(), &prompt.text, &tools);
+                                }
+                            }
+                            None => {
+                                let _ = tx.send(AgentEvent::Error(
+                                    "this backend cannot switch models".to_string(),
+                                ));
+                            }
+                        }
                         continue;
                     }
                     Control::Compact => None,
@@ -462,14 +520,20 @@ pub(crate) async fn run_with(
                     result = &mut turn => break result,
                     Some(control) = rx_control.recv() => match control {
                         Control::Context(reply) => {
-                            let _ = reply.send(report(&before, &calls_before));
+                            let _ = reply.send(report(&before, &calls_before, tokenizer));
                         }
                         // Never while a tool call may be pending: once the turn is over.
                         Control::Compact => compact_next = true,
-                        // The session refuses one while a turn runs, so this cannot happen.
+                        // The session refuses either while a turn runs, so neither can
+                        // happen; a switch mid-call would answer with the wrong model.
                         Control::Workflow { .. } => {
                             let _ = tx.send(AgentEvent::Error(
                                 "a workflow cannot start while a turn is running".to_string(),
+                            ));
+                        }
+                        Control::Model { .. } => {
+                            let _ = tx.send(AgentEvent::Error(
+                                "the model cannot change while a turn is running".to_string(),
                             ));
                         }
                     },
@@ -1259,6 +1323,10 @@ pub mod fake {
         /// Every intentional reset, as the conversation, the calls it had already made
         /// and the reason.
         pub resets: Arc<Mutex<Vec<(String, usize, String)>>>,
+        /// The model and effort it answers as; `switch` hands back the same script
+        /// under another pair, as the real client does.
+        pub model: String,
+        pub effort: String,
         conversation: String,
         key: String,
         guard: Arc<Mutex<CacheGuard>>,
@@ -1277,6 +1345,8 @@ pub mod fake {
                 bodies: Arc::default(),
                 breaks: Arc::default(),
                 resets: Arc::default(),
+                model: "fake".to_string(),
+                effort: "medium".to_string(),
                 conversation: "parent".to_string(),
                 key: "sess".to_string(),
                 guard: Arc::new(Mutex::new(CacheGuard::new("parent", None, false))),
@@ -1368,8 +1438,8 @@ pub mod fake {
                     .collect();
                 self.offered.lock().unwrap().push(names);
                 let body = crate::client::request_body(
-                    "fake",
-                    "medium",
+                    &self.model,
+                    &self.effort,
                     &self.key,
                     instructions,
                     tools,
@@ -1420,8 +1490,18 @@ pub mod fake {
             })
         }
 
+        fn switch(&self, model: &str, effort: &str) -> Option<Arc<dyn Model>> {
+            let switched = Self {
+                model: model.to_string(),
+                effort: effort.to_string(),
+                ..self.clone()
+            };
+            switched.reset("the model changed");
+            Some(Arc::new(switched))
+        }
+
         fn name(&self) -> &str {
-            "fake"
+            &self.model
         }
 
         fn strict_cache(&self) -> bool {
@@ -1430,8 +1510,8 @@ pub mod fake {
 
         fn seed(&self, instructions: &str, tools: &[Value], input: &[Value]) {
             let body = crate::client::request_body(
-                "fake",
-                "medium",
+                &self.model,
+                &self.effort,
                 &self.key,
                 instructions,
                 tools,
@@ -2595,6 +2675,105 @@ mod tests {
             "Summary of earlier conversation:\nshort"
         );
         assert_eq!(input.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_switch_moves_the_next_call_to_the_new_model() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![vec![say("one")], vec![say("two")]]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        tx_control
+            .send(Control::Model {
+                model: "gpt-9".to_string(),
+                effort: "xhigh".to_string(),
+                window: Some(400_000),
+            })
+            .await
+            .unwrap();
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0].1["model"], "fake");
+        assert_eq!(bodies[1].1["model"], "gpt-9");
+        assert_eq!(bodies[1].1["reasoning"]["effort"], "xhigh");
+        // The switch forgets the last request rather than reporting it as a break.
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let reasons: Vec<_> = fake
+            .resets
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, reason)| reason.clone())
+            .collect();
+        assert_eq!(reasons, ["the model changed"]);
+    }
+
+    #[tokio::test]
+    async fn a_switch_drops_the_thinking_of_the_model_before_it() {
+        use fake::{Fake, say};
+
+        let think = json!({"type": "reasoning", "encrypted_content": "opaque"});
+        let fake = Fake::new(vec![vec![think.clone(), say("one")], vec![say("two")]]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        tx_control
+            .send(Control::Model {
+                model: "gpt-9".to_string(),
+                effort: "high".to_string(),
+                window: None,
+            })
+            .await
+            .unwrap();
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        let sent = bodies[1].1["input"].as_array().unwrap();
+        assert!(
+            !sent.iter().any(|item| item["type"] == "reasoning"),
+            "encrypted reasoning cannot be replayed to another model: {sent:?}"
+        );
+        assert_eq!(sent.last().unwrap()["content"][0]["text"], "second");
     }
 
     /// A session that misses the cache on every judged call, one call per script step,
