@@ -25,6 +25,7 @@ use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
 use crate::session::{Approval, Event, Prompt, Session};
 use crate::skills::Skill;
+use crate::speed::Speed;
 use crate::workflow::{self, Found};
 
 /// Lines a mouse wheel notch moves the transcript.
@@ -177,6 +178,8 @@ pub struct App {
     pub mode: Mode,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// How fast the model is answering, for the working row.
+    pub speed: Speed,
     pub last_usage: Option<Usage>,
     /// The field that broke the prompt cache, until the next clean call.
     pub cache_break: Option<String>,
@@ -246,6 +249,7 @@ impl App {
             mode: session.state().mode,
             tokens_in: 0,
             tokens_out: 0,
+            speed: Speed::default(),
             last_usage: None,
             cache_break: None,
             cache_miss: None,
@@ -757,7 +761,18 @@ impl App {
             Event::Usage(usage) => {
                 self.tokens_in += usage.input;
                 self.tokens_out += usage.output;
+                // The stream only summarises reasoning, so the count it never showed
+                // goes to the speed here, while the call is still on the clock.
+                self.speed.reported(Instant::now(), usage.output);
                 self.last_usage = Some(usage);
+            }
+            Event::Streaming(on) => match on {
+                true => self.speed.start(Instant::now()),
+                false => self.speed.end(Instant::now()),
+            },
+            Event::Reasoning(ref text) | Event::Text(ref text) => {
+                let tokens = crate::tokens::for_model(&self.model).count(text);
+                self.speed.streamed(Instant::now(), tokens as u64);
             }
             // Children count towards the status bar total, not the cache rate.
             Event::ChildUsage(usage) => {
@@ -1704,6 +1719,39 @@ mod tests {
         assert!(
             matches!(app.entries().list.last(), Some(Entry::Info(t)) if t.starts_with("queue:"))
         );
+    }
+
+    #[test]
+    fn the_speed_counts_only_what_the_model_streams() {
+        let mut app = App::detached();
+        app.on_event(Event::Text("not while idle".to_string()));
+        assert_eq!(app.speed.counted(), 0);
+
+        app.on_event(Event::Streaming(true));
+        app.on_event(Event::Reasoning("thinking".to_string()));
+        app.on_event(Event::Text("hello world".to_string()));
+        assert_eq!(
+            app.speed.counted(),
+            5,
+            "bytes/4 for a model with no tokenizer"
+        );
+
+        // The call's own count tops that up with the reasoning it never showed.
+        let usage = Usage {
+            input: 10,
+            cached: 0,
+            output: 500,
+            reasoning: 480,
+        };
+        app.on_event(Event::Usage(usage));
+        assert_eq!(app.speed.counted(), 500);
+        assert_eq!(app.tokens_out, 500, "the totals are unchanged by any of it");
+
+        // A child's call is the parent's idle time, and so is everything after the end.
+        app.on_event(Event::Streaming(false));
+        app.on_event(Event::ChildUsage(usage));
+        app.on_event(Event::Text("nor after".to_string()));
+        assert_eq!(app.speed.counted(), 500);
     }
 
     #[test]

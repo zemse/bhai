@@ -71,6 +71,9 @@ pub enum AgentEvent {
     CacheStalled(usize),
     /// The latest rate-limit headroom; one account, so a child's counts too.
     RateLimits(RateLimits),
+    /// A model call is on the wire, or is over; the UI times these to say how fast the
+    /// model is answering, leaving out the time tools and approvals take.
+    Streaming(bool),
     Error(String),
     /// The agent is done with this turn and is waiting for input.
     TurnEnd,
@@ -516,10 +519,12 @@ async fn turn(
 
         // On interrupt or failure nothing is appended, so the history never holds a
         // function_call without its matching output.
-        let items = match model
+        let _ = tx.send(AgentEvent::Streaming(true));
+        let answer = model
             .respond(instructions, tools, history, &mut on_delta, cancel)
-            .await
-        {
+            .await;
+        let _ = tx.send(AgentEvent::Streaming(false));
+        let items = match answer {
             Ok(items) => items,
             // An interrupt is the user's decision, not an error worth reporting.
             Err(_) if cancel.load(Ordering::Relaxed) => return (step, Ok(())),
@@ -827,6 +832,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 // and items index the child's history, not the parent's.
                 AgentEvent::Reasoning(_)
                 | AgentEvent::Text(_)
+                // The parent's own calls are what the speed readout times.
+                | AgentEvent::Streaming(_)
                 | AgentEvent::TurnEnd
                 | AgentEvent::Call(_)
                 | AgentEvent::Item(_)

@@ -7,7 +7,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use std::ops::Range;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::app::{App, Entry, TrustGate};
 use crate::client::Usage;
@@ -201,6 +201,9 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
             format!(" · auto mode is checking {}", clip(call, JUDGING_CLIP)),
             Style::new().fg(Color::Cyan),
         ));
+    }
+    if let Some(rate) = app.speed.rate(Instant::now()) {
+        spans.push(Span::styled(format!(" · {rate:.0} tok/s"), dim));
     }
     if app.queued > 0 {
         spans.push(Span::styled(format!(" · {} queued", app.queued), dim));
@@ -1022,6 +1025,32 @@ mod tests {
         let long = clip(&"x".repeat(200), JUDGING_CLIP);
         assert_eq!(long, "x".repeat(47) + "\u{2026}");
         assert_eq!(clip("one\ntwo", JUDGING_CLIP), "one two");
+    }
+
+    #[test]
+    fn the_working_row_shows_how_fast_the_model_is_answering() {
+        let mut app = App::detached();
+        app.working = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("tok/s"), "nothing streamed yet");
+
+        // Four seconds of streaming, two hundred tokens of it.
+        app.speed.start(Instant::now() - Duration::from_secs(4));
+        app.on_event(Event::Usage(Usage {
+            input: 0,
+            cached: 0,
+            output: 200,
+            reasoning: 0,
+        }));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("working · 50 tok/s"), "{shown}");
+
+        // It is a working-row reading, so it goes with the row.
+        app.on_event(Event::TurnEnd);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("tok/s"));
     }
 
     #[test]

@@ -69,6 +69,8 @@ pub enum Event {
     CacheStalled(usize),
     /// The latest rate-limit headroom.
     RateLimits(RateLimits),
+    /// A model call is on the wire, or is over; what the tokens a second readout times.
+    Streaming(bool),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
     /// The judge is deciding that call, or `None` once it has.
@@ -494,6 +496,7 @@ impl Session {
                 inner.rate_limits = Some(limits);
                 Event::RateLimits(limits)
             }
+            AgentEvent::Streaming(on) => Event::Streaming(on),
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Judging(what) => Event::Judging(what),
             AgentEvent::Compacted(s) => Event::Compacted(s),

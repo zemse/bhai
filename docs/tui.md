@@ -33,10 +33,19 @@ first word that is not name-shaped, such as `/usr/bin/env is missing`, is a prom
 any other.
 
 The top bar carries only session facts (model, token totals, cache and rate-limit
-headroom) plus the answer keys while an approval waits. The spinner, the queue count and
-the interrupt key sit on their own row just above the prompt, where the eye already is,
-and that row is there only while a turn is actually running. The rest of the keys are in
-`/help`.
+headroom) plus the answer keys while an approval waits. The spinner, the speed, the queue
+count and the interrupt key sit on their own row just above the prompt, where the eye
+already is, and that row is there only while a turn is actually running. The rest of the
+keys are in `/help`.
+
+The speed is output tokens a second over the last ten seconds the model was actually
+streaming. Time spent running a tool, waiting for an approval or waiting for the next
+prompt is left out, so the number says how fast the model is answering rather than how
+fast the turn is going, and it holds steady rather than decaying while a build runs. The
+window spans calls, so a reply that arrives in three bursts reads as one rate. A call's
+real output count lands when it finishes, which is how reasoning the stream only
+summarised gets in; until then the reading is what has been streamed, so a model that
+thinks for a while before writing starts low and catches up.
 
 ## Keys
 

@@ -28,6 +28,7 @@ mod server;
 mod session;
 mod sessions;
 mod skills;
+mod speed;
 mod tokens;
 mod tools;
 mod ui;
@@ -741,6 +742,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             | AgentEvent::Call(_)
             | AgentEvent::Item(_)
             | AgentEvent::Judging(None)
+            | AgentEvent::Streaming(_)
             | AgentEvent::ToolProgress(_) => {}
             AgentEvent::CacheHit(hit) => {
                 if let (Some(expected), Some(ratio)) = (hit.expected_cached, hit.hit_ratio) {
