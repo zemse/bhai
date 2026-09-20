@@ -678,11 +678,16 @@ impl Checker<'_> {
                 Some(commands) => !commands.iter().any(bash::mentions_protected),
                 None => false,
             },
+            // Reading outside the project is the judge's to rule on, and so is a
+            // scratch file; a protected path is the user's alone, and so is a write
+            // anywhere else on the machine.
             "read" | "write" | "edit" => match text("path") {
                 Some(path) => {
                     let path = Path::new(path);
                     !rules::is_protected(path, self.base.home)
-                        && rules::is_inside(path, self.base.cwd)
+                        && (tool == "read"
+                            || rules::is_inside(path, self.base.cwd)
+                            || rules::is_scratch(path))
                 }
                 None => false,
             },
@@ -1362,9 +1367,16 @@ mod tests {
         assert!(!command("sudo cargo clippy"), "sudo");
         assert!(!command("ls $(rm x)"), "unparseable");
         assert!(!command("cat .env"), "protected path");
-        assert!(!path("write", &dir.join("outside/x.rs")), "outside");
+        assert!(!path("write", &PathBuf::from("/etc/hosts")), "outside");
         assert!(!path("edit", &repo.join(".env")), "protected");
         assert!(!p.judgeable("write", &json!({})), "no path");
+
+        // What the judge is there to rule on: a scratch file, and reading outside.
+        assert!(path("write", &dir.join("outside/x.rs")), "scratch");
+        assert!(path("write", &PathBuf::from("/tmp/notes.json")), "scratch");
+        assert!(command("cargo test > /tmp/out.txt"), "a scratch redirect");
+        assert!(path("read", &PathBuf::from("/etc/hosts")), "read outside");
+        assert!(!path("read", &repo.join(".env")), "read protected");
 
         // Neither other mode ever asks the judge, trusted or not.
         for mode in [Mode::Ask, Mode::Bypass] {

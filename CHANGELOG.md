@@ -6,6 +6,10 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- The judge rules on a scratch file and on reading outside the project, which used to be
+  held for the user: `/tmp` and the system temp directory are scratch, not the machine.
+  A protected path, and a write anywhere else outside the project, still are the user's
+  alone.
 - The permission tokenizer reads a redirection instead of refusing the command it is on:
   `> f`, `>> f` and `2> f` are writes, checked where a write is checked. A redirect into
   the project is relaxed in `auto` like any write there; one into a protected path asks;
