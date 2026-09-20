@@ -7,7 +7,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use std::ops::Range;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::app::{App, Entry, TrustGate};
 use crate::client::Usage;
@@ -246,7 +246,7 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Cyan),
         ));
     }
-    if let Some(rate) = app.speed.rate(Instant::now()) {
+    if let Some(rate) = app.speed.rate() {
         spans.push(Span::styled(format!(" · {rate:.0} tok/s"), dim));
     }
     if app.queued > 0 {
@@ -920,6 +920,7 @@ mod tests {
     use crate::session::{Approval, Event};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::time::Instant;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::style::Modifier;
 

@@ -1,7 +1,7 @@
 //! How fast the model is answering: output tokens a second over the last few seconds it
 //! was actually streaming. Time spent running tools, waiting for an approval or waiting
-//! for the next prompt is left out, so the number says how quickly the model writes
-//! rather than how quickly the turn is going.
+//! for the next prompt is left out, and so is the silence after the last token, so the
+//! number says how quickly the model writes rather than how quickly the turn is going.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -61,20 +61,18 @@ impl Speed {
         }
     }
 
-    /// Tokens a second over the window, or nothing until there is enough of it.
-    pub fn rate(&self, now: Instant) -> Option<f64> {
-        let clock = self.clock(now);
-        let span = clock.min(WINDOW);
+    /// Tokens a second over the window, or nothing until there is enough of it. The
+    /// window ends at the last token rather than at now: a model that has stopped
+    /// writing is not writing slowly, so silence holds the number where it was instead
+    /// of dragging it down to nothing while the model thinks or a request is retried.
+    pub fn rate(&self) -> Option<f64> {
+        let (last, _) = *self.samples.back()?;
+        // Everything still held arrived inside the window, since `push` drops the rest.
+        let span = last.min(WINDOW);
         if span < MIN {
             return None;
         }
-        let from = clock - span;
-        let tokens: u64 = self
-            .samples
-            .iter()
-            .filter(|(at, _)| *at > from)
-            .map(|(_, tokens)| tokens)
-            .sum();
+        let tokens: u64 = self.samples.iter().map(|(_, tokens)| tokens).sum();
         (tokens > 0).then(|| tokens as f64 / span.as_secs_f64())
     }
 
@@ -128,14 +126,28 @@ mod tests {
         let clock = Clock::new();
         let mut speed = Speed::default();
         speed.start(clock.at(0.0));
-        assert_eq!(speed.rate(clock.at(1.0)), None, "too early to say");
+        assert_eq!(speed.rate(), None, "too early to say");
         for i in 1..=4 {
             speed.streamed(clock.at(i as f64), 50);
         }
         // Four seconds of streaming, two hundred tokens.
-        assert_eq!(speed.rate(clock.at(4.0)), Some(50.0));
-        // The clock keeps running while the model thinks, so the rate falls.
-        assert_eq!(speed.rate(clock.at(8.0)), Some(25.0));
+        assert_eq!(speed.rate(), Some(50.0));
+    }
+
+    #[test]
+    fn silence_holds_the_rate_rather_than_decaying_it() {
+        let clock = Clock::new();
+        let mut speed = Speed::default();
+        speed.start(clock.at(0.0));
+        for i in 1..=4 {
+            speed.streamed(clock.at(i as f64), 50);
+        }
+        // A minute of thinking, or of a request being retried, moves the streaming clock
+        // but brings no token with it, and the rate stays where the last one left it.
+        assert_eq!(speed.rate(), Some(50.0));
+        // It starts writing again, and only then does the quiet stretch count.
+        speed.streamed(clock.at(64.0), 50);
+        assert_eq!(speed.rate(), Some(5.0));
     }
 
     #[test]
@@ -148,10 +160,10 @@ mod tests {
         // A minute of tool output moves the wall clock, not the streaming one.
         speed.start(clock.at(62.0));
         speed.streamed(clock.at(64.0), 100);
-        assert_eq!(speed.rate(clock.at(64.0)), Some(50.0), "four seconds of it");
+        assert_eq!(speed.rate(), Some(50.0), "four seconds of it");
         speed.end(clock.at(64.0));
         // Idle between turns does not decay it either.
-        assert_eq!(speed.rate(clock.at(600.0)), Some(50.0));
+        assert_eq!(speed.rate(), Some(50.0));
     }
 
     #[test]
@@ -164,7 +176,7 @@ mod tests {
             speed.streamed(clock.at(i as f64), 10);
         }
         // The burst at one second has fallen out of the window.
-        assert_eq!(speed.rate(clock.at(20.0)), Some(10.0));
+        assert_eq!(speed.rate(), Some(10.0));
         assert_eq!(speed.samples.len(), 10);
     }
 
@@ -175,12 +187,12 @@ mod tests {
         speed.start(clock.at(0.0));
         // Ten seconds of thinking, then a two hundred token summary.
         speed.streamed(clock.at(10.0), 200);
-        assert_eq!(speed.rate(clock.at(10.0)), Some(20.0));
+        assert_eq!(speed.rate(), Some(20.0));
         speed.reported(clock.at(10.0), 2000);
-        assert_eq!(speed.rate(clock.at(10.0)), Some(200.0));
+        assert_eq!(speed.rate(), Some(200.0));
         // A count below what was streamed takes nothing back off.
         speed.reported(clock.at(10.0), 1);
-        assert_eq!(speed.rate(clock.at(10.0)), Some(200.0));
+        assert_eq!(speed.rate(), Some(200.0));
     }
 
     #[test]
@@ -191,10 +203,10 @@ mod tests {
         speed.reported(clock.at(1.0), 500);
         speed.start(clock.at(2.0));
         speed.streamed(clock.at(4.0), 100);
-        assert_eq!(speed.rate(clock.at(4.0)), Some(50.0));
+        assert_eq!(speed.rate(), Some(50.0));
         // Two ends in a row, and a second start, leave the clock alone.
         speed.end(clock.at(4.0));
         speed.end(clock.at(9.0));
-        assert_eq!(speed.rate(clock.at(9.0)), Some(50.0));
+        assert_eq!(speed.rate(), Some(50.0));
     }
 }
