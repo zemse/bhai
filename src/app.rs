@@ -1736,6 +1736,17 @@ mod tests {
             "bytes/4 for a model with no tokenizer"
         );
 
+        // A model with a tokenizer of its own is counted with it, not by its bytes.
+        let mut gpt = App::detached();
+        gpt.model = "gpt-5.6-sol".to_string();
+        gpt.on_event(Event::Streaming(true));
+        gpt.on_event(Event::Text("hello world".to_string()));
+        assert_eq!(
+            gpt.speed.counted(),
+            2,
+            "o200k_base, as the codex backend uses"
+        );
+
         // The call's own count tops that up with the reasoning it never showed.
         let usage = Usage {
             input: 10,
