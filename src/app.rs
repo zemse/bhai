@@ -28,6 +28,7 @@ use crate::session::{Approval, ChildRow, Event, Prompt, Session};
 use crate::skills::Skill;
 use crate::speed::Speed;
 use crate::workflow::{self, Found};
+use crate::wrap::Join;
 
 /// Lines a mouse wheel notch moves the transcript.
 const WHEEL_LINES: usize = 3;
@@ -94,6 +95,15 @@ impl Selection {
     }
 }
 
+/// What a drag's copy left behind: when it happened, how much it took and the cell the
+/// drag ended on, which the note is drawn beside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Copied {
+    pub at: Instant,
+    pub chars: usize,
+    pub cell: Position,
+}
+
 /// The question asked on opening a project the trust store does not know. Until it is
 /// answered the session is in `ask` mode, since `auto` and `bypass` run code this
 /// project supplies.
@@ -150,6 +160,8 @@ pub struct App {
     selecting: bool,
     /// Plain text of each wrapped transcript line, filled in by the renderer.
     pub lines: Vec<String>,
+    /// How each of those lines joins the one above it, so a copy can undo the wrapping.
+    pub joins: Vec<Join>,
     /// The transcript's text area, filled in by the renderer.
     pub transcript_area: Option<Rect>,
     /// The selected span of the transcript, drawn reversed and copied by `ctrl+y`.
@@ -162,9 +174,8 @@ pub struct App {
     clicks: Option<(Instant, u16, u16, u8)>,
     /// Mouse capture is on; `/mouse` turns it off for the terminal's own selection.
     pub mouse: bool,
-    /// The last drag's copy: when it happened and how much it took, for the note on the
-    /// input's border.
-    pub copied: Option<(Instant, usize)>,
+    /// The last drag's copy, for the note drawn where the drag ended.
+    pub copied: Option<Copied>,
     pub input: Editor,
     /// The `/` menu's highlighted row, while the menu is open.
     pub menu: Option<usize>,
@@ -245,6 +256,7 @@ impl App {
             dragging: false,
             selecting: false,
             lines: Vec::new(),
+            joins: Vec::new(),
             transcript_area: None,
             selection: None,
             anchor: None,
@@ -539,7 +551,8 @@ impl App {
                 // A press and release on one cell is a click, not a drag.
                 let clicked = self.press.take() == Some((mouse.column, mouse.row));
                 if selecting && !clicked {
-                    return self.copy_selection() | self.rehover();
+                    let at = Position::new(mouse.column, mouse.row);
+                    return self.copy_selection(at) | self.rehover();
                 }
                 return clicked && self.click_entry(mouse.row);
             }
@@ -657,22 +670,37 @@ impl App {
         std::mem::replace(&mut self.selection, selection) != selection
     }
 
-    /// The selected transcript text, lines joined and trailing spaces trimmed.
+    /// The selected transcript text, trailing spaces trimmed. Rows the wrap broke go
+    /// back on one line: only the newlines the text itself has survive the copy.
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
         let (from, to) = selection.range();
-        let text: Vec<String> = (from.0..=to.0.min(self.lines.len().checked_sub(1)?))
+        let rows: Vec<(usize, String)> = (from.0..=to.0.min(self.lines.len().checked_sub(1)?))
             .map(|line| {
                 let chars = self.lines[line].chars();
                 let range = selection.on_line(line, self.lines[line].chars().count());
                 let range = range.unwrap_or(0..0);
                 let part: String = chars.skip(range.start).take(range.len()).collect();
-                part.trim_end().to_string()
+                (line, part.trim_end().to_string())
             })
             .collect();
-        text.iter()
-            .any(|line| !line.is_empty())
-            .then(|| text.join("\n"))
+        if rows.iter().all(|(_, part)| part.is_empty()) {
+            return None;
+        }
+        let mut text = String::new();
+        for (index, (line, part)) in rows.iter().enumerate() {
+            match index {
+                0 => text.push_str(part),
+                _ => self.join_at(*line).append(&mut text, part),
+            }
+        }
+        Some(text)
+    }
+
+    /// How transcript line `line` joins the one above it. A renderer that has not run
+    /// says nothing, so the line stands on its own.
+    fn join_at(&self, line: usize) -> Join {
+        self.joins.get(line).copied().unwrap_or_default()
     }
 
     /// Extend the input's selection to the char under the pointer. The anchor lands on
@@ -712,9 +740,9 @@ impl App {
 
     /// What the end of a drag copies on its own: the selection it just made, and nothing
     /// when it made none, since a click must not put the whole input on the clipboard.
-    /// It says so on the input's border rather than in the transcript, which a drag has
-    /// no business writing to. Returns whether the screen needs a redraw.
-    fn copy_selection(&mut self) -> bool {
+    /// It says so beside where the drag ended rather than in the transcript, which a
+    /// drag has no business writing to. Returns whether the screen needs a redraw.
+    fn copy_selection(&mut self, at: Position) -> bool {
         let Some(text) = self.selected_text().or_else(|| self.input.selected()) else {
             return false;
         };
@@ -723,7 +751,13 @@ impl App {
         }
         let chars = text.chars().count();
         match clipboard::copy(&text) {
-            Ok(()) => self.copied = Some((Instant::now(), chars)),
+            Ok(()) => {
+                self.copied = Some(Copied {
+                    at: Instant::now(),
+                    chars,
+                    cell: at,
+                })
+            }
             Err(err) => self.note(Entry::Error(format!("copy failed: {err}"))),
         }
         true
@@ -1828,7 +1862,7 @@ mod tests {
             clipboard::last_copied().as_deref(),
             Some("two\nthree\nfour")
         );
-        assert_eq!(app.copied.map(|(_, chars)| chars), Some(14));
+        assert_eq!(app.copied.map(|c| c.chars), Some(14));
         // A drag back up the way it came selects the same span.
         app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 3, 2));
         app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 4, 0));

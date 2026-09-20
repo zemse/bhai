@@ -5,6 +5,8 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::wrap::Join;
+
 /// One styled character; lines are built from these so wrapping keeps styles.
 type Cell = (char, Style);
 
@@ -13,8 +15,9 @@ const DIM: Style = Style::new().fg(Color::DarkGray);
 /// Code block lines are indented by this much.
 const CODE_INDENT: &str = "  ";
 
-/// Renders `text` into lines no wider than `width` chars.
-pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
+/// Renders `text` into lines no wider than `width` chars, each with how it joins the one
+/// above so a copy of a selection can undo the wrapping done here.
+pub fn render(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Join>) {
     let mut renderer = Renderer {
         width: width.max(1),
         ..Renderer::default()
@@ -24,7 +27,7 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
         renderer.event(event);
     }
     renderer.flush();
-    renderer.lines
+    (renderer.lines, renderer.joins)
 }
 
 /// A block that prefixes every line inside it: a list item or a block quote.
@@ -38,6 +41,8 @@ struct Container {
 struct Renderer {
     width: usize,
     lines: Vec<Line<'static>>,
+    /// How each line joins the one above it.
+    joins: Vec<Join>,
     /// Inline content of the block being built.
     inline: Vec<Cell>,
     styles: Vec<Style>,
@@ -73,7 +78,7 @@ impl Renderer {
             Event::Rule => {
                 self.block();
                 let rule = "─".repeat(self.width.saturating_sub(self.prefix_width()).min(40));
-                self.emit(rule.chars().map(|c| (c, DIM)).collect());
+                self.emit(rule.chars().map(|c| (c, DIM)).collect(), Join::Newline);
                 self.gap = true;
             }
             Event::TaskListMarker(done) => {
@@ -177,7 +182,7 @@ impl Renderer {
                 self.flush();
                 // An empty item still shows its marker.
                 if self.containers.last().is_some_and(|c| !c.used) {
-                    self.emit(Vec::new());
+                    self.emit(Vec::new(), Join::Newline);
                 }
                 self.containers.pop();
             }
@@ -227,6 +232,7 @@ impl Renderer {
             } else {
                 Line::from(Span::styled(trimmed, DIM))
             });
+            self.joins.push(Join::Newline);
         }
     }
 
@@ -237,8 +243,8 @@ impl Renderer {
         }
         let cells = std::mem::take(&mut self.inline);
         let width = self.width.saturating_sub(self.prefix_width()).max(4);
-        for line in wrap(&cells, width) {
-            self.emit(line);
+        for (line, join) in wrap(&cells, width) {
+            self.emit(line, join);
         }
     }
 
@@ -249,8 +255,8 @@ impl Renderer {
         if !lang.is_empty() {
             let cells: Vec<Cell> = lang.chars().map(|c| (c, DIM)).collect();
             let width = self.width.saturating_sub(self.prefix_width()).max(4);
-            for line in wrap(&cells, width) {
-                self.emit(line);
+            for (line, join) in wrap(&cells, width) {
+                self.emit(line, join);
             }
         }
         let width = self
@@ -266,10 +272,15 @@ impl Renderer {
             } else {
                 cells.chunks(width).collect()
             };
-            for chunk in chunks {
+            for (index, chunk) in chunks.into_iter().enumerate() {
                 let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, CODE)).collect();
                 row.extend_from_slice(chunk);
-                self.emit(row);
+                // The line was split to fit, not reflowed, so nothing stands between.
+                let join = match index {
+                    0 => Join::Newline,
+                    _ => Join::Split,
+                };
+                self.emit(row, join);
             }
         }
         self.gap = true;
@@ -305,13 +316,13 @@ impl Renderer {
                 Style::new()
             };
             let cells: Vec<Cell> = text.trim_end().chars().map(|c| (c, style)).collect();
-            for line in wrap(&cells, width) {
-                self.emit(line);
+            for (line, join) in wrap(&cells, width) {
+                self.emit(line, join);
             }
             if index == 0 {
                 let total = widths.iter().sum::<usize>() + 2 * columns.saturating_sub(1);
                 let rule = "─".repeat(total.min(width));
-                self.emit(rule.chars().map(|c| (c, DIM)).collect());
+                self.emit(rule.chars().map(|c| (c, DIM)).collect(), Join::Newline);
             }
         }
         self.gap = true;
@@ -325,7 +336,7 @@ impl Renderer {
     }
 
     /// Pushes one screen line behind the container prefixes.
-    fn emit(&mut self, cells: Vec<Cell>) {
+    fn emit(&mut self, cells: Vec<Cell>, join: Join) {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for container in &mut self.containers {
             let prefix = if container.used {
@@ -349,14 +360,18 @@ impl Renderer {
             spans.push(Span::styled(run, style));
         }
         self.lines.push(Line::from(spans));
+        self.joins.push(join);
     }
 }
 
-/// Greedy word wrap over styled chars; a word longer than the line is hard-split.
-fn wrap(cells: &[Cell], width: usize) -> Vec<Vec<Cell>> {
+/// Greedy word wrap over styled chars, each line with how it joins the one above; a word
+/// longer than the line is hard-split.
+fn wrap(cells: &[Cell], width: usize) -> Vec<(Vec<Cell>, Join)> {
     let width = width.max(1);
     let mut out = Vec::new();
     let mut line: Vec<Cell> = Vec::new();
+    // The first line of a block stands under whatever the caller put above it.
+    let mut join = Join::Newline;
     let mut pos: usize = 0;
     for word in cells.split(|(c, _)| *c == ' ') {
         let space = pos.checked_sub(1).map(|i| cells[i]);
@@ -364,20 +379,23 @@ fn wrap(cells: &[Cell], width: usize) -> Vec<Vec<Cell>> {
         let mut word = word;
         while word.len() > width {
             if !line.is_empty() {
-                out.push(std::mem::take(&mut line));
+                out.push((std::mem::take(&mut line), join));
+                join = Join::Space;
             }
-            out.push(word[..width].to_vec());
+            out.push((word[..width].to_vec(), join));
+            join = Join::Split;
             word = &word[width..];
         }
         let extra = usize::from(!line.is_empty());
         if line.len() + extra + word.len() > width {
-            out.push(std::mem::take(&mut line));
+            out.push((std::mem::take(&mut line), join));
+            join = Join::Space;
         } else if let Some(space) = space.filter(|_| extra == 1) {
             line.push(space);
         }
         line.extend_from_slice(word);
     }
-    out.push(line);
+    out.push((line, join));
     out
 }
 
@@ -385,6 +403,11 @@ fn wrap(cells: &[Cell], width: usize) -> Vec<Vec<Cell>> {
 mod tests {
     use super::*;
     use ratatui::style::Modifier;
+
+    /// The lines alone, for the tests that have nothing to say about the wrapping.
+    fn lines(source: &str, width: usize) -> Vec<Line<'static>> {
+        render(source, width).0
+    }
 
     fn text(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()
@@ -401,7 +424,7 @@ mod tests {
 
     #[test]
     fn headings_are_bold_without_hashes() {
-        let lines = render("# Title\n\nbody", 40);
+        let lines = lines("# Title\n\nbody", 40);
         assert_eq!(text(&lines), vec!["Title", "", "body"]);
         let style = style_of(&lines, "Title");
         assert!(style.add_modifier.contains(Modifier::BOLD));
@@ -410,7 +433,7 @@ mod tests {
 
     #[test]
     fn code_blocks_keep_their_lines_and_show_the_language() {
-        let lines = render(
+        let lines = lines(
             "before\n\n```rust\nfn main() {\n    let  x = 1;\n}\n```\nafter",
             40,
         );
@@ -433,7 +456,7 @@ mod tests {
 
     #[test]
     fn an_unclosed_fence_renders_as_code() {
-        let lines = render("text\n\n```py\nprint(1)\nx = [", 40);
+        let lines = lines("text\n\n```py\nprint(1)\nx = [", 40);
         assert_eq!(
             text(&lines),
             vec!["text", "", "py", "  print(1)", "  x = ["]
@@ -443,19 +466,19 @@ mod tests {
 
     #[test]
     fn long_code_lines_are_split_not_reflowed() {
-        let lines = render("```\nabcdefghij klm\n```", 8);
+        let lines = lines("```\nabcdefghij klm\n```", 8);
         assert_eq!(text(&lines), vec!["  abcdef", "  ghij k", "  lm"]);
     }
 
     #[test]
     fn a_long_language_tag_fits_the_width() {
-        let lines = render("```abcdefghijkl\nx\n```", 8);
+        let lines = lines("```abcdefghijkl\nx\n```", 8);
         assert_eq!(text(&lines), vec!["abcdefgh", "ijkl", "  x"]);
     }
 
     #[test]
     fn inline_styles_apply_to_their_spans() {
-        let lines = render("a `code` **bold** *it* ~~no~~", 40);
+        let lines = lines("a `code` **bold** *it* ~~no~~", 40);
         assert_eq!(text(&lines), vec!["a code bold it no"]);
         assert_eq!(style_of(&lines, "code"), CODE);
         assert!(
@@ -477,7 +500,7 @@ mod tests {
 
     #[test]
     fn links_show_their_destination() {
-        let lines = render("see [docs](https://x.io) or <https://y.io>", 60);
+        let lines = lines("see [docs](https://x.io) or <https://y.io>", 60);
         assert_eq!(
             text(&lines),
             vec!["see docs (https://x.io) or https://y.io"]
@@ -486,7 +509,7 @@ mod tests {
 
     #[test]
     fn list_items_wrap_with_a_hanging_indent() {
-        let lines = render(
+        let lines = lines(
             "- one two three four\n- five\n\n3. alpha beta\n4. gamma",
             12,
         );
@@ -506,13 +529,13 @@ mod tests {
 
     #[test]
     fn nested_lists_indent_under_their_item() {
-        let lines = render("- outer\n  - inner\n- next", 40);
+        let lines = lines("- outer\n  - inner\n- next", 40);
         assert_eq!(text(&lines), vec!["• outer", "  • inner", "• next"]);
     }
 
     #[test]
     fn block_quotes_get_a_bar() {
-        let lines = render("> quoted words here\n>\n> more", 10);
+        let lines = lines("> quoted words here\n>\n> more", 10);
         assert_eq!(
             text(&lines),
             vec!["│ quoted", "│ words", "│ here", "│", "│ more"]
@@ -521,7 +544,7 @@ mod tests {
 
     #[test]
     fn tables_render_as_aligned_rows() {
-        let lines = render("| a | long |\n|---|---|\n| wide cell | b |", 40);
+        let lines = lines("| a | long |\n|---|---|\n| wide cell | b |", 40);
         assert_eq!(
             text(&lines),
             vec!["a          long", "───────────────", "wide cell  b"]
@@ -534,7 +557,7 @@ mod tests {
                       - a list item that also wraps a lot\n\n> a quote that wraps too\n\n\
                       ```\nsome code that is quite long indeed\n```";
         for width in [10, 17, 30] {
-            for line in render(source, width) {
+            for line in lines(source, width) {
                 assert!(line.width() <= width, "{width}: {line:?}");
             }
         }
@@ -542,11 +565,11 @@ mod tests {
 
     #[test]
     fn soft_breaks_keep_the_author_lines() {
-        assert_eq!(text(&render("one\ntwo", 40)), vec!["one", "two"]);
+        assert_eq!(text(&lines("one\ntwo", 40)), vec!["one", "two"]);
     }
 
     #[test]
     fn empty_text_renders_nothing() {
-        assert!(render("", 40).is_empty());
+        assert!(lines("", 40).is_empty());
     }
 }

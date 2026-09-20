@@ -20,6 +20,7 @@ use crate::models::Picker;
 use crate::permissions::Mode;
 use crate::profile::{Method, Tokens};
 use crate::session::{ChildRow, ChildState};
+use crate::wrap::{Join, joined, wrap};
 
 /// Rows a tool output shows until it is clicked open.
 const COLLAPSED_LINES: usize = 3;
@@ -33,12 +34,48 @@ const JUDGING_CLIP: usize = 48;
 /// Subagents the panel lists before it shows only the most recent ones.
 const MAX_CHILD_ROWS: usize = 4;
 
-/// How long the note about a drag's copy stays on the input's border.
+/// How long the note about a drag's copy stays on screen.
 const COPIED_FOR: Duration = Duration::from_secs(3);
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    draw(frame, app);
+    // Last, so it sits over whatever the drag was made on.
+    render_copied(frame, app);
+}
+
+/// What a drag's copy leaves behind, beside where the drag ended so the eye is already
+/// there, on a background so it reads as a note over the transcript and not a row of it.
+fn render_copied(frame: &mut Frame, app: &App) {
+    let Some(copied) = app.copied.filter(|c| c.at.elapsed() < COPIED_FOR) else {
+        return;
+    };
+    let text = format!(" copied {} chars ", copied.chars);
+    let screen = frame.area();
+    let width = (text.chars().count() as u16).min(screen.width);
+    // Under the pointer, or over it at the last row, and never off the right edge.
+    let y = match copied.cell.y + 1 < screen.bottom() {
+        true => copied.cell.y + 1,
+        false => copied.cell.y.saturating_sub(1),
+    };
+    let area = Rect {
+        x: copied.cell.x.min(screen.right().saturating_sub(width)),
+        y,
+        width,
+        height: 1,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            text,
+            Style::new().fg(Color::Black).bg(Color::Cyan).bold(),
+        )),
+        area,
+    );
+}
+
+fn draw(frame: &mut Frame, app: &mut App) {
     // The trust question takes the bottom area before anything else can, sized to what
     // it has to say.
     if let Some(gate) = app.trust_gate.clone() {
@@ -310,12 +347,14 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
     let entries = app.entries();
     let mut spans = Vec::with_capacity(entries.list.len());
+    let mut joins: Vec<Join> = Vec::new();
     let mut folds = HashSet::new();
     for (index, entry) in entries.list.iter().enumerate() {
         let start = lines.len();
-        let (rows, folded) = entry_lines(entry, width, app.expanded.contains(&index));
-        lines.extend(rows);
-        if folded {
+        let rows = entry_lines(entry, width, app.expanded.contains(&index));
+        lines.extend(rows.lines);
+        joins.extend(rows.joins);
+        if rows.folded {
             folds.insert(index);
         }
         // The blank separator line belongs to no entry.
@@ -336,6 +375,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     app.rows = row_map(&spans, app.scroll, area);
     app.transcript_area = Some(text_area);
     app.lines = lines.iter().map(plain).collect();
+    app.joins = joins;
     app.rehover();
 
     if let Some(selection) = app.selection {
@@ -511,16 +551,30 @@ fn collapsed_rows(entry: &Entry) -> Option<usize> {
     }
 }
 
+/// What an entry draws: its rows, how each one joins the row above it, and whether it
+/// has rows a click folds away.
+struct Rows {
+    lines: Vec<Line<'static>>,
+    joins: Vec<Join>,
+    folded: bool,
+}
+
 /// An entry's rows plus a blank separator, and whether it has rows a click folds away.
 /// Thinking and long tool output show only a little of themselves unless `expanded`.
-fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> (Vec<Line<'static>>, bool) {
+fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Rows {
     if let Entry::Assistant(text) = entry {
-        let mut lines = markdown::render(text, width);
+        let (mut lines, mut joins) = markdown::render(text, width);
         if lines.is_empty() {
             lines.push(Line::from(""));
+            joins.push(Join::Newline);
         }
         lines.push(Line::from(""));
-        return (lines, false);
+        joins.push(Join::Newline);
+        return Rows {
+            lines,
+            joins,
+            folded: false,
+        };
     }
     let (prefix, text, style): (&str, &str, Style) = match entry {
         Entry::User(t) => ("› ", t, Style::new().fg(Color::Cyan).bold()),
@@ -541,7 +595,8 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> (Vec<Line<'static
     let lead = prefix.chars().count();
     let indent = " ".repeat(lead);
     let mut lines: Vec<Line> = Vec::new();
-    let mut wrapped_lines = wrap(text, width.saturating_sub(lead).max(4));
+    let mut joins: Vec<Join> = Vec::new();
+    let mut wrapped_lines = joined(text, width.saturating_sub(lead).max(4));
     let hidden = collapsed_rows(entry).map_or(0, |rows| wrapped_lines.len().saturating_sub(rows));
     if hidden > 0 && !expanded {
         match entry {
@@ -555,18 +610,23 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> (Vec<Line<'static
     // Thinking stays on its one line, so what it hides is said at the end of it rather
     // than on a row of its own.
     let inline = hidden > 0 && !expanded && matches!(entry, Entry::Reasoning(_));
-    if inline && let Some(first) = wrapped_lines.first_mut() {
+    if inline && let Some((first, _)) = wrapped_lines.first_mut() {
         let note = format!(" [+{hidden} lines]");
         let room = width.saturating_sub(lead + note.chars().count()).max(1);
         *first = format!("{}{note}", clip(first, room));
     }
-    for (i, wrapped) in wrapped_lines.into_iter().enumerate() {
+    for (i, (wrapped, join)) in wrapped_lines.into_iter().enumerate() {
         let lead = if i == 0 {
             prefix.to_string()
         } else {
             indent.clone()
         };
         lines.push(Line::from(Span::styled(format!("{lead}{wrapped}"), style)));
+        // The entry starts under the one before it, whatever the wrap made of the rest.
+        joins.push(match i {
+            0 => Join::Newline,
+            _ => join,
+        });
     }
     // A running command says how far it has got instead, on the row below.
     if hidden > 0 && !inline && !matches!(entry, Entry::Running { .. }) {
@@ -577,6 +637,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> (Vec<Line<'static
             },
             Style::new().fg(Color::DarkGray),
         )));
+        joins.push(Join::Newline);
     }
     if let Entry::Running { tail, lines: done } = entry {
         let total = done + usize::from(!tail.is_empty() && !tail.ends_with('\n'));
@@ -584,9 +645,15 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> (Vec<Line<'static
             format!("[running, {total} lines]"),
             Style::new().fg(Color::DarkGray),
         )));
+        joins.push(Join::Newline);
     }
     lines.push(Line::from(""));
-    (lines, hidden > 0)
+    joins.push(Join::Newline);
+    Rows {
+        lines,
+        joins,
+        folded: hidden > 0,
+    }
 }
 
 /// The width the input text wraps at: the text area less the cursor's own column.
@@ -733,17 +800,6 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
     if let Some(inside) = &app.inside {
         block = block.title(Line::styled(
             format!(" to {} · {} ", inside.identity, inside.description),
-            Style::new().fg(Color::Cyan),
-        ));
-    }
-    // A drag copies as it ends, and says so here rather than in the transcript.
-    if let Some(chars) = app
-        .copied
-        .filter(|(at, _)| at.elapsed() < COPIED_FOR)
-        .map(|(_, n)| n)
-    {
-        block = block.title_bottom(Line::styled(
-            format!(" copied {chars} chars "),
             Style::new().fg(Color::Cyan),
         ));
     }
@@ -923,42 +979,6 @@ fn render_trust(frame: &mut Frame, area: Rect, gate: &TrustGate) {
         Span::raw("o, stay in ask mode"),
     ]));
     frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Greedy word wrap that keeps existing newlines and never loses characters.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    for paragraph in text.split('\n') {
-        let mut line = String::new();
-        for word in paragraph.split(' ') {
-            let mut word = word;
-            // A single word longer than the line gets hard-split.
-            while word.chars().count() > width {
-                if !line.is_empty() {
-                    out.push(std::mem::take(&mut line));
-                }
-                let split = char_index(word, width);
-                out.push(word[..split].to_string());
-                word = &word[split..];
-            }
-            let extra = if line.is_empty() { 0 } else { 1 };
-            if line.chars().count() + extra + word.chars().count() > width {
-                out.push(std::mem::take(&mut line));
-            } else if extra == 1 {
-                line.push(' ');
-            }
-            line.push_str(word);
-        }
-        out.push(line);
-    }
-    out
-}
-
-fn char_index(s: &str, chars: usize) -> usize {
-    s.char_indices()
-        .nth(chars)
-        .map_or(s.len(), |(index, _)| index)
 }
 
 #[cfg(test)]
@@ -1535,6 +1555,65 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_puts_back_the_rows_the_wrap_broke() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Output(
+            "one two three four five\nsecond line".to_string(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
+        assert_eq!(rows.len(), 3, "the first line wraps onto two rows");
+        let area = app.transcript_area.unwrap();
+
+        assert!(app.on_mouse(down(area.x, rows.start)));
+        assert!(app.on_mouse(left(
+            MouseEventKind::Drag(MouseButton::Left),
+            area.right() - 1,
+            rows.end - 1
+        )));
+        // The break the wrap made is a space again; the one the text has stays a newline.
+        assert_eq!(
+            app.selected_text().as_deref(),
+            Some("one two three four five\nsecond line")
+        );
+    }
+
+    #[test]
+    fn the_copy_note_lands_beside_the_drag_that_made_it() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Output("one two".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
+        let area = app.transcript_area.unwrap();
+        app.on_mouse(down(area.x, rows.start));
+        app.on_mouse(left(
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x + 6,
+            rows.start,
+        ));
+        app.on_mouse(left(
+            MouseEventKind::Up(MouseButton::Left),
+            area.x + 6,
+            rows.start,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        // On the row under the pointer, not down on the prompt's border.
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, rows.start + 1)].symbol())
+            .collect();
+        assert!(row.trim_end().ends_with(" copied 7 chars"), "{row:?}");
+        assert!(
+            row.starts_with("      "),
+            "it starts under the pointer: {row:?}"
+        );
+        assert_eq!(buffer[(area.x + 6, rows.start + 1)].bg, Color::Cyan);
+    }
+
+    #[test]
     fn dragging_the_scrollbar_scrolls_in_proportion() {
         let mut app = App::detached();
         for i in 0..40 {
@@ -1632,29 +1711,6 @@ mod tests {
         // The cursor sits at the end of the second row, not off the right edge.
         let at = terminal.get_cursor_position().unwrap();
         assert_eq!((at.x, at.y), (area.x + 12, area.y + 1));
-    }
-
-    #[test]
-    fn wrap_keeps_every_character() {
-        let text = "the quick brown fox jumps over the lazy dog";
-        let wrapped = wrap(text, 10);
-        assert!(wrapped.iter().all(|l| l.chars().count() <= 10));
-        assert_eq!(wrapped.join(" "), text);
-    }
-
-    #[test]
-    fn wrap_preserves_blank_lines() {
-        assert_eq!(wrap("a\n\nb", 10), vec!["a", "", "b"]);
-    }
-
-    #[test]
-    fn wrap_hard_splits_a_long_word() {
-        assert_eq!(wrap("abcdefgh", 3), vec!["abc", "def", "gh"]);
-    }
-
-    #[test]
-    fn wrap_handles_multibyte_text() {
-        assert_eq!(wrap("héllo wörld", 5), vec!["héllo", "wörld"]);
     }
 
     fn window(used_percent: f64, window_minutes: u64) -> limits::Window {

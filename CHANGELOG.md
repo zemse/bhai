@@ -4,6 +4,13 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-09-21
+
+- Copying a selection undoes the wrapping: a line the terminal broke comes back on one
+  line and only the newlines the text really has survive. The note a drag leaves lands
+  beside where the drag ended, on a background of its own, rather than on the prompt's
+  border.
+
 ## 2026-09-20
 
 - The transcript draws a tool call as the tool it is. A shell command keeps the `$`, and

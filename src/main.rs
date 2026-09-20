@@ -34,6 +34,7 @@ mod tokens;
 mod tools;
 mod ui;
 mod workflow;
+mod wrap;
 
 use std::path::PathBuf;
 use std::sync::Arc;
