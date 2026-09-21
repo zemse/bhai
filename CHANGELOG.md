@@ -10,8 +10,9 @@ carries the shape of what is there.
   token to another rather than from the start of the model call, so the seconds spent
   thinking before the first token are no longer in the denominator with nothing
   against them: a stream at a flat 28 tok/s used to read 1, climb for ten seconds and
-  only then say 28. It now says 28 from its first reading, and says nothing at all for
-  the first second and a half rather than a number it would have to take back.
+  only then say 28. It now says 28 from its first reading, about half a second after
+  the model starts writing, and says nothing before that rather than a number it
+  would have to take back.
   Reasoning a call reports but never streamed is no longer added in: it was never on
   screen, and it only went in to offset the same dead time.
 - A prompt typed while a turn runs no longer appears in the transcript at the moment

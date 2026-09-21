@@ -10,9 +10,12 @@ use std::time::{Duration, Instant};
 /// How much streaming time the rate is averaged over.
 const WINDOW: Duration = Duration::from_secs(10);
 
-/// Writing time before the rate is worth showing: below it a chunk or two reads as a
-/// wild number.
-const MIN: Duration = Duration::from_millis(1500);
+/// Writing between two tokens before the rate is worth showing. Short, because the
+/// span is measured token to token and is honest at any length: it is only there so a
+/// single chunk landing either side of a very short span cannot read as a wild number.
+/// Longer, and the readout stays blank through the opening seconds of every answer,
+/// which is when it is being looked at.
+const MIN: Duration = Duration::from_millis(500);
 
 /// The streaming clock and what arrived on it. The clock runs only between `start` and
 /// `end`, so the window spans several calls when tool runs sit between them.
@@ -153,13 +156,7 @@ mod tests {
         assert_eq!(speed.rate(), None);
         for n in 1..=20 {
             speed.streamed(token(n as f64), 28);
-            let rate = speed.rate();
-            match n {
-                // Still under the minimum span, so it says nothing rather than a
-                // number it would have to take back.
-                1 => assert_eq!(rate, None),
-                _ => assert_eq!(rate, Some(28.0), "at {n} seconds of writing"),
-            }
+            assert_eq!(speed.rate(), Some(28.0), "at {n} seconds of writing");
         }
     }
 
