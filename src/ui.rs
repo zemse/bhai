@@ -1564,14 +1564,11 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!screen(&terminal).contains("tok/s"), "nothing streamed yet");
 
-        // Four seconds of streaming, two hundred tokens of it.
-        app.speed.start(Instant::now() - Duration::from_secs(4));
-        app.on_event(Event::Usage(Usage {
-            input: 0,
-            cached: 0,
-            output: 200,
-            reasoning: 0,
-        }));
+        // Four seconds of writing, two hundred tokens over them.
+        let began = Instant::now() - Duration::from_secs(4);
+        app.speed.start(began);
+        app.speed.streamed(began, 1);
+        app.speed.streamed(Instant::now(), 200);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
         assert!(shown.contains("working · 50 tok/s"), "{shown}");

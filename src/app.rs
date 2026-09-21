@@ -884,9 +884,6 @@ impl App {
             Event::Usage(usage) => {
                 self.tokens_in += usage.input;
                 self.tokens_out += usage.output;
-                // The stream only summarises reasoning, so the count it never showed
-                // goes to the speed here, while the call is still on the clock.
-                self.speed.reported(Instant::now(), usage.output);
                 self.last_usage = Some(usage);
             }
             Event::Streaming(on) => match on {
@@ -2290,7 +2287,8 @@ mod tests {
             "o200k_base, as the codex backend uses"
         );
 
-        // The call's own count tops that up with the reasoning it never showed.
+        // The reasoning a call reports but never streamed stays out of it: the rate
+        // describes the text on screen, and none of that was.
         let usage = Usage {
             input: 10,
             cached: 0,
@@ -2298,14 +2296,14 @@ mod tests {
             reasoning: 480,
         };
         app.on_event(Event::Usage(usage));
-        assert_eq!(app.speed.counted(), 500);
-        assert_eq!(app.tokens_out, 500, "the totals are unchanged by any of it");
+        assert_eq!(app.speed.counted(), 5);
+        assert_eq!(app.tokens_out, 500, "the totals count all of it");
 
         // A child's call is the parent's idle time, and so is everything after the end.
         app.on_event(Event::Streaming(false));
         app.on_event(Event::ChildUsage(usage));
         app.on_event(Event::Text("nor after".to_string()));
-        assert_eq!(app.speed.counted(), 500);
+        assert_eq!(app.speed.counted(), 5);
     }
 
     #[test]
