@@ -6,6 +6,10 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- A missing Ollama reads as one line in the `/model` picker: "no server at <url>. Start
+  one with `ollama serve`.", rather than that sentence with reqwest's whole connect
+  chain unrolled after it. A timeout says the same; any other failure still carries
+  its own reason.
 - The `/` menu completes a name wherever it is typed, not only at the start of the
   prompt: it opens on the `/word` at the cursor, tab writes the name in place and leaves
   the rest of the prompt alone. A `/` that starts no word, in a path, a url or a date,

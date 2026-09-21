@@ -235,11 +235,16 @@ pub fn codex_models(body: &Value) -> Vec<Model> {
 /// What Ollama has pulled, from `/api/tags`.
 async fn tags(http: &reqwest::Client, url: &str) -> Result<Vec<Model>> {
     let endpoint = format!("{}/api/tags", url.trim_end_matches('/'));
-    let body: Value = http
-        .get(&endpoint)
-        .send()
-        .await
-        .with_context(|| format!("no server at {url}. Start one with `ollama serve`."))?
+    let response = match http.get(&endpoint).send().await {
+        Ok(response) => response,
+        // Nothing listening is the ordinary case, not a fault: the note says so in one
+        // line rather than unrolling reqwest's connect chain across the picker.
+        Err(e) if e.is_connect() || e.is_timeout() => {
+            anyhow::bail!("no server at {url}. Start one with `ollama serve`.")
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("{endpoint} failed"))),
+    };
+    let body: Value = response
         .json()
         .await
         .with_context(|| format!("{endpoint} did not answer JSON"))?;
@@ -620,6 +625,19 @@ mod tests {
             "no effort reaches Ollama"
         );
         assert_eq!(models[1].id, "ollama:qwen3:8b");
+    }
+
+    #[tokio::test]
+    async fn a_dead_ollama_reads_as_one_line() {
+        // Port 1 has nothing on it, so the connection is refused.
+        let e = tags(&reqwest::Client::new(), "http://127.0.0.1:1")
+            .await
+            .unwrap_err();
+        let note = format!("ollama: {e:#}");
+        assert_eq!(
+            note,
+            "ollama: no server at http://127.0.0.1:1. Start one with `ollama serve`."
+        );
     }
 
     #[test]
