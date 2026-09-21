@@ -153,10 +153,15 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let working_height = u16::from(app.working && app.pending.is_none());
 
     // The turn's subagents sit above all of that, so the panel does not move as the
-    // menu opens or the spinner comes and goes.
+    // menu opens or the spinner comes and goes. Once the turn is over there is nothing
+    // to watch, so the rows go rather than sitting between the transcript and the
+    // prompt; a pane that is open keeps them, since the panel is its title and its way
+    // back out.
     let children = app.children();
+    let watching = app.working || app.inside.is_some();
     let children_height = match children.len() {
         0 => 0,
+        _ if !watching => 0,
         rows => rows.min(MAX_CHILD_ROWS) as u16 + 2,
     };
 
@@ -728,10 +733,15 @@ fn render_children(frame: &mut Frame, area: Rect, app: &mut App, children: &[Chi
         return;
     }
     let dim = Style::new().fg(Color::DarkGray);
+    let open = app.inside.as_ref().map(|inside| inside.id.as_str());
+    let hint = match open {
+        Some(_) => " ctrl+o next · esc close ",
+        None => " ctrl+o opens one · click to read ",
+    };
     let block = Block::bordered()
         .border_style(dim)
         .title(Line::styled(" subagents ", dim))
-        .title_bottom(Line::styled(" ctrl+o opens one · esc leaves ", dim).right_aligned());
+        .title_bottom(Line::styled(hint, dim).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -739,7 +749,6 @@ fn render_children(frame: &mut Frame, area: Rect, app: &mut App, children: &[Chi
     let rows = inner.height as usize;
     // The running ones are the newest, so it is the tail that is worth the room.
     let top = children.len().saturating_sub(rows);
-    let open = app.inside.as_ref().map(|inside| inside.id.as_str());
     let width = inner.width as usize;
     let lines: Vec<Line> = children
         .iter()
@@ -758,6 +767,9 @@ fn render_children(frame: &mut Frame, area: Rect, app: &mut App, children: &[Chi
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// What the open pane's row offers at its right end, and what a click on it does.
+const CLOSE: &str = " ✕ close ";
+
 /// One subagent row: how it is doing, its id, who it runs as and what it was sent for.
 fn child_row(child: &ChildRow, width: usize, spinner: usize, open: bool) -> Line<'static> {
     let (mark, colour) = match child.state {
@@ -767,13 +779,16 @@ fn child_row(child: &ChildRow, width: usize, spinner: usize, open: bool) -> Line
     };
     let head = format!(" {mark} {} ", child.id);
     let mut tail = format!("{} · {}", child.identity, child.description);
-    let room = width.saturating_sub(head.chars().count());
+    // The open row is the way back out, which nothing said until it said so: the close
+    // reads as a button and the whole row is what a click lands on.
+    let close = if open { CLOSE } else { "" };
+    let room = width.saturating_sub(head.chars().count() + close.chars().count());
     tail = clip(&tail, room);
     let pad = room.saturating_sub(tail.chars().count());
     if open {
         // The open pane's row is the transcript's title, so it reads as selected.
         return Line::styled(
-            format!("{head}{tail}{}", " ".repeat(pad)),
+            format!("{head}{tail}{}{close}", " ".repeat(pad)),
             Style::new().fg(Color::Black).bg(Color::Cyan),
         );
     }
@@ -1331,6 +1346,7 @@ mod tests {
     #[test]
     fn a_modal_view_takes_the_subagent_rows_with_it() {
         let mut app = App::detached();
+        app.working = true;
         app.session().publish(Event::ChildStarted {
             id: "a1".to_string(),
             identity: "worker".to_string(),
@@ -1356,6 +1372,7 @@ mod tests {
             description: description.to_string(),
             task: "go".to_string(),
         };
+        app.working = true;
         app.session().publish(started("a1", "read the docs"));
         app.session().publish(started("b2", "count the files"));
         app.session().publish(Event::ChildEnded {
@@ -1370,15 +1387,71 @@ mod tests {
         assert!(shown.contains("✓ a1 worker · read the docs"), "{shown}");
         assert!(shown.contains("b2 worker · count the files"), "{shown}");
 
-        // Going inside one says so on the prompt, since that is where it now types.
+        // Going inside one says so on the prompt, since that is where it now types, and
+        // the row it is the pane of offers the way back out.
         app.open_child("b2");
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
         assert!(shown.contains("to worker · count the files"), "{shown}");
+        assert!(shown.contains("✕ close"), "{shown}");
+        assert!(shown.contains("esc close"), "{shown}");
 
         app.leave_child();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert!(!screen(&terminal).contains("to worker"));
+        let shown = screen(&terminal);
+        assert!(!shown.contains("to worker"), "{shown}");
+        assert!(!shown.contains("✕ close"), "{shown}");
+    }
+
+    #[test]
+    fn the_close_on_the_open_row_ends_the_pane() {
+        let mut app = App::detached();
+        app.working = true;
+        app.session().publish(Event::ChildStarted {
+            id: "b2c9".to_string(),
+            identity: "worker".to_string(),
+            description: "count the files".to_string(),
+            task: "go".to_string(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(64, 16)).unwrap();
+        app.open_child("b2c9");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("✕ close"));
+
+        let (area, _) = app.child_rows.iter().find(|(_, id)| id == "b2c9").unwrap();
+        let (x, y) = (area.right() - 4, area.y);
+        assert!(click(&mut app, x, y));
+        assert!(app.inside.is_none(), "the close did not close the pane");
+    }
+
+    #[test]
+    fn the_subagent_panel_goes_once_the_turn_is_over() {
+        let mut app = App::detached();
+        app.working = true;
+        app.session().publish(Event::ChildStarted {
+            id: "a1".to_string(),
+            identity: "worker".to_string(),
+            description: "read the docs".to_string(),
+            task: "go".to_string(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("subagents"));
+        assert_eq!(app.child_rows.len(), 1);
+
+        // Nothing left to watch, so the rows stop sitting above the prompt.
+        app.on_event(Event::TurnEnd);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("subagents"));
+        assert!(app.child_rows.is_empty());
+
+        // Reading one back brings them with it: the panel is the pane's way out.
+        app.open_child("a1");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("subagents"), "{shown}");
+        assert!(shown.contains("✕ close"), "{shown}");
+        assert_eq!(app.child_rows.len(), 1);
     }
 
     #[test]

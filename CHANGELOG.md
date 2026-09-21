@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- The subagent panel goes once the turn is over, rather than sitting between the
+  transcript and the prompt until the next message. Opening a pane brings it back,
+  since the panel is what that pane is titled by and read from.
+- The open pane's row says how to leave it: a `✕ close` at its right end, and a
+  hint that reads `ctrl+o next · esc close`. Clicking the row already closed the
+  pane, but nothing on screen said so.
 - A turn that ends on a failure says so as a failure rather than an error, and the
   transcript offers to run it again: clicking it re-sends the call on the history
   the agent still holds, so a request that broke on the wire no longer has to be
