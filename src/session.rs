@@ -361,7 +361,6 @@ impl Session {
     pub fn clear_queue(&self) -> usize {
         let dropped = self.lock().queue.drain(..).count();
         if dropped > 0 {
-            self.entries().drop_queued();
             self.publish(Event::Info(format!("dropped {dropped} queued prompt(s)")));
         }
         dropped
@@ -990,6 +989,30 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_prompt_joins_the_transcript_where_the_history_puts_it() {
+        // It used to be shown the moment it was typed, which put it before the rest of
+        // the running turn's answer, while the model saw it after. The transcript read
+        // as a conversation that never happened in that order.
+        let (session, mut rx_user) = session();
+        session.submit("a".to_string()).unwrap();
+        assert_eq!(rx_user.try_recv().unwrap(), "a");
+        session.on_agent(AgentEvent::Text("half an ".to_string()));
+        session.submit("b".to_string()).unwrap();
+        session.on_agent(AgentEvent::Text("answer".to_string()));
+        {
+            let entries = session.entries();
+            let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+            assert_eq!(texts, ["a", "half an answer"]);
+        }
+
+        session.on_agent(AgentEvent::TurnEnd);
+        assert_eq!(rx_user.try_recv().unwrap(), "b");
+        let entries = session.entries();
+        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        assert_eq!(texts, ["a", "half an answer", "b"]);
+    }
+
+    #[test]
     fn a_prompt_can_show_something_other_than_what_it_sends() {
         let (session, mut rx_user) = session();
         let mut events = session.subscribe();
@@ -1025,16 +1048,9 @@ mod tests {
         assert!(rx_user.try_recv().is_err());
         let entries = session.entries();
         let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
-        assert_eq!(
-            texts,
-            [
-                "a",
-                "dropped: b",
-                "dropped: c",
-                "interrupted",
-                "dropped 2 queued prompt(s)"
-            ]
-        );
+        // Only the turn that ran is in the transcript: what was waiting never became
+        // part of the conversation, so there is nothing there to cross out.
+        assert_eq!(texts, ["a", "interrupted", "dropped 2 queued prompt(s)"]);
     }
 
     #[test]

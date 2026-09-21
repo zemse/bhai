@@ -33,6 +33,8 @@ const JUDGING_CLIP: usize = 48;
 
 /// Subagents the panel lists before it shows only the most recent ones.
 const MAX_CHILD_ROWS: usize = 4;
+/// Rows the queue panel shows before it says how many more are behind them.
+const MAX_QUEUED_ROWS: usize = 3;
 
 /// How long the note about a drag's copy stays on screen.
 const COPIED_FOR: Duration = Duration::from_secs(3);
@@ -169,10 +171,19 @@ fn draw(frame: &mut Frame, app: &mut App) {
         rows => rows.min(MAX_CHILD_ROWS) as u16 + 2,
     };
 
+    // Prompts waiting on the turn sit with the prompt box, not in the transcript: they
+    // are not part of the conversation until their turn starts, and the transcript is
+    // what the model is being shown.
+    let queued_height = match app.queued.len() {
+        0 => 0,
+        rows => rows.min(MAX_QUEUED_ROWS) as u16 + 2,
+    };
+
     let [
         status_area,
         transcript_area,
         children_area,
+        queued_area,
         menu_area,
         working_area,
         bottom_area,
@@ -180,6 +191,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(children_height),
+        Constraint::Length(queued_height),
         Constraint::Length(menu_height),
         Constraint::Length(working_height),
         Constraint::Length(approval_height),
@@ -202,6 +214,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.input_area = None;
         // The pane covered those rows, so they go back on top.
         render_children(frame, children_area, app, &children);
+        render_queued(frame, queued_area, app);
         render_working(frame, working_area, app);
         if app.pending.is_some() {
             render_approval(frame, bottom_area, app);
@@ -210,6 +223,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     render_transcript(frame, transcript_area, app);
     render_children(frame, children_area, app, &children);
+    render_queued(frame, queued_area, app);
     if menu_height > 0 {
         render_menu(frame, menu_area, &items, app.menu.unwrap_or(0));
     }
@@ -221,6 +235,51 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.buttons.clear();
         render_input(frame, bottom_area, app);
     }
+}
+
+/// The prompts waiting on the running turn. They are shown here rather than in the
+/// transcript because that is what they are: typed, not yet said. Each joins the
+/// transcript when its own turn starts, in the place the model's history puts it.
+fn render_queued(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 {
+        return;
+    }
+    let dim = Style::new().fg(Color::DarkGray);
+    let block = Block::bordered()
+        .border_style(dim)
+        .title(Line::styled(" queued ", dim))
+        .title_bottom(Line::styled(" /queue clear drops them ", dim).right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+    // The last row is spent saying how many did not fit, rather than dropping them
+    // silently: what is waiting is the whole point of the panel.
+    let shown = match app.queued.len() > rows {
+        true => rows - 1,
+        false => rows,
+    };
+    let mut lines: Vec<Line> = app
+        .queued
+        .iter()
+        .take(shown)
+        .enumerate()
+        .map(|(at, text)| {
+            let head = format!(" {}. ", at + 1);
+            let room = width.saturating_sub(head.chars().count()).max(1);
+            // A prompt of several lines is one row here; it is sent whole when it runs.
+            Line::from(vec![
+                Span::styled(head, dim),
+                Span::styled(clip(text, room), dim),
+            ])
+        })
+        .collect();
+    if let Some(rest) = app.queued.len().checked_sub(shown).filter(|n| *n > 0) {
+        lines.push(Line::styled(format!("    {rest} more"), dim));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -300,8 +359,8 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(rate) = app.speed.rate() {
         spans.push(Span::styled(format!(" · {rate:.0} tok/s"), dim));
     }
-    if app.queued > 0 {
-        spans.push(Span::styled(format!(" · {} queued", app.queued), dim));
+    if !app.queued.is_empty() {
+        spans.push(Span::styled(format!(" · {} queued", app.queued.len()), dim));
     }
     spans.push(Span::styled(" · ctrl+c interrupt", dim));
     frame.render_widget(Clear, area);
@@ -623,7 +682,6 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> 
     }
     let (prefix, text, style): (&str, &str, Style) = match entry {
         Entry::User(t) => ("› ", t, Style::new().bg(USER_BG)),
-        Entry::Queued(t) => ("queued › ", t, Style::new().fg(Color::DarkGray)),
         Entry::Assistant(t) => ("", t, Style::new()),
         Entry::Reasoning(t) => ("✻ ", t, Style::new().fg(Color::DarkGray).italic()),
         Entry::Command { tool, summary } => {
@@ -1302,18 +1360,51 @@ mod tests {
     }
 
     #[test]
-    fn the_spinner_and_the_queue_count_sit_above_the_prompt() {
+    fn the_queue_panel_names_what_it_could_not_fit() {
+        let mut app = App::detached();
+        app.working = true;
+        for (n, text) in ["one", "two", "three", "four"].iter().enumerate() {
+            app.on_event(Event::Queued {
+                position: n + 1,
+                text: text.to_string(),
+            });
+        }
+        let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains(" 1. one"), "{shown}");
+        assert!(shown.contains(" 2. two"), "{shown}");
+        // The last row is spent on the count rather than on one more prompt.
+        assert!(!shown.contains("three"), "{shown}");
+        assert!(shown.contains("2 more"), "{shown}");
+
+        // The panel is above the prompt, and the transcript holds none of it: nothing
+        // waiting is part of the conversation yet.
+        let rows: Vec<&str> = shown.lines().collect();
+        let panel = rows.iter().position(|r| r.contains("queued ")).unwrap();
+        let prompt = rows.iter().rposition(|r| r.contains("\u{203a}")).unwrap();
+        assert!(panel < prompt, "{shown}");
+        let entries = app.entries();
+        assert!(
+            !entries.list.iter().any(|e| e.text().contains("one")),
+            "nothing waiting is in the transcript"
+        );
+    }
+
+    #[test]
+    fn the_spinner_and_the_queue_sit_above_the_prompt() {
         let mut app = App::detached();
         app.working = true;
         app.on_event(Event::Queued {
             position: 1,
             text: "later".to_string(),
         });
-        app.entries().push(Entry::Queued("later".to_string()));
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
-        assert!(shown.contains("queued › later"), "{shown}");
+        // Waiting, so it is shown with the prompt box and not in the transcript.
+        assert!(shown.contains("1. later"), "{shown}");
+        assert!(shown.contains("queued"), "{shown}");
 
         let rows: Vec<&str> = shown.lines().collect();
         let working = rows.iter().position(|r| r.contains("working")).unwrap();

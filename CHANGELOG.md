@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- A prompt typed while a turn runs no longer appears in the transcript at the moment
+  it is typed, which put it before the rest of that turn's answer while the model saw
+  it after. It waits in a `queued` panel above the prompt box and joins the transcript
+  when its own turn starts, in the place the model's history puts it. `/queue` and
+  `/queue clear` are unchanged.
 - A fenced code block is coloured by the language its fence names: comments grey,
   strings green, numbers yellow, keywords magenta, upper case names cyan, the rest a
   plain grey. A fence that names no language, or one this does not know, stays plain

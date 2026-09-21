@@ -17,8 +17,6 @@ const LIVE_BYTES: usize = 16_000;
 #[derive(Debug)]
 pub enum Entry {
     User(String),
-    /// A prompt waiting for the running turn; it becomes a `User` entry when it starts.
-    Queued(String),
     Assistant(String),
     Reasoning(String),
     /// A tool call, kept with the tool that ran it so the transcript can draw a shell
@@ -54,8 +52,6 @@ struct Attribution {
     totals: Option<Usage>,
     /// Child agent usage since the last tool result.
     child: Option<Usage>,
-    /// A queued prompt that just started, which sits before the mark.
-    started: Option<usize>,
 }
 
 /// The transcript as shown, with token attribution by entry index.
@@ -75,18 +71,12 @@ impl Entries {
     /// Update the transcript for a published event.
     pub fn apply(&mut self, event: &Event) {
         match event {
-            Event::User(message) => {
-                // A prompt that waited in the queue already has an entry; it becomes
-                // the user entry in place, so the transcript never shows both.
-                match self.queued(message) {
-                    Some(index) => {
-                        self.list[index] = Entry::User(message.clone());
-                        self.attribution.started = Some(index);
-                    }
-                    None => self.push(Entry::User(message.clone())),
-                }
-            }
-            Event::Queued { text, .. } => self.push(Entry::Queued(text.clone())),
+            // The transcript is the conversation the model is having, so a message
+            // only joins it when the turn it belongs to starts. A prompt still waiting
+            // in the queue is shown above the prompt box instead, where the eye that
+            // typed it already is, and where it is plainly not part of the history yet.
+            Event::User(message) => self.push(Entry::User(message.clone())),
+            Event::Queued { .. } => {}
             Event::Text(delta) => self.append(delta, Stream::Assistant),
             Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
             Event::ToolStart { tool, summary } => self.push(Entry::Command {
@@ -284,27 +274,12 @@ impl Entries {
                 }
             }
             None => {
-                let started = self.attribution.started.take();
-                if let Some(entry) = last(|e| matches!(e, Entry::User(_))).or(started) {
+                if let Some(entry) = last(|e| matches!(e, Entry::User(_))) {
                     self.attribution.items.insert(index, entry);
                 }
             }
         }
         self.attribution.mark = self.list.len();
-    }
-
-    /// The first queued entry holding `text`.
-    fn queued(&self, text: &str) -> Option<usize> {
-        (0..self.list.len()).find(|&i| matches!(&self.list[i], Entry::Queued(t) if t == text))
-    }
-
-    /// Rewrite the queued entries of prompts that will never run.
-    pub fn drop_queued(&mut self) {
-        for entry in &mut self.list {
-            if let Entry::Queued(text) = entry {
-                *entry = Entry::Info(format!("dropped: {text}"));
-            }
-        }
     }
 
     /// The running command entry, if a call is still in flight.
@@ -365,7 +340,6 @@ impl Entry {
     pub fn text(&self) -> &str {
         match self {
             Entry::User(t)
-            | Entry::Queued(t)
             | Entry::Assistant(t)
             | Entry::Reasoning(t)
             | Entry::Command { summary: t, .. }
@@ -381,7 +355,6 @@ impl Entry {
     pub fn kind(&self) -> &'static str {
         match self {
             Entry::User(_) => "user",
-            Entry::Queued(_) => "queued",
             Entry::Assistant(_) => "assistant",
             Entry::Reasoning(_) => "thinking",
             Entry::Command { .. } => "command",

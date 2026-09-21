@@ -182,8 +182,10 @@ pub struct App {
     /// Submitted prompts, for `ctrl+p` and `ctrl+n`.
     pub history: History,
     pub working: bool,
-    /// Prompts waiting behind the running turn, for the status bar.
-    pub queued: usize,
+    /// Prompts waiting behind the running turn, as they were typed. They are not in
+    /// the transcript: a message joins the conversation when its turn starts, which is
+    /// where the model sees it too.
+    pub queued: Vec<String>,
     /// The call the judge is deciding, while it decides one.
     pub judging: Option<String>,
     /// The tool call waiting for approval.
@@ -268,7 +270,7 @@ impl App {
             menu: None,
             history: History::default(),
             working: false,
-            queued: 0,
+            queued: Vec::new(),
             judging: None,
             pending: None,
             trust_gate: None,
@@ -843,18 +845,24 @@ impl App {
                 self.follow = true;
                 self.working = true;
                 // Nothing waits unless a turn runs, so a user message with a queue
-                // behind it is the front of that queue starting.
-                self.queued = self.queued.saturating_sub(1);
+                // behind it is the front of that queue starting, and it has just
+                // joined the transcript as the entry the model will see.
+                if !self.queued.is_empty() {
+                    self.queued.remove(0);
+                }
             }
             // The position is the length of the queue the prompt joined. Scrolling to it
             // is what a submitted prompt does, queued or not.
-            Event::Queued { position, .. } => {
+            Event::Queued { position, text } => {
                 self.follow = true;
-                self.queued = position;
+                // The position is the length of the queue the prompt joined, so a
+                // prompt from another consumer this never saw still leaves no gap.
+                self.queued.truncate(position.saturating_sub(1));
+                self.queued.push(text);
             }
             // An interrupt drops whatever was waiting.
             Event::Interrupted => {
-                self.queued = 0;
+                self.queued.clear();
                 self.judging = None;
             }
             Event::Approval {
@@ -1132,11 +1140,11 @@ impl App {
             if self.session.clear_queue() == 0 {
                 self.note(Entry::Info("queue: nothing waiting".to_string()));
             }
-            self.queued = 0;
+            self.queued.clear();
             return;
         }
         let queued = self.session.queued();
-        self.queued = queued.len();
+        self.queued = queued.clone();
         self.note(Entry::Info(queue_report(&queued)));
     }
 
@@ -1857,16 +1865,17 @@ mod tests {
         app.follow = false;
         app.on_event(queued(1));
         app.on_event(queued(2));
-        assert_eq!(app.queued, 2);
+        assert_eq!(app.queued, ["p1", "p2"]);
         // A queued prompt scrolls into view like a message that starts a turn.
         assert!(app.follow);
-        // The front of the queue starting is a user message like any other.
+        // The front of the queue starting is a user message like any other, and it
+        // leaves the queue as it joins the transcript.
         app.on_event(Event::User("p1".to_string()));
-        assert_eq!(app.queued, 1);
+        assert_eq!(app.queued, ["p2"]);
         app.on_event(Event::Interrupted);
-        assert_eq!(app.queued, 0);
+        assert!(app.queued.is_empty());
         app.on_event(Event::User("fresh".to_string()));
-        assert_eq!(app.queued, 0);
+        assert!(app.queued.is_empty());
     }
 
     #[test]
