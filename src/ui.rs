@@ -41,6 +41,10 @@ const COPIED_FOR: Duration = Duration::from_secs(3);
 /// prompt reads as a prompt rather than as something said in a colour of its own.
 const USER_BG: Color = Color::Indexed(236);
 
+/// The scrollbar track: there to say how far the transcript runs, faint enough that
+/// the eye does not keep landing on it.
+const TRACK: Color = Color::Indexed(238);
+
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -411,9 +415,16 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         let mut state = ScrollbarState::new(max_scroll + 1)
             .position(app.scroll)
             .viewport_content_length(height);
+        // A thin thumb against the screen edge, in the same greys as the rest of the
+        // furniture: the bar says where in the transcript you are, and a full block in
+        // the terminal's brightest white said it louder than the text beside it.
         let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
-            .end_symbol(None);
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .track_style(Style::new().fg(TRACK))
+            .thumb_symbol("▐")
+            .thumb_style(Style::new().fg(Color::DarkGray));
         frame.render_stateful_widget(bar, bar_area, &mut state);
     }
 }
@@ -1834,6 +1845,22 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = app.scrollbar.unwrap();
         assert_eq!(bar.x, 39);
+        // A thin thumb on a fainter track, both grey: the bar used to be a solid block
+        // on a double rule, in the terminal's brightest white.
+        let buffer = terminal.backend().buffer();
+        let column: Vec<&str> = (bar.top()..bar.bottom())
+            .map(|y| buffer[(bar.x, y)].symbol())
+            .collect();
+        let thumb = column
+            .iter()
+            .position(|s| *s == "\u{2590}")
+            .expect("a thumb");
+        assert!(column.contains(&"\u{2502}"), "{column:?}");
+        assert_eq!(
+            buffer[(bar.x, bar.top() + thumb as u16)].fg,
+            Color::DarkGray
+        );
+        assert_eq!(buffer[(bar.x, bar.top())].fg, TRACK);
         assert!(app.max_scroll > 0);
         assert_eq!(app.scroll, app.max_scroll);
 

@@ -6,6 +6,9 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- The transcript scrollbar is drawn in greys rather than the terminal's brightest
+  white, with a thin thumb against the screen edge in place of the solid block, on a
+  single faint rule in place of the double one.
 - The subagent panel goes once the turn is over, rather than sitting between the
   transcript and the prompt until the next message. Opening a pane brings it back,
   since the panel is what that pane is titled by and read from.
