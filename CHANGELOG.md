@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- Interrupting a turn no longer throws away the prompts queued behind it. Typing a
+  correction while a turn goes wrong and then stopping that turn used to drop the
+  correction with it, which is the one keypress guaranteed to be followed by wanting
+  it. The interrupt cancels the call in flight; the front of the queue starts as soon
+  as that turn ends, so one interrupt stops one turn. `/queue clear` still drops what
+  is waiting.
+
 - A turn no longer stops after 40 model calls. The cap was there so a confused loop
   could not run forever, but a long task hits it while it is still working and gets
   `stopped after 40 steps without finishing` instead of an answer. The turn now runs

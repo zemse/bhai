@@ -860,11 +860,9 @@ impl App {
                 self.queued.truncate(position.saturating_sub(1));
                 self.queued.push(text);
             }
-            // An interrupt drops whatever was waiting.
-            Event::Interrupted => {
-                self.queued.clear();
-                self.judging = None;
-            }
+            // The queue survives an interrupt, so the panel keeps showing it; the
+            // front of it starts as soon as the cancelled turn ends.
+            Event::Interrupted => self.judging = None,
             Event::Approval {
                 id,
                 tool,
@@ -1869,7 +1867,11 @@ mod tests {
         // leaves the queue as it joins the transcript.
         app.on_event(Event::User("p1".to_string()));
         assert_eq!(app.queued, ["p2"]);
+        // An interrupt stops the turn and leaves the panel alone: what is waiting is
+        // still waiting, and the front of it starts once the cancelled turn ends.
         app.on_event(Event::Interrupted);
+        assert_eq!(app.queued, ["p2"]);
+        app.on_event(Event::User("p2".to_string()));
         assert!(app.queued.is_empty());
         app.on_event(Event::User("fresh".to_string()));
         assert!(app.queued.is_empty());

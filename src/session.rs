@@ -416,8 +416,9 @@ impl Session {
         self.cancel.store(true, Ordering::Relaxed);
         self.answer(Answer::Reject, None);
         self.publish(Event::Interrupted);
-        // Stop means stop, so nothing that was waiting behind the turn runs.
-        self.clear_queue();
+        // What was typed behind the turn keeps its place: an interrupt cancels the call
+        // in flight, not the prompts the user has already asked for. `/queue clear`
+        // drops them.
         true
     }
 
@@ -1035,22 +1036,63 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupt_drops_the_queue() {
+    fn an_interrupt_keeps_the_queue() {
+        // Interrupting used to drop what was waiting, so a correction typed while the
+        // turn went wrong was thrown away by the very keypress that stopped it.
         let (session, mut rx_user) = session();
         session.submit("a".to_string()).unwrap();
         assert_eq!(rx_user.try_recv().unwrap(), "a");
         session.submit("b".to_string()).unwrap();
         session.submit("c".to_string()).unwrap();
         assert!(session.interrupt());
-        assert!(session.state().queued.is_empty());
+        assert_eq!(session.state().queued, ["b", "c"]);
+        // Nothing is sent until the cancelled turn ends; then the queue drains as usual.
+        assert!(rx_user.try_recv().is_err());
+        session.on_agent(AgentEvent::TurnEnd);
+        assert_eq!(rx_user.try_recv().unwrap(), "b");
+        assert!(session.state().working);
+        // The interrupt cleared the cancel flag on the way out, so the new turn runs.
+        assert!(!session.cancel.load(Ordering::Relaxed));
+        session.on_agent(AgentEvent::TurnEnd);
+        assert_eq!(rx_user.try_recv().unwrap(), "c");
+        session.on_agent(AgentEvent::TurnEnd);
+        assert!(!session.state().working);
+        let entries = session.entries();
+        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        assert_eq!(texts, ["a", "interrupted", "b", "c"]);
+    }
+
+    #[test]
+    fn one_interrupt_stops_one_turn() {
+        // Stopping the queue as well takes either an interrupt each or `/queue clear`.
+        let (session, mut rx_user) = session();
+        session.submit("a".to_string()).unwrap();
+        session.submit("b".to_string()).unwrap();
+        assert_eq!(rx_user.try_recv().unwrap(), "a");
+
+        assert!(session.interrupt());
+        session.on_agent(AgentEvent::TurnEnd);
+        assert_eq!(rx_user.try_recv().unwrap(), "b");
+        assert!(session.state().working);
+
+        assert!(session.interrupt());
         session.on_agent(AgentEvent::TurnEnd);
         assert!(!session.state().working);
         assert!(rx_user.try_recv().is_err());
-        let entries = session.entries();
-        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
-        // Only the turn that ran is in the transcript: what was waiting never became
-        // part of the conversation, so there is nothing there to cross out.
-        assert_eq!(texts, ["a", "interrupted", "dropped 2 queued prompt(s)"]);
+    }
+
+    #[test]
+    fn clearing_the_queue_after_an_interrupt_stops_everything() {
+        let (session, mut rx_user) = session();
+        session.submit("a".to_string()).unwrap();
+        session.submit("b".to_string()).unwrap();
+        session.submit("c".to_string()).unwrap();
+        assert_eq!(rx_user.try_recv().unwrap(), "a");
+        assert!(session.interrupt());
+        assert_eq!(session.clear_queue(), 2);
+        session.on_agent(AgentEvent::TurnEnd);
+        assert!(!session.state().working);
+        assert!(rx_user.try_recv().is_err());
     }
 
     #[test]
