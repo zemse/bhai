@@ -49,6 +49,11 @@ const TRACK: Color = Color::Indexed(238);
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
+/// The mark a message of the model's own carries, in the same left margin a tool call's
+/// sigil sits in. Unstyled, because the message is: the mark says where one starts, and
+/// the margin it opens keeps the whole of it set in from everything around it.
+const MESSAGE_MARK: &str = "⏺ ";
+
 pub fn render(frame: &mut Frame, app: &mut App) {
     draw(frame, app);
     // Last, so it sits over whatever the drag was made on.
@@ -667,9 +672,27 @@ struct Rows {
 /// Thinking and long tool output show only a little of themselves unless `expanded`.
 fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> Rows {
     if let Entry::Assistant(text) = entry {
-        let (mut lines, mut joins) = markdown::render(text, width);
+        let lead = MESSAGE_MARK.chars().count();
+        let indent = " ".repeat(lead);
+        let (rendered, mut joins) = markdown::render(text, width.saturating_sub(lead).max(4));
+        let mut lines: Vec<Line> = rendered
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut line)| {
+                line.spans.insert(
+                    0,
+                    match i {
+                        0 => Span::raw(MESSAGE_MARK),
+                        _ => Span::raw(indent.clone()),
+                    },
+                );
+                line
+            })
+            .collect();
+        // A message that has only started still gets its mark, so the eye has somewhere
+        // to land while the first words are on their way.
         if lines.is_empty() {
-            lines.push(Line::from(""));
+            lines.push(Line::from(MESSAGE_MARK));
             joins.push(Join::Newline);
         }
         lines.push(Line::from(""));
@@ -1257,6 +1280,30 @@ mod tests {
     }
 
     #[test]
+    fn a_message_is_marked_and_every_row_of_it_sits_in_from_the_mark() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Assistant(
+            "a message long enough that it wraps around".to_string(),
+        ));
+        // Tall enough that no scrollbar takes a column off the rows.
+        let mut terminal = Terminal::new(TestBackend::new(24, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        let rows: Vec<&str> = shown
+            .lines()
+            .map(str::trim_end)
+            .filter(|row| !row.is_empty())
+            .collect();
+        let start = rows
+            .iter()
+            .position(|row| row.starts_with("\u{23fa} "))
+            .unwrap_or_else(|| panic!("{rows:?}"));
+        assert_eq!(rows[start], "\u{23fa} a message long enough");
+        // What the wrap made of the rest lines up under the message, not under the mark.
+        assert_eq!(rows[start + 1], "  that it wraps around");
+    }
+
+    #[test]
     fn an_entry_cut_off_at_the_bottom_keeps_its_badge_on_its_last_row() {
         let mut app = App::detached();
         app.entries()
@@ -1312,9 +1359,9 @@ mod tests {
             .iter()
             .map(|l| l.trim_end())
             .collect();
-        assert_eq!(entry[0], "Plan");
-        assert!(entry.contains(&"  around"), "{entry:?}");
-        assert!(entry[entry.len() - 1].starts_with("  ls"), "{entry:?}");
+        assert_eq!(entry[0], "\u{23fa} Plan");
+        assert!(entry.contains(&"    wraps around"), "{entry:?}");
+        assert!(entry[entry.len() - 1].starts_with("    ls"), "{entry:?}");
         assert!(!entry[entry.len() - 1].contains("tokenized"), "{entry:?}");
         // The badge is on the blank row the entry does not own.
         assert!(

@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- A message from the model now carries a `⏺` in the left margin, and the whole of it
+  sits in from that mark. Every other entry already had a sigil of its own, so a message
+  was the one thing in the transcript with nothing to say where it started: after a wall
+  of tool output it read as more output. Thinking keeps its `✱`.
+
 - Interrupting a turn no longer throws away the prompts queued behind it. Typing a
   correction while a turn goes wrong and then stopping that turn used to drop the
   correction with it, which is the one keypress guaranteed to be followed by wanting
