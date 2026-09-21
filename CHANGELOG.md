@@ -6,6 +6,9 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- Startup says the same when a session is put on an `ollama:` model with nothing
+  listening: the preflight sentence alone, not that sentence with reqwest's own
+  wording for a refused connection parenthesised inside it.
 - A missing Ollama reads as one line in the `/model` picker: "no server at <url>. Start
   one with `ollama serve`.", rather than that sentence with reqwest's whole connect
   chain unrolled after it. A timeout says the same; any other failure still carries

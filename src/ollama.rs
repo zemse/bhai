@@ -249,10 +249,15 @@ fn usage(event: &Value) -> Usage {
 /// Check the server is up and the model is pulled, before the TUI takes the terminal.
 pub async fn preflight(http: &reqwest::Client, url: &str, model: &str) -> Result<()> {
     let endpoint = format!("{}/api/tags", url.trim_end_matches('/'));
-    let resp =
-        http.get(&endpoint).send().await.map_err(|e| {
-            anyhow!("no Ollama server at {url} ({e}). Start one with `ollama serve`.")
-        })?;
+    let resp = match http.get(&endpoint).send().await {
+        Ok(resp) => resp,
+        // Nothing listening is the ordinary case, not a fault, and reqwest's words for it
+        // say nothing the sentence has not already said.
+        Err(e) if e.is_connect() || e.is_timeout() => {
+            anyhow::bail!("no Ollama server at {url}. Start one with `ollama serve`.")
+        }
+        Err(e) => return Err(anyhow!("{endpoint} failed: {e}")),
+    };
     let body: Value = resp
         .json()
         .await
@@ -310,6 +315,22 @@ mod tests {
             json!({"type": "message", "role": "assistant",
                    "content": [{"type": "output_text", "text": "one file"}]}),
         ]
+    }
+
+    #[tokio::test]
+    async fn a_dead_server_fails_preflight_in_one_line() {
+        // Port 1 has nothing on it, so the connection is refused.
+        let e = preflight(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            "ollama:gemma4:e2b",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "no Ollama server at http://127.0.0.1:1. Start one with `ollama serve`."
+        );
     }
 
     #[test]
