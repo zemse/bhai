@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- A token badge is drawn on the blank row under its entry rather than over the last
+  row of the text, so hovering a message no longer covers the words being read.
+  Nothing reflows: the row was already there, between the entry and the next one.
+  An entry the bottom edge cuts off has no such row in view, and keeps the badge
+  on its last row.
 - Startup says the same when a session is put on an `ollama:` model with nothing
   listening: the preflight sentence alone, not that sentence with reqwest's own
   wording for a refused connection parenthesised inside it.

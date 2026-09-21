@@ -460,8 +460,8 @@ fn row_map(spans: &[(Range<usize>, usize)], scroll: usize, area: Rect) -> Vec<(R
         .collect()
 }
 
-/// Badges of hovered, pinned or (with ctrl+t) all entries, right-aligned on each
-/// entry's last visible row.
+/// Badges of hovered, pinned or (with ctrl+t) all entries, right-aligned on the blank
+/// row under each entry, or on its last visible row when that blank is not in view.
 fn render_badges(frame: &mut Frame, area: Rect, app: &App) {
     let entries = app.entries();
     for (rows, entry) in &app.rows {
@@ -469,18 +469,37 @@ fn render_badges(frame: &mut Frame, area: Rect, app: &App) {
         let Some(text) = entries.tokens.get(entry).filter(|_| shown).and_then(badge) else {
             continue;
         };
-        // A badge on an entry with a ground of its own keeps that ground, so it does not
-        // punch a hole in the block.
-        let style = match entries.list.get(*entry) {
-            Some(Entry::User(_)) => Style::new().fg(Color::DarkGray).bg(USER_BG),
+        // The separator under the entry belongs to no entry, so a badge there covers no
+        // text being read. An entry clipped by the bottom edge has none in view, and the
+        // badge goes back on its last row rather than the transcript moving to make room.
+        let under =
+            (rows.end < area.bottom() && blank_row(app, area, rows.end)).then_some(rows.end);
+        // A badge inside an entry with a ground of its own keeps that ground, so it does
+        // not punch a hole in the block. The separator below is outside the block.
+        let style = match (under, entries.list.get(*entry)) {
+            (None, Some(Entry::User(_))) => Style::new().fg(Color::DarkGray).bg(USER_BG),
             _ => Style::new().fg(Color::DarkGray),
         };
         let line = Line::from(Span::styled(format!(" {text}"), style));
         let width = (line.width() as u16).min(area.width);
-        let spot = Rect::new(area.right() - width, rows.end - 1, width, 1);
+        let spot = Rect::new(
+            area.right() - width,
+            under.unwrap_or(rows.end - 1),
+            width,
+            1,
+        );
         frame.render_widget(Clear, spot);
         frame.render_widget(Paragraph::new(line), spot);
     }
+}
+
+/// Is the screen row empty text? The separator between two entries is; a row the bottom
+/// edge cut an entry off at is not.
+fn blank_row(app: &App, area: Rect, row: u16) -> bool {
+    let line = app.scroll + (row - area.y) as usize;
+    app.lines
+        .get(line)
+        .is_some_and(|text| text.trim().is_empty())
 }
 
 /// An entry's token badge, with only the parts that are known.
@@ -1063,7 +1082,7 @@ mod tests {
     }
 
     #[test]
-    fn hovering_draws_the_badge_on_the_entry_last_row() {
+    fn hovering_draws_the_badge_under_the_entry() {
         let mut app = App::detached();
         app.entries()
             .push(Entry::User("hello there, a message that wraps".to_string()));
@@ -1090,7 +1109,8 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol())
                 .collect()
         };
-        assert!(!row_text(&terminal, rows.end - 1).contains("tokenized"));
+        assert!(!row_text(&terminal, rows.end).contains("tokenized"));
+        let last = row_text(&terminal, rows.end - 1);
         let moved = MouseEvent {
             kind: MouseEventKind::Moved,
             column: 3,
@@ -1099,14 +1119,53 @@ mod tests {
         };
         assert!(app.on_mouse(moved));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        // The badge lands on the blank row under the entry, so the message reads the
+        // same hovered as not, and nothing above or below it has moved.
         assert!(
-            row_text(&terminal, rows.end - 1)
+            row_text(&terminal, rows.end)
                 .trim_end()
                 .ends_with(" in 5 (tokenized)"),
             "{:?}",
-            row_text(&terminal, rows.end - 1)
+            row_text(&terminal, rows.end)
         );
+        assert_eq!(row_text(&terminal, rows.end - 1), last);
         assert!(row_text(&terminal, rows.start).starts_with("› hello"));
+        // That row is outside the user block, so it does not carry its ground.
+        let buffer = terminal.backend().buffer();
+        assert_ne!(buffer[(buffer.area.width - 1, rows.end)].bg, USER_BG);
+    }
+
+    #[test]
+    fn an_entry_cut_off_at_the_bottom_keeps_its_badge_on_its_last_row() {
+        let mut app = App::detached();
+        app.entries()
+            .push(Entry::Assistant("a line\n".repeat(40).to_string()));
+        app.entries().tokens.insert(
+            1,
+            Tokens {
+                input: Some(5),
+                method: Method::Tokenized,
+                ..Tokens::default()
+            },
+        );
+        app.all_badges = true;
+        app.follow = false;
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        // Scrolled past the intro, so the entry fills the view and runs past the bottom.
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.scroll = 8;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
+        // The entry runs past the bottom, so there is no blank row under it in view.
+        let area = app.transcript_area.unwrap();
+        assert_eq!(rows.end, area.bottom(), "{rows:?} in {area:?}");
+        let shown = screen(&terminal);
+        let lines: Vec<&str> = shown.lines().collect();
+        assert!(
+            lines[rows.end as usize - 1].contains("in 5 (tokenized)"),
+            "{:?}",
+            lines[rows.end as usize - 1]
+        );
     }
 
     #[test]
@@ -1135,7 +1194,13 @@ mod tests {
         assert_eq!(entry[0], "Plan");
         assert!(entry.contains(&"  around"), "{entry:?}");
         assert!(entry[entry.len() - 1].starts_with("  ls"), "{entry:?}");
-        assert!(entry[entry.len() - 1].ends_with("(tokenized)"), "{entry:?}");
+        assert!(!entry[entry.len() - 1].contains("tokenized"), "{entry:?}");
+        // The badge is on the blank row the entry does not own.
+        assert!(
+            lines[rows.end as usize].trim_end().ends_with("(tokenized)"),
+            "{:?}",
+            lines[rows.end as usize]
+        );
         assert!(matches!(&app.entries().list[1], Entry::Assistant(t) if t == raw));
     }
 
