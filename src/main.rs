@@ -30,6 +30,7 @@ mod session;
 mod sessions;
 mod skills;
 mod speed;
+mod syntax;
 mod tokens;
 mod tools;
 mod ui;

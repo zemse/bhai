@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- A fenced code block is coloured by the language its fence names: comments grey,
+  strings green, numbers yellow, keywords magenta, upper case names cyan, the rest a
+  plain grey. A fence that names no language, or one this does not know, stays plain
+  rather than being guessed at and painted in another language's rules. Rust, Python,
+  JavaScript and TypeScript, Go, the C family, Ruby, shell, JSON, TOML, YAML, SQL and
+  CSS are known.
 - The transcript scrollbar is drawn in greys rather than the terminal's brightest
   white, with a thin thumb against the screen edge in place of the solid block, on a
   single faint rule in place of the double one.

@@ -5,6 +5,7 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::syntax::{self, PLAIN};
 use crate::wrap::Join;
 
 /// One styled character; lines are built from these so wrapping keeps styles.
@@ -264,8 +265,11 @@ impl Renderer {
             .saturating_sub(self.prefix_width() + CODE_INDENT.len())
             .max(4);
         let code = code.strip_suffix('\n').unwrap_or(&code);
-        for line in code.split('\n') {
-            let cells: Vec<Cell> = line.chars().map(|c| (c, CODE)).collect();
+        // Coloured as a whole, since a string or a comment can cross a line, then cut
+        // back into the lines the code has.
+        let painted = syntax::highlight(code, &lang);
+        for line in split_lines(&painted) {
+            let cells: Vec<Cell> = line.to_vec();
             // Long lines are split, never reflowed.
             let chunks: Vec<&[Cell]> = if cells.is_empty() {
                 vec![&[]]
@@ -273,7 +277,7 @@ impl Renderer {
                 cells.chunks(width).collect()
             };
             for (index, chunk) in chunks.into_iter().enumerate() {
-                let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, CODE)).collect();
+                let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, PLAIN)).collect();
                 row.extend_from_slice(chunk);
                 // The line was split to fit, not reflowed, so nothing stands between.
                 let join = match index {
@@ -364,6 +368,20 @@ impl Renderer {
     }
 }
 
+/// The cells of each line of a painted block, without the newlines between them.
+fn split_lines(painted: &[Cell]) -> Vec<&[Cell]> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (index, (c, _)) in painted.iter().enumerate() {
+        if *c == '\n' {
+            lines.push(&painted[start..index]);
+            start = index + 1;
+        }
+    }
+    lines.push(&painted[start..]);
+    lines
+}
+
 /// Greedy word wrap over styled chars, each line with how it joins the one above; a word
 /// longer than the line is hard-split.
 fn wrap(cells: &[Cell], width: usize) -> Vec<(Vec<Cell>, Join)> {
@@ -451,7 +469,10 @@ mod tests {
             ]
         );
         assert_eq!(style_of(&lines, "rust"), DIM);
-        assert_eq!(style_of(&lines, "fn main"), CODE);
+        // The block is coloured as the language the fence names.
+        assert_eq!(style_of(&lines, "fn"), syntax::KEYWORD);
+        assert_eq!(style_of(&lines, "main"), syntax::PLAIN);
+        assert_eq!(style_of(&lines, "1"), syntax::NUMBER);
     }
 
     #[test]
@@ -461,7 +482,15 @@ mod tests {
             text(&lines),
             vec!["text", "", "py", "  print(1)", "  x = ["]
         );
-        assert_eq!(style_of(&lines, "x = ["), CODE);
+        assert_eq!(style_of(&lines, "x = ["), PLAIN);
+    }
+
+    #[test]
+    fn a_fence_with_no_language_stays_plain() {
+        let lines = lines("```\nit's fine # not a comment\n```", 40);
+        for span in lines.iter().flat_map(|l| l.spans.iter()) {
+            assert_eq!(span.style, PLAIN);
+        }
     }
 
     #[test]
