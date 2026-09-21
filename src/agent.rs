@@ -27,9 +27,9 @@ use crate::tokens;
 use crate::tools::{self, BoxFuture, Registry};
 use crate::workflow::{self, Workflow};
 
-/// Hard cap on model calls in a single turn, so a confused loop cannot run forever.
-const MAX_STEPS: usize = 40;
-/// Stop the turn after this many consecutive rounds where every tool call failed.
+/// Stop the turn after this many consecutive rounds where every tool call failed. A turn
+/// is otherwise unbounded: a long task keeps going until it is done, interrupted, or
+/// stuck on failing calls.
 const MAX_ERROR_ROUNDS: usize = 3;
 
 /// Everything the agent tells the UI.
@@ -659,7 +659,9 @@ async fn turn(
 ) -> (usize, anyhow::Result<()>) {
     let mut error_rounds = 0usize;
 
-    for step in 1..=MAX_STEPS {
+    let mut step = 0usize;
+    loop {
+        step += 1;
         // Whatever was typed into this agent's pane joins the history before the call,
         // so the next answer has it.
         let typed = steered(steer.as_deref_mut());
@@ -799,11 +801,6 @@ async fn turn(
             return (step, Ok(()));
         }
     }
-
-    let _ = tx.send(AgentEvent::Error(format!(
-        "stopped after {MAX_STEPS} steps without finishing"
-    )));
-    (MAX_STEPS, Ok(()))
 }
 
 /// The messages posted to an agent's mailbox since the last look, as history items.

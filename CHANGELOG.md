@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- A turn no longer stops after 40 model calls. The cap was there so a confused loop
+  could not run forever, but a long task hits it while it is still working and gets
+  `stopped after 40 steps without finishing` instead of an answer. The turn now runs
+  until the model stops calling tools. What still ends a runaway: three consecutive
+  rounds where every tool call failed, an interrupt, and the backend's rate limits.
+
 - The `tok/s` readout says what the text on screen is doing. It is measured from one
   token to another rather than from the start of the model call, so the seconds spent
   thinking before the first token are no longer in the denominator with nothing
