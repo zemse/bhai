@@ -39,6 +39,7 @@ fn router(session: Arc<Session>) -> Router {
         .route("/approve", post(approve))
         .route("/reject", post(reject))
         .route("/interrupt", post(interrupt))
+        .route("/retry", post(retry))
         .route("/mode", post(mode))
         .route("/context", get(context))
         .route("/children", get(children))
@@ -203,6 +204,15 @@ async fn interrupt(State(session): State<Arc<Session>>) -> Response {
         ok()
     } else {
         error(StatusCode::CONFLICT, "no turn is running")
+    }
+}
+
+/// Run the last turn again, after it failed. Nothing is added to the history, so this is
+/// the same call going out again rather than a new message.
+async fn retry(State(session): State<Arc<Session>>) -> Response {
+    match session.retry() {
+        Ok(()) => ok(),
+        Err(e) => error(StatusCode::CONFLICT, &e.to_string()),
     }
 }
 
@@ -537,6 +547,25 @@ mod tests {
             post(&http, format!("{base}/mode"), json!({"mode": "yolo"}))
                 .await
                 .is_client_error()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_runs_a_turn_again_unless_one_is_running() {
+        let (base, _) = start().await;
+        let http = reqwest::Client::new();
+        assert_eq!(
+            post(&http, format!("{base}/retry"), json!({})).await,
+            StatusCode::OK
+        );
+        // The session is working on it, so there is nothing to run again yet.
+        assert_eq!(
+            get_json(&http, format!("{base}/state")).await["working"],
+            true
+        );
+        assert_eq!(
+            post(&http, format!("{base}/retry"), json!({})).await,
+            StatusCode::CONFLICT
         );
     }
 

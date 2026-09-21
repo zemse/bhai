@@ -35,6 +35,9 @@ pub enum Entry {
     Output(String),
     Rejected(String),
     Error(String),
+    /// A turn that failed rather than answering. Unlike an `Error`, the history still
+    /// stands behind it, so the transcript offers to run the turn again.
+    Failed(String),
     Info(String),
 }
 
@@ -131,6 +134,7 @@ impl Entries {
                 self.push(Entry::Info("conversation cleared".to_string()));
             }
             Event::Error(message) => self.push(Entry::Error(message.clone())),
+            Event::TurnFailed(message) => self.push(Entry::Failed(message.clone())),
             Event::Interrupted => self.push(Entry::Info("interrupted".to_string())),
             _ => {}
         }
@@ -369,6 +373,7 @@ impl Entry {
             | Entry::Output(t)
             | Entry::Rejected(t)
             | Entry::Error(t)
+            | Entry::Failed(t)
             | Entry::Info(t) => t,
         }
     }
@@ -384,6 +389,7 @@ impl Entry {
             Entry::Output(_) => "output",
             Entry::Rejected(_) => "rejected",
             Entry::Error(_) => "error",
+            Entry::Failed(_) => "failed",
             Entry::Info(_) => "info",
         }
     }

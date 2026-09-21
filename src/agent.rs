@@ -101,8 +101,20 @@ pub enum AgentEvent {
     /// model is answering, leaving out the time tools and approvals take.
     Streaming(bool),
     Error(String),
+    /// The turn ended on a failure rather than a reply: the model call did not get
+    /// through, or a tool broke the loop. The history still stands, so the same turn can
+    /// be run again without the user retyping anything.
+    TurnFailed(String),
     /// The agent is done with this turn and is waiting for input.
     TurnEnd,
+}
+
+/// What the loop does next, once something has woken it: a turn on a new message, a
+/// turn on the history as it stands, or a compaction pass of its own.
+enum Next {
+    Turn(String),
+    Retry,
+    Compact,
 }
 
 /// Requests answered by the agent task, which owns the history, even mid-turn.
@@ -115,6 +127,9 @@ pub enum Control {
     Compact(Option<String>),
     /// Drop the history, so the next turn starts from nothing.
     Clear,
+    /// Run a turn again on the history as it stands, after one failed. Nothing is added
+    /// to the history, so the call goes out as the failed one did.
+    Retry,
     /// Run a workflow now, as a turn of its own. Only the user starts one.
     Workflow {
         workflow: Arc<Workflow>,
@@ -403,7 +418,7 @@ pub(crate) async fn run_with(
     let mut asked: Option<String> = None;
 
     loop {
-        let message = tokio::select! {
+        let next = tokio::select! {
             // Control first, so a `/model` switch is in force for the message typed
             // right after it rather than one turn late.
             biased;
@@ -487,16 +502,17 @@ pub(crate) async fn run_with(
                     }
                     Control::Compact(prompt) => {
                         asked = prompt;
-                        None
+                        Next::Compact
                     }
+                    Control::Retry => Next::Retry,
                 }
             }
             message = rx_user.recv() => match message {
-                Some(message) => Some(message),
+                Some(message) => Next::Turn(message),
                 None => break,
             },
         };
-        let Some(message) = message else {
+        if let Next::Compact = next {
             let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
             let pass = Compaction {
                 model: model.as_ref(),
@@ -514,19 +530,26 @@ pub(crate) async fn run_with(
             let _ = tx.send(AgentEvent::TurnEnd);
             continue;
         };
-        // The judge decides against the task the user just gave, with a fresh budget.
-        if let Some(judge) = &judge {
-            judge.start_turn(&message);
+        // A retry runs the turn the history already describes, so nothing is added to it
+        // and the judge keeps the budget and the log of the attempt that failed.
+        if let Next::Turn(message) = &next {
+            // The judge decides against the task just given, with a fresh budget.
+            if let Some(judge) = &judge {
+                judge.start_turn(message);
+            }
+            // `Session::submit` clears `cancel` before sending, so an early interrupt
+            // holds.
+            history.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": message }],
+            }));
+            let _ = tx.send(AgentEvent::Item(history.len() - 1));
         }
-        // `Session::submit` clears `cancel` before sending, so an early interrupt holds.
-        history.push(json!({
-            "type": "message",
-            "role": "user",
-            "content": [{ "type": "input_text", "text": message }],
-        }));
-        let _ = tx.send(AgentEvent::Item(history.len() - 1));
         let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
-        record(&mut sink, &history[history.len() - 1..], &tx);
+        if let Next::Turn(_) = &next {
+            record(&mut sink, &history[history.len() - 1..], &tx);
+        }
 
         // The turn holds the history, so mid-turn requests see it as the turn started.
         let (before, calls_before) = (history.clone(), calls.clone());
@@ -578,12 +601,17 @@ pub(crate) async fn run_with(
                                     .to_string(),
                             ));
                         }
+                        Control::Retry => {
+                            let _ = tx.send(AgentEvent::Error(
+                                "a turn is already running".to_string(),
+                            ));
+                        }
                     },
                 }
             }
         };
         if let (_, Err(e)) = result {
-            let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
+            let _ = tx.send(AgentEvent::TurnFailed(format!("{e:#}")));
         }
         // Between turns the history holds every call's output, so it can be rewritten.
         // After an interrupt the summary call would be cut off, so the next turn does it.
@@ -1067,8 +1095,10 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     reply,
                 },
                 // An error is what the parent reports when the child ends without an
-                // answer, so it is kept here as well as shown in the child's pane.
-                AgentEvent::Error(s) => {
+                // answer, so it is kept here as well as shown in the child's pane. Only
+                // the session's own turn can be run again, so a child's failure is shown
+                // as the error it is.
+                AgentEvent::Error(s) | AgentEvent::TurnFailed(s) => {
                     failure = Some(s.clone());
                     inside(AgentEvent::Error(s))
                 }
@@ -1874,6 +1904,28 @@ mod tests {
         // As `Session::submit` does.
         cancel.store(false, Ordering::Relaxed);
         tx_user.send(message.to_string()).await.unwrap();
+        collect(rx, cancel, message, answers).await
+    }
+
+    /// A turn run again on the history as it stands, as `Session::retry` asks for it.
+    async fn drive_retry(
+        tx_control: &mpsc::Sender<Control>,
+        rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+        cancel: &AtomicBool,
+        answers: &[Answer],
+    ) -> Vec<AgentEvent> {
+        cancel.store(false, Ordering::Relaxed);
+        tx_control.send(Control::Retry).await.unwrap();
+        collect(rx, cancel, "retry", answers).await
+    }
+
+    /// Everything the loop says until the turn ends, answering approvals as they come.
+    async fn collect(
+        rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+        cancel: &AtomicBool,
+        message: &str,
+        answers: &[Answer],
+    ) -> Vec<AgentEvent> {
         let mut answers = answers.iter();
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -2323,32 +2375,50 @@ mod tests {
             Limits::default(),
         ));
         let accept = Answer::Accept(None);
-        let mut turn = async |message: &str, answers: &[Answer]| {
-            drive(&tx_user, &mut rx, &cancel, message, answers).await
+        // `rx` is passed in rather than captured, so a retry can read from it too.
+        let turn = async |rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+                          message: &str,
+                          answers: &[Answer]| {
+            drive(&tx_user, rx, &cancel, message, answers).await
         };
 
-        turn("hello", &[]).await;
-        let events = turn("run it", &[accept]).await;
+        turn(&mut rx, "hello", &[]).await;
+        let events = turn(&mut rx, "run it", &[accept]).await;
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("approved")))
         );
-        let events = turn("try this", &[Answer::Reject]).await;
+        let events = turn(&mut rx, "try this", &[Answer::Reject]).await;
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ToolRejected(_)))
         );
-        let events = turn("take long", &[]).await;
+        let events = turn(&mut rx, "take long", &[]).await;
         assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
-        let events = turn("fail", &[]).await;
+        let events = turn(&mut rx, "fail", &[]).await;
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::Error(m) if m.contains("scripted failure")))
+                .any(|e| matches!(e, AgentEvent::TurnFailed(m) if m.contains("scripted failure")))
         );
-        turn("again", &[]).await;
+        // A retry runs the failed turn again on the history it left behind: the same
+        // input goes out, with nothing new said, so the cache serves the whole prefix.
+        let sent = |fake: &Fake| fake.bodies.lock().unwrap().last().unwrap().1["input"].clone();
+        let failed_with = sent(&fake);
+        let events = drive_retry(&tx_control, &mut rx, &cancel, &[]).await;
+        assert_eq!(sent(&fake), failed_with, "the retry said something new");
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Call(_))),
+            "the retry made no call: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnFailed(_) | AgentEvent::Error(_))),
+            "{events:?}"
+        );
 
         let (reply, wait) = oneshot::channel();
         tx_control.send(Control::Context(reply)).await.unwrap();
@@ -2359,14 +2429,14 @@ mod tests {
         policy.set_mode(policy.next_mode());
         assert_eq!(policy.mode(), Mode::Auto);
 
-        let events = turn("delegate", &[]).await;
+        let events = turn(&mut rx, "delegate", &[]).await;
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("child done")))
         );
         // No judge runs here, and `auto` never prompts, so the call is denied outright.
-        let events = turn("look it up", &[]).await;
+        let events = turn(&mut rx, "look it up", &[]).await;
         assert!(events.iter().any(
             |e| matches!(e, AgentEvent::ToolRejected(m) if m.contains("no judge is running"))
         ));
@@ -2374,11 +2444,11 @@ mod tests {
         policy.set_mode(policy.next_mode());
         assert_eq!(policy.mode(), Mode::Bypass);
         // `touch` is not read-only, so bypass runs it and ask prompts for it.
-        turn("write one", &[]).await;
+        turn(&mut rx, "write one", &[]).await;
         assert!(bypassed.exists());
         policy.set_mode(policy.next_mode());
         assert_eq!(policy.mode(), Mode::Ask);
-        turn("write another", &[accept]).await;
+        turn(&mut rx, "write another", &[accept]).await;
         assert!(asked.exists());
 
         // A compaction rewrites history, which is a reset the guard is told about.

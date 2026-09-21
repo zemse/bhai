@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-21
 
+- A turn that ends on a failure says so as a failure rather than an error, and the
+  transcript offers to run it again: clicking it re-sends the call on the history
+  the agent still holds, so a request that broke on the wire no longer has to be
+  restarted by typing something. The offer stands only while the failure is the
+  last thing said and nothing is running. `POST /retry` does the same over the
+  debug server.
 - A token badge is drawn on the blank row under its entry rather than over the last
   row of the text, so hovering a message no longer covers the words being read.
   Nothing reflows: the row was already there, between the entry and the next one.

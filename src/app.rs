@@ -636,13 +636,17 @@ impl App {
         true
     }
 
-    /// The release of a click that never moved: an entry with rows folded away expands
-    /// or collapses and any other pins its badge. Returns whether the screen needs a
-    /// redraw.
+    /// The release of a click that never moved: the failure the last turn ended on runs
+    /// that turn again, an entry with rows folded away expands or collapses and any
+    /// other pins its badge. Returns whether the screen needs a redraw.
     fn click_entry(&mut self, y: u16) -> bool {
         let Some(entry) = self.entry_at(y) else {
             return false;
         };
+        if self.retryable() == Some(entry) {
+            self.retry();
+            return true;
+        }
         let set = if self.folds.contains(&entry) {
             &mut self.expanded
         } else {
@@ -1277,6 +1281,25 @@ impl App {
         self.session.entries().push(entry);
     }
 
+    /// The entry a click would run the turn again on: the failure the last turn ended
+    /// on, and only while nothing is running and nothing has been said since.
+    fn retryable(&self) -> Option<usize> {
+        if self.working || self.inside.is_some() {
+            return None;
+        }
+        let entries = self.entries();
+        let last = entries.list.len().checked_sub(1)?;
+        matches!(entries.list.get(last), Some(Entry::Failed(_))).then_some(last)
+    }
+
+    /// Run the failed turn again, on the history the agent still holds.
+    fn retry(&mut self) {
+        self.follow = true;
+        if let Err(e) = self.session.retry() {
+            self.note(Entry::Error(e.to_string()));
+        }
+    }
+
     /// Answer the trust question. Yes records the project and lets it into the mode the
     /// config asked for; no leaves it in `ask`, and `/trust` can still change that later.
     fn answer_trust(&mut self, trust: bool) {
@@ -1541,6 +1564,55 @@ mod tests {
             ..moved(4)
         };
         assert!(app.on_mouse(wheel), "the wheel still scrolls");
+    }
+
+    #[test]
+    fn clicking_the_failure_the_turn_ended_on_runs_it_again() {
+        let (mut app, _user, mut control) = connected();
+        app.session()
+            .publish(Event::TurnFailed("request failed".to_string()));
+        app.on_event(Event::TurnEnd);
+        let last = app.entries().list.len() - 1;
+        assert!(matches!(
+            app.entries().list.last(),
+            Some(Entry::Failed(t)) if t == "request failed"
+        ));
+        app.rows = vec![(0..1, 0), (2..3, last)];
+
+        let click = |app: &mut App, row: u16| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                ..moved(row)
+            }) | app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                ..moved(row)
+            })
+        };
+        assert!(click(&mut app, 2));
+        assert!(
+            matches!(control.try_recv(), Ok(crate::agent::Control::Retry)),
+            "the click did not ask for a retry"
+        );
+        // Not a pin: the click ran the turn rather than marking the entry.
+        assert!(app.pinned.is_empty());
+
+        // While that turn runs there is nothing to run again, so the click pins as usual.
+        assert!(click(&mut app, 2));
+        assert!(app.pinned.contains(&last));
+        assert!(control.try_recv().is_err(), "a second retry went out");
+    }
+
+    #[test]
+    fn only_the_last_entry_is_the_one_a_click_runs_again() {
+        let mut app = App::detached();
+        app.session()
+            .publish(Event::TurnFailed("request failed".to_string()));
+        app.on_event(Event::TurnEnd);
+        let failed = app.entries().list.len() - 1;
+        assert_eq!(app.retryable(), Some(failed));
+        // Anything said since has moved the history on.
+        app.entries().push(Entry::User("never mind".to_string()));
+        assert_eq!(app.retryable(), None);
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {

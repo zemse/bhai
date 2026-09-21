@@ -108,6 +108,9 @@ pub enum Event {
         effort: String,
     },
     Error(String),
+    /// The turn failed rather than answering. The history still stands, so `retry` can
+    /// run the same turn again without the user retyping anything.
+    TurnFailed(String),
     Interrupted,
     TurnEnd,
 }
@@ -515,6 +518,22 @@ impl Session {
         Ok(())
     }
 
+    /// Run the last turn again, after it failed. Nothing is added to the history, so the
+    /// call goes out as the failed one did, and the user retypes nothing.
+    pub fn retry(&self) -> Result<(), SubmitError> {
+        let mut inner = self.lock();
+        if inner.working {
+            return Err(SubmitError::Busy);
+        }
+        self.cancel.store(false, Ordering::Relaxed);
+        self.tx_control
+            .try_send(Control::Retry)
+            .map_err(|_| SubmitError::Closed)?;
+        inner.working = true;
+        self.publish(Event::Info("retrying".to_string()));
+        Ok(())
+    }
+
     /// Drop the conversation: the agent's history and the transcript that showed it.
     /// Refused while a turn runs, since the turn holds the history it would drop.
     pub fn clear(&self) -> Result<(), SubmitError> {
@@ -632,6 +651,7 @@ impl Session {
             AgentEvent::Compacted(s) => Event::Compacted(s),
             AgentEvent::Cleared => Event::Cleared,
             AgentEvent::Error(s) => Event::Error(s),
+            AgentEvent::TurnFailed(s) => Event::TurnFailed(s),
             AgentEvent::TurnEnd => {
                 // The session keeps working while queued prompts wait behind the turn.
                 inner.working = !inner.queue.is_empty();

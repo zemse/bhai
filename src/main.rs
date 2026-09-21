@@ -790,7 +790,9 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
                     println!("[rate limit] {} {:.0}%", w.label(), w.used_percent);
                 }
             }
-            AgentEvent::Error(message) => println!("\n[error] {message}"),
+            AgentEvent::Error(message) | AgentEvent::TurnFailed(message) => {
+                println!("\n[error] {message}")
+            }
             AgentEvent::TurnEnd => break,
         }
     }

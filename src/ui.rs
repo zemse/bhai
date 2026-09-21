@@ -355,7 +355,10 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut folds = HashSet::new();
     for (index, entry) in entries.list.iter().enumerate() {
         let start = lines.len();
-        let rows = entry_lines(entry, width, app.expanded.contains(&index));
+        // Only the last entry can be run again: anything after it has moved the history
+        // on, and a turn of its own is already running.
+        let retryable = index + 1 == entries.list.len() && !app.working;
+        let rows = entry_lines(entry, width, app.expanded.contains(&index), retryable);
         lines.extend(rows.lines);
         joins.extend(rows.joins);
         if rows.folded {
@@ -587,7 +590,7 @@ struct Rows {
 
 /// An entry's rows plus a blank separator, and whether it has rows a click folds away.
 /// Thinking and long tool output show only a little of themselves unless `expanded`.
-fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Rows {
+fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> Rows {
     if let Entry::Assistant(text) = entry {
         let (mut lines, mut joins) = markdown::render(text, width);
         if lines.is_empty() {
@@ -614,7 +617,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Rows {
         Entry::Output(t) => ("", t, Style::new().fg(Color::Gray)),
         Entry::Running { tail, .. } => ("", tail.trim_end(), Style::new().fg(Color::Gray)),
         Entry::Rejected(t) => ("✗ ", t, Style::new().fg(Color::Red)),
-        Entry::Error(t) => ("! ", t, Style::new().fg(Color::Red).bold()),
+        Entry::Error(t) | Entry::Failed(t) => ("! ", t, Style::new().fg(Color::Red).bold()),
         Entry::Info(t) => ("", t, Style::new().fg(Color::DarkGray)),
     };
 
@@ -669,6 +672,15 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool) -> Rows {
                 true => format!("{indent}[collapse]"),
                 false => format!("{indent}[+{hidden} lines]"),
             },
+            Style::new().fg(Color::DarkGray),
+        )));
+        joins.push(Join::Newline);
+    }
+    // Said on a row of its own, the way a fold says what it hides, rather than inside the
+    // failure, which is the backend's words and is what a copy of the entry should carry.
+    if matches!(entry, Entry::Failed(_)) && retryable {
+        lines.push(Line::from(Span::styled(
+            format!("{indent}[click to retry]"),
             Style::new().fg(Color::DarkGray),
         )));
         joins.push(Join::Newline);
@@ -1133,6 +1145,31 @@ mod tests {
         // That row is outside the user block, so it does not carry its ground.
         let buffer = terminal.backend().buffer();
         assert_ne!(buffer[(buffer.area.width - 1, rows.end)].bg, USER_BG);
+    }
+
+    #[test]
+    fn a_failed_turn_offers_to_run_again_while_it_is_the_last_thing_said() {
+        let mut app = App::detached();
+        app.session()
+            .publish(Event::TurnFailed("request failed: no route".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("! request failed: no route"), "{shown}");
+        assert!(shown.contains("[click to retry]"), "{shown}");
+
+        // Not while that turn runs: there is nothing to run again until it is over.
+        app.working = true;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("[click to retry]"));
+
+        // Nor once anything has been said after it, which moves the history on.
+        app.working = false;
+        app.entries().push(Entry::User("never mind".to_string()));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("! request failed: no route"), "{shown}");
+        assert!(!shown.contains("[click to retry]"), "{shown}");
     }
 
     #[test]
