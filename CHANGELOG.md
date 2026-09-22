@@ -6,6 +6,15 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- A ```mermaid fence is drawn as a diagram rather than shown as its source. A model
+  asked to explain a flow reaches for mermaid, and what arrived was a dozen lines of
+  `A->>B` to read as text. `merman-core` parses it and `merman-ascii` lays it out as
+  box-drawing lines, for the diagram types it draws: sequence, flowchart, class, ER and
+  xychart. A diagram is art rather than text, so one too wide for the view is not drawn
+  at all: splitting box-drawing lines to fit leaves something worse to read than the
+  source, so the fence falls back to being a code block, and so does anything that does
+  not parse or is not a type merman draws. `mmd` is the same fence as `mermaid`.
+
 - Fenced code is coloured by syntect's grammars rather than by a lexer written here.
   The old one knew thirteen language groups and read each as a set of rules about what
   a comment, a string, a number and a keyword look like, which is most of the way there

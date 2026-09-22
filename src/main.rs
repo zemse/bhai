@@ -20,6 +20,7 @@ mod judge;
 mod limits;
 mod markdown;
 mod mcp;
+mod mermaid;
 mod models;
 mod ollama;
 mod palette;

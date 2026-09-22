@@ -5,6 +5,7 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::mermaid;
 use crate::syntax::{self, PLAIN};
 use crate::wrap::Join;
 
@@ -254,6 +255,12 @@ impl Renderer {
         let Some((lang, code)) = self.code.take() else {
             return;
         };
+        // Only the word before any attributes, which fences carry in several dialects.
+        let name = lang.split([' ', ',', '{', ':']).next().unwrap_or("").trim();
+        if mermaid::is_mermaid(name) && self.diagram(&code) {
+            self.gap = true;
+            return;
+        }
         if !lang.is_empty() {
             let cells: Vec<Cell> = lang.chars().map(|c| (c, DIM)).collect();
             let width = self.width.saturating_sub(self.prefix_width()).max(4);
@@ -289,6 +296,28 @@ impl Renderer {
             }
         }
         self.gap = true;
+    }
+
+    /// A mermaid fence drawn as a diagram, or `false` when it is to be shown as source.
+    /// A diagram is art rather than text: splitting a line of it to fit the view leaves
+    /// something worse to read than the source it was drawn from, so one too wide for
+    /// the view is not drawn at all.
+    fn diagram(&mut self, source: &str) -> bool {
+        let width = self
+            .width
+            .saturating_sub(self.prefix_width() + CODE_INDENT.len());
+        let Some(lines) = mermaid::render(source) else {
+            return false;
+        };
+        if lines.iter().any(|l| l.chars().count() > width) {
+            return false;
+        }
+        for line in lines {
+            let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, PLAIN)).collect();
+            row.extend(line.chars().map(|c| (c, PLAIN)));
+            self.emit(row, Join::Newline);
+        }
+        true
     }
 
     /// Tables as a grid, columns padded to line up. A cell too long for its column wraps
@@ -527,6 +556,37 @@ mod tests {
             text(&lines),
             vec!["text", "", "py", "  print(1)", "  x = ["]
         );
+    }
+
+    #[test]
+    fn a_mermaid_fence_is_drawn_rather_than_shown() {
+        let source = "```mermaid\nsequenceDiagram\n    A->>B: hello\n```";
+        let lines = lines(source, 80);
+        let drawn = text(&lines).join("\n");
+        // The diagram, not its source: no fence language line, no `->>`.
+        assert!(drawn.contains("hello"), "{drawn}");
+        assert!(!drawn.contains("->>"), "{drawn}");
+        assert!(!drawn.contains("sequenceDiagram"), "{drawn}");
+        assert!(
+            !text(&lines).iter().any(|l| l.trim() == "mermaid"),
+            "{drawn}"
+        );
+    }
+
+    #[test]
+    fn a_diagram_too_wide_for_the_view_is_shown_as_its_source() {
+        let source = "```mermaid\nsequenceDiagram\n    A->>B: hello\n```";
+        let lines = lines(source, 12);
+        let shown = text(&lines);
+        // Splitting box-drawing art reads worse than the source it was drawn from.
+        assert_eq!(shown[0], "mermaid");
+        assert!(shown.iter().any(|l| l.contains("->>")), "{shown:?}");
+    }
+
+    #[test]
+    fn a_mermaid_fence_that_does_not_parse_is_shown_as_its_source() {
+        let lines = lines("```mermaid\nnot a diagram\n```", 80);
+        assert_eq!(text(&lines), vec!["mermaid", "  not a diagram"]);
     }
 
     #[test]
