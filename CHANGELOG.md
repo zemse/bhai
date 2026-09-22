@@ -6,6 +6,15 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- The delegation section says what a child costs instead of asking for one. It read
+  "delegate read-heavy or specialised work to the cheapest fitting identity", which is
+  an instruction to delegate exactly the case the parent is already best at: it has read
+  the files, and the child has to find them again from nothing. "Cheapest" was not true
+  either, since an identity with no model of its own runs on the parent's, at the
+  parent's effort. It now says a child starts blind and is thrown away with its context,
+  so it is worth it only when it would read far more than it reports back, and that a
+  child is held to what the permission rules allow outright.
+
 - A child agent has a step budget. Nobody is watching a child: the user can interrupt
   the turn in front of them, but a child that has lost the thread reads and re-reads
   until the model gives up on its own, and a delegated look around a large repository

@@ -77,8 +77,13 @@ impl SystemPrompt {
         let start = self.text.len();
         self.text.push_str(
             "\n\n# Delegation\n\nThe `agent` tool runs a task in a child agent as one of these \
-identities. Delegate read-heavy or specialised work to the cheapest fitting identity; do \
-not delegate tightly coupled edits.\n",
+identities. A child starts with none of this conversation and is thrown away with its \
+context after, so it earns its cost only when it would read far more than it reports \
+back: what you have already read, or could read in a few calls, is cheaper to do here. \
+It is held to what the permission rules allow outright, so it may be refused a call you \
+would have been given. Pick the identity whose tools and skills fit the task; one with \
+no model of its own runs on yours, at your effort. Do not delegate edits that depend on \
+each other.\n",
         );
         for identity in listed {
             let _ = write!(self.text, "\n- {}: {}", identity.name, identity.description);

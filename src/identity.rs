@@ -660,7 +660,7 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         let identities = discover(&f.roots);
         let config = Config::default();
         let parent = build(&config, &f.roots, &general(), &identities);
-        assert!(parent.text.contains("cheapest fitting identity"));
+        assert!(parent.text.contains("# Delegation"));
         assert!(parent.text.ends_with("- general: Everything: all skills, tools and instructions, no extra prompt.\n- rust-engineer: Rust work"));
         assert!(!parent.text.contains("- router"));
         assert!(parent.agents_bytes > 0);
