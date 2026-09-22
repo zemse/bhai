@@ -587,8 +587,17 @@ fn dot_name(part: &str) -> bool {
     part.starts_with('.') && part != "." && part != ".."
 }
 
+/// Flags whose value is a pattern the command skips rather than a path it touches.
+/// `grep --exclude-dir=.git` names `.git` only to stay out of it.
+const SKIP_FLAGS: [&str; 2] = ["--exclude", "--exclude-dir"];
+
 fn protected_word(word: &str) -> bool {
     let lower = word.to_lowercase();
+    if let Some((flag, _)) = lower.split_once('=')
+        && SKIP_FLAGS.contains(&flag)
+    {
+        return false;
+    }
     let parts: Vec<&str> = lower.split(['/', '=', ':', ',']).collect();
     parts
         .iter()
@@ -984,6 +993,7 @@ mod tests {
             "cat /r/.git/config",
             "cat '.gi'\"t\"/HEAD",
             "grep x --file=.env",
+            "grep -r --include=.git x src",
             "ls ~/.config/bhai",
             "cat .bhai/config.toml",
             "cp x .bhai/settings.local.json",
@@ -999,6 +1009,9 @@ mod tests {
             "ls .github",
             "ls ../src/*.rs",
             "cat src/env.rs",
+            // An exclusion names the path to stay out of it, so it is not a mention.
+            "grep -RIn --exclude-dir=.git -E pat circuits docs",
+            "grep -r --exclude=.env x src",
         ] {
             assert!(!protected(input), "{input}");
         }

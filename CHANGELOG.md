@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- An exclusion is no longer read as a mention. `grep --exclude-dir=.git` names `.git`
+  only to stay out of it, but the protected-path check split every word on `=` and saw
+  the `.git` part, so the safest way to write the search was the one thing that made the
+  command the user's alone to approve, and in `auto` mode that is a denial with no way
+  through. The one command that avoided `.git` was refused while the one that walked into
+  it went by. `--exclude` and `--exclude-dir` now name a pattern the command skips rather
+  than a path it touches; `--include` and `--file` still name one it reads.
+
 - A table wider than the view keeps its columns. Each row was laid out as one padded
   string and then wrapped like a paragraph, so the moment a table did not fit, the
   overflow landed back at the left margin where it read as another row, and the columns
