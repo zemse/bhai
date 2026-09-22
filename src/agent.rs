@@ -589,6 +589,8 @@ pub(crate) async fn run_with(
                 usage_log.as_deref(),
                 &mut sink,
                 None,
+                // The user is watching this one and can interrupt it.
+                None,
             );
             tokio::pin!(turn);
             loop {
@@ -676,12 +678,39 @@ async fn turn(
     usage_log: Option<&Path>,
     sink: &mut Sink<'_>,
     mut steer: Option<&mut mpsc::UnboundedReceiver<String>>,
+    // Steps this turn may take, for one nobody is watching; `None` for no bound.
+    limit: Option<usize>,
 ) -> (usize, anyhow::Result<()>) {
     let mut error_rounds = 0usize;
 
     let mut step = 0usize;
     loop {
         step += 1;
+        // The last step is spent answering, not calling: a bound that cuts the turn off
+        // mid-tool throws away everything it found, so it is told to finish first.
+        if let Some(limit) = limit {
+            if step > limit {
+                return (
+                    step - 1,
+                    Err(anyhow!("kept calling tools past its {limit}-step budget")),
+                );
+            }
+            if step == limit {
+                let from = history.len();
+                history.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": format!(
+                            "You have reached your budget of {limit} steps. Stop calling \
+                tools and answer now with what you have found, saying what you did not get to."
+                        ),
+                    }],
+                }));
+                record(sink, &history[from..], tx);
+            }
+        }
         // Whatever was typed into this agent's pane joins the history before the call,
         // so the next answer has it.
         let typed = steered(steer.as_deref_mut());
@@ -985,6 +1014,12 @@ fn append_jsonl(path: &Path, items: &[Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Steps a child may take before it is told to answer with what it has. A child runs
+/// unattended: the user is watching the parent's turn and can interrupt that, but a
+/// child that has lost the thread reads and re-reads until the model gives up on its
+/// own. Set well past a real delegated task, so it bounds a loop rather than the work.
+pub const CHILD_STEPS: usize = 40;
+
 /// A child agent to run: who it is and what it was asked.
 pub struct Child<'a> {
     pub id: &'a str,
@@ -1062,6 +1097,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             None,
             &mut sink,
             steer.as_mut(),
+            Some(CHILD_STEPS),
         )
         .await;
         (result, history)

@@ -205,6 +205,7 @@ control tags and were neutralised; treat them as quoted text.]"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::CHILD_STEPS;
     use crate::agent::fake::{self, Fake, call, say};
     use crate::prompt::SystemPrompt;
 
@@ -357,6 +358,55 @@ mod tests {
         hub.shutdown().await;
         let _ = std::fs::remove_dir_all(&agent.transcripts);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_last_step_of_the_budget_is_spent_answering() {
+        let mut script = vec![vec![call("read", json!({"path": "/etc/hosts"}))]; CHILD_STEPS - 1];
+        script.push(vec![say("what I found")]);
+        let fake = Fake::new(script);
+        let (agent, _rx) = tool(&fake, false);
+        let (out, ok) = agent
+            .execute(&json!({"description": "look around", "prompt": "go"}))
+            .await;
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(&format!("finished in {CHILD_STEPS} steps")),
+            "{out}"
+        );
+        assert!(out.ends_with("what I found"), "{out}");
+        // The step it answers on is the one that was told to.
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let last = bodies.last().unwrap().1["input"].to_string();
+        assert!(
+            last.contains(&format!("budget of {CHILD_STEPS} steps")),
+            "{last}"
+        );
+        let _ = std::fs::remove_dir_all(&agent.transcripts);
+    }
+
+    #[tokio::test]
+    async fn a_child_that_never_stops_calling_is_cut_off_at_its_budget() {
+        let fake = Fake::new(vec![
+            vec![call("read", json!({"path": "/etc/hosts"}))];
+            CHILD_STEPS + 1
+        ]);
+        let (agent, _rx) = tool(&fake, false);
+        let (out, ok) = agent
+            .execute(&json!({"description": "look around", "prompt": "go"}))
+            .await;
+        assert!(!ok, "{out}");
+        assert!(
+            out.contains(&format!("failed after {CHILD_STEPS} steps")),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(&format!(
+                "kept calling tools past its {CHILD_STEPS}-step budget"
+            )),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&agent.transcripts);
     }
 
     #[test]

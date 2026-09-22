@@ -6,6 +6,16 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- A child agent has a step budget. Nobody is watching a child: the user can interrupt
+  the turn in front of them, but a child that has lost the thread reads and re-reads
+  until the model gives up on its own, and a delegated look around a large repository
+  has gone seventy steps and several million tokens of input doing it. A child now gets
+  forty steps, and the last one is spent answering rather than cut off mid-tool: at the
+  budget it is told to stop calling tools and say what it found and what it did not get
+  to, so the work up to there comes back instead of being thrown away. One that keeps
+  calling anyway ends as a failure naming the budget. The session's own turn is not
+  bounded.
+
 - An exclusion is no longer read as a mention. `grep --exclude-dir=.git` names `.git`
   only to stay out of it, but the protected-path check split every word on `=` and saw
   the `.git` part, so the safest way to write the search was the one thing that made the
