@@ -215,7 +215,8 @@ struct State {
     ledger: VecDeque<String>,
     /// Lines folded away so far, named in the line that replaces them.
     folded: usize,
-    /// One verdict per `tool` and target, so the same call is never judged twice.
+    /// One verdict per task and call, so the same call is never judged twice while the
+    /// task it was judged against still stands.
     cache: HashMap<String, Verdict>,
     /// Calls judged in the running turn.
     spent: usize,
@@ -311,11 +312,11 @@ impl Judge {
             return None;
         }
         // A target the summary would cut short is not judgeable: the judge would be ruling
-        // on a fragment, and a deny is cached for the session. No verdict instead.
+        // on a fragment, and a deny stands for the rest of the task. No verdict instead.
         if target.chars().count() > TARGET_CLIP {
             return None;
         }
-        let key = format!("{tool}\u{0}{target}");
+        let key = self.key(tool, target, detail);
         let request = {
             let mut state = self.lock();
             if let Some(verdict) = state.cache.get(&key) {
@@ -437,6 +438,16 @@ impl Judge {
         }
     }
 
+    /// What a verdict is remembered by. The task is part of it: a verdict is an answer
+    /// about a call *and* the task it was judged against, so the user's next message
+    /// puts a denied call to the judge again rather than being answered by the deny it
+    /// got under the task before. So is the detail, since the path alone is not the
+    /// call: two edits to one file are two different things to rule on.
+    fn key(&self, tool: &str, target: &str, detail: &str) -> String {
+        let task = &self.lock().task;
+        format!("{task}\u{0}{tool}\u{0}{target}\u{0}{detail}")
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -537,10 +548,17 @@ pub fn target(tool: &str, args: &Value, summary: &str) -> (String, String) {
     let first = |s: &str| clip(&s.lines().next().unwrap_or_default().replace('\t', " "), 80);
     match tool {
         "bash" => (text("command"), String::new()),
-        "write" => (
-            text("path"),
-            format!("{} bytes written", text("content").len()),
-        ),
+        "write" => {
+            let content = text("content");
+            (
+                text("path"),
+                format!(
+                    "{} bytes written, starting `{}`",
+                    content.len(),
+                    first(&content)
+                ),
+            )
+        }
         "edit" => (
             text("path"),
             format!(
@@ -842,7 +860,7 @@ mod tests {
     }
 
     /// A command too long to show the judge in full is asked, not judged, so a cached
-    /// deny can never make a legitimate long chain unapprovable for the session.
+    /// deny can never make a legitimate long chain unapprovable for the rest of the task.
     #[tokio::test]
     async fn an_over_long_command_skips_the_judge() {
         let (judge, backend) = judge(Answers::Verdict(approve("fine")), Path::new("/p"));
@@ -878,6 +896,58 @@ mod tests {
             ]
         );
         assert_eq!(calls[1].task, "add a unit test for the parser");
+    }
+
+    /// The one thing the user has left when a call is denied is to say so, and a verdict
+    /// remembered past the task it was given under takes that away: the same command is
+    /// refused with the old reason and the model is never even asked.
+    #[tokio::test]
+    async fn the_next_task_judges_a_denied_call_again() {
+        let (judge, backend) = judge(
+            Answers::Replies(vec![
+                r#"{"verdict":"deny","reason":"unrelated to the task"}"#.to_string(),
+                r#"{"verdict":"approve","reason":"the user asked for it"}"#.to_string(),
+            ]),
+            Path::new("/p"),
+        );
+        let call = "scrapebadger twitter users latest-tweets zemse";
+        assert!(matches!(
+            judge.decide("bash", call, "").await,
+            Some(Verdict::Deny { .. })
+        ));
+        // The same call under the same task is the one the cache is for.
+        assert!(matches!(
+            judge.decide("bash", call, "").await,
+            Some(Verdict::Deny { .. })
+        ));
+        assert_eq!(backend.calls.lock().unwrap().len(), 1);
+
+        judge.start_turn(&format!("yes, run `{call}`, I am asking you to"));
+        assert_eq!(
+            judge.decide("bash", call, "").await,
+            Some(approve("the user asked for it"))
+        );
+    }
+
+    /// A path is not a call: what is being written to it is the half the judge ruled on.
+    #[tokio::test]
+    async fn two_edits_to_one_file_are_two_decisions() {
+        let (judge, backend) = judge(
+            Answers::Replies(vec![
+                r#"{"verdict":"deny","reason":"that file is unrelated"}"#.to_string(),
+                r#"{"verdict":"approve","reason":"the test the task asked for"}"#.to_string(),
+            ]),
+            Path::new("/p"),
+        );
+        assert!(matches!(
+            judge.decide("edit", "/p/src/main.rs", "- a\n+ b").await,
+            Some(Verdict::Deny { .. })
+        ));
+        assert_eq!(
+            judge.decide("edit", "/p/src/main.rs", "- c\n+ d").await,
+            Some(approve("the test the task asked for"))
+        );
+        assert_eq!(backend.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1056,7 +1126,7 @@ mod tests {
         assert!(state.lines().starts_with(&before));
     }
 
-    /// A full summary around `target`: every list at its limit, a real task.    /// A full summary around `target`: every list at its limit, a real task.
+    /// A full summary around `target`: every list at its limit, a real task.
     fn realistic(target: &str) -> JudgeRequest {
         JudgeRequest {
             task: "the write tool truncates files over 64k, find out why and add a \

@@ -4,6 +4,15 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-09-22
+
+- A denied call is no longer denied for the rest of the session. The judge remembered
+  one verdict per call, so once something was refused, saying "yes, run that" got the
+  same refusal back with the old reason and the model was never asked again. A verdict
+  is now remembered against the task it was given under, so the next message judges the
+  call afresh. The detail is part of that too: two different edits to one file used to
+  share one verdict, and the first one decided both.
+
 ## 2026-09-21
 
 - A message from the model now carries a `⏺` in the left margin, and the whole of it
