@@ -33,6 +33,10 @@ use crate::wrap::Join;
 /// Lines a mouse wheel notch moves the transcript.
 const WHEEL_LINES: usize = 3;
 
+/// Most lines one tick of a selection drag held past the edge of the transcript moves it.
+/// A row past the edge is a line, so a small overshoot creeps and a big one travels.
+const EDGE_LINES: isize = 5;
+
 /// Presses on one cell this close together count as a double or triple click.
 const MULTI_CLICK: Duration = Duration::from_millis(400);
 
@@ -158,6 +162,11 @@ pub struct App {
     dragging: bool,
     /// A left drag that started in the input is selecting text.
     selecting: bool,
+    /// Where a transcript selection drag was last seen, while one is under way. The
+    /// terminal reports a drag only when the pointer moves, so a pointer held past the
+    /// edge has to be carried on by the tick, and a wheel turned mid-drag has to take
+    /// the selection with it.
+    drag_at: Option<(u16, u16)>,
     /// Plain text of each wrapped transcript line, filled in by the renderer.
     pub lines: Vec<String>,
     /// How each of those lines joins the one above it, so a copy can undo the wrapping.
@@ -257,6 +266,7 @@ impl App {
             scrollbar: None,
             dragging: false,
             selecting: false,
+            drag_at: None,
             lines: Vec::new(),
             joins: Vec::new(),
             transcript_area: None,
@@ -546,8 +556,8 @@ impl App {
             return diff_mouse(diff, mouse);
         }
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_by(-(WHEEL_LINES as isize)),
-            MouseEventKind::ScrollDown => self.scroll_by(WHEEL_LINES as isize),
+            MouseEventKind::ScrollUp => self.wheel(-(WHEEL_LINES as isize)),
+            MouseEventKind::ScrollDown => self.wheel(WHEEL_LINES as isize),
             MouseEventKind::Moved => {
                 self.mouse_row = Some(mouse.row);
                 let at = Position::new(mouse.column, mouse.row);
@@ -571,6 +581,7 @@ impl App {
                 self.dragging = false;
                 self.selecting = false;
                 self.anchor = None;
+                self.drag_at = None;
                 // A press and release on one cell is a click, not a drag.
                 let clicked = self.press.take() == Some((mouse.column, mouse.row));
                 if selecting && !clicked {
@@ -682,19 +693,73 @@ impl App {
         count
     }
 
-    /// Extend the transcript selection to the cell under the pointer.
-    /// Returns whether the screen needs a redraw.
+    /// The transcript cell a drag is over, with the pointer allowed to be outside the
+    /// transcript: a drag is how a selection runs past what is on screen, so above the
+    /// transcript is the top line in view and below it the bottom one. Past the bottom
+    /// takes the whole line and past the top takes none of it, so the lines a drag has
+    /// travelled over are the ones it holds.
+    fn drag_cell(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        let area = self.transcript_area?;
+        let last = self.lines.len().checked_sub(1)?;
+        let row = y.clamp(area.y, area.bottom().saturating_sub(1));
+        let line = (self.scroll + (row - area.y) as usize).min(last);
+        let column = match y {
+            _ if y < area.y => 0,
+            _ if y >= area.bottom() => self.lines[line].chars().count(),
+            _ => x.clamp(area.x, area.right()).saturating_sub(area.x) as usize,
+        };
+        Some((line, column))
+    }
+
+    /// Lines to scroll for a pointer this far past the edge of the transcript, away from
+    /// the view it left. Zero while it is inside, where each drag event says enough on
+    /// its own.
+    fn edge_scroll(&self, y: u16) -> isize {
+        let Some(area) = self.transcript_area else {
+            return 0;
+        };
+        match y {
+            _ if y < area.y => -(((area.y - y) as isize).min(EDGE_LINES)),
+            _ if y >= area.bottom() => ((y + 1 - area.bottom()) as isize).min(EDGE_LINES),
+            _ => 0,
+        }
+    }
+
+    /// Scroll the transcript, taking a selection drag under way with it: the pointer has
+    /// not moved, so the cell under it is whatever the wheel has just brought there.
+    fn wheel(&mut self, delta: isize) {
+        self.scroll_by(delta);
+        if let Some((x, y)) = self.drag_at {
+            self.extend_selection(x, y, 0);
+        }
+    }
+
+    /// Extend the transcript selection to the cell under the pointer, scrolling the view
+    /// when the pointer has left it. Returns whether the screen needs a redraw.
     fn drag_selection(&mut self, x: u16, y: u16) -> bool {
         // A drag reported on the press cell has not moved yet, so it is still a click.
         if self.press == Some((x, y)) {
             return false;
         }
         self.press = None;
-        let (Some(anchor), Some(head)) = (self.anchor, self.cell_at(x, y)) else {
-            return false;
+        self.drag_at = Some((x, y));
+        let step = self.edge_scroll(y);
+        self.extend_selection(x, y, step)
+    }
+
+    /// Scroll by `step` and take the selection to where that leaves the pointer.
+    /// Returns whether the screen needs a redraw.
+    fn extend_selection(&mut self, x: u16, y: u16, step: isize) -> bool {
+        let before = self.scroll;
+        if step != 0 {
+            self.scroll_by(step);
+        }
+        let scrolled = self.scroll != before;
+        let (Some(anchor), Some(head)) = (self.anchor, self.drag_cell(x, y)) else {
+            return scrolled;
         };
         let selection = Some(Selection { anchor, head });
-        std::mem::replace(&mut self.selection, selection) != selection
+        std::mem::replace(&mut self.selection, selection) != selection || scrolled
     }
 
     /// The selected transcript text, trailing spaces trimmed. Rows the wrap broke go
@@ -924,6 +989,11 @@ impl App {
     pub fn tick(&mut self) {
         if self.working {
             self.spinner = self.spinner.wrapping_add(1);
+        }
+        // A selection drag still held past the edge of the transcript, which the
+        // terminal has nothing more to say about until the pointer moves again.
+        if let Some((x, y)) = self.drag_at.filter(|&(_, y)| self.edge_scroll(y) != 0) {
+            self.extend_selection(x, y, self.edge_scroll(y));
         }
         // The backends answer on a task of their own; this is where the picker hears.
         if let Some(picker) = &mut self.picker {
@@ -2024,6 +2094,93 @@ mod tests {
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.selection, None, "esc clears it");
         assert_eq!(app.copy_text(), "", "back to the empty input");
+    }
+
+    /// A transcript taller than the view it is drawn in, with a row above it so both
+    /// edges can be dragged past.
+    fn scrolled(lines: usize, height: u16) -> App {
+        let mut app = App::detached();
+        app.lines = (0..lines).map(|i| format!("line {i}")).collect();
+        app.transcript_area = Some(Rect::new(0, 1, 40, height));
+        app.max_scroll = lines - height as usize;
+        app.follow = false;
+        app
+    }
+
+    /// The whole point of a drag: the text worth copying is usually longer than the
+    /// window, and a selection that stopped at the bottom row could never reach it.
+    #[test]
+    fn a_drag_past_the_bottom_edge_scrolls_and_keeps_selecting() {
+        let mut app = scrolled(20, 4);
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 0, 1));
+        // One row below the transcript: the view follows, and the line it lands on is
+        // taken whole, since the drag has travelled over it.
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 0, 5));
+        assert_eq!(app.scroll, 1);
+        assert_eq!(
+            app.selected_text().as_deref(),
+            Some("line 0\nline 1\nline 2\nline 3\nline 4")
+        );
+
+        // Held there, the pointer says nothing more, so the tick carries it on.
+        app.tick();
+        assert_eq!(app.scroll, 2);
+        assert!(app.selected_text().unwrap().ends_with("line 5"));
+        for _ in 0..40 {
+            app.tick();
+        }
+        assert_eq!(app.scroll, app.max_scroll, "it stops at the end");
+        assert!(app.selected_text().unwrap().ends_with("line 19"));
+
+        // The release ends it: the tick has nothing left to carry.
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 0, 5));
+        let (scroll, selected) = (app.scroll, app.selected_text());
+        app.tick();
+        assert_eq!((app.scroll, app.selected_text()), (scroll, selected));
+    }
+
+    #[test]
+    fn a_drag_past_the_top_edge_scrolls_back_up() {
+        let mut app = scrolled(20, 4);
+        app.scroll = 10;
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 6, 2));
+        // Above the transcript: the top line in view, and none of it, so the drag holds
+        // what it has passed over rather than the line it is heading into.
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 0, 0));
+        assert_eq!(app.scroll, 9);
+        assert_eq!(
+            app.selected_text().as_deref(),
+            Some("line 9\nline 10\nline 11")
+        );
+        app.tick();
+        assert_eq!(app.scroll, 8);
+        assert_eq!(
+            app.selected_text().as_deref(),
+            Some("line 8\nline 9\nline 10\nline 11")
+        );
+    }
+
+    /// The other way to reach text that is off screen, for anyone who would rather
+    /// scroll than hold the pointer past the edge.
+    #[test]
+    fn the_wheel_takes_a_running_drag_with_it() {
+        let mut app = scrolled(20, 4);
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 0, 1));
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 6, 2));
+        assert_eq!(app.selected_text().as_deref(), Some("line 0\nline 1"));
+        app.on_mouse(at(MouseEventKind::ScrollDown, 6, 2));
+        assert_eq!(app.scroll, 3);
+        // The pointer has not moved, so the head is whatever the wheel brought under it.
+        assert_eq!(
+            app.selected_text().as_deref(),
+            Some("line 0\nline 1\nline 2\nline 3\nline 4")
+        );
+        // With no drag under way the wheel only scrolls.
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 6, 2));
+        let selected = app.selected_text();
+        app.on_mouse(at(MouseEventKind::ScrollDown, 6, 2));
+        assert_eq!(app.scroll, 6);
+        assert_eq!(app.selected_text(), selected);
     }
 
     #[test]

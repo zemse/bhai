@@ -6,6 +6,16 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- A drag can select more than one screenful. The selection was always anchored to the
+  wrapped transcript rather than to the screen, but nothing scrolled the view while the
+  button was down, so a selection could never reach past the rows in front of it, which
+  is exactly the case where selecting by hand is worth anything. Dragging past the top
+  or bottom edge now scrolls the transcript and keeps selecting, a line for each row
+  past the edge and up to five, and it carries on while the pointer is held there rather
+  than stopping the moment it stops moving. The wheel takes a running drag with it too.
+  Past the bottom edge takes the line it lands on whole and past the top takes none of
+  it, so a drag holds the lines it has travelled over.
+
 - The terminal's title says where the session is and what it is doing: the project
   directory on its own until the first message, then the directory and a few words on
   the work, as `bhai · fix the judge cache`. A tab is narrow and keeps the end of what
