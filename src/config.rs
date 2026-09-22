@@ -35,6 +35,8 @@ pub struct Config {
     pub auto_project_commands: bool,
     /// `judge*`: the auto-approval judge, which only ever runs in `auto`.
     pub judge: crate::judge::Settings,
+    /// `title`: name the session for the terminal's title, which is one small call.
+    pub title: bool,
     /// Rules from Claude Code's `settings.json` files.
     pub import_claude_permissions: bool,
     /// When history is compacted: `context_window` and `compact_at`.
@@ -58,6 +60,7 @@ impl Default for Config {
             auto_project_writes: true,
             auto_project_commands: true,
             judge: crate::judge::Settings::default(),
+            title: true,
             import_claude_permissions: true,
             limits: Limits::default(),
             choice: crate::client::Choice::default(),
@@ -131,6 +134,7 @@ struct Layer {
     judge_effort: Option<String>,
     judge_timeout_ms: Option<u64>,
     judge_max_per_turn: Option<usize>,
+    title: Option<bool>,
     import_claude_permissions: Option<bool>,
     model: Option<String>,
     effort: Option<String>,
@@ -262,6 +266,7 @@ impl Config {
             (&mut self.auto_project_writes, layer.auto_project_writes),
             (&mut self.auto_project_commands, layer.auto_project_commands),
             (&mut self.judge.on, layer.judge),
+            (&mut self.title, layer.title),
             (
                 &mut self.import_claude_permissions,
                 layer.import_claude_permissions,

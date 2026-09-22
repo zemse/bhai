@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- The terminal's title says where the session is and what it is doing: the project
+  directory on its own until the first message, then the directory and a few words on
+  the work, as `bhai · fix the judge cache`. A tab is narrow and keeps the end of what
+  it cannot fit, so the words go last and the directory is what gets cut. One small
+  model call names the session, off its first message and never again: a title that
+  changed under you every turn would be worse than one a little behind. `title = false`
+  turns it off, and a run with no terminal (`--headless`, `--workflow`) never asks.
+
 - `--judge-eval` scores the shapes the judge was getting wrong. Every case it shipped
   with was a single message stating the whole task, so it read 29 of 29 while real
   sessions were denying work the user had asked for one message earlier. Ten cases now

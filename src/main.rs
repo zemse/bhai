@@ -31,6 +31,7 @@ mod sessions;
 mod skills;
 mod speed;
 mod syntax;
+mod title;
 mod tokens;
 mod tools;
 mod ui;
@@ -144,6 +145,7 @@ async fn main() -> Result<()> {
         delegation,
         limits,
         judge,
+        title: titled,
         choice,
     } = load(args.flags, &name).await?;
     let hub = prompt.mcp.clone();
@@ -264,7 +266,17 @@ allow it.",
     let session_id = saved.writer.header.session.clone();
     let ollama_url = client.ollama_url().to_string();
     let (session, events) = start(
-        client, prompt, policy, judge, usage_log, delegation, saved, limits,
+        client,
+        prompt,
+        policy,
+        judge,
+        // Only the terminal shows a title, so a run with no terminal does not pay for
+        // one: `--headless` and `--workflow` both end without ever drawing a frame.
+        titled && !args.headless && args.workflow.is_none(),
+        usage_log,
+        delegation,
+        saved,
+        limits,
     );
     // `--workflow` is a run of its own: no TUI, no turn, just the steps and their report.
     if let Some((name, input)) = args.workflow.clone() {
@@ -291,6 +303,8 @@ allow it.",
     }
 
     let terminal = ratatui::init();
+    // The terminal keeps the title it had, for as far as it is willing to put it back.
+    title::push();
     // Mouse capture is what turns the wheel into scroll events. It also takes over
     // click-drag, so terminals need shift (or option) held to select text while bhai runs.
     let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
@@ -308,6 +322,7 @@ allow it.",
     let crashed = (dir.clone(), session_id.clone());
     std::panic::set_hook(Box::new(move |info| {
         release_modes(mouse, paste, keyboard);
+        title::pop();
         hook(info);
         if let Some(hint) = sessions::exit_hint(&crashed.0, &crashed.1) {
             eprint!("{hint}");
@@ -333,6 +348,7 @@ allow it.",
     )
     .await;
     release_modes(mouse, paste, keyboard);
+    title::pop();
     ratatui::restore();
     shutdown(hub).await;
     if let Some(hint) = sessions::exit_hint(&dir, &session_id) {
@@ -406,6 +422,8 @@ struct Setup {
     delegation: Delegation,
     limits: Limits,
     judge: judge::Settings,
+    /// `title`: whether the session is named for the terminal's title.
+    title: bool,
     /// The model the config asks for, before the identity and the flags have their say.
     choice: client::Choice,
 }
@@ -437,6 +455,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     };
     let limits = config.limits;
     let judge = config.judge.clone();
+    let titled = config.title;
     let choice = config.choice.clone();
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
@@ -446,6 +465,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
         delegation,
         limits,
         judge,
+        title: titled,
         choice,
     })
 }
@@ -593,6 +613,7 @@ fn start(
     prompt: SystemPrompt,
     policy: Policy,
     settings: judge::Settings,
+    titled: bool,
     usage_log: Option<PathBuf>,
     delegation: Delegation,
     saved: Saved,
@@ -605,12 +626,22 @@ fn start(
     let policy = Arc::new(policy);
     // Built whatever the mode is, since `shift+tab` cycles into `auto` mid-session; the
     // policy is what decides that a call may reach it at all.
+    let settings_model = settings.model.clone();
     let judge = settings.on.then(|| {
         let backend = Arc::new(ModelJudge::new(client.clone(), &settings));
         let root = std::env::current_dir().unwrap_or_default();
         Arc::new(
             Judge::new(backend, root, settings).with_log(profile::debug_dir().join("judge.jsonl")),
         )
+    });
+    // One small call names the session for the terminal's title. It is not the judge's
+    // model: the cheapest one on the backend can write four words.
+    let namer: Option<Arc<dyn title::Name>> = titled.then(|| {
+        Arc::new(title::ModelNamer::new(
+            client.clone(),
+            settings_model.clone(),
+            "low",
+        )) as Arc<dyn title::Name>
     });
     let session = Session::new(
         client.model().to_string(),
@@ -634,6 +665,7 @@ fn start(
         prompt,
         policy,
         judge,
+        namer,
         rx_user,
         rx_control,
         tx_agent,
@@ -716,6 +748,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
         system,
         Arc::new(Policy::default()),
         None,
+        None,
         rx_user,
         rx_control,
         tx_agent,
@@ -772,6 +805,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
                 println!("\n[cache break] {}: {}", found.field, found.detail)
             }
             AgentEvent::Judging(Some(call)) => println!("[judging] {call}"),
+            AgentEvent::Titled(name) => println!("[title] {name}"),
             AgentEvent::Cache(None)
             | AgentEvent::Call(_)
             | AgentEvent::Item(_)
@@ -1034,6 +1068,9 @@ async fn run(
             .push(app::Entry::Info(format!("debug server on http://{addr}")));
         tokio::spawn(server::serve(listener, session));
     }
+    // The tab says where the session is running until the model says what it is doing.
+    let root = std::env::current_dir().unwrap_or_default();
+    title::set(&title::compose(&root, None));
     // Mouse motion arrives in floods, so it only redraws when the hover changes.
     let mut dirty = true;
     let mut captured = mouse;
@@ -1055,6 +1092,11 @@ async fn run(
                 true
             }
             Event::Session(event) => {
+                // The terminal is written to from the thread that draws it, never from
+                // the task that named the session.
+                if let session::Event::Titled(name) = &event {
+                    title::set(&title::compose(&root, Some(name)));
+                }
                 app.on_event(event);
                 true
             }

@@ -23,6 +23,7 @@ use crate::permissions::{Answer, Decision, Mode, Offers, Policy};
 use crate::profile::{self, Call, CallTokens, Profile};
 use crate::prompt::SystemPrompt;
 use crate::sessions::{self, Writer};
+use crate::title::Name;
 use crate::tokens;
 use crate::tools::{self, BoxFuture, Registry};
 use crate::workflow::{self, Workflow};
@@ -105,6 +106,10 @@ pub enum AgentEvent {
     /// through, or a tool broke the loop. The history still stands, so the same turn can
     /// be run again without the user retyping anything.
     TurnFailed(String),
+    /// What this session is working on, in a few words, for the terminal's title. It
+    /// arrives once, a moment after the first message, and only the TUI does anything
+    /// with it.
+    Titled(String),
     /// The agent is done with this turn and is waiting for input.
     TurnEnd,
 }
@@ -312,13 +317,15 @@ impl<'a> From<Option<&'a Path>> for Sink<'a> {
 
 /// `usage_log` is the JSONL file each model call's usage is appended to, if any.
 /// `saved` persists the session and holds the history it resumes from. `limits` say
-/// when history is compacted. `judge` decides the calls `auto` mode would prompt for.
+/// when history is compacted. `judge` decides the calls `auto` mode would prompt for,
+/// and `namer` says in a few words what the session is doing, for the terminal's title.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: Client,
     prompt: SystemPrompt,
     policy: Arc<Policy>,
     judge: Option<Arc<Judge>>,
+    namer: Option<Arc<dyn Name>>,
     rx_user: mpsc::Receiver<String>,
     rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
@@ -331,8 +338,8 @@ pub async fn run(
     let session_id = client.session_id().to_string();
     let model: Arc<dyn Model> = Arc::new(client);
     run_with(
-        model, session_id, prompt, policy, judge, rx_user, rx_control, tx, cancel, usage_log,
-        delegation, saved, limits,
+        model, session_id, prompt, policy, judge, namer, rx_user, rx_control, tx, cancel,
+        usage_log, delegation, saved, limits,
     )
     .await;
 }
@@ -345,6 +352,7 @@ pub(crate) async fn run_with(
     prompt: SystemPrompt,
     policy: Arc<Policy>,
     judge: Option<Arc<Judge>>,
+    mut namer: Option<Arc<dyn Name>>,
     mut rx_user: mpsc::Receiver<String>,
     mut rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
@@ -536,6 +544,18 @@ pub(crate) async fn run_with(
             // The judge decides against the task just given, with a fresh budget.
             if let Some(judge) = &judge {
                 judge.start_turn(message);
+            }
+            // The session is named once, off its first message: a title that changed
+            // under the user every turn would be worse than one that is a little stale,
+            // and naming is a model call. It runs beside the turn rather than in front
+            // of it, since nothing waits on a tab title.
+            if let Some(namer) = namer.take() {
+                let (tx, message) = (tx.clone(), message.clone());
+                tokio::spawn(async move {
+                    if let Some(name) = namer.name(&message).await {
+                        let _ = tx.send(AgentEvent::Titled(name));
+                    }
+                });
             }
             // `Session::submit` clears `cancel` before sending, so an early interrupt
             // holds.
@@ -1076,6 +1096,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::Item(_)
                 // A child's calls never reach the judge, so this cannot arrive.
                 | AgentEvent::Judging(_)
+                // The terminal is titled by the session, not by a child of one turn of it.
+                | AgentEvent::Titled(_)
                 | AgentEvent::Compacted(_)
                 | AgentEvent::Cleared => continue,
                 // An approval is modal, so it is answered where every other one is,
@@ -1664,6 +1686,7 @@ mod tests {
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(Policy::default()),
             None,
+            None,
             rx_user,
             rx_control,
             tx,
@@ -1764,6 +1787,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(policy),
+            None,
             None,
             rx_user,
             rx_control,
@@ -2018,6 +2042,7 @@ mod tests {
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(policy),
             Some(Arc::clone(&judge)),
+            None,
             rx_user,
             rx_control,
             tx,
@@ -2165,6 +2190,56 @@ mod tests {
         }
     }
 
+    /// The terminal's title is named once, off the session's first message. A title
+    /// that changed under the user every turn would be worse than a slightly stale one,
+    /// and each one is a model call.
+    #[tokio::test]
+    async fn the_session_is_named_once_off_its_first_message() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![vec![say("one")], vec![say("two")]]);
+        let namer = crate::title::fake::Namer::new(Some("fix the judge cache"));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            Some(namer.clone()),
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+
+        let mut events = drive(&tx_user, &mut rx, &cancel, "fix the judge cache", &[]).await;
+        events.extend(drive(&tx_user, &mut rx, &cancel, "now the budget", &[]).await);
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let named: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Titled(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named, ["fix the judge cache"]);
+        // Named off the first message, and not asked again on the second.
+        assert_eq!(
+            *namer.asked.lock().unwrap(),
+            ["fix the judge cache".to_string()]
+        );
+    }
+
     /// A spent budget is not a judge that looked at the call: the agent is told which
     /// it was, so it can say what happened rather than keep rewording the same call.
     #[tokio::test]
@@ -2283,6 +2358,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             policy,
+            None,
             None,
             rx_user,
             rx_control,
@@ -2410,6 +2486,7 @@ mod tests {
             prompt(),
             Arc::clone(&policy),
             None,
+            None,
             rx_user,
             rx_control,
             tx,
@@ -2532,6 +2609,7 @@ mod tests {
             prompt(),
             Arc::clone(&policy),
             None,
+            None,
             rx_user,
             rx_control,
             tx,
@@ -2617,6 +2695,7 @@ mod tests {
                 crate::prompt::system_prompt(&[], Vec::new()),
                 Arc::new(Policy::default()),
                 None,
+                None,
                 rx_user,
                 rx_control,
                 tx,
@@ -2694,6 +2773,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(policy),
+            None,
             None,
             rx_user,
             rx_control,
@@ -2792,6 +2872,7 @@ mod tests {
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(Policy::default()),
             None,
+            None,
             rx_user,
             rx_control,
             tx,
@@ -2827,6 +2908,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(Policy::default()),
+            None,
             None,
             rx_user,
             rx_control,
@@ -2895,6 +2977,7 @@ mod tests {
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(Policy::default()),
             None,
+            None,
             rx_user,
             rx_control,
             tx,
@@ -2948,6 +3031,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(Policy::default()),
+            None,
             None,
             rx_user,
             rx_control,
@@ -3004,6 +3088,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(policy),
+            None,
             None,
             rx_user,
             rx_control,
@@ -3090,6 +3175,7 @@ mod tests {
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
             Arc::new(policy),
+            None,
             None,
             rx_user,
             rx_control,

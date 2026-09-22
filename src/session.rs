@@ -28,6 +28,9 @@ const EVENT_BUFFER: usize = 4096;
 pub enum Event {
     /// A user message was accepted and a turn started.
     User(String),
+    /// What this session is working on, in a few words. The TUI puts it in the
+    /// terminal's title; nothing else has a use for it.
+    Titled(String),
     /// A user message typed while a turn ran; it waits at `position` in the queue.
     Queued {
         position: usize,
@@ -648,6 +651,7 @@ impl Session {
             AgentEvent::Streaming(on) => Event::Streaming(on),
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Judging(what) => Event::Judging(what),
+            AgentEvent::Titled(name) => Event::Titled(name),
             AgentEvent::Compacted(s) => Event::Compacted(s),
             AgentEvent::Cleared => Event::Cleared,
             AgentEvent::Error(s) => Event::Error(s),

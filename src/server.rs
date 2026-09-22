@@ -462,6 +462,7 @@ mod tests {
             crate::prompt::system_prompt(&[], Vec::new()),
             policy,
             None,
+            None,
             rx_user,
             rx_control,
             tx_agent,
