@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- The judge is told what the user asked before this message, not only the message it is
+  judging against. A goal is stated once and then referred to: "now do the same for the
+  other file", or a question about which tool to use, says nothing on its own, and a
+  judge reading the latest sentence as the whole task denied the step the earlier
+  message had asked for. The last three messages now sit beside the task, where a fold
+  of the ledger cannot take them away.
+
 - A denied call is no longer denied for the rest of the session. The judge remembered
   one verdict per call, so once something was refused, saying "yes, run that" got the
   same refusal back with the old reason and the model was never asked again. A verdict
