@@ -12,7 +12,10 @@ carries the shape of what is there.
   is exactly the case where selecting by hand is worth anything. Dragging past the top
   or bottom edge now scrolls the transcript and keeps selecting, a line for each row
   past the edge and up to five, and it carries on while the pointer is held there rather
-  than stopping the moment it stops moving. The wheel takes a running drag with it too.
+  than stopping the moment it stops moving. Reaching the first or last row in view is
+  enough to start it, since that is where a drag runs out of transcript, and the further
+  out the pointer goes the faster the view moves. The wheel takes a running drag with it
+  too, and `ctrl+a` with nothing drafted takes the whole transcript in one go.
   Past the bottom edge takes the line it lands on whole and past the top takes none of
   it, so a drag holds the lines it has travelled over.
 

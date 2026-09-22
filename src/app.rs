@@ -424,6 +424,9 @@ impl App {
             KeyCode::Char('y') if ctrl => self.copy(),
             KeyCode::Char('v') if ctrl => self.paste(),
             KeyCode::Char('a') if ctrl && !self.input.is_empty() => self.input.select_all(),
+            // With nothing drafted there is nothing in the prompt to take, so ctrl+a
+            // reaches past it to the transcript, which is the thing worth taking whole.
+            KeyCode::Char('a') if ctrl => self.select_transcript(),
             KeyCode::BackTab => {
                 let mode = self.session.cycle_mode();
                 // The only mode on offer in an untrusted project is `ask`, so say why.
@@ -711,18 +714,33 @@ impl App {
         Some((line, column))
     }
 
-    /// Lines to scroll for a pointer this far past the edge of the transcript, away from
-    /// the view it left. Zero while it is inside, where each drag event says enough on
-    /// its own.
+    /// Lines to scroll for a selection drag at this row, away from the edge it is on.
+    /// Reaching the first or last row in view is enough to start it, since that is where
+    /// a drag runs out of transcript; a row is a line, so the further past the edge the
+    /// pointer goes the faster the view moves under it.
     fn edge_scroll(&self, y: u16) -> isize {
         let Some(area) = self.transcript_area else {
             return 0;
         };
+        let last = area.bottom().saturating_sub(1);
         match y {
-            _ if y < area.y => -(((area.y - y) as isize).min(EDGE_LINES)),
-            _ if y >= area.bottom() => ((y + 1 - area.bottom()) as isize).min(EDGE_LINES),
+            _ if y <= area.y => -((1 + (area.y - y) as isize).min(EDGE_LINES)),
+            _ if y >= last => (1 + (y - last) as isize).min(EDGE_LINES),
             _ => 0,
         }
+    }
+
+    /// `ctrl+a` with nothing drafted: the whole transcript, from its first cell to the
+    /// last cell of its last line. Only the part in view is highlighted; `ctrl+y` takes
+    /// the lot.
+    fn select_transcript(&mut self) {
+        let Some(last) = self.lines.len().checked_sub(1) else {
+            return;
+        };
+        self.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (last, self.lines[last].chars().count()),
+        });
     }
 
     /// Scroll the transcript, taking a selection drag under way with it: the pointer has
@@ -2113,19 +2131,19 @@ mod tests {
     fn a_drag_past_the_bottom_edge_scrolls_and_keeps_selecting() {
         let mut app = scrolled(20, 4);
         app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 0, 1));
-        // One row below the transcript: the view follows, and the line it lands on is
+        // One row below the transcript: two lines a step, and the line it lands on is
         // taken whole, since the drag has travelled over it.
         app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 0, 5));
-        assert_eq!(app.scroll, 1);
+        assert_eq!(app.scroll, 2);
         assert_eq!(
             app.selected_text().as_deref(),
-            Some("line 0\nline 1\nline 2\nline 3\nline 4")
+            Some("line 0\nline 1\nline 2\nline 3\nline 4\nline 5")
         );
 
         // Held there, the pointer says nothing more, so the tick carries it on.
         app.tick();
-        assert_eq!(app.scroll, 2);
-        assert!(app.selected_text().unwrap().ends_with("line 5"));
+        assert_eq!(app.scroll, 4);
+        assert!(app.selected_text().unwrap().ends_with("line 7"));
         for _ in 0..40 {
             app.tick();
         }
@@ -2147,17 +2165,56 @@ mod tests {
         // Above the transcript: the top line in view, and none of it, so the drag holds
         // what it has passed over rather than the line it is heading into.
         app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 0, 0));
-        assert_eq!(app.scroll, 9);
-        assert_eq!(
-            app.selected_text().as_deref(),
-            Some("line 9\nline 10\nline 11")
-        );
-        app.tick();
         assert_eq!(app.scroll, 8);
         assert_eq!(
             app.selected_text().as_deref(),
             Some("line 8\nline 9\nline 10\nline 11")
         );
+        app.tick();
+        assert_eq!(app.scroll, 6);
+        assert!(app.selected_text().unwrap().starts_with("line 6\n"));
+    }
+
+    /// A drag runs out of transcript at the last row in view, not at the edge of the
+    /// window, so that is where it starts pulling more of it into view.
+    #[test]
+    fn the_last_row_in_view_scrolls_without_leaving_the_transcript() {
+        let mut app = scrolled(20, 4);
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 0, 1));
+        // Row 4 is the last of the four in view, and the pointer is still inside it.
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 6, 4));
+        assert_eq!(app.scroll, 1, "one line, the plain rate");
+        app.tick();
+        app.tick();
+        assert_eq!(app.scroll, 3);
+        assert!(app.selected_text().unwrap().ends_with("line 6"));
+
+        // The first row does the same the other way, and a row in between does nothing.
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 6, 1));
+        assert_eq!(app.scroll, 2);
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 6, 2));
+        let scroll = app.scroll;
+        app.tick();
+        assert_eq!(app.scroll, scroll, "the middle of the view holds still");
+    }
+
+    #[test]
+    fn ctrl_a_takes_the_whole_transcript_when_nothing_is_drafted() {
+        let mut app = scrolled(4, 2);
+        app.on_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.copy_text(),
+            "line 0\nline 1\nline 2\nline 3",
+            "every line, not the two in view"
+        );
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.selection, None);
+
+        // A draft in the prompt is what ctrl+a is for while there is one.
+        app.input.set("half a thought".to_string());
+        app.on_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.selection, None, "the transcript is left alone");
+        assert_eq!(app.copy_text(), "half a thought");
     }
 
     /// The other way to reach text that is off screen, for anyone who would rather

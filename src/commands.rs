@@ -226,7 +226,8 @@ pub fn help() -> String {
         "\n  ctrl+c interrupt, then quit · ctrl+d quit on an empty prompt",
         "\n  up and down walk the prompt history · tab takes the grey completion",
         "\n  wheel, pgup/pgdn or ctrl+up/down scroll · click a tool output to expand it",
-        "\n  drag selects · ctrl+y copies · ctrl+v pastes · ctrl+t shows every badge",
+        "\n  drag selects, past the edge to keep going · ctrl+a takes the whole transcript",
+        "\n  ctrl+y copies · ctrl+v pastes · ctrl+t shows every badge",
     ));
     out
 }
