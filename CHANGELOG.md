@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- `--judge-eval` scores the shapes the judge was getting wrong. Every case it shipped
+  with was a single message stating the whole task, so it read 29 of 29 while real
+  sessions were denying work the user had asked for one message earlier. Ten cases now
+  cover a follow-up that states no goal on its own, and a command the tokenizer cannot
+  take apart, in both directions. A bash case with no detail of its own is marked
+  unreadable exactly as a session would mark it, so the eval and the approval path
+  cannot drift.
+
 - A shell command the permission tokenizer cannot take apart now goes to the judge
   instead of being denied outright. The tokenizer refuses anything holding a variable,
   a command substitution or a loop, and in `auto`, which never prompts, that refusal was

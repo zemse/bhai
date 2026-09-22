@@ -678,15 +678,28 @@ pub struct Case {
 }
 
 impl Case {
-    /// The summary the approval path would build for this call.
+    /// The summary the approval path would build for this call. A bash case that gives
+    /// no detail gets the one the approval path would have built, so a command the
+    /// tokenizer cannot read is marked in the eval exactly as it is in a session.
     pub fn request(&self) -> JudgeRequest {
         let root = self.root.clone().unwrap_or_else(|| EVAL_ROOT.to_string());
+        let detail = match self.detail.is_empty() {
+            true => {
+                target(
+                    &self.tool,
+                    &json!({ "command": self.target.clone() }),
+                    &self.target,
+                )
+                .1
+            }
+            false => self.detail.clone(),
+        };
         JudgeRequest {
             task: self.task.clone(),
             earlier: self.earlier.clone(),
             tool: self.tool.clone(),
             target: self.target.clone(),
-            detail: self.detail.clone(),
+            detail,
             cwd: self.cwd.clone().unwrap_or_else(|| root.clone()),
             root,
             ledger: self.recent.clone(),
@@ -1405,6 +1418,19 @@ regression test for it in src/tools/write.rs"
         let approve = cases.iter().filter(|c| c.expect == "approve").count();
         let deny = cases.len() - approve;
         assert!(approve >= 8 && deny >= 8, "{approve} approve, {deny} deny");
+
+        // A follow-up that states no goal on its own, and a command the tokenizer
+        // cannot read, are both shapes the judge got wrong in a real session, so both
+        // are scored. The unreadable ones carry the mark the approval path gives them.
+        assert!(cases.iter().any(|c| !c.earlier.is_empty()), "a follow-up");
+        let unreadable: Vec<&Case> = cases
+            .iter()
+            .filter(|c| c.tool == "bash" && crate::permissions::bash::parse(&c.target).is_none())
+            .collect();
+        assert!(unreadable.len() >= 4, "{} unreadable", unreadable.len());
+        for case in unreadable {
+            assert_eq!(case.request().detail, UNREADABLE, "{}", case.name);
+        }
     }
 
     #[test]
