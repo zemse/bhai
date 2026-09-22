@@ -155,6 +155,24 @@ impl JudgeRequest {
     }
 }
 
+/// Why a call has no verdict. `auto` mode denies every one of them, so each says which
+/// it was: the agent is told something it can act on, and a spent budget does not read
+/// as a judge that looked at the call and could not make up its mind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Undecided {
+    /// No judge runs in this session.
+    Off,
+    /// The rules keep this call for the user, so it is never put to the judge.
+    Unjudgeable,
+    /// Too long to show the judge in full, and a fragment is not something to rule on.
+    TooLong,
+    /// The turn has used up its judged calls.
+    Budget,
+    /// The judge was asked and gave no verdict: it failed, timed out, or never answered
+    /// as the agreed object.
+    Unanswered,
+}
+
 /// Why a call to the judge came back with no verdict.
 #[derive(Debug)]
 pub enum Failed {
@@ -201,6 +219,10 @@ pub struct Settings {
     /// `judge_effort`: the cheapest effort the backend takes.
     pub effort: String,
     pub timeout: Duration,
+    /// `judge_max_per_turn`: judged calls one turn may spend before the rest are denied.
+    /// A bound on what a confused loop can cost, not a working limit, so it sits well
+    /// past any real turn: a turn runs as long as the task takes, and a task that has
+    /// genuinely needed a hundred decisions is not the one to cut off.
     pub max_per_turn: usize,
 }
 
@@ -211,7 +233,7 @@ impl Default for Settings {
             model: None,
             effort: "low".to_string(),
             timeout: Duration::from_millis(15_000),
-            max_per_turn: 20,
+            max_per_turn: 200,
         }
     }
 }
@@ -336,25 +358,30 @@ impl Judge {
         )
     }
 
-    /// Decide one call. `None` is no verdict: the caller denies it in `auto` mode and
-    /// asks the user in any other.
-    pub async fn decide(&self, tool: &str, target: &str, detail: &str) -> Option<Verdict> {
+    /// Decide one call. An `Undecided` is no verdict: the caller denies it in `auto`
+    /// mode and asks the user in any other.
+    pub async fn decide(
+        &self,
+        tool: &str,
+        target: &str,
+        detail: &str,
+    ) -> Result<Verdict, Undecided> {
         if !self.settings.on {
-            return None;
+            return Err(Undecided::Off);
         }
         // A target the summary would cut short is not judgeable: the judge would be ruling
         // on a fragment, and a deny stands for the rest of the task. No verdict instead.
         if target.chars().count() > TARGET_CLIP {
-            return None;
+            return Err(Undecided::TooLong);
         }
         let key = self.key(tool, target, detail);
         let request = {
             let mut state = self.lock();
             if let Some(verdict) = state.cache.get(&key) {
-                return Some(verdict.clone());
+                return Ok(verdict.clone());
             }
             if state.spent >= self.settings.max_per_turn {
-                return None;
+                return Err(Undecided::Budget);
             }
             state.spent += 1;
             JudgeRequest {
@@ -417,7 +444,7 @@ impl Judge {
             // Every try spent on an answer that never took shape: stop paying for the
             // retries for the rest of the session.
             state.shapeless |= misshapen == TRIES;
-            return None;
+            return Err(Undecided::Unanswered);
         };
         let usage = spent;
         {
@@ -430,7 +457,7 @@ impl Judge {
                 verdict.reason()
             ));
         }
-        Some(verdict)
+        Ok(verdict)
     }
 
     /// Append one JSONL line; a failed write must never fail the call.
@@ -901,9 +928,12 @@ mod tests {
     async fn an_over_long_command_skips_the_judge() {
         let (judge, backend) = judge(Answers::Verdict(approve("fine")), Path::new("/p"));
         let long = "echo ".to_string() + &"x".repeat(TARGET_CLIP);
-        assert_eq!(judge.decide("bash", &long, "").await, None);
+        assert_eq!(
+            judge.decide("bash", &long, "").await,
+            Err(Undecided::TooLong)
+        );
         assert!(backend.calls.lock().unwrap().is_empty(), "never called");
-        assert!(judge.decide("bash", "echo hi", "").await.is_some());
+        assert!(judge.decide("bash", "echo hi", "").await.is_ok());
     }
 
     #[tokio::test]
@@ -911,18 +941,18 @@ mod tests {
         let (judge, backend) = judge(Answers::Verdict(approve("in the project")), Path::new("/p"));
         assert_eq!(
             judge.decide("bash", "cargo test", "").await,
-            Some(approve("in the project"))
+            Ok(approve("in the project"))
         );
         // The same call again is answered from the cache, not by a second model call.
         assert_eq!(
             judge.decide("bash", "cargo test", "").await,
-            Some(approve("in the project"))
+            Ok(approve("in the project"))
         );
         assert_eq!(backend.calls.lock().unwrap().len(), 1);
         assert_eq!(judge.total().input, 700);
 
         // The second call carries the first verdict, and the budget is what is left.
-        judge.decide("bash", "cargo build", "").await;
+        let _ = judge.decide("bash", "cargo build", "").await;
         let calls = backend.calls.lock().unwrap();
         assert_eq!(
             calls[1].ledger,
@@ -949,19 +979,19 @@ mod tests {
         let call = "scrapebadger twitter users latest-tweets zemse";
         assert!(matches!(
             judge.decide("bash", call, "").await,
-            Some(Verdict::Deny { .. })
+            Ok(Verdict::Deny { .. })
         ));
         // The same call under the same task is the one the cache is for.
         assert!(matches!(
             judge.decide("bash", call, "").await,
-            Some(Verdict::Deny { .. })
+            Ok(Verdict::Deny { .. })
         ));
         assert_eq!(backend.calls.lock().unwrap().len(), 1);
 
         judge.start_turn(&format!("yes, run `{call}`, I am asking you to"));
         assert_eq!(
             judge.decide("bash", call, "").await,
-            Some(approve("the user asked for it"))
+            Ok(approve("the user asked for it"))
         );
     }
 
@@ -973,7 +1003,7 @@ mod tests {
         let (judge, backend) = judge(Answers::Verdict(approve("fine")), Path::new("/p"));
         judge.start_turn("check the latest tweet from zemse");
         judge.start_turn("dont you have scrapebadger?");
-        judge
+        let _ = judge
             .decide("bash", "scrapebadger twitter users latest-tweets zemse", "")
             .await;
 
@@ -1024,11 +1054,11 @@ mod tests {
         );
         assert!(matches!(
             judge.decide("edit", "/p/src/main.rs", "- a\n+ b").await,
-            Some(Verdict::Deny { .. })
+            Ok(Verdict::Deny { .. })
         ));
         assert_eq!(
             judge.decide("edit", "/p/src/main.rs", "- c\n+ d").await,
-            Some(approve("the test the task asked for"))
+            Ok(approve("the test the task asked for"))
         );
         assert_eq!(backend.calls.lock().unwrap().len(), 2);
     }
@@ -1045,13 +1075,16 @@ mod tests {
         );
         assert_eq!(
             judge.decide("bash", "cargo build", "").await,
-            Some(approve("fine"))
+            Ok(approve("fine"))
         );
-        assert_eq!(judge.decide("bash", "cargo doc", "").await, None);
+        assert_eq!(
+            judge.decide("bash", "cargo doc", "").await,
+            Err(Undecided::Budget)
+        );
         judge.start_turn("now document it");
         assert_eq!(
             judge.decide("bash", "cargo doc", "").await,
-            Some(approve("fine"))
+            Ok(approve("fine"))
         );
         assert_eq!(backend.calls.lock().unwrap().len(), 2);
     }
@@ -1061,7 +1094,10 @@ mod tests {
         // Asking again would fail the same way, so each is put once and costs nothing.
         for answers in [Answers::Error("429".to_string()), Answers::Hang] {
             let (judge, backend) = judge(answers, Path::new("/p"));
-            assert_eq!(judge.decide("bash", "cargo test", "").await, None);
+            assert_eq!(
+                judge.decide("bash", "cargo test", "").await,
+                Err(Undecided::Unanswered)
+            );
             assert_eq!(judge.total(), Usage::default());
             assert_eq!(backend.calls.lock().unwrap().len(), 1);
         }
@@ -1081,7 +1117,7 @@ mod tests {
         );
         assert_eq!(
             judge.decide("bash", "cargo test", "").await,
-            Some(approve("fine"))
+            Ok(approve("fine"))
         );
         assert_eq!(backend.calls.lock().unwrap().len(), 3);
         // Every attempt cost tokens, whether or not it parsed.
@@ -1095,12 +1131,18 @@ mod tests {
         // clock: the two bounds are tested apart.
         let judge = Judge::new(backend.clone(), "/p".into(), Settings::default());
         judge.start_turn("add a unit test for the parser");
-        assert_eq!(judge.decide("bash", "cargo test", "").await, None);
+        assert_eq!(
+            judge.decide("bash", "cargo test", "").await,
+            Err(Undecided::Unanswered)
+        );
         assert_eq!(backend.calls.lock().unwrap().len(), TRIES);
         assert_eq!(judge.total().input, 700 * TRIES as u64);
 
         // Having proved it cannot produce the object, it is put once from here on.
-        assert_eq!(judge.decide("bash", "cargo doc", "").await, None);
+        assert_eq!(
+            judge.decide("bash", "cargo doc", "").await,
+            Err(Undecided::Unanswered)
+        );
         assert_eq!(backend.calls.lock().unwrap().len(), TRIES + 1);
     }
 
@@ -1112,7 +1154,10 @@ mod tests {
             Answers::Slow(Duration::from_millis(20), "sure, go ahead".to_string()),
             Path::new("/p"),
         );
-        assert_eq!(judge.decide("bash", "cargo test", "").await, None);
+        assert_eq!(
+            judge.decide("bash", "cargo test", "").await,
+            Err(Undecided::Unanswered)
+        );
         let tries = backend.calls.lock().unwrap().len();
         assert!((2..TRIES).contains(&tries), "{tries} tries");
     }
@@ -1128,7 +1173,10 @@ mod tests {
                 ..Settings::default()
             },
         );
-        assert_eq!(judge.decide("bash", "cargo test", "").await, None);
+        assert_eq!(
+            judge.decide("bash", "cargo test", "").await,
+            Err(Undecided::Off)
+        );
         assert!(backend.calls.lock().unwrap().is_empty());
         assert_eq!(judge.describe(), "\njudge: off");
     }
@@ -1153,10 +1201,10 @@ mod tests {
         judge.start_turn("add a unit test for the parser");
         for i in 0..6 {
             judge.note(&format!("bash: cargo test {i}"));
-            judge.decide("bash", &format!("cargo test {i}"), "").await;
+            let _ = judge.decide("bash", &format!("cargo test {i}"), "").await;
         }
         judge.start_turn("now do the same for the lexer");
-        judge.decide("bash", "cargo test lexer", "").await;
+        let _ = judge.decide("bash", "cargo test lexer", "").await;
 
         // What the judge reads is the previous request plus what has happened since, so
         // the backend is charged for the new lines and serves the rest from its cache.

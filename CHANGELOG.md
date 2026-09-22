@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- A call `auto` mode denies now says which of the five things happened, and a turn's
+  budget of judged calls went from 20 to 200. Since a turn runs as long as the task
+  takes, a long one used up the 20 and then had every remaining call denied, each with
+  "the judge could not decide it", which is what an undecided call says too. The budget
+  is a bound on what a confused loop can cost, so it now sits past any real turn, and
+  when it does run out the agent is told that is what happened and that the user's next
+  message refills it.
+
 - The judge is told what the user asked before this message, not only the message it is
   judging against. A goal is stated once and then referred to: "now do the same for the
   other file", or a question about which tool to use, says nothing on its own, and a

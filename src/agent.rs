@@ -17,7 +17,7 @@ use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
 use crate::client::{Client, Delta, Usage};
 use crate::compact::{self, Limits};
 use crate::identity::Identity;
-use crate::judge::{self, Judge, Verdict};
+use crate::judge::{self, Judge, Undecided, Verdict};
 use crate::limits::RateLimits;
 use crate::permissions::{Answer, Decision, Mode, Offers, Policy};
 use crate::profile::{self, Call, CallTokens, Profile};
@@ -1250,7 +1250,7 @@ not retry it. Try a different approach, or ask the user."
                 let _ = tx.send(AgentEvent::Judging(None));
             }
             match verdict {
-                Some(Verdict::Approve { reason }) => {
+                Ok(Verdict::Approve { reason }) => {
                     // Deciding takes seconds, so an interrupt during it still means stop.
                     if cancel.load(Ordering::Relaxed) {
                         return (
@@ -1262,7 +1262,7 @@ not retry it. Try a different approach, or ask the user."
                         "auto-approved: {summary} ({reason})"
                     )));
                 }
-                Some(Verdict::Deny { reason }) => {
+                Ok(Verdict::Deny { reason }) => {
                     let _ = tx.send(AgentEvent::ToolRejected(format!(
                         "auto-denied: {summary} ({reason})"
                     )));
@@ -1278,16 +1278,24 @@ as-is. Try a different approach, or ask the user."
                 // verdict on is denied rather than put to the user. The agent is told to
                 // ask in what it writes, which is the one way through that does not stop
                 // the turn on a modal.
-                None if policy.mode() == Mode::Auto => {
-                    let (why, how) = match (judge.is_some(), asking) {
-                        (_, true) => ("the judge could not decide it", ""),
+                Err(undecided) if policy.mode() == Mode::Auto => {
+                    let (why, how) = match undecided {
+                        Undecided::Unanswered => ("the judge could not decide it", ""),
                         // Saying which of the three it is would take the checker apart
                         // for the model; naming all three lets it see which it tripped.
-                        (true, false) => (
+                        Undecided::Unjudgeable => (
                             "only the user may approve this one",
                             " It names a protected path, writes outside the project and its scratch directories, or is a command the permission checker cannot read, such as one holding an expansion, a subshell or an unquoted heredoc. Written plainer it may go through.",
                         ),
-                        (false, false) => ("no judge is running in this session", ""),
+                        Undecided::TooLong => (
+                            "it is too long to put to the judge in full",
+                            " Broken into shorter commands, each one may go through.",
+                        ),
+                        Undecided::Budget => (
+                            "this turn has spent its judged calls",
+                            " The budget refills on the user's next message, so this is the moment to stop and say what is left to do.",
+                        ),
+                        Undecided::Off => ("no judge is running in this session", ""),
                     };
                     let _ = tx.send(AgentEvent::ToolRejected(format!(
                         "auto-denied: {summary} ({why})"
@@ -1299,7 +1307,7 @@ as-is. Try a different approach, or ask the user."
                         false,
                     );
                 }
-                None => {
+                Err(_) => {
                     let offers = policy.offers(name, &args);
                     if let Some(result) = ask(name, &summary, &offers, policy, tx).await {
                         return result;
@@ -1331,8 +1339,8 @@ as-is. Try a different approach, or ask the user."
     (output, ok)
 }
 
-/// The judge's verdict on a call the rules left at `Ask`, or `None` when the user must be
-/// asked: no judge, a category the judge never sees, or a call it could not decide.
+/// The judge's verdict on a call the rules left at `Ask`, or why there is none and the
+/// user must be asked instead.
 async fn judged(
     judge: Option<&Judge>,
     policy: &Policy,
@@ -1340,9 +1348,11 @@ async fn judged(
     args: &Value,
     target: &str,
     detail: &str,
-) -> Option<Verdict> {
-    let judge = judge?;
-    policy.judgeable(name, args).then_some(())?;
+) -> Result<Verdict, Undecided> {
+    let judge = judge.ok_or(Undecided::Off)?;
+    if !policy.judgeable(name, args) {
+        return Err(Undecided::Unjudgeable);
+    }
     judge.decide(name, target, detail).await
 }
 
@@ -1960,6 +1970,16 @@ mod tests {
         deny: &[&str],
         replies: &[Answer],
     ) -> Judged {
+        judged_with(answers, deny, replies, crate::judge::Settings::default()).await
+    }
+
+    /// `judged` with the judge's settings, for what it does when a budget runs out.
+    async fn judged_with(
+        answers: crate::judge::fake::Answers,
+        deny: &[&str],
+        replies: &[Answer],
+        settings: crate::judge::Settings,
+    ) -> Judged {
         use crate::permissions::{Relax, Rule, Rules, Trust};
         use fake::{Fake, call, say};
 
@@ -1986,7 +2006,7 @@ mod tests {
             )],
             vec![say("done")],
         ]);
-        let (judge, backend) = crate::judge::fake::judge(answers, &repo);
+        let (judge, backend) = crate::judge::fake::judge_with(answers, &repo, settings);
         let judge = Arc::new(judge);
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx_user, rx_user) = mpsc::channel(1);
@@ -2143,6 +2163,34 @@ mod tests {
             );
             assert_eq!(run.cost == Usage::default(), !shaped, "{:?}", run.cost);
         }
+    }
+
+    /// A spent budget is not a judge that looked at the call: the agent is told which
+    /// it was, so it can say what happened rather than keep rewording the same call.
+    #[tokio::test]
+    async fn a_spent_budget_says_so_rather_than_reading_as_an_undecided_call() {
+        use crate::judge::fake::Answers;
+
+        let run = judged_with(
+            Answers::Verdict(crate::judge::Verdict::Approve {
+                reason: "fine".to_string(),
+            }),
+            &[],
+            &[],
+            crate::judge::Settings {
+                max_per_turn: 0,
+                ..crate::judge::Settings::default()
+            },
+        )
+        .await;
+        assert!(!asked(&run.events));
+        assert!(run.backend.calls.lock().unwrap().is_empty(), "never asked");
+        assert!(
+            run.outputs[0]
+                .starts_with("denied by auto policy: this turn has spent its judged calls"),
+            "{}",
+            run.outputs[0]
+        );
     }
 
     #[tokio::test]
