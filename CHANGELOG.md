@@ -6,6 +6,20 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- Fenced code is coloured by syntect's grammars rather than by a lexer written here.
+  The old one knew thirteen language groups and read each as a set of rules about what
+  a comment, a string, a number and a keyword look like, which is most of the way there
+  for a language it had been taught and nothing at all for one it had not. syntect
+  brings the default grammar set, so a fence naming almost anything is coloured, and it
+  is a real parse rather than a guess. What is kept is the property that made the old
+  one readable: a fence that names no language, or names one there is no grammar for,
+  stays plain, since syntect will otherwise identify a block of log output as some
+  language by its first line and paint it in that language's rules. A theme's colours
+  are 24-bit and some terminals silently drop those, so every one goes through a new
+  `palette` that hands back the nearest xterm-256 entry where truecolor is not on
+  offer. `code_theme` names the theme; an unknown name is a config error listing the
+  ones there are.
+
 - The delegation section says what a child costs instead of asking for one. It read
   "delegate read-heavy or specialised work to the cheapest fitting identity", which is
   an instruction to delegate exactly the case the parent is already best at: it has read

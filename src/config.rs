@@ -37,6 +37,9 @@ pub struct Config {
     pub judge: crate::judge::Settings,
     /// `title`: name the session for the terminal's title, which is one small call.
     pub title: bool,
+    /// `code_theme`: the syntect theme fenced code is coloured with. `None` for the
+    /// default, which is dark like the rest of what bhai draws.
+    pub code_theme: Option<String>,
     /// Rules from Claude Code's `settings.json` files.
     pub import_claude_permissions: bool,
     /// When history is compacted: `context_window` and `compact_at`.
@@ -61,6 +64,7 @@ impl Default for Config {
             auto_project_commands: true,
             judge: crate::judge::Settings::default(),
             title: true,
+            code_theme: None,
             import_claude_permissions: true,
             limits: Limits::default(),
             choice: crate::client::Choice::default(),
@@ -135,6 +139,7 @@ struct Layer {
     judge_timeout_ms: Option<u64>,
     judge_max_per_turn: Option<usize>,
     title: Option<bool>,
+    code_theme: Option<String>,
     import_claude_permissions: Option<bool>,
     model: Option<String>,
     effort: Option<String>,
@@ -242,6 +247,14 @@ impl Config {
         {
             return Err(bad(format!("compact_at {at} is not in (0, 1]")));
         }
+        if let Some(theme) = &layer.code_theme
+            && !crate::syntax::themes().contains(theme)
+        {
+            return Err(bad(format!(
+                "code_theme {theme:?} is not one of: {}",
+                crate::syntax::themes().join(", ")
+            )));
+        }
         let parse = |rules: &[String]| {
             rules
                 .iter()
@@ -327,6 +340,9 @@ impl Config {
         }
         if let Some(max) = layer.judge_max_per_turn {
             self.judge.max_per_turn = max;
+        }
+        if layer.code_theme.is_some() {
+            self.code_theme = layer.code_theme;
         }
         match layer.skills {
             Some(SkillsLayer::Enabled(enabled)) => self.skills = enabled,
@@ -582,6 +598,22 @@ compact_at = 0.9
 ",
         );
         assert!(Config::load(Some(&home), &cwd).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_code_theme_must_be_one_syntect_ships() {
+        let dir = temp_dir();
+        let path = dir.join(".bhai/config.toml");
+        write(&path, "code_theme = \"Solarized (light)\"\n");
+        let config = Config::load(None, &dir).unwrap();
+        assert_eq!(config.code_theme.as_deref(), Some("Solarized (light)"));
+        // A typo names the file and lists what it could have been, rather than falling
+        // back to the default without saying so.
+        write(&path, "code_theme = \"solarised-lite\"\n");
+        let err = format!("{:#}", Config::load(None, &dir).unwrap_err());
+        assert!(err.contains("solarised-lite"), "{err}");
+        assert!(err.contains(crate::syntax::DEFAULT_THEME), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

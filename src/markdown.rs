@@ -513,10 +513,11 @@ mod tests {
             ]
         );
         assert_eq!(style_of(&lines, "rust"), DIM);
-        // The block is coloured as the language the fence names.
-        assert_eq!(style_of(&lines, "fn"), syntax::KEYWORD);
-        assert_eq!(style_of(&lines, "main"), syntax::PLAIN);
-        assert_eq!(style_of(&lines, "1"), syntax::NUMBER);
+        // The block is coloured as the language the fence names, so the keyword and the
+        // literal are told apart. Which colours exactly is the theme's business.
+        let keyword = style_of(&lines, "fn");
+        assert_ne!(keyword, syntax::PLAIN);
+        assert_ne!(keyword, style_of(&lines, "1"));
     }
 
     #[test]
@@ -526,7 +527,6 @@ mod tests {
             text(&lines),
             vec!["text", "", "py", "  print(1)", "  x = ["]
         );
-        assert_eq!(style_of(&lines, "x = ["), PLAIN);
     }
 
     #[test]

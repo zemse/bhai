@@ -22,6 +22,7 @@ mod markdown;
 mod mcp;
 mod models;
 mod ollama;
+mod palette;
 mod permissions;
 mod profile;
 mod prompt;
@@ -435,6 +436,10 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
+    // Named once for the process: code already on screen is not repainted.
+    if let Some(theme) = &config.code_theme {
+        syntax::set_theme(theme);
+    }
     let identities = identity::discover(&roots);
     let identity = identity::find(&identities, name)?;
     let hub = mcp::start(&config, &roots, &identity).await;
