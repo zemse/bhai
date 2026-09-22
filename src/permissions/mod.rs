@@ -674,10 +674,19 @@ impl Checker<'_> {
         }
         let text = |key| args.get(key).and_then(Value::as_str);
         match tool {
-            "bash" => match bash::parse(text("command").unwrap_or_default()) {
-                Some(commands) => !commands.iter().any(bash::mentions_protected),
-                None => false,
-            },
+            "bash" => {
+                let command = text("command").unwrap_or_default();
+                match bash::parse(command) {
+                    Some(commands) => !commands.iter().any(bash::mentions_protected),
+                    // A command the tokenizer could not take apart is still the judge's
+                    // to rule on: it reads the text as written, and a variable or a
+                    // substitution is most of what the tokenizer refuses. What it must
+                    // not be handed is a command that runs its arguments as shell code
+                    // or as someone else, or one naming a protected path, since the
+                    // shape those hide behind is the reason they are the user's alone.
+                    None => !bash::mentions_reserved(command),
+                }
+            }
             // Reading outside the project is the judge's to rule on, and so is a
             // scratch file; a protected path is the user's alone, and so is a write
             // anywhere else on the machine.
@@ -1365,11 +1374,25 @@ mod tests {
 
         // The categories that always reach the user instead.
         assert!(!command("sudo cargo clippy"), "sudo");
-        assert!(!command("ls $(rm x)"), "unparseable");
         assert!(!command("cat .env"), "protected path");
         assert!(!path("write", &PathBuf::from("/etc/hosts")), "outside");
         assert!(!path("edit", &repo.join(".env")), "protected");
         assert!(!p.judgeable("write", &json!({})), "no path");
+
+        // A command the tokenizer cannot take apart is the judge's, unless its text
+        // names one of those categories, which is all that can be read off it.
+        assert!(command("cat $HOME/.cargo/config.toml"), "an expansion");
+        assert!(command(
+            "cd $(git rev-parse --show-toplevel) && cargo build"
+        ));
+        assert!(command("for f in src/*.rs; do wc -l $f; done"), "a loop");
+        assert!(!command("ls $(sudo rm x)"), "sudo behind a substitution");
+        assert!(
+            !command("sh -c \"$SCRIPT\""),
+            "a shell reading its argument"
+        );
+        assert!(!command("cat $HOME/.ssh/id_ed25519"), "a protected path");
+        assert!(!command("cat $HOME/.e*"), "a glob that may reach one");
 
         // What the judge is there to rule on: a scratch file, and reading outside.
         assert!(path("write", &dir.join("outside/x.rs")), "scratch");

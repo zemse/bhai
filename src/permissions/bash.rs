@@ -312,8 +312,7 @@ impl Tokenizer {
             return;
         }
         let word = std::mem::take(&mut self.word);
-        let dotted = |part: &str| part.starts_with('.') && part != "." && part != "..";
-        if self.glob && word.split('/').any(dotted) {
+        if self.glob && word.split('/').any(dot_name) {
             self.current.dot_glob = true;
         }
         self.current.words.push(word);
@@ -557,19 +556,48 @@ fn is_short_flag(arg: &str, flag: char) -> bool {
 /// may glob into one.
 pub fn mentions_protected(command: &Command) -> bool {
     command.dot_glob
-        || command.words.iter().chain(&command.writes).any(|word| {
-            let lower = word.to_lowercase();
-            let parts: Vec<&str> = lower.split(['/', '=', ':', ',']).collect();
-            parts.iter().any(|p| {
-                matches!(*p, ".git" | ".ssh" | ".codex" | ".claude") || p.starts_with(".env")
-            }) || parts.windows(2).any(|w| {
-                matches!(
-                    w,
-                    [".config", "bhai"]
-                        | [".bhai", "config.toml"]
-                        | [".bhai", "settings.local.json"]
-                )
-            })
+        || command
+            .words
+            .iter()
+            .chain(&command.writes)
+            .any(|word| protected_word(word))
+}
+
+/// Whether the raw text of a command this parser could not read names anything only the
+/// user may approve: a program that runs its arguments as shell code or as someone else,
+/// a protected path, or a glob that could reach one. It is all that can be said about a
+/// command whose shape is unknown, and it is what decides whether such a command may be
+/// put to the auto-approval judge rather than denied outright. The split is deliberately
+/// blunt: it looks inside substitutions and quotes, because it cannot tell them apart.
+pub fn mentions_reserved(input: &str) -> bool {
+    input
+        .split(|c: char| c.is_whitespace() || "'\"`$();|&<>{}".contains(c))
+        .filter(|word| !word.is_empty())
+        .any(|word| {
+            let name = basename(word);
+            REFUSED.contains(&name)
+                || SHELLS.contains(&name)
+                || protected_word(word)
+                || (word.contains(['*', '?', '[']) && word.split('/').any(dot_name))
+        })
+}
+
+/// A path component that is a dot name, so a glob over it may reach a hidden file.
+fn dot_name(part: &str) -> bool {
+    part.starts_with('.') && part != "." && part != ".."
+}
+
+fn protected_word(word: &str) -> bool {
+    let lower = word.to_lowercase();
+    let parts: Vec<&str> = lower.split(['/', '=', ':', ',']).collect();
+    parts
+        .iter()
+        .any(|p| matches!(*p, ".git" | ".ssh" | ".codex" | ".claude") || p.starts_with(".env"))
+        || parts.windows(2).any(|w| {
+            matches!(
+                w,
+                [".config", "bhai"] | [".bhai", "config.toml"] | [".bhai", "settings.local.json"]
+            )
         })
 }
 
@@ -577,6 +605,32 @@ pub fn mentions_protected(command: &Command) -> bool {
 mod tests {
     use super::*;
 
+    /// What can be read off a command this parser refuses: the programs that run their
+    /// arguments as something else, and the paths only the user may approve.
+    #[test]
+    fn a_command_that_cannot_be_read_still_shows_what_it_names() {
+        for tame in [
+            "cat $HOME/.cargo/config.toml",
+            "cd $(git rev-parse --show-toplevel) && cargo build",
+            "for f in src/*.rs; do wc -l $f; done",
+            "curl -H \"x-api-key: $KEY\" https://api.example.test/v1",
+            "echo \"$(date)\" >> notes.md",
+        ] {
+            assert!(parse(tame).is_none(), "{tame}");
+            assert!(!mentions_reserved(tame), "{tame}");
+        }
+        for reserved in [
+            "ls $(sudo rm x)",
+            "sh -c \"$SCRIPT\"",
+            "eval \"$CMD\"",
+            "cat $HOME/.ssh/id_ed25519",
+            "cat ${DIR}/.env",
+            "cat $HOME/.e*",
+            "git --git-dir=$D/.git log",
+        ] {
+            assert!(mentions_reserved(reserved), "{reserved}");
+        }
+    }
     fn words(input: &str) -> Option<Vec<Vec<String>>> {
         parse(input).map(|cs| cs.into_iter().map(|c| c.words).collect())
     }

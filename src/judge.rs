@@ -42,6 +42,11 @@ const TASK_CLIP: usize = 1200;
 /// away, and they are clipped like a ledger line rather than like the task: a goal is
 /// usually a sentence, and the message being judged against gets the full width.
 const EARLIER: usize = 3;
+/// What the detail says about a command the permission tokenizer could not take apart.
+/// The checker hands those over instead of keeping them for the user, so the judge has
+/// to know it is reading text the shell will still do something to.
+const UNREADABLE: &str = "the permission checker could not take this command apart: it \
+holds shell syntax it does not read, such as a variable, a command substitution or a loop";
 /// The cache key suffix of every judge call, so its prefix caches on its own.
 const CACHE_KEY: &str = "judge";
 /// Times one call is put to the judge before it counts as undecided. Only an answer that
@@ -83,6 +88,12 @@ to a remote; anything destructive beyond what the task implies. When you are uns
 deny.
 
 A field marked truncated means you cannot see the whole command, so deny.
+
+A command whose detail says it could not be read is one the shell expands before it \
+runs. Judge the text as written: `$HOME` or `$(git rev-parse --show-toplevel)` names a \
+path, and ruling on it is no different from ruling on the path. Deny when you cannot \
+tell what a name would come out as, and deny when the expansion runs something you \
+would not approve on its own.
 
 Answer with a strict JSON object and nothing else, no prose and no code fence:
 {\"verdict\":\"approve\",\"reason\":\"<at most 12 words>\"}";
@@ -606,7 +617,16 @@ pub fn target(tool: &str, args: &Value, summary: &str) -> (String, String) {
     };
     let first = |s: &str| clip(&s.lines().next().unwrap_or_default().replace('\t', " "), 80);
     match tool {
-        "bash" => (text("command"), String::new()),
+        "bash" => {
+            let command = text("command");
+            // The checker hands over a command it could not take apart rather than
+            // denying it outright, so the judge is told that is what it is looking at.
+            let detail = match crate::permissions::bash::parse(&command) {
+                Some(_) => String::new(),
+                None => UNREADABLE.to_string(),
+            };
+            (command, detail)
+        }
         "write" => {
             let content = text("content");
             (
@@ -1289,11 +1309,13 @@ regression test for it in src/tools/write.rs"
     }
 
     #[test]
-    fn a_full_ledger_stays_between_the_cache_floor_and_fifteen_hundred_tokens() {
+    fn a_full_ledger_stays_between_the_cache_floor_and_sixteen_hundred_tokens() {
         let count = tokens(&realistic("cargo test --all-features -- --nocapture write"));
         // Under about a thousand tokens the backend caches nothing at all, and a full
-        // ledger is the steady state, so it is worth being over that line.
-        assert!((1100..1500).contains(&count), "{count} tokens");
+        // ledger is the steady state, so it is worth being over that line. The ceiling
+        // is what each call costs when the cache misses, and most of the growth since
+        // it was set is the system prompt, which is a fixed prefix the backend keeps.
+        assert!((1100..1600).contains(&count), "{count} tokens");
     }
 
     #[test]

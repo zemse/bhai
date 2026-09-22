@@ -6,6 +6,16 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- A shell command the permission tokenizer cannot take apart now goes to the judge
+  instead of being denied outright. The tokenizer refuses anything holding a variable,
+  a command substitution or a loop, and in `auto`, which never prompts, that refusal was
+  the end of it: `cat $HOME/.cargo/config.toml`, `cd $(git rev-parse --show-toplevel) &&
+  cargo build` and a `for` loop were all dead ends, while auto mode is the mode that
+  does its work through the shell. The judge is told the command is one it has to read
+  as written. What still never reaches it is what can be read off the text whatever
+  shape it is in: `sudo`, `eval`, a shell running its argument, a protected path, or a
+  glob that may reach one.
+
 - A call `auto` mode denies now says which of the five things happened, and a turn's
   budget of judged calls went from 20 to 200. Since a turn runs as long as the task
   takes, a long one used up the 20 and then had every remaining call denied, each with
