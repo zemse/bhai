@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- Task lists and footnotes render. Both handlers were already written, and neither had
+  ever run: the parser was built with tables and strikethrough alone, so `- [x] done`
+  reached the renderer as a list item whose text begins with a literal `[x]`, and the
+  `FootnoteDefinition` arm was unreachable code. A checked item now shows as `• [x]`
+  and a footnote keeps its reference next to what it marks.
+
 - A ```mermaid fence is drawn as a diagram rather than shown as its source. A model
   asked to explain a flow reaches for mermaid, and what arrived was a dozen lines of
   `A->>B` to read as text. `merman-core` parses it and `merman-ascii` lays it out as

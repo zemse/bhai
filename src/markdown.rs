@@ -24,7 +24,10 @@ pub fn render(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Join>) {
         width: width.max(1),
         ..Renderer::default()
     };
-    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
     for event in Parser::new_ext(text, options) {
         renderer.event(event);
     }
@@ -556,6 +559,23 @@ mod tests {
             text(&lines),
             vec!["text", "", "py", "  print(1)", "  x = ["]
         );
+    }
+
+    #[test]
+    fn a_task_list_shows_what_is_done() {
+        let lines = lines("- [x] landed\n- [ ] still to do\n- plain", 40);
+        assert_eq!(
+            text(&lines),
+            vec!["• [x] landed", "• [ ] still to do", "• plain"]
+        );
+    }
+
+    #[test]
+    fn a_footnote_keeps_its_reference_and_its_definition() {
+        let lines = lines("a claim[^1]\n\n[^1]: the source", 40);
+        let shown = text(&lines);
+        assert!(shown.iter().any(|l| l.contains("[^1]")), "{shown:?}");
+        assert!(shown.iter().any(|l| l.contains("the source")), "{shown:?}");
     }
 
     #[test]
