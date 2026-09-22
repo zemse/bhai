@@ -6,6 +6,16 @@ carries the shape of what is there.
 
 ## 2026-09-22
 
+- A table wider than the view keeps its columns. Each row was laid out as one padded
+  string and then wrapped like a paragraph, so the moment a table did not fit, the
+  overflow landed back at the left margin where it read as another row, and the columns
+  stopped lining up at exactly the point they were needed. A table now has the room
+  taken off its widest columns, so a column of short values keeps its natural width and
+  a column of prose is the one that gives way, and a cell too long for its column wraps
+  inside it, under the column it belongs to. What is inside a cell keeps its styling
+  too: inline code in a table is coloured the way it is anywhere else, rather than
+  flattened to plain text on the way in.
+
 - A drag can select more than one screenful. The selection was always anchored to the
   wrapped transcript rather than to the screen, but nothing scrolled the view while the
   button was down, so a selection could never reach past the rows in front of it, which

@@ -54,8 +54,9 @@ struct Renderer {
     links: Vec<(String, usize)>,
     /// Language and text of the open code block.
     code: Option<(String, String)>,
-    table: Vec<Vec<String>>,
-    row: Vec<String>,
+    /// Rows of the open table, each a row of cells, each cell its styled chars.
+    table: Vec<Vec<Vec<Cell>>>,
+    row: Vec<Vec<Cell>>,
     /// A blank line goes before the next block.
     gap: bool,
 }
@@ -193,7 +194,7 @@ impl Renderer {
                 self.gap = true;
             }
             TagEnd::TableCell => {
-                let cell = self.inline.drain(..).map(|(c, _)| c).collect();
+                let cell = self.inline.drain(..).collect();
                 self.row.push(cell);
             }
             TagEnd::TableHead | TagEnd::TableRow => {
@@ -290,42 +291,70 @@ impl Renderer {
         self.gap = true;
     }
 
-    /// Tables as plain rows with columns padded to line up.
+    /// Tables as a grid, columns padded to line up. A cell too long for its column wraps
+    /// inside it rather than running into the next line of the view, so every line of a
+    /// row keeps its columns and a reader can still tell which one they are reading.
     fn table(&mut self) {
         let rows = std::mem::take(&mut self.table);
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-        let widths: Vec<usize> = (0..columns)
+        let natural: Vec<usize> = (0..columns)
             .map(|i| {
                 rows.iter()
                     .filter_map(|row| row.get(i))
-                    .map(|cell| cell.chars().count())
+                    .map(Vec::len)
                     .max()
                     .unwrap_or(0)
             })
             .collect();
         let width = self.width.saturating_sub(self.prefix_width()).max(4);
+        let gaps = 2 * columns.saturating_sub(1);
+        let widths = fit(&natural, width.saturating_sub(gaps));
         for (index, row) in rows.iter().enumerate() {
-            let text = widths
+            let head = index == 0;
+            // Each cell wrapped to its own column, so the row is as tall as the cell
+            // that needed the most lines.
+            let cells: Vec<Vec<Vec<Cell>>> = widths
                 .iter()
                 .enumerate()
-                .map(|(i, w)| {
-                    let cell = row.get(i).map_or("", String::as_str);
-                    format!("{cell}{}", " ".repeat(w - cell.chars().count()))
+                .map(|(i, w)| match row.get(i) {
+                    Some(cell) => wrap(cell, *w).into_iter().map(|(line, _)| line).collect(),
+                    None => vec![Vec::new()],
                 })
-                .collect::<Vec<_>>()
-                .join("  ");
-            let style = if index == 0 {
-                Style::new().bold()
-            } else {
-                Style::new()
-            };
-            let cells: Vec<Cell> = text.trim_end().chars().map(|c| (c, style)).collect();
-            for (line, join) in wrap(&cells, width) {
-                self.emit(line, join);
+                .collect();
+            let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+            for line in 0..height {
+                let mut text: Vec<Cell> = Vec::new();
+                for (i, w) in widths.iter().enumerate() {
+                    if i > 0 {
+                        text.extend([(' ', Style::new()); 2]);
+                    }
+                    let part = cells[i].get(line).map_or(&[][..], Vec::as_slice);
+                    text.extend(part.iter().map(|(c, style)| match head {
+                        true => (*c, style.bold()),
+                        false => (*c, *style),
+                    }));
+                    let pad = w.saturating_sub(part.len());
+                    text.extend(std::iter::repeat_n((' ', Style::new()), pad));
+                }
+                while text.last().is_some_and(|(c, _)| *c == ' ') {
+                    text.pop();
+                }
+                // The line is a grid row, so it goes out as it was laid out: the wrap
+                // would take the leading spaces off it and with them the columns a
+                // continuation line sits under. Only a table squeezed into a view too
+                // narrow to give every column a character can still be too wide, and
+                // that one is past keeping its shape anyway.
+                match text.len() > width {
+                    true => {
+                        for (line, _) in wrap(&text, width) {
+                            self.emit(line, Join::Newline);
+                        }
+                    }
+                    false => self.emit(text, Join::Newline),
+                }
             }
-            if index == 0 {
-                let total = widths.iter().sum::<usize>() + 2 * columns.saturating_sub(1);
-                let rule = "─".repeat(total.min(width));
+            if head {
+                let rule = "─".repeat((widths.iter().sum::<usize>() + gaps).min(width));
                 self.emit(rule.chars().map(|c| (c, DIM)).collect(), Join::Newline);
             }
         }
@@ -380,6 +409,21 @@ fn split_lines(painted: &[Cell]) -> Vec<&[Cell]> {
     }
     lines.push(&painted[start..]);
     lines
+}
+
+/// Column widths that fit `budget`. What has to go comes off the widest columns first,
+/// so a column of short values keeps its natural width and a column of prose is the one
+/// that wraps. Below one character a column it is past helping, and the caller wraps.
+fn fit(natural: &[usize], budget: usize) -> Vec<usize> {
+    if natural.iter().sum::<usize>() <= budget {
+        return natural.to_vec();
+    }
+    let held = |cap: &usize| natural.iter().map(|w| (*w).min(*cap)).sum::<usize>() <= budget;
+    let cap = (1..=natural.iter().copied().max().unwrap_or(1))
+        .take_while(held)
+        .last()
+        .unwrap_or(1);
+    natural.iter().map(|w| (*w).min(cap).max(1)).collect()
 }
 
 /// Greedy word wrap over styled chars, each line with how it joins the one above; a word
@@ -577,6 +621,56 @@ mod tests {
         assert_eq!(
             text(&lines),
             vec!["a          long", "───────────────", "wide cell  b"]
+        );
+    }
+
+    /// A table wider than the view keeps its columns: the room comes off the widest
+    /// column and what will not fit wraps inside it, under the column it belongs to,
+    /// rather than running back to the left margin where it reads as a new row.
+    #[test]
+    fn a_table_too_wide_wraps_inside_its_columns() {
+        let table = "| tool | what it does |\n|---|---|\n                     | read | opens a file and returns the lines asked for |\n                     | edit | replaces one exact string in a file |";
+        assert_eq!(
+            text(&lines(table, 32)),
+            vec![
+                "tool  what it does",
+                "────────────────────────────────",
+                "read  opens a file and returns",
+                "      the lines asked for",
+                "edit  replaces one exact string",
+                "      in a file",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_fits_the_width_it_is_given() {
+        let table = "| a very long heading indeed | and another one here |\n|---|---|\n                     | a cell with a good deal of text in it | short |";
+        for width in [12, 20, 40, 80] {
+            for line in lines(table, width) {
+                assert!(line.width() <= width, "{width}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_cell_keeps_the_styles_inside_it() {
+        let table = "| call | note |\n|---|---|\n| `cargo test` | runs them |";
+        let rendered = lines(table, 40);
+        assert_eq!(
+            style_of(&rendered, "cargo test"),
+            style_of(&lines("`x`", 40), "x")
+        );
+        // The header is bold, and the rule under it is not.
+        assert!(
+            style_of(&rendered, "call")
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            !style_of(&rendered, "runs")
+                .add_modifier
+                .contains(Modifier::BOLD)
         );
     }
 
