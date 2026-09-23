@@ -605,17 +605,29 @@ pub fn mentions_reserved(input: &str) -> bool {
     names_reserved(input) || names_reserved(&unquoted)
 }
 
-fn names_reserved(input: &str) -> bool {
+/// The words of a command this parser could not read, split the same blunt way and with
+/// each program reduced to its last path component. Deliberately over-broad: a rule read
+/// off these only ever denies or asks, never allows.
+pub fn raw_words(input: &str) -> Vec<String> {
+    blunt_split(input)
+        .map(|w| basename(w).to_string())
+        .collect()
+}
+
+fn blunt_split(input: &str) -> impl Iterator<Item = &str> {
     input
         .split(|c: char| c.is_whitespace() || "'\"`$();|&<>{}".contains(c))
         .filter(|word| !word.is_empty())
-        .any(|word| {
-            let name = basename(word);
-            REFUSED.contains(&name)
-                || SHELLS.contains(&name)
-                || protected_word(word)
-                || (word.contains(['*', '?', '[']) && word.split('/').any(dot_name))
-        })
+}
+
+fn names_reserved(input: &str) -> bool {
+    blunt_split(input).any(|word| {
+        let name = basename(word);
+        REFUSED.contains(&name)
+            || SHELLS.contains(&name)
+            || protected_word(word)
+            || (word.contains(['*', '?', '[']) && word.split('/').any(dot_name))
+    })
 }
 
 /// A path component that is a dot name, so a glob over it may reach a hidden file.

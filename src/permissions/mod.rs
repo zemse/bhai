@@ -598,28 +598,23 @@ impl Checker<'_> {
                 .cloned()
         };
         let Some(commands) = bash::parse(command) else {
-            // Unparseable: only a rule for every command can decide it, and never allow.
-            return match any(&self.rules.deny) {
+            // Unparseable, so it is never allowed. A rule for every command decides it,
+            // and so does a worded one over the raw text: the words the user denied are
+            // still in there, whatever shape the tokenizer could not read.
+            return match any(&self.rules.deny).or_else(|| self.find_raw(&self.rules.deny, command))
+            {
                 Some(rule) => denied(&rule),
                 None => Decision::Ask,
             };
         };
-        // Deny and ask rules also see the program behind wrappers and paths, in any case.
-        let find_loose = |rules: &[Rule], c: &bash::Command| {
-            let forms = loose_forms(c);
-            rules
-                .iter()
-                .find(|r| r.applies_to("bash") && forms.iter().any(|w| r.matches_words(w, true)))
-                .cloned()
-        };
         for c in &commands {
-            if let Some(rule) = find_loose(&self.rules.deny, c) {
+            if let Some(rule) = self.find_loose(&self.rules.deny, c) {
                 return denied(&rule);
             }
         }
         if commands
             .iter()
-            .any(|c| find_loose(&self.rules.ask, c).is_some() || bash::mentions_protected(c))
+            .any(|c| self.find_loose(&self.rules.ask, c).is_some() || bash::mentions_protected(c))
         {
             return Decision::Ask;
         }
@@ -668,24 +663,59 @@ impl Checker<'_> {
         self.fallback(Some(reasons.join(", ")))
     }
 
+    /// Deny and ask rules see the program behind wrappers and paths, and behind a
+    /// `find -exec`, in any case.
+    fn find_loose(&self, rules: &[Rule], c: &bash::Command) -> Option<Rule> {
+        let forms = loose_forms(c);
+        rules
+            .iter()
+            .find(|r| r.applies_to("bash") && forms.iter().any(|w| r.matches_words(w, true)))
+            .cloned()
+    }
+
+    /// A worded rule over the raw text of a command the tokenizer refused. Every suffix
+    /// is tried, since nothing here knows where the program starts; matching too much is
+    /// safe where the answer can only be deny or ask.
+    fn find_raw(&self, rules: &[Rule], command: &str) -> Option<Rule> {
+        let words = bash::raw_words(command);
+        rules
+            .iter()
+            .find(|r| {
+                r.applies_to("bash") && (0..words.len()).any(|i| r.matches_words(&words[i..], true))
+            })
+            .cloned()
+    }
+
     /// See `Policy::judgeable`.
     fn judgeable(&self, tool: &str, args: &Value) -> bool {
         if !self.relaxed() {
             return false;
         }
         let text = |key| args.get(key).and_then(Value::as_str);
+        // An ask rule is the user saying they want to see this one. The judge waving it
+        // through would leave the rule tightening nothing in the mode that needs it.
+        let asked = |rules: &[Rule], path: &Path| {
+            rules
+                .iter()
+                .any(|r| r.applies_to(tool) && r.matches_path(path, self.base, true))
+        };
         match tool {
             "bash" => {
                 let command = text("command").unwrap_or_default();
                 match bash::parse(command) {
-                    Some(commands) => !commands.iter().any(bash::mentions_protected),
+                    Some(commands) => !commands.iter().any(|c| {
+                        bash::mentions_protected(c) || self.find_loose(&self.rules.ask, c).is_some()
+                    }),
                     // A command the tokenizer could not take apart is still the judge's
                     // to rule on: it reads the text as written, and a variable or a
                     // substitution is most of what the tokenizer refuses. What it must
                     // not be handed is a command that runs its arguments as shell code
                     // or as someone else, or one naming a protected path, since the
                     // shape those hide behind is the reason they are the user's alone.
-                    None => !bash::mentions_reserved(command),
+                    None => {
+                        !bash::mentions_reserved(command)
+                            && self.find_raw(&self.rules.ask, command).is_none()
+                    }
                 }
             }
             // Reading outside the project is the judge's to rule on, and so is a
@@ -695,6 +725,7 @@ impl Checker<'_> {
                 Some(path) => {
                     let path = Path::new(path);
                     !rules::is_protected(path, self.base.home)
+                        && !asked(&self.rules.ask, path)
                         && (tool == "read"
                             || rules::is_inside(path, self.base.cwd)
                             || rules::is_scratch(path))
@@ -703,7 +734,7 @@ impl Checker<'_> {
             },
             // An MCP server the user has not approved is never connected, so an
             // `mcp_call` that gets this far names one they did approve.
-            _ => true,
+            _ => !self.rules.ask.iter().any(|r| r.applies_to(tool)),
         }
     }
 
@@ -972,8 +1003,10 @@ mod tests {
             ),
             // Ask beats allow.
             (&auto, "git log -p", Decision::Ask),
-            (&auto, "ls $(rm x)", Decision::Ask),
             (&auto, "cat .env", Decision::Ask),
+            // A shape the tokenizer cannot read still names what the rule denies.
+            (&auto, "ls $(rm x)", deny_rm.clone()),
+            (&auto, "rm -rf $DIR", deny_rm.clone()),
             (&auto, "cargo test", allowed("auto, inside the project")),
             (&ask_mode, "ls", Decision::Ask),
             (&ask_mode, "rm x", deny_rm.clone()),
@@ -1122,11 +1155,22 @@ mod tests {
 
     #[test]
     fn a_bare_deny_covers_unparseable_commands() {
-        let policy = policy(Mode::Bypass, &[], &["Bash"], &[]);
+        let bare = policy(Mode::Bypass, &[], &["Bash"], &[]);
         assert_eq!(
-            bash(&policy, "ls $(x)"),
+            bash(&bare, "ls $(x)"),
             Decision::Deny("deny rule Bash".to_string())
         );
+        // A worded rule covers one too: the tokenizer refused the shape, not the words.
+        let worded = policy(Mode::Bypass, &[], &["Bash(rm:*)", "Bash(curl:*)"], &[]);
+        assert_eq!(
+            bash(&worded, "rm -rf $DIR"),
+            Decision::Deny("deny rule Bash(rm:*)".to_string())
+        );
+        assert_eq!(
+            bash(&worded, "curl $URL"),
+            Decision::Deny("deny rule Bash(curl:*)".to_string())
+        );
+        assert_eq!(bash(&worded, "ls $(x)"), Decision::Ask);
     }
 
     #[test]
@@ -1453,6 +1497,30 @@ mod tests {
         );
         assert!(!command("cat $HOME/.ssh/id_ed25519"), "a protected path");
         assert!(!command("cat $HOME/.e*"), "a glob that may reach one");
+
+        // An ask rule is the user saying they want to see it, so the judge does not get
+        // to wave it through in the one mode where nothing else would stop it.
+        let asking = Policy::new(
+            Mode::Auto,
+            Rules {
+                ask: rules(&[
+                    "Bash(git log -p:*)",
+                    "Bash(cargo publish:*)",
+                    "Write(gen/**)",
+                ]),
+                ..Rules::default()
+            },
+            None,
+            repo.clone(),
+        )
+        .with_trust(Trust::new(&dir.join("config"), &repo));
+        asking.trust().unwrap();
+        assert!(asking.judgeable("bash", &json!({"command": "cargo clippy"})));
+        assert!(!asking.judgeable("bash", &json!({"command": "git log -p"})));
+        assert!(!asking.judgeable("bash", &json!({"command": "cargo publish"})));
+        assert!(!asking.judgeable("bash", &json!({"command": "cargo publish $CRATE"})));
+        assert!(!asking.judgeable("write", &json!({"path": repo.join("gen/x.rs")})));
+        assert!(asking.judgeable("write", &json!({"path": repo.join("src/x.rs")})));
 
         // What the judge is there to rule on: a scratch file, and reading outside.
         assert!(path("write", &dir.join("outside/x.rs")), "scratch");

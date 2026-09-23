@@ -1348,7 +1348,7 @@ as-is. Try a different approach, or ask the user."
                         // for the model; naming all three lets it see which it tripped.
                         Undecided::Unjudgeable => (
                             "only the user may approve this one",
-                            " It names a protected path, writes outside the project and its scratch directories, or is a command the permission checker cannot read, such as one holding an expansion, a subshell or an unquoted heredoc. Written plainer it may go through.",
+                            " It names a protected path, writes outside the project and its scratch directories, matches an ask rule the user set, or is a command the permission checker cannot read, such as one holding an expansion, a subshell or an unquoted heredoc. Written plainer it may go through.",
                         ),
                         Undecided::TooLong => (
                             "it is too long to put to the judge in full",
