@@ -7,6 +7,7 @@
 //! A model id prefixed `ollama:` is served by Ollama on this machine instead; the body
 //! and the stream are then [`crate::ollama`]'s, and everything else here is the same.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,8 @@ const DEFAULT_MODEL: &str = "gpt-5.5";
 const DEFAULT_EFFORT: &str = "medium";
 /// Give up on a stream that has produced nothing for this long.
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often a wait inside [`IDLE_TIMEOUT`] looks at the cancel flag.
+const CANCEL_POLL: Duration = Duration::from_millis(50);
 const MAX_ATTEMPTS: usize = 3;
 
 /// Where a session's inference runs.
@@ -398,11 +401,13 @@ impl Client {
         }
         let auth = auth::load(&self.http).await.map_err(Error::Fatal)?;
 
-        let resp = self
-            .request(&auth, body)
-            .send()
-            .await
-            .map_err(|e| Error::Retryable(anyhow!("request failed: {e}")))?;
+        let resp = watched(
+            self.request(&auth, body).send(),
+            cancel,
+            "request timed out",
+        )
+        .await?
+        .map_err(|e| Error::Retryable(anyhow!("request failed: {e}")))?;
 
         // A debug aid only; a failed write must not fail the call or draw over the TUI.
         if let Some(path) = &self.header_log {
@@ -430,27 +435,22 @@ impl Client {
         }
 
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         // The ChatGPT backend leaves `response.completed.response.output` empty, so the
         // turn is assembled from the per-item `done` events instead.
         let mut items: Vec<Value> = Vec::new();
         let mut completed = false;
 
         loop {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(Error::Interrupted);
-            }
-            let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
-                Err(_) => return Err(Error::Retryable(anyhow!("stream idle for too long"))),
-                Ok(None) => break,
-                Ok(Some(Err(e))) => return Err(Error::Retryable(anyhow!("stream error: {e}"))),
-                Ok(Some(Ok(chunk))) => chunk,
+            let chunk = match watched(stream.next(), cancel, "stream idle for too long").await? {
+                None => break,
+                Some(Err(e)) => return Err(Error::Retryable(anyhow!("stream error: {e}"))),
+                Some(Ok(chunk)) => chunk,
             };
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.extend_from_slice(&chunk);
 
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim_end_matches('\r').to_string();
-                buf.drain(..=nl);
+            while let Some(line) = take_line(&mut buf) {
+                let line = line.trim_end_matches('\r');
                 let Some(data) = line.strip_prefix("data:") else {
                     continue; // `event:` lines and blank separators carry nothing we need
                 };
@@ -481,7 +481,9 @@ impl Client {
                             items.push(item.clone());
                         }
                     }
-                    "response.completed" => {
+                    // `incomplete` is terminal too: the model stopped at a cap, and what
+                    // it produced is the answer rather than something to send again.
+                    "response.completed" | "response.incomplete" => {
                         completed = true;
                         // Some deployments do populate it; prefer their copy when present.
                         if let Some(output) = event
@@ -516,6 +518,11 @@ impl Client {
                     _ => {}
                 }
             }
+            // The rest of the batch is drained above, so nothing sharing the terminal
+            // event's chunk is lost by leaving here rather than waiting for the close.
+            if completed {
+                break;
+            }
         }
 
         if completed {
@@ -547,6 +554,38 @@ impl Client {
         }
         req
     }
+}
+
+/// Await `fut` while watching `cancel`, giving up after [`IDLE_TIMEOUT`] with `idle` as
+/// the message. The flag is polled rather than awaited, since an `AtomicBool` has nothing
+/// to wake on, and a stream can go a long time between chunks with an interrupt pending.
+pub(crate) async fn watched<T>(
+    fut: impl Future<Output = T>,
+    cancel: &Arc<AtomicBool>,
+    idle: &str,
+) -> std::result::Result<T, Error> {
+    let deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+    tokio::pin!(fut);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Interrupted);
+        }
+        let until = (tokio::time::Instant::now() + CANCEL_POLL).min(deadline);
+        match tokio::time::timeout_at(until, &mut fut).await {
+            Ok(done) => return Ok(done),
+            Err(_) if until == deadline => return Err(Error::Retryable(anyhow!("{idle}"))),
+            Err(_) => {}
+        }
+    }
+}
+
+/// The next complete line in `buf`, removed from it. Decoding is per line and not per
+/// chunk, since a network chunk can end in the middle of a multi-byte character.
+pub(crate) fn take_line(buf: &mut Vec<u8>) -> Option<String> {
+    let nl = buf.iter().position(|b| *b == b'\n')?;
+    let line = String::from_utf8_lossy(&buf[..nl]).into_owned();
+    buf.drain(..=nl);
+    Some(line)
 }
 
 /// A fresh guard for `conversation`, logging to `.bhai/debug/cache.jsonl`.
@@ -665,6 +704,27 @@ fn toml_string(line: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_character_split_across_chunks_is_decoded_whole() {
+        let text = "data: {\"delta\":\"🙂\"}\n";
+        let split = text.find('🙂').unwrap() + 2;
+        let mut buf = text.as_bytes()[..split].to_vec();
+        assert_eq!(take_line(&mut buf), None);
+        buf.extend_from_slice(&text.as_bytes()[split..]);
+        assert_eq!(
+            take_line(&mut buf).as_deref(),
+            Some("data: {\"delta\":\"🙂\"}")
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_watched_wait_gives_up_as_soon_as_the_turn_is_cancelled() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let waited = watched(std::future::pending::<()>(), &cancel, "idle").await;
+        assert!(matches!(waited, Err(Error::Interrupted)));
+    }
 
     #[test]
     fn usage_is_read_from_response_completed() {

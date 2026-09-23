@@ -10,13 +10,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-use crate::client::{Delta, Error, IDLE_TIMEOUT, Usage};
+use crate::client::{self, Delta, Error, Usage};
 
 pub const DEFAULT_URL: &str = "http://localhost:11434";
 /// What picks this backend in a model id: `ollama:gemma4:e2b`.
@@ -123,12 +123,13 @@ pub async fn attempt(
     cancel: &Arc<AtomicBool>,
 ) -> std::result::Result<Vec<Value>, Error> {
     let endpoint = format!("{}/api/chat", url.trim_end_matches('/'));
-    let resp = http
-        .post(&endpoint)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| Error::Retryable(anyhow!("request to {endpoint} failed: {e}")))?;
+    let resp = client::watched(
+        http.post(&endpoint).json(body).send(),
+        cancel,
+        "request timed out",
+    )
+    .await?
+    .map_err(|e| Error::Retryable(anyhow!("request to {endpoint} failed: {e}")))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -141,30 +142,26 @@ pub async fn attempt(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut text = String::new();
     let mut calls: Vec<Value> = Vec::new();
     let mut done = false;
 
     loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Error::Interrupted);
-        }
-        let chunk = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
-            Err(_) => return Err(Error::Retryable(anyhow!("stream idle for too long"))),
-            Ok(None) => break,
-            Ok(Some(Err(e))) => return Err(Error::Retryable(anyhow!("stream error: {e}"))),
-            Ok(Some(Ok(chunk))) => chunk,
+        let chunk = match client::watched(stream.next(), cancel, "stream idle for too long").await?
+        {
+            None => break,
+            Some(Err(e)) => return Err(Error::Retryable(anyhow!("stream error: {e}"))),
+            Some(Ok(chunk)) => chunk,
         };
-        buf.push_str(&String::from_utf8_lossy(&chunk));
+        buf.extend_from_slice(&chunk);
 
-        while let Some(nl) = buf.find('\n') {
-            let line = buf[..nl].trim().to_string();
-            buf.drain(..=nl);
+        while let Some(line) = client::take_line(&mut buf) {
+            let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            let Ok(event) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
             if let Some(msg) = event.get("error").and_then(Value::as_str) {
@@ -191,6 +188,11 @@ pub async fn attempt(
                 done = true;
                 on_delta(Delta::Usage(usage(&event)));
             }
+        }
+        // The rest of the batch is drained above, so nothing sharing the final event's
+        // chunk is lost by leaving here rather than waiting for the close.
+        if done {
+            break;
         }
     }
 
@@ -315,6 +317,68 @@ mod tests {
             json!({"type": "message", "role": "assistant",
                    "content": [{"type": "output_text", "text": "one file"}]}),
         ]
+    }
+
+    /// One `/api/chat` reply written as `chunks` over a raw socket that is never closed,
+    /// so the read loop has to end on `done` rather than on the transport.
+    async fn serve_chunks(chunks: Vec<Vec<u8>>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0u8; 4096]).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in chunks {
+                let framed = format!("{:x}\r\n", chunk.len());
+                socket.write_all(framed.as_bytes()).await.unwrap();
+                socket.write_all(&chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_reply_ends_at_done_with_a_character_split_across_chunks() {
+        let body = concat!(
+            "{\"message\":{\"content\":\"héllo 🙂\"},\"done\":false}\n",
+            "{\"message\":{\"content\":\"!\"},\"done\":true}\n",
+        );
+        let split = body.find('🙂').unwrap() + 2;
+        let chunks = vec![
+            body.as_bytes()[..split].to_vec(),
+            body.as_bytes()[split..].to_vec(),
+        ];
+        let url = serve_chunks(chunks).await;
+
+        let mut text = String::new();
+        let mut on_delta = |delta: Delta| {
+            if let Delta::Text(part) = delta {
+                text.push_str(&part);
+            }
+        };
+        let http = reqwest::Client::new();
+        let request = json!({});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let read = attempt(&http, &url, &request, &mut on_delta, &cancel);
+        let items = match tokio::time::timeout(std::time::Duration::from_secs(5), read).await {
+            Ok(Ok(items)) => items,
+            Ok(Err(_)) => panic!("the reply was refused"),
+            Err(_) => panic!("the reply waited for a socket that never closed"),
+        };
+        assert_eq!(text, "héllo 🙂!");
+        assert_eq!(items[0]["content"][0]["text"], "héllo 🙂!");
     }
 
     #[tokio::test]
