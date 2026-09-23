@@ -20,9 +20,12 @@ const REFUSED: &[&str] = &[
     "eval", "exec", "source", ".", "sudo", "doas", "command", "builtin",
 ];
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"];
-/// Prefixes that run the rest of the words as a command.
+/// Prefixes that run the rest of the words as a command. The shell keywords are here
+/// because the tokenizer reads `if ...; then rm -rf x; fi` as ordinary words, so without
+/// them a deny or ask rule would never see the `rm` behind the `then`.
 const WRAPPERS: &[&str] = &[
-    "env", "nohup", "time", "timeout", "nice", "xargs", "stdbuf", "!",
+    "env", "nohup", "time", "timeout", "nice", "xargs", "stdbuf", "!", "if", "then", "elif",
+    "else", "for", "do", "while", "until",
 ];
 /// `find` flags whose arguments, up to a `;` or `+` word, are a command of their own.
 const EXEC_FLAGS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];

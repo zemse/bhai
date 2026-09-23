@@ -1094,6 +1094,11 @@ mod tests {
             r"find . -execdir /usr/bin/git push origin main \;",
             "xargs -n1 git push",
             "xargs -n1 -0 git push",
+            // A shell keyword is an ordinary word to the tokenizer, so without it in
+            // WRAPPERS no form of the command starts at the program the rule names.
+            "if true; then git push origin main; fi",
+            "while true; do git push; done",
+            "if false; then ls; else git push; fi",
         ] {
             assert_eq!(bash(&deny_policy, command), deny, "{command}");
         }
