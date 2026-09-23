@@ -305,13 +305,24 @@ fn answered<'a>(items: impl Iterator<Item = &'a Value>) -> usize {
 #[derive(Debug)]
 pub struct Summary {
     pub path: PathBuf,
+    /// The id from the file name, which is all a session that will not load has.
+    pub id: String,
+    pub modified: std::time::SystemTime,
+    /// What the file holds, or why [`load`] refused it.
+    pub details: Result<Details, String>,
+}
+
+/// The part of a session `bhai sessions` prints.
+#[derive(Debug)]
+pub struct Details {
     pub header: Header,
     pub first: Option<String>,
     pub items: usize,
-    pub modified: std::time::SystemTime,
 }
 
-/// Every readable session under `dir`, most recently written first.
+/// Every session under `dir`, most recently written first. One that will not load
+/// keeps its place, carrying the reason instead of its contents, so a file that is
+/// there is never reported as missing.
 pub fn list(dir: &Path) -> Vec<Summary> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -322,11 +333,17 @@ pub fn list(dir: &Path) -> Vec<Summary> {
         .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
         .filter_map(|path| {
             let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
-            let loaded = load(&path).ok()?;
+            let id = path.file_stem()?.to_string_lossy().into_owned();
+            let details = load(&path)
+                .map(|loaded| Details {
+                    first: loaded.items.iter().find_map(user_text).map(truncate),
+                    items: loaded.items.len(),
+                    header: loaded.header,
+                })
+                .map_err(|e| format!("{e:#}"));
             Some(Summary {
-                first: loaded.items.iter().find_map(user_text).map(truncate),
-                items: loaded.items.len(),
-                header: loaded.header,
+                id,
+                details,
                 path,
                 modified,
             })
@@ -336,15 +353,17 @@ pub fn list(dir: &Path) -> Vec<Summary> {
     sessions
 }
 
-/// The session to resume: `id` (or a unique prefix of it), else the latest.
+/// The session to resume: `id` (or a unique prefix of it), else the latest. A file
+/// that will not load is matched like any other, so the reason reaches the user.
 pub fn find(dir: &Path, id: Option<&str>) -> Result<Loaded> {
     let sessions = list(dir);
     let found: Vec<&Summary> = match id {
-        Some(id) => sessions
+        Some(id) => sessions.iter().filter(|s| s.id.starts_with(id)).collect(),
+        None => sessions
             .iter()
-            .filter(|s| s.header.session.starts_with(id))
+            .filter(|s| s.details.is_ok())
+            .take(1)
             .collect(),
-        None => sessions.iter().take(1).collect(),
     };
     match (found.as_slice(), id) {
         ([one], _) => load(&one.path),
@@ -362,15 +381,16 @@ pub fn report(sessions: &[Summary]) -> String {
     }
     sessions
         .iter()
-        .map(|s| {
-            format!(
+        .map(|s| match &s.details {
+            Ok(d) => format!(
                 "--resume {}  {}  {:<10} {:>4} items  {}\n",
-                s.header.session,
-                s.header.created.format("%Y-%m-%d %H:%M"),
-                s.header.identity,
-                s.items,
-                s.first.as_deref().unwrap_or("")
-            )
+                d.header.session,
+                d.header.created.format("%Y-%m-%d %H:%M"),
+                d.header.identity,
+                d.items,
+                d.first.as_deref().unwrap_or("")
+            ),
+            Err(e) => format!("--resume {}  (unreadable: {e})\n", s.id),
         })
         .collect()
 }
@@ -391,7 +411,11 @@ pub fn exit_hint(dir: &Path, id: &str) -> Option<String> {
     if items == 0 {
         return None;
     }
-    let newest = list(dir).first().is_some_and(|s| s.header.session == id);
+    // The newest that loads, since that is the one a bare `--resume` picks.
+    let newest = list(dir)
+        .iter()
+        .find(|s| s.details.is_ok())
+        .is_some_and(|s| s.id == id);
     Some(hint(id, items, newest))
 }
 
@@ -599,14 +623,33 @@ mod tests {
             .set_modified(past)
             .unwrap();
         std::fs::write(dir.join("broken.jsonl"), "not json\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("broken.jsonl"))
+            .unwrap()
+            .set_modified(past - std::time::Duration::from_secs(60))
+            .unwrap();
 
         let sessions = list(&dir);
-        let ids: Vec<_> = sessions.iter().map(|s| s.header.session.as_str()).collect();
-        assert_eq!(ids, ["bbb222", "aaa111"]);
-        assert_eq!(sessions[0].first.as_deref(), Some("hi \u{1F600} \"there\""));
-        assert_eq!(sessions[1].items, 5);
+        let ids: Vec<_> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["bbb222", "aaa111", "broken"]);
+        fn details(s: &Summary) -> &Details {
+            s.details.as_ref().unwrap()
+        }
+        assert_eq!(
+            details(&sessions[0]).first.as_deref(),
+            Some("hi \u{1F600} \"there\"")
+        );
+        assert_eq!(details(&sessions[1]).items, 5);
         assert!(report(&sessions).contains("--resume aaa111"));
         assert!(report(&sessions).contains("5 items"));
+
+        // A file that will not load is still listed and still resumable by name, so
+        // the reason reaches the user instead of the session looking lost.
+        assert!(report(&sessions).contains("--resume broken  (unreadable: "));
+        assert!(report(&sessions).contains("bad header"));
+        let refused = find(&dir, Some("broken")).unwrap_err().to_string();
+        assert!(refused.contains("bad header"), "{refused}");
 
         assert_eq!(find(&dir, None).unwrap().header.session, "bbb222");
         assert_eq!(find(&dir, Some("aaa")).unwrap().header.session, "aaa111");
