@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{BoxFuture, Live, Tool, string_arg};
+use super::{BoxFuture, Live, Tool, string_arg, truncate};
 use crate::mcp::Hub;
 
 pub const SEARCH: &str = "mcp_search";
@@ -64,7 +64,7 @@ impl Tool for Search {
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
         Box::pin(async move {
             match query(args) {
-                Ok(q) => (self.hub.search(q).await, true),
+                Ok(q) => (truncate(&self.hub.search(q).await), true),
                 Err(e) => (e, false),
             }
         })
@@ -261,5 +261,19 @@ mod tests {
         assert!(!ok && out.contains("interrupted"), "{out}");
         call.hub.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_search_trims_a_server_schema_too_big_to_read() {
+        let huge = ToolInfo {
+            schema: json!({"pad": "x".repeat(60_000)}),
+            ..ToolInfo::test("gh", "get_issue", "Get an issue")
+        };
+        let search = Search {
+            hub: Arc::new(Hub::offline(vec![("gh", vec![huge])])),
+        };
+        let (out, ok) = search.execute(&json!({"query": "issue"})).await;
+        assert!(ok && out.len() < 30_000, "{} bytes", out.len());
+        assert!(out.contains("bytes trimmed"), "{out}");
     }
 }
