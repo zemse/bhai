@@ -1,7 +1,8 @@
 """A tiny MCP stdio server for bhai's tests: initialize, two tools, and an echo call.
 
-`fake_mcp.py hang` never answers; `fake_mcp.py exit` quits at once; `fake_mcp.py http`
-serves the same tools over streamable HTTP on a free port, printed as JSON on stdout.
+`fake_mcp.py hang` never answers; `fake_mcp.py hangcall` answers everything but a call;
+`fake_mcp.py exit` quits at once; `fake_mcp.py http` serves the same tools over streamable
+HTTP on a free port, printed as JSON on stdout.
 """
 
 import json
@@ -56,6 +57,8 @@ def serve_stdio(mode):
         msg = json.loads(line)
         id = msg.get("id")
         if id is None:
+            continue
+        if mode == "hangcall" and msg.get("method") == "tools/call":
             continue
         found = result(msg)
         if found is None:

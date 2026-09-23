@@ -30,6 +30,9 @@ use servers::Server;
 
 /// How long a server gets to start, initialize and list its tools.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a server gets to answer one call. Generous: MCP tools can legitimately run
+/// for minutes, and an interrupt already ends the wait sooner.
+const CALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Tool names the prompt line shows per server.
 const PROMPT_TOOLS: usize = 3;
 /// Results `mcp_search` returns.
@@ -366,6 +369,15 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
     /// Run `full_name`; returns the output and whether it succeeded. A tool of a deferred
     /// server starts that server first.
     pub async fn call(&self, full_name: &str, arguments: Value) -> (String, bool) {
+        self.call_within(full_name, arguments, CALL_TIMEOUT).await
+    }
+
+    async fn call_within(
+        &self,
+        full_name: &str,
+        arguments: Value,
+        timeout: Duration,
+    ) -> (String, bool) {
         let found = match self.find(full_name) {
             Some(tool) => Some((
                 tool.clone(),
@@ -394,9 +406,17 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
         if let Value::Object(arguments) = arguments {
             params = params.with_arguments(arguments);
         }
-        match peer.call_tool(params).await {
-            Ok(result) => render(&result),
-            Err(e) => (format!("MCP call failed: {e}"), false),
+        match tokio::time::timeout(timeout, peer.call_tool(params)).await {
+            Ok(Ok(result)) => render(&result),
+            Ok(Err(e)) => (format!("MCP call failed: {e}"), false),
+            Err(_) => (
+                format!(
+                    "MCP server `{}` did not answer in {}s.",
+                    tool.server,
+                    timeout.as_secs()
+                ),
+                false,
+            ),
         }
     }
 
@@ -815,6 +835,32 @@ mod tests {
         hub.shutdown().await;
         let (out, ok) = hub.call("mcp__fake__echo", serde_json::json!({})).await;
         assert!(!ok, "{out}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_call_a_server_never_answers_fails_with_the_server_named() {
+        if !python() {
+            return;
+        }
+        let dir = temp_dir();
+        let hub = Hub::connect(
+            vec![fake("stuck", "hangcall")],
+            &Identity::default(),
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
+        let (out, ok) = hub
+            .call_within(
+                "mcp__stuck__echo",
+                serde_json::json!({"message": "hi"}),
+                Duration::from_millis(200),
+            )
+            .await;
+        assert!(!ok && out.contains("`stuck`"), "{out}");
+        hub.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 

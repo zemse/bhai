@@ -2,10 +2,12 @@
 //! approval, decided under its `mcp__server__tool` name.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{BoxFuture, Tool, string_arg};
+use super::{BoxFuture, Live, Tool, string_arg};
 use crate::mcp::Hub;
 
 pub const SEARCH: &str = "mcp_search";
@@ -13,6 +15,8 @@ pub const CALL: &str = "mcp_call";
 
 /// Longest argument summary shown in the approval prompt.
 const SUMMARY_ARGS: usize = 160;
+/// How soon an interrupt stops the wait for a server's answer.
+const TICK: Duration = Duration::from_millis(50);
 
 pub struct Search {
     pub hub: Arc<Hub>,
@@ -126,11 +130,40 @@ impl Tool for Call {
     }
 
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        let live = Live {
+            progress: &|_| {},
+            cancel: &NEVER,
+        };
+        self.execute_live(args, live)
+    }
+
+    /// Dropping the call's future is what abandons a server that stopped answering.
+    fn execute_live<'a>(
+        &'a self,
+        args: &'a Value,
+        live: Live<'a>,
+    ) -> BoxFuture<'a, (String, bool)> {
         Box::pin(async move {
             let name = string_arg(args, "name").unwrap_or_default();
-            match arguments(args) {
-                Ok(arguments) => self.hub.call(name, arguments).await,
-                Err(e) => (e, false),
+            let arguments = match arguments(args) {
+                Ok(arguments) => arguments,
+                Err(e) => return (e, false),
+            };
+            let call = self.hub.call(name, arguments);
+            tokio::pin!(call);
+            let mut tick = tokio::time::interval(TICK);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tick.tick() => {
+                        if live.cancel.load(Ordering::Relaxed) {
+                            let why = format!("The user interrupted the turn; `{name}` did not finish.");
+                            return (why, false);
+                        }
+                    }
+                    out = &mut call => return out,
+                }
             }
         })
     }
@@ -198,5 +231,35 @@ mod tests {
             "mcp_search issue"
         );
         assert!(search.describe(&json!({"query": " "})).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_call_stops_waiting_for_the_server() {
+        static CANCELLED: AtomicBool = AtomicBool::new(false);
+        let Some(server) = crate::mcp::fake_server("stuck", "hangcall") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("bhai-mcp-call-{}", uuid::Uuid::new_v4()));
+        let hub = Hub::connect(
+            vec![server],
+            &crate::identity::Identity::default(),
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            CANCELLED.store(true, Ordering::Relaxed);
+        });
+        let call = Call { hub: Arc::new(hub) };
+        let live = Live {
+            progress: &|_| {},
+            cancel: &CANCELLED,
+        };
+        let args = json!({"name": "mcp__stuck__echo", "arguments": {"message": "hi"}});
+        let (out, ok) = call.execute_live(&args, live).await;
+        assert!(!ok && out.contains("interrupted"), "{out}");
+        call.hub.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
