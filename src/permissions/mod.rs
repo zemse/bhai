@@ -652,6 +652,7 @@ impl Checker<'_> {
                 .allow()
                 .iter()
                 .find(|r| r.applies_to("bash") && r.matches_words(&c.words, false))
+                .filter(|_| self.redirects_allowed(c, &cwd))
                 .map(rule_reason)
                 .or_else(|| read_only.then(|| "read-only".to_string()))
                 .or_else(|| self.project_command(c, &cwd).then(project_reason));
@@ -741,10 +742,34 @@ impl Checker<'_> {
     /// make: a redirect is a write, so `auto` relaxes it on the same terms. A command
     /// that writes nowhere passes.
     fn redirects_inside(&self, command: &bash::Command, cwd: &Path) -> bool {
-        command
-            .writes
-            .iter()
-            .all(|target| self.project_write("write", &cwd.join(target)))
+        command.writes.iter().all(|target| {
+            self.write_target(cwd, target)
+                .is_some_and(|path| self.project_write("write", &path))
+        })
+    }
+
+    /// Whether every file the command redirects into is one the rules allow writing. An
+    /// allow rule names a program, not the files a redirect points its output at, so the
+    /// targets are checked as writes in their own right and a deny, an ask or a
+    /// protected path still stops them.
+    fn redirects_allowed(&self, command: &bash::Command, cwd: &Path) -> bool {
+        command.writes.iter().all(|target| {
+            self.write_target(cwd, target).is_some_and(|path| {
+                matches!(self.check_path("write", &path, true), Decision::Allow(_))
+            })
+        })
+    }
+
+    /// The file a redirect target names. A leading `~/` is the home directory; `Path::join`
+    /// would take it for a relative component and land it inside the project. Any other
+    /// `~` form is an expansion nothing here can resolve, so there is no path to check
+    /// and the redirect fails closed.
+    fn write_target(&self, cwd: &Path, target: &str) -> Option<PathBuf> {
+        match target.strip_prefix("~/") {
+            Some(rest) => Some(self.base.home?.join(rest)),
+            None if target.starts_with('~') => None,
+            None => Some(cwd.join(target)),
+        }
     }
 
     /// The allow rules this mode honours.
@@ -831,6 +856,32 @@ mod tests {
 
     fn allowed(reason: &str) -> Decision {
         Decision::Allow(reason.to_string())
+    }
+
+    /// An allow rule names a program. It says nothing about where a redirect points
+    /// that program's output, so the target is checked as the write it is.
+    #[test]
+    fn an_allow_rule_does_not_carry_a_redirect_with_it() {
+        let allow = Rules {
+            allow: rules(&["Bash(cargo test)", "Bash(git log:*)"])
+                .into_iter()
+                .map(Rule::by_user)
+                .collect(),
+            ..Rules::default()
+        };
+        let p = Policy::new(
+            Mode::Ask,
+            allow,
+            Some("/home/u".into()),
+            "/home/u/repo".into(),
+        );
+        assert_eq!(bash(&p, "cargo test"), allowed("rule Bash(cargo test)"));
+        assert_eq!(bash(&p, "git log -p"), allowed("rule Bash(git log:*)"));
+        assert_eq!(bash(&p, "cargo test > ~/.zshrc"), Decision::Ask);
+        assert_eq!(bash(&p, "cargo test > /etc/cron.d/evil"), Decision::Ask);
+        assert_eq!(bash(&p, "git log > ~/.profile"), Decision::Ask);
+        // The pattern would carry only the words, so there is no exact rule to offer.
+        assert!(rules::exact_command("cargo test > /etc/cron.d/evil").is_none());
     }
 
     #[test]
@@ -1310,6 +1361,10 @@ mod tests {
         assert_eq!(bash(&p, "cargo test > /tmp/out.txt"), Decision::Ask);
         assert_eq!(bash(&p, "cargo test > ../out.txt"), Decision::Ask);
         assert_eq!(bash(&p, "cargo test > .env"), Decision::Ask);
+        // `~` is a shell expansion, not a directory of that name in the project.
+        assert_eq!(bash(&p, "cargo test > ~/x"), Decision::Ask);
+        assert_eq!(bash(&p, "cargo test > ~/.zshrc"), Decision::Ask);
+        assert_eq!(bash(&p, "cargo test > ~x/y"), Decision::Ask);
         // A symlink out of the project, a path outside it and a protected path still ask.
         let away = repo.join("away/x.rs");
         assert_eq!(file(&p, "edit", away.to_str().unwrap()), Decision::Ask);

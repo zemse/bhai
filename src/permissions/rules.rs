@@ -192,7 +192,13 @@ const MULTI_VERB: &[&str] = &[
 
 /// `Bash(<command>)` for exactly this simple command, if the rule reads back as such.
 pub fn exact_command(command: &str) -> Option<Rule> {
-    let words = single(command)?.words;
+    let parsed = single(command)?;
+    // The pattern would carry only the words, so the rule would read as an allowance for
+    // the program with any redirect at all; there is no exact rule to offer.
+    if !parsed.writes.is_empty() {
+        return None;
+    }
+    let words = parsed.words;
     let rule = Rule::parse(&format!("Bash({})", command.trim())).ok()?;
     let want = Pattern::Command {
         words,
