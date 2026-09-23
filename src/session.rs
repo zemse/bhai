@@ -506,6 +506,18 @@ impl Session {
         out
     }
 
+    /// The mode the config asked for, which trust may be holding back, for the debug
+    /// export: a session sitting in `ask` when it was started in `auto` is a question
+    /// about trust rather than about the mode.
+    pub fn wanted_mode(&self) -> Mode {
+        self.policy.wanted()
+    }
+
+    /// Whether this project's own settings files are trusted.
+    pub fn trusted(&self) -> bool {
+        self.policy.trusted()
+    }
+
     /// Add an allow rule, for `/allow`. It is the user's own, so it holds in every mode
     /// and is saved where a remembered approval goes. `auto` mode never prompts, so this
     /// is the only way to permit a call from the prompt rather than by changing mode:

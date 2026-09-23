@@ -2,3 +2,4 @@
 /.bhai/debug/
 /.bhai/settings.local.json
 /.bhai/sessions/
+/bhai-debug-*.md

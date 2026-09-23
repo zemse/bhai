@@ -11,6 +11,7 @@ mod clipboard;
 mod commands;
 mod compact;
 mod config;
+mod debug;
 mod diff;
 mod entries;
 mod frontmatter;
@@ -353,6 +354,7 @@ allow it.",
         workflows,
         trust_gate,
         ollama_url,
+        session_id.clone(),
         limits,
     )
     .await;
@@ -1035,6 +1037,7 @@ async fn run(
     workflows: workflow::Found,
     trust_gate: Option<app::TrustGate>,
     ollama_url: String,
+    session_id: String,
     limits: Limits,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
@@ -1082,6 +1085,7 @@ async fn run(
     app.history = prompts;
     app.trust_gate = trust_gate;
     app.ollama_url = ollama_url;
+    app.session_id = session_id;
     app.limits = limits;
     {
         let mut entries = app.entries();

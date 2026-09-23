@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use std::collections::HashSet;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,7 @@ use crate::client::Usage;
 use crate::clipboard;
 use crate::commands::{self, Item};
 use crate::compact::Limits;
+use crate::debug;
 use crate::diff::DiffView;
 use crate::entries::Entries;
 pub use crate::entries::Entry;
@@ -256,6 +258,8 @@ pub struct App {
     pub picker: Option<Picker>,
     /// Where the Ollama server is, for asking it what it has pulled.
     pub ollama_url: String,
+    /// The session's id, which names its file on disk; empty until main fills it in.
+    pub session_id: String,
     pub quit: bool,
     session: Arc<Session>,
 }
@@ -324,6 +328,7 @@ impl App {
             child_rows: Vec::new(),
             picker: None,
             ollama_url: crate::ollama::DEFAULT_URL.to_string(),
+            session_id: String::new(),
             quit: false,
             session,
         }
@@ -1095,6 +1100,10 @@ impl App {
             }
             return;
         }
+        if message.starts_with("/export-debug") {
+            self.export_debug();
+            return;
+        }
         if message.starts_with("/permissions") {
             self.follow = true;
             self.note(Entry::Info(self.session.permissions()));
@@ -1296,6 +1305,61 @@ impl App {
             };
             session.publish(event);
         });
+    }
+
+    /// Everything about this session in one file, for `/export-debug`. It goes in the
+    /// working directory rather than under `.bhai/debug`, since the point of it is to be
+    /// handed to someone: a path the user can see beats one they have to be told about.
+    /// The profile is the one part that has to be asked for, so the rest is gathered
+    /// here and the write waits on it.
+    fn export_debug(&mut self) {
+        self.follow = true;
+        let transcript = self.transcript();
+        let session = Arc::clone(&self.session);
+        let mut bundle = self.debug_bundle();
+        tokio::spawn(async move {
+            bundle.profile = session.context().await.map(|mut profile| {
+                profile.transcript = Some(transcript);
+                profile
+            });
+            let dir = std::env::current_dir().unwrap_or_default();
+            session.publish(match debug::export(&bundle, &dir) {
+                Ok(path) => Event::Info(bundle.summary(&path)),
+                Err(e) => Event::Error(format!("debug export failed: {e:#}")),
+            });
+        });
+    }
+
+    /// Everything the export carries except the profile, which has to be asked for.
+    fn debug_bundle(&self) -> debug::Bundle {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        debug::Bundle {
+            version: env!("CARGO_PKG_VERSION"),
+            session_id: self.session_id.clone(),
+            session_file: (!self.session_id.is_empty())
+                .then(|| crate::sessions::path(&cwd.join(crate::sessions::DIR), &self.session_id)),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            branch: self.branch.name().map(str::to_string),
+            terminal: ratatui::crossterm::terminal::size().ok(),
+            backend: match self.model.starts_with("ollama:") {
+                true => format!("ollama at {}", self.ollama_url),
+                false => "codex".to_string(),
+            },
+            state: self.session.state(),
+            wanted_mode: self.session.wanted_mode(),
+            trusted: self.session.trusted(),
+            limits: self.limits,
+            permissions: self.session.permissions(),
+            skills: skills_report(&self.skills),
+            mcp: crate::mcp::report(self.mcp.as_deref()),
+            workflows: workflow::report(&self.workflows),
+            judged: debug::judge_log(&profile::debug_dir().join("judge.jsonl")),
+            children: self.session.children(),
+            // The session's own transcript, not the child pane that may be open over it.
+            entries: self.session.entries().list.clone(),
+            profile: None,
+            cwd,
+        }
     }
 
     /// The badge numbers of every attributed entry, with the session totals.
@@ -1909,6 +1973,44 @@ mod tests {
         app.input.set("/allow not a rule".to_string());
         app.submit();
         assert!(last(&mut app).contains("expected a tool name"));
+    }
+
+    /// The export is meant to be handed to someone instead of a screenshot, so what it
+    /// says about the session has to be the session, not a default the assembly missed.
+    #[test]
+    fn the_debug_export_carries_the_session_it_was_taken_from() {
+        let (mut app, _user, _control) = connected();
+        app.session_id = "abc123".to_string();
+        app.input.set("/allow Bash(brew install:*)".to_string());
+        app.submit();
+        app.entries().push(Entry::Command {
+            tool: "bash".to_string(),
+            summary: "brew install gnupg".to_string(),
+        });
+
+        let bundle = app.debug_bundle();
+        assert_eq!(bundle.session_id, "abc123");
+        assert!(
+            bundle
+                .session_file
+                .as_ref()
+                .is_some_and(|f| f.ends_with(".bhai/sessions/abc123.jsonl")),
+            "{:?}",
+            bundle.session_file
+        );
+        assert_eq!(bundle.state.model, "gpt-5.5");
+        assert_eq!(bundle.backend, "codex");
+        assert!(bundle.permissions.contains("Bash(brew install:*)"));
+
+        let dir = std::env::temp_dir().join(format!("bhai-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = crate::debug::export(&bundle, &dir).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("brew install gnupg"), "the transcript");
+        assert!(text.contains("- session: abc123"), "the header");
+        assert!(text.contains("Bash(brew install:*)"), "the rules");
+        assert!(bundle.summary(&path).contains("not profiled"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

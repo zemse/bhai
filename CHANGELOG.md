@@ -6,6 +6,16 @@ carries the shape of what is there.
 
 ## 2026-09-23
 
+- `/export-debug` writes the whole session to one markdown file in the working directory
+  and says where it went, so a report is a file to hand over rather than a screenshot of
+  the transcript. What goes in is what the loop's own questions turn on: the model, mode
+  and identity it ran under, whether trust held the mode back, the totals and rate-limit
+  windows, every permission rule and where it came from, the last 50 judge decisions with
+  the exact summary each was sent, the skills, MCP servers and workflows found, the token
+  profile, and the transcript in order. The home directory is written as `~`, which is the
+  only thing rewritten; the header says so, and says the transcript below holds whatever
+  the session saw.
+
 - `auto` mode stops denying the work the user asked for. Four things were wrong at once,
   found from a session that set up GPG on the machine and got nowhere. `command -v gpg`
   was read as running its arguments, the way `sudo` is, so one of them made a whole
