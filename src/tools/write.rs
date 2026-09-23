@@ -47,8 +47,14 @@ impl Tool for Write {
 
     fn describe(&self, args: &Value) -> Result<String, String> {
         let (path, content) = parse(args)?;
+        // Creating a file and replacing one are the same call, and the approval line is
+        // where that difference has to be visible.
+        let over = match std::fs::metadata(path) {
+            Ok(meta) => format!("over {} bytes", meta.len()),
+            Err(_) => "new file".to_string(),
+        };
         Ok(format!(
-            "write {} ({} bytes)",
+            "write {} ({} bytes, {over})",
             path.display(),
             content.len()
         ))
@@ -99,8 +105,20 @@ mod tests {
 
     #[test]
     fn describes_the_path_and_size() {
-        let args = json!({"path": "/tmp/x.txt", "content": "abc"});
-        assert_eq!(Write.describe(&args).unwrap(), "write /tmp/x.txt (3 bytes)");
+        let dir = super::super::temp_dir();
+        let fresh = dir.join("x.txt");
+        let args = json!({"path": fresh, "content": "abc"});
+        assert_eq!(
+            Write.describe(&args).unwrap(),
+            format!("write {} (3 bytes, new file)", fresh.display())
+        );
+        // The one gate that matters has to say a create from an overwrite.
+        std::fs::write(&fresh, "0123456789").unwrap();
+        assert_eq!(
+            Write.describe(&args).unwrap(),
+            format!("write {} (3 bytes, over 10 bytes)", fresh.display())
+        );
+        let _ = std::fs::remove_dir_all(dir);
         assert!(
             Write
                 .describe(&json!({"path": "x.txt", "content": ""}))

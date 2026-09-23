@@ -260,6 +260,10 @@ fn render_queued(frame: &mut Frame, area: Rect, app: &App) {
 
     let rows = inner.height as usize;
     let width = inner.width as usize;
+    // A bordered block has no inside at all on a terminal two rows tall.
+    if rows == 0 {
+        return;
+    }
     // The last row is spent saying how many did not fit, rather than dropping them
     // silently: what is waiting is the whole point of the panel.
     let shown = match app.queued.len() > rows {
@@ -398,11 +402,12 @@ fn limit_spans(found: &RateLimits, hover: bool) -> Vec<Span<'static>> {
     spans
 }
 
-/// `text` cut to `max` characters, with an ellipsis when it had more.
+/// `text` cut to `max` characters, with an ellipsis when it had more. Callers work out
+/// their room by subtraction, so `max` can reach zero on a narrow terminal.
 fn clip(text: &str, max: usize) -> String {
     let flat = text.replace('\n', " ");
     match flat.chars().count() > max {
-        true => flat.chars().take(max - 1).collect::<String>() + "…",
+        true => flat.chars().take(max.saturating_sub(1)).collect::<String>() + "…",
         false => flat,
     }
 }
@@ -1254,6 +1259,19 @@ mod tests {
         assert_ne!(buffer[(buffer.area.width - 1, rows.end)].bg, USER_BG);
     }
 
+    /// A bordered block has no inside on a terminal this short, so the panel has no row
+    /// to spend on the "N more" line and must not go looking for one.
+    #[test]
+    fn the_queued_panel_survives_a_terminal_with_no_room_for_it() {
+        for rows in 1..=10 {
+            let mut app = App::detached();
+            app.working = true;
+            app.queued = (1..=4).map(|i| format!("prompt {i}")).collect();
+            let mut terminal = Terminal::new(TestBackend::new(40, rows)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        }
+    }
+
     #[test]
     fn a_failed_turn_offers_to_run_again_while_it_is_the_last_thing_said() {
         let mut app = App::detached();
@@ -1490,6 +1508,9 @@ mod tests {
         let long = clip(&"x".repeat(200), JUDGING_CLIP);
         assert_eq!(long, "x".repeat(47) + "\u{2026}");
         assert_eq!(clip("one\ntwo", JUDGING_CLIP), "one two");
+        // A caller works its room out by subtraction, so it can reach zero.
+        assert_eq!(clip("abc", 0), "\u{2026}");
+        assert_eq!(clip("", 0), "");
     }
 
     #[test]
