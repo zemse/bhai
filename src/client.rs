@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 
 use crate::auth::{self, Auth};
 use crate::cache::{self, CacheBreak, CacheGuard};
+use crate::compact;
 use crate::limits::{self, RateLimits};
 use crate::ollama;
 
@@ -124,6 +125,8 @@ pub struct Client {
     effort: String,
     /// Where the Ollama server is, for a model served by one.
     ollama_url: String,
+    /// The configured context window, when one is set; what Ollama is asked to hold.
+    window: Option<u64>,
     /// The conversation's cache guard; shared by clones, fresh for each child.
     guard: Arc<Mutex<CacheGuard>>,
     /// `--profile`: where the rate-limit response headers are logged.
@@ -150,8 +153,16 @@ impl Client {
                 .clone()
                 .or_else(|| env("BHAI_OLLAMA_URL"))
                 .unwrap_or_else(|| ollama::DEFAULT_URL.to_string()),
+            window: None,
             header_log: None,
         })
+    }
+
+    /// The configured context window, which Ollama is asked for rather than left to
+    /// guess. Compaction reads the same number, so the two agree on what fits.
+    pub fn with_window(mut self, window: Option<u64>) -> Self {
+        self.window = window;
+        self
     }
 
     /// Which backend this client's model is served by.
@@ -348,7 +359,9 @@ impl Client {
                 &[],
                 &input,
             ),
-            Provider::Ollama => ollama::request_body(model, instructions, &[], &input),
+            Provider::Ollama => {
+                ollama::request_body(model, instructions, &[], &input, self.window(model))
+            }
         };
         let mut usage = Usage::default();
         let mut on_delta = |delta: Delta| {
@@ -383,8 +396,21 @@ impl Client {
                 tools,
                 input,
             ),
-            Provider::Ollama => ollama::request_body(&self.model, instructions, tools, input),
+            Provider::Ollama => ollama::request_body(
+                &self.model,
+                instructions,
+                tools,
+                input,
+                self.window(&self.model),
+            ),
         }
+    }
+
+    /// The window to ask a backend for: the configured one, else what `model` is
+    /// assumed to hold, which is what compaction measures against too.
+    fn window(&self, model: &str) -> u64 {
+        self.window
+            .unwrap_or_else(|| compact::default_window(model))
     }
 
     /// One call. `provider` is passed rather than read off the client, since `aside`
@@ -717,6 +743,21 @@ mod tests {
             Some("data: {\"delta\":\"🙂\"}")
         );
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn an_ollama_call_says_how_much_context_it_wants() {
+        let ollama = || {
+            Client::new(&Choice::default())
+                .unwrap()
+                .with_overrides(Some("ollama:gemma4:e2b".to_string()), None)
+        };
+        // Unset, the server would apply its own 4096 and truncate the instructions.
+        let assumed = ollama().body("be brief", &[], &[]);
+        assert_eq!(assumed["options"]["num_ctx"], compact::OLLAMA_WINDOW);
+        // The configured window wins, so compaction and the server agree on what fits.
+        let configured = ollama().with_window(Some(8192)).body("be brief", &[], &[]);
+        assert_eq!(configured["options"]["num_ctx"], 8192);
     }
 
     #[tokio::test]

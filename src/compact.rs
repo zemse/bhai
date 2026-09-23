@@ -7,6 +7,14 @@ use crate::tokens::{self, Tokenizer};
 
 /// The context window of the gpt-5 family, in tokens.
 pub const GPT5_WINDOW: u64 = 272_000;
+/// What Ollama is asked to hold, and what compaction assumes it holds. Its own default
+/// is 4096, which the system prompt and the tool schemas overflow between them, and it
+/// truncates from the front with nothing but a line in the server's log to say so.
+pub const OLLAMA_WINDOW: u64 = 32_768;
+/// What a model nothing else says a window for is assumed to hold. Compaction has to
+/// assume something: with no window at all it never runs, and a full context is then a
+/// fatal 4xx on every turn until the user compacts by hand.
+pub const DEFAULT_WINDOW: u64 = 128_000;
 /// The default fraction of the window a call may read before history is compacted.
 pub const COMPACT_AT: f64 = 0.8;
 /// Compaction aims for this fraction of the window.
@@ -23,7 +31,8 @@ touched, what is done and what is left. Do not call any tools; reply with the su
 /// When to compact, from the config.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Limits {
-    /// The context window in tokens; unset means the model's own, if known.
+    /// The context window in tokens; unset means the model's own, or what it is assumed
+    /// to hold when nothing reports one.
     pub window: Option<u64>,
     pub compact_at: f64,
 }
@@ -38,22 +47,30 @@ impl Default for Limits {
 }
 
 impl Limits {
-    /// The window for `model`: the configured one, else the gpt-5 family's.
-    pub fn window(&self, model: &str) -> Option<u64> {
-        self.window
-            .or_else(|| model.starts_with("gpt-5").then_some(GPT5_WINDOW))
+    /// The window for `model`: the configured one, else what it is assumed to hold.
+    pub fn window(&self, model: &str) -> u64 {
+        self.window.unwrap_or_else(|| default_window(model))
     }
 
     /// Whether a call that read `input` tokens filled the window past `compact_at`.
     pub fn over(&self, model: &str, input: u64) -> bool {
-        self.window(model)
-            .is_some_and(|window| input as f64 > self.compact_at * window as f64)
+        input as f64 > self.compact_at * self.window(model) as f64
     }
 
     /// The size compaction aims for, in tokens, never above `compact_at`.
-    pub fn target(&self, model: &str) -> Option<u64> {
-        self.window(model)
-            .map(|window| (TARGET.min(self.compact_at) * window as f64) as u64)
+    pub fn target(&self, model: &str) -> u64 {
+        (TARGET.min(self.compact_at) * self.window(model) as f64) as u64
+    }
+}
+
+/// What `model` is assumed to hold when nothing reports its window.
+pub fn default_window(model: &str) -> u64 {
+    if model.starts_with("gpt-5") {
+        GPT5_WINDOW
+    } else if model.starts_with(crate::ollama::PREFIX) {
+        OLLAMA_WINDOW
+    } else {
+        DEFAULT_WINDOW
     }
 }
 
@@ -165,22 +182,25 @@ mod tests {
     #[test]
     fn limits_know_the_gpt5_window() {
         let limits = Limits::default();
-        assert_eq!(limits.window("gpt-5.1-codex"), Some(GPT5_WINDOW));
-        assert_eq!(limits.window("other"), None);
+        assert_eq!(limits.window("gpt-5.1-codex"), GPT5_WINDOW);
         assert!(limits.over("gpt-5", 220_000));
         assert!(!limits.over("gpt-5", 210_000));
-        assert!(!limits.over("other", u64::MAX));
+        // A model nothing reports a window for still compacts, on an assumed one.
+        assert_eq!(limits.window("other"), DEFAULT_WINDOW);
+        assert_eq!(limits.window("ollama:gemma4:e2b"), OLLAMA_WINDOW);
+        assert!(limits.over("other", u64::MAX));
+        assert!(!limits.over("other", 100_000));
         let set = Limits {
             window: Some(1000),
             compact_at: 0.7,
         };
         assert!(set.over("other", 701));
-        assert_eq!(set.target("other"), Some(600));
+        assert_eq!(set.target("other"), 600);
         let low = Limits {
             compact_at: 0.5,
             ..set
         };
-        assert_eq!(low.target("other"), Some(500));
+        assert_eq!(low.target("other"), 500);
     }
 
     #[test]

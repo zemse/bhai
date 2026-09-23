@@ -162,10 +162,13 @@ async fn main() -> Result<()> {
             .with_session(&loaded.header.session);
     }
     let client = client.with_overrides(args.model.clone(), args.effort.clone());
-    let client = client.strict_cache(args.strict_cache).log_headers(
-        args.profile
-            .then(|| profile::debug_dir().join("headers.jsonl")),
-    );
+    let client = client
+        .strict_cache(args.strict_cache)
+        .with_window(limits.window)
+        .log_headers(
+            args.profile
+                .then(|| profile::debug_dir().join("headers.jsonl")),
+        );
     // Fail before taking over the terminal if the backend cannot serve the model.
     if let Err(e) = client.preflight().await {
         shutdown(hub.clone()).await;
@@ -744,10 +747,12 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
     let (_tx_control, rx_control) = mpsc::channel::<Control>(1);
     let (tx_agent, mut rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
-    let client = client::Client::new(&setup.choice)?.with_overrides(
-        system.identity.model.clone(),
-        system.identity.effort.clone(),
-    );
+    let client = client::Client::new(&setup.choice)?
+        .with_overrides(
+            system.identity.model.clone(),
+            system.identity.effort.clone(),
+        )
+        .with_window(setup.limits.window);
     client.preflight().await?;
     tokio::spawn(agent::run(
         client,
@@ -857,10 +862,12 @@ struct CacheRow {
 /// later got nothing from the cache.
 async fn cache_check(setup: Setup) -> Result<bool> {
     let (system, policy, delegation) = (setup.prompt, setup.policy, setup.delegation);
-    let client = client::Client::new(&setup.choice)?.with_overrides(
-        system.identity.model.clone(),
-        system.identity.effort.clone(),
-    );
+    let client = client::Client::new(&setup.choice)?
+        .with_overrides(
+            system.identity.model.clone(),
+            system.identity.effort.clone(),
+        )
+        .with_window(setup.limits.window);
     client.preflight().await?;
     // Only the Codex backend reports how much of the input its cache served, so on any
     // other one there is nothing to measure and three live calls would prove nothing.
@@ -985,10 +992,12 @@ async fn judge_eval(setup: Setup, path: Option<String>) -> Result<bool> {
     if cases.is_empty() {
         bail!("no cases in {}", path.display());
     }
-    let client = client::Client::new(&setup.choice)?.with_overrides(
-        system.identity.model.clone(),
-        system.identity.effort.clone(),
-    );
+    let client = client::Client::new(&setup.choice)?
+        .with_overrides(
+            system.identity.model.clone(),
+            system.identity.effort.clone(),
+        )
+        .with_window(setup.limits.window);
     client.preflight().await?;
     let backend = ModelJudge::new(client, &settings);
     let outcomes = judge::eval(&backend, &cases, settings.timeout).await;

@@ -27,12 +27,21 @@ pub fn model_name(spec: &str) -> &str {
     spec.strip_prefix(PREFIX).unwrap_or(spec)
 }
 
-/// The `/api/chat` request body for one call.
-pub fn request_body(model: &str, instructions: &str, tools: &[Value], input: &[Value]) -> Value {
+/// The `/api/chat` request body for one call. `window` is asked for as `num_ctx`: left
+/// out, the server applies its own 4096 and truncates the front of the prompt, which is
+/// the instructions and the tool schemas, saying so only in its own log.
+pub fn request_body(
+    model: &str,
+    instructions: &str,
+    tools: &[Value],
+    input: &[Value],
+    window: u64,
+) -> Value {
     let mut body = json!({
         "model": model_name(model),
         "messages": messages(instructions, input),
         "stream": true,
+        "options": { "num_ctx": window },
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tool_defs(tools));
@@ -444,9 +453,11 @@ mod tests {
     fn the_prefix_picks_the_backend_but_not_the_model_name() {
         assert_eq!(model_name("ollama:gemma4:e2b"), "gemma4:e2b");
         assert_eq!(model_name("gpt-5.5"), "gpt-5.5");
-        let body = request_body("ollama:gemma4:e2b", "hi", &[], &[]);
+        let body = request_body("ollama:gemma4:e2b", "hi", &[], &[], 32_768);
         assert_eq!(body["model"], "gemma4:e2b");
         assert_eq!(body["stream"], true);
+        // Without this the server applies its own 4096 and truncates the instructions.
+        assert_eq!(body["options"]["num_ctx"], 32_768);
         // An empty tool list is left out rather than sent as one.
         assert!(body.get("tools").is_none());
     }

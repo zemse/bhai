@@ -893,8 +893,8 @@ impl Compaction<'_> {
         let tokenizer = tokens::for_model(name);
         let before = compact::estimate(history, tokenizer);
         let mut next = history.clone();
-        if let (Some(size), Some(target)) = (size, self.limits.target(name)) {
-            let excess = size.saturating_sub(target);
+        if let Some(size) = size {
+            let excess = size.saturating_sub(self.limits.target(name));
             if compact::evict(&mut next, excess, tokenizer) >= excess {
                 self.commit("evict", before, next, history, sink);
                 return Ok(());
