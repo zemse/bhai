@@ -1,8 +1,9 @@
 //! bhai's own switches: `~/.config/bhai/config.toml`, then `.bhai/config.toml` in the
 //! working directory on top, then command-line flags on top of both. The project file
 //! may only tighten permissions: its `permission_mode` and `allow` rules are ignored, so
-//! a cloned repo cannot approve its own commands. MCP servers are likewise only read
-//! from the global file.
+//! a cloned repo cannot approve its own commands. MCP is likewise the global file's call:
+//! the project file may turn it off but never on, and servers are only read from the
+//! global file.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -307,13 +308,21 @@ impl Config {
                 }
             }
         }
-        self.apply(layer);
+        self.apply(layer, trusted);
         Ok(())
     }
 
-    fn apply(&mut self, layer: Layer) {
+    fn apply(&mut self, layer: Layer, trusted: bool) {
         let set = |field: &mut bool, value: Option<bool>| {
             if let Some(value) = value {
+                *field = value;
+            }
+        };
+        // A project file may turn one off, never on.
+        let off_only = |field: &mut bool, value: Option<bool>| {
+            if let Some(value) = value
+                && (trusted || !value)
+            {
                 *field = value;
             }
         };
@@ -329,17 +338,21 @@ impl Config {
         if let Some(at) = layer.compact_at {
             self.limits.compact_at = at;
         }
-        if layer.judge_model.is_some() {
-            self.judge.model = layer.judge_model;
-        }
-        if let Some(effort) = layer.judge_effort {
-            self.judge.effort = effort;
-        }
-        if let Some(ms) = layer.judge_timeout_ms {
-            self.judge.timeout = std::time::Duration::from_millis(ms);
-        }
-        if let Some(max) = layer.judge_max_per_turn {
-            self.judge.max_per_turn = max;
+        // Which model approves the session's calls, and how many it may wave through, is
+        // the user's call as much as which model runs the turn.
+        if trusted {
+            if layer.judge_model.is_some() {
+                self.judge.model = layer.judge_model;
+            }
+            if let Some(effort) = layer.judge_effort {
+                self.judge.effort = effort;
+            }
+            if let Some(ms) = layer.judge_timeout_ms {
+                self.judge.timeout = std::time::Duration::from_millis(ms);
+            }
+            if let Some(max) = layer.judge_max_per_turn {
+                self.judge.max_per_turn = max;
+            }
         }
         if layer.code_theme.is_some() {
             self.code_theme = layer.code_theme;
@@ -355,8 +368,8 @@ impl Config {
             None => {}
         }
         match layer.mcp {
-            Some(McpLayer::Enabled(enabled)) => self.mcp = enabled,
-            Some(McpLayer::Table { enabled, .. }) => set(&mut self.mcp, enabled),
+            Some(McpLayer::Enabled(enabled)) => off_only(&mut self.mcp, Some(enabled)),
+            Some(McpLayer::Table { enabled, .. }) => off_only(&mut self.mcp, enabled),
             None => {}
         }
     }
@@ -397,7 +410,7 @@ mod tests {
         );
         write(
             &cwd.join(".bhai/config.toml"),
-            "skills = true\nmcp = true\n[other]\nx = 1\n",
+            "skills = true\n[other]\nx = 1\n",
         );
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert_eq!(
@@ -407,7 +420,6 @@ mod tests {
                 load_global_agents: true,
                 load_project_instructions: true,
                 skills: true,
-                mcp: true,
                 ..Config::default()
             }
         );
@@ -477,6 +489,46 @@ mod tests {
         write(&project, "import_claude_permissions = false\n");
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert!(!config.import_claude_permissions);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_project_can_only_turn_mcp_off() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        let global = home.join(".config/bhai/config.toml");
+        let project = cwd.join(".bhai/config.toml");
+        // Otherwise a cloned repo spawns the user's servers by shipping one line.
+        write(&project, "mcp = true\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().mcp);
+        write(&project, "[mcp]\nenabled = true\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().mcp);
+        write(&global, "mcp = true\n");
+        write(&project, "[mcp]\nenabled = false\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().mcp);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_the_global_file_picks_the_judge() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &home.join(".config/bhai/config.toml"),
+            "judge_model = \"ollama:gemma4:e2b\"\njudge_max_per_turn = 4\n",
+        );
+        // A repo must not pick the model that approves its own tool calls, nor how many
+        // calls it may wave through.
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "judge_model = \"ollama:pushover\"\njudge_effort = \"high\"\n\
+             judge_timeout_ms = 60000\njudge_max_per_turn = 999\n",
+        );
+        let judge = Config::load(Some(&home), &cwd).unwrap().judge;
+        assert_eq!(judge.model.as_deref(), Some("ollama:gemma4:e2b"));
+        assert_eq!(judge.max_per_turn, 4);
+        assert_eq!(judge.effort, crate::judge::Settings::default().effort);
+        assert_eq!(judge.timeout, crate::judge::Settings::default().timeout);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
