@@ -60,8 +60,12 @@ pub enum AgentEvent {
     Info(String),
     /// The auto-approval judge is deciding this call, or `None` once it has.
     Judging(Option<String>),
-    /// History was compacted, so earlier item indexes no longer hold; with a notice.
-    Compacted(String),
+    /// History was compacted, so earlier item indexes no longer hold; with a notice,
+    /// and the summary the earlier turns were folded into when there was one.
+    Compacted {
+        notice: String,
+        summary: Option<String>,
+    },
     /// History was dropped: the conversation starts again from nothing.
     Cleared,
     /// Token counts for the model call that just finished.
@@ -916,13 +920,13 @@ impl Compaction<'_> {
         if let Some(size) = size {
             let excess = size.saturating_sub(self.limits.target(name));
             if compact::evict(&mut next, excess, tokenizer) >= excess {
-                self.commit("evict", before, next, history, sink);
+                self.commit(before, next, None, history, sink);
                 return Ok(());
             }
         }
         if compact::fold(&next, "").is_none() {
             if next != *history {
-                self.commit("evict", before, next, history, sink);
+                self.commit(before, next, None, history, sink);
             } else {
                 let _ = self.tx.send(AgentEvent::Info(
                     "nothing to compact: there is no earlier turn to summarise".to_string(),
@@ -937,12 +941,12 @@ impl Compaction<'_> {
         match self.summarize(&next).await {
             Ok(summary) => {
                 let folded = compact::fold(&next, &summary).expect("checked above");
-                self.commit("summary", before, folded, history, sink);
+                self.commit(before, folded, Some(summary), history, sink);
                 Ok(())
             }
             Err(e) => {
                 if next != *history {
-                    self.commit("evict", before, next, history, sink);
+                    self.commit(before, next, None, history, sink);
                 }
                 Err(e)
             }
@@ -974,19 +978,26 @@ impl Compaction<'_> {
             )
             .await?;
         final_text(&items)
-            .filter(|text| !text.trim().is_empty())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
             .ok_or_else(|| anyhow!("the model wrote no summary"))
     }
 
     /// Replace `history` with `next`, reset the cache guard, record it and say so.
+    /// `summary` is what the earlier turns were folded into; without one, `next` is the
+    /// same history with its old tool outputs evicted.
     fn commit(
         &self,
-        stage: &str,
         before: u64,
         next: Vec<Value>,
+        summary: Option<String>,
         history: &mut Vec<Value>,
         sink: &mut Sink<'_>,
     ) {
+        let (stage, what) = match summary {
+            Some(_) => ("summary", "summarised earlier turns"),
+            None => ("evict", "evicted old tool outputs"),
+        };
         let after = compact::estimate(&next, tokens::for_model(self.model.name()));
         self.model.reset(&format!("compaction: {stage}"));
         *history = next;
@@ -997,13 +1008,10 @@ impl Compaction<'_> {
                 .tx
                 .send(AgentEvent::Error(format!("transcript: {e:#}")));
         }
-        let what = match stage {
-            "evict" => "evicted old tool outputs",
-            _ => "summarised earlier turns",
-        };
-        let _ = self.tx.send(AgentEvent::Compacted(format!(
-            "compacted history ({what}): ~{before} -> ~{after} tokens"
-        )));
+        let _ = self.tx.send(AgentEvent::Compacted {
+            notice: format!("compacted history ({what}): ~{before} -> ~{after} tokens"),
+            summary,
+        });
     }
 }
 
@@ -1155,7 +1163,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::Judging(_)
                 // The terminal is titled by the session, not by a child of one turn of it.
                 | AgentEvent::Titled(_)
-                | AgentEvent::Compacted(_)
+                | AgentEvent::Compacted { .. }
                 | AgentEvent::Cleared => continue,
                 // An approval is modal, so it is answered where every other one is,
                 // with the tag saying which child is asking.
@@ -2687,11 +2695,9 @@ mod tests {
                 other => events.push(other),
             }
         }
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::Compacted(m) if m.contains("summarised")))
-        );
+        assert!(events.iter().any(
+            |e| matches!(e, AgentEvent::Compacted { notice, .. } if notice.contains("summarised"))
+        ));
         drive(&tx_user, &mut rx, &cancel, "carry on", &[]).await;
 
         // Resuming the file seeds a fresh guard with the history as it was left.
@@ -2898,20 +2904,31 @@ mod tests {
             events
                 .iter()
                 .filter_map(|e| match e {
-                    AgentEvent::Compacted(m) => Some(m.clone()),
+                    AgentEvent::Compacted { notice, summary } => {
+                        Some((notice.clone(), summary.clone()))
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
         };
 
-        // Evicting the three oldest of nine results is enough.
+        // Evicting the three oldest of nine results is enough, and evicting says nothing
+        // about the conversation, so it carries no summary.
         let events = drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
         let notices = compacted(&events);
         assert_eq!(notices.len(), 1);
-        assert!(notices[0].starts_with("compacted history (evicted old tool outputs): ~"));
-        // Nothing left to evict, so the earlier turn is summarised.
+        assert!(
+            notices[0]
+                .0
+                .starts_with("compacted history (evicted old tool outputs): ~")
+        );
+        assert_eq!(notices[0].1, None);
+        // Nothing left to evict, so the earlier turn is summarised, and the summary the
+        // history now carries comes with the notice.
         let events = drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
-        assert!(compacted(&events)[0].contains("summarised earlier turns"));
+        let (notice, summary) = compacted(&events)[0].clone();
+        assert!(notice.contains("summarised earlier turns"));
+        assert_eq!(summary.as_deref(), Some("the summary"));
         drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
 
         assert_eq!(*fake.breaks.lock().unwrap(), []);
@@ -3054,7 +3071,11 @@ mod tests {
             AgentEvent::Info(m) if m.starts_with("nothing to compact"))));
         drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
         let events = compact(&mut rx, Some("the file paths")).await;
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Compacted(_))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compacted { summary, .. } if summary.is_some()))
+        );
         drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
 
         assert_eq!(*fake.breaks.lock().unwrap(), []);

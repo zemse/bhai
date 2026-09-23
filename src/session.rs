@@ -102,8 +102,13 @@ pub enum Event {
     Info(String),
     /// The judge is deciding that call, or `None` once it has.
     Judging(Option<String>),
-    /// History was compacted; earlier history indexes no longer hold.
-    Compacted(String),
+    /// History was compacted; earlier history indexes no longer hold. `summary` is what
+    /// the earlier turns were folded into, when they were folded rather than evicted.
+    Compacted {
+        notice: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
     /// History was dropped, so the transcript that showed it goes too.
     Cleared,
     /// The permission mode changed.
@@ -676,7 +681,7 @@ impl Session {
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Judging(what) => Event::Judging(what),
             AgentEvent::Titled(name) => Event::Titled(name),
-            AgentEvent::Compacted(s) => Event::Compacted(s),
+            AgentEvent::Compacted { notice, summary } => Event::Compacted { notice, summary },
             AgentEvent::Cleared => Event::Cleared,
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnFailed(s) => Event::TurnFailed(s),
@@ -958,6 +963,16 @@ mod tests {
         assert_eq!(json, serde_json::json!({"type": "text", "data": "hi"}));
         let json = serde_json::to_value(Event::TurnEnd).unwrap();
         assert_eq!(json, serde_json::json!({"type": "turn_end"}));
+        // An eviction has no summary, so it says nothing where one would be.
+        let json = serde_json::to_value(Event::Compacted {
+            notice: "compacted history".to_string(),
+            summary: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"type": "compacted", "data": {"notice": "compacted history"}})
+        );
     }
 
     #[test]

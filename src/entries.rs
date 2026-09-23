@@ -37,6 +37,9 @@ pub enum Entry {
     /// stands behind it, so the transcript offers to run the turn again.
     Failed(String),
     Info(String),
+    /// The summary a compaction folded the earlier turns into. It is the context the
+    /// conversation carries from here, so the transcript shows it where it happened.
+    Summary(String),
 }
 
 /// Ties history items and calls to the entries that show them.
@@ -112,9 +115,12 @@ impl Entries {
                 "cache missed {misses} calls in a row; the prefix may no longer be served"
             ))),
             Event::Info(message) => self.push(Entry::Info(message.clone())),
-            Event::Compacted(message) => {
+            Event::Compacted { notice, summary } => {
                 self.attribution.items.clear();
-                self.push(Entry::Info(message.clone()));
+                self.push(Entry::Info(notice.clone()));
+                if let Some(summary) = summary {
+                    self.push(Entry::Summary(summary.clone()));
+                }
             }
             // The conversation is gone, so the transcript of it goes with it.
             Event::Cleared => {
@@ -143,7 +149,10 @@ impl Entries {
                     .join("\n")
             };
             let entry = match item["type"].as_str() {
-                Some("message") if item["role"] == "user" => Entry::User(text("content")),
+                Some("message") if item["role"] == "user" => match summarised(&text("content")) {
+                    Some(summary) => Entry::Summary(summary),
+                    None => Entry::User(text("content")),
+                },
                 Some("message") => Entry::Assistant(text("content")),
                 Some("reasoning") if !text("summary").is_empty() => {
                     Entry::Reasoning(text("summary"))
@@ -165,7 +174,7 @@ impl Entries {
                 ),
                 _ => continue,
             };
-            if matches!(entry, Entry::User(_) | Entry::Output(_)) {
+            if matches!(entry, Entry::User(_) | Entry::Summary(_) | Entry::Output(_)) {
                 self.attribution.items.insert(index, self.list.len());
             }
             self.list.push(entry);
@@ -348,7 +357,8 @@ impl Entry {
             | Entry::Rejected(t)
             | Entry::Error(t)
             | Entry::Failed(t)
-            | Entry::Info(t) => t,
+            | Entry::Info(t)
+            | Entry::Summary(t) => t,
         }
     }
 
@@ -364,6 +374,7 @@ impl Entry {
             Entry::Error(_) => "error",
             Entry::Failed(_) => "failed",
             Entry::Info(_) => "info",
+            Entry::Summary(_) => "summary",
         }
     }
 
@@ -375,6 +386,12 @@ impl Entry {
             None => line.to_string(),
         }
     }
+}
+
+/// The summary inside a folded user message, without the line that marks it as one.
+fn summarised(text: &str) -> Option<String> {
+    let rest = text.strip_prefix(crate::compact::SUMMARY_PREFIX)?;
+    Some(rest.trim_start().to_string())
 }
 
 #[derive(Clone, Copy)]
@@ -568,5 +585,46 @@ mod tests {
         assert_eq!(kinds, ["user", "command", "output", "assistant"]);
         assert_eq!(app.list[3].text(), "ok");
         assert_eq!(app.attribution.items.get(&3), Some(&3));
+    }
+
+    #[test]
+    fn a_compaction_shows_the_summary_it_folded_the_turns_into() {
+        let mut app = intro();
+        app.apply(&Event::User("hi".to_string()));
+        app.apply(&Event::Item(0));
+        app.apply(&Event::Compacted {
+            notice: "compacted history (summarised earlier turns): ~9 -> ~4 tokens".to_string(),
+            summary: Some("did things".to_string()),
+        });
+        let kinds: Vec<_> = app.list[1..].iter().map(Entry::kind).collect();
+        assert_eq!(kinds, ["user", "info", "summary"]);
+        assert_eq!(app.list[3].text(), "did things");
+        // The indexes the entries were tied to no longer hold.
+        assert!(app.attribution.items.is_empty());
+
+        // Evicting says nothing about the conversation, so there is nothing to show.
+        app.apply(&Event::Compacted {
+            notice: "compacted history (evicted old tool outputs): ~4 -> ~2 tokens".to_string(),
+            summary: None,
+        });
+        assert_eq!(app.list.len(), 5);
+        assert_eq!(app.list[4].kind(), "info");
+    }
+
+    #[test]
+    fn a_restored_summary_is_not_something_the_user_said() {
+        let mut app = intro();
+        let message = |text: &str| serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]});
+        let history = [
+            message("hi"),
+            message(&format!("{}\ndid things", crate::compact::SUMMARY_PREFIX)),
+            message("carry on"),
+        ];
+        app.restore(&history);
+        let kinds: Vec<_> = app.list[1..].iter().map(Entry::kind).collect();
+        assert_eq!(kinds, ["user", "summary", "user"]);
+        // The summary costs tokens like any other item, so it is still attributed.
+        assert_eq!(app.list[2].text(), "did things");
+        assert_eq!(app.attribution.items.get(&1), Some(&2));
     }
 }

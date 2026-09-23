@@ -790,8 +790,12 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             AgentEvent::ToolStart { summary, .. } => println!("\n$ {summary}"),
             AgentEvent::ToolOutput(output) => println!("{output}"),
             AgentEvent::ToolRejected(command) => println!("[rejected] {command}"),
-            AgentEvent::Info(message) | AgentEvent::Compacted(message) => {
-                println!("[info] {message}")
+            AgentEvent::Info(message) => println!("[info] {message}"),
+            AgentEvent::Compacted { notice, summary } => {
+                println!("[info] {notice}");
+                if let Some(summary) = summary {
+                    println!("{summary}");
+                }
             }
             AgentEvent::Cleared => println!("[info] history cleared"),
             AgentEvent::Usage(u) => println!(

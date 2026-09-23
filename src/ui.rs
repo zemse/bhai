@@ -677,12 +677,12 @@ fn tool_mark(tool: &str) -> (&'static str, Color) {
 }
 
 /// Rows an entry shows while it is closed, or `None` when it is never folded. Thinking
-/// comes down to the one line that says it is thinking; output and a shell command to
-/// their first rows.
+/// comes down to the one line that says it is thinking; output, a shell command and a
+/// compaction summary to their first rows.
 fn collapsed_rows(entry: &Entry) -> Option<usize> {
     match entry {
         Entry::Reasoning(_) => Some(1),
-        Entry::Output(_) | Entry::Running { .. } => Some(COLLAPSED_LINES),
+        Entry::Output(_) | Entry::Running { .. } | Entry::Summary(_) => Some(COLLAPSED_LINES),
         Entry::Command { tool, .. } if tool == crate::tools::bash::NAME => Some(COLLAPSED_LINES),
         _ => None,
     }
@@ -744,6 +744,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> 
         Entry::Rejected(t) => ("✗ ", t, Style::new().fg(Color::Red)),
         Entry::Error(t) | Entry::Failed(t) => ("! ", t, Style::new().fg(Color::Red).bold()),
         Entry::Info(t) => ("", t, Style::new().fg(Color::DarkGray)),
+        Entry::Summary(t) => ("≡ ", t, Style::new().fg(Color::DarkGray)),
     };
 
     let lead = prefix.chars().count();
@@ -1880,6 +1881,36 @@ mod tests {
         let (rows, _) = app.rows.iter().find(|(_, e)| *e == 2).cloned().unwrap();
         assert!(click(&mut app, 2, rows.start));
         assert_eq!(app.pinned.iter().copied().collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn a_compaction_summary_shows_its_first_rows_until_it_is_clicked() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Info(
+            "compacted history (summarised earlier turns): ~900 -> ~400 tokens".to_string(),
+        ));
+        app.entries().push(Entry::Summary(
+            "The goal is the picker.\nThe list is cached.\nThe keys are bound.\nThe badge is left."
+                .to_string(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("\u{2261} The goal is the picker.\n"),
+            "{text}"
+        );
+        assert!(text.contains("[+1 lines]"), "{text}");
+        assert!(!text.contains("badge is left"), "{text}");
+
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 2).cloned().unwrap();
+        assert!(click(&mut app, 2, rows.start));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("  The badge is left.\n  [collapse]\n"),
+            "{text}"
+        );
     }
 
     #[test]

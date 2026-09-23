@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-23
 
+- A compaction shows the summary it folded the earlier turns into, under the notice that
+  says what it cost. The summary is the context the conversation carries from there, and
+  it was the one thing the transcript never said: the notice reported two numbers and the
+  words the model wrote were only visible on a resume, as something the user appeared to
+  have typed. It is an entry of its own (`≡`), folded to its first rows like tool output,
+  and a resumed history draws the folded message as the same entry rather than as a
+  prompt. Evicting tool outputs says nothing about the conversation, so it carries none.
+
 - The tok/s readout is what the last half second of streaming carried, scaled to a
   second, instead of an average over ten seconds of it. The old number took a whole
   window to answer a change in the stream and held its last value through a stall,
