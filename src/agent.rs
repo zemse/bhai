@@ -2773,10 +2773,10 @@ mod tests {
         let dir = tools::temp_dir();
         let session = async |fake: &Fake, saved: Saved, message: &str| {
             let (tx_user, rx_user) = mpsc::channel(1);
-            let (_tx_control, rx_control) = mpsc::channel(1);
+            let (tx_control, rx_control) = mpsc::channel(1);
             let (tx, mut rx) = mpsc::unbounded_channel();
             let cancel = Arc::new(AtomicBool::new(false));
-            tokio::spawn(run_with(
+            let running = tokio::spawn(run_with(
                 Arc::new(fake.clone()),
                 "sess".to_string(),
                 crate::prompt::system_prompt(&[], Vec::new()),
@@ -2792,7 +2792,12 @@ mod tests {
                 Some(saved),
                 Limits::default(),
             ));
-            drive(&tx_user, &mut rx, &cancel, message, &[]).await
+            let events = drive(&tx_user, &mut rx, &cancel, message, &[]).await;
+            // The loop holds the session file until it ends, so a resume waits for it.
+            drop(tx_user);
+            drop(tx_control);
+            running.await.unwrap();
+            events
         };
         let header = Header::new("sess", "general", "fake", "medium", &dir);
         let fresh = Saved {
@@ -2853,9 +2858,9 @@ mod tests {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx_user, rx_user) = mpsc::channel(1);
-        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_with(
+        let running = tokio::spawn(run_with(
             Arc::new(fake.clone()),
             "sess".to_string(),
             crate::prompt::system_prompt(&[], Vec::new()),
@@ -2937,7 +2942,11 @@ mod tests {
             ]
         );
 
-        // A resume replays the compactions and continues without a break.
+        // A resume replays the compactions and continues without a break. The loop
+        // holds the session file until it ends, so it ends first.
+        drop(tx_user);
+        drop(tx_control);
+        running.await.unwrap();
         let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
         let summary = compact::user_message("Summary of earlier conversation:\nsummary two");
         assert_eq!(

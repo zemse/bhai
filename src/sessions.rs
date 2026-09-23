@@ -74,6 +74,8 @@ pub struct Writer {
     last: Option<String>,
     /// Where child transcripts of this session go.
     children: PathBuf,
+    /// The session file, locked for as long as this writer lives.
+    held: Option<std::fs::File>,
 }
 
 impl Writer {
@@ -84,6 +86,7 @@ impl Writer {
             header,
             started: false,
             last: None,
+            held: None,
         }
     }
 
@@ -95,6 +98,9 @@ impl Writer {
             .write(true)
             .open(&path)
             .with_context(|| format!("could not open {}", path.display()))?;
+        // Before the truncation, so a session another bhai is still appending to is
+        // left alone rather than cut back to what this one read.
+        hold(&file, &loaded.header.session)?;
         if file.metadata()?.len() != loaded.len {
             file.set_len(loaded.len)?;
         }
@@ -104,6 +110,7 @@ impl Writer {
             header: loaded.header.clone(),
             started: true,
             last: loaded.last.clone(),
+            held: Some(file),
         })
     }
 
@@ -156,6 +163,8 @@ impl Writer {
             .open(&self.path)
             .with_context(|| format!("could not open {}", self.path.display()))?;
         if !self.started {
+            hold(&file, &self.header.session)?;
+            self.held = Some(file.try_clone()?);
             let mut header = serde_json::to_value(&self.header)?;
             header["type"] = json!("header");
             writeln!(file, "{header}")?;
@@ -179,6 +188,20 @@ impl Writer {
         let id = output.strip_prefix("child ")?.split(' ').next()?;
         let path = self.children.join(format!("child-{id}.jsonl"));
         path.exists().then_some(path)
+    }
+}
+
+/// Take `file` exclusively, so two bhai never interleave records into one session and
+/// branch its parent chain. The lock goes when the handle does.
+fn hold(file: &std::fs::File, session: &str) -> Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("session {session} is open in another bhai")
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("could not lock session {session}"))
+        }
     }
 }
 
@@ -587,6 +610,7 @@ mod tests {
         writer.append(&items()[2]).unwrap();
 
         // The unanswered call after the compaction is dropped, and a resume cuts it off.
+        drop(writer);
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.items, [&compacted[..], &items()[..1]].concat());
         assert!(loaded.warnings[0].contains("dropped 1"));
@@ -597,6 +621,24 @@ mod tests {
         let reloaded = load(&path).unwrap();
         assert_eq!(reloaded.items.len(), 4);
         assert!(reloaded.warnings.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_session_already_open_is_refused_rather_than_truncated() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+        let loaded = load(&path).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+
+        let writer = Writer::resume(&dir, &loaded).unwrap();
+        let refused = Writer::resume(&dir, &loaded).err().unwrap().to_string();
+        assert!(refused.contains("open in another bhai"), "{refused}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+
+        // The lock goes with the writer, so the session can be picked up again.
+        drop(writer);
+        assert!(Writer::resume(&dir, &loaded).is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 
