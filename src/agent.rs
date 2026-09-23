@@ -1375,6 +1375,14 @@ as-is. Try a different approach, or ask the user."
                     if let Some(result) = ask(name, &summary, &offers, policy, tx).await {
                         return result;
                     }
+                    // An interrupt that landed while the prompt was up cannot reject it
+                    // once the approval has left the channel, so it is honoured here.
+                    if cancel.load(Ordering::Relaxed) {
+                        return (
+                            "Not executed: the user interrupted the turn.".to_string(),
+                            false,
+                        );
+                    }
                 }
             }
         }
@@ -2365,6 +2373,44 @@ mod tests {
         assert!(!ok);
         assert_eq!(output, "Not executed: the user interrupted the turn.");
         assert_eq!(backend.calls.lock().unwrap().len(), 1);
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The same for an interrupt while the prompt is up: the approval is already out of
+    /// the channel by then, so nothing can reject it and the check has to be here.
+    #[tokio::test]
+    async fn an_interrupt_while_the_user_decides_stops_the_call() {
+        let dir = tools::temp_dir();
+        let target = dir.join("notes.txt");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let answering = tokio::spawn({
+            let cancel = Arc::clone(&cancel);
+            async move {
+                while let Some(event) = rx.recv().await {
+                    if let AgentEvent::Approval { reply, .. } = event {
+                        cancel.store(true, Ordering::Relaxed);
+                        let _ = reply.send(Answer::Accept(None));
+                        return;
+                    }
+                }
+            }
+        });
+        let (output, ok) = execute(
+            &Registry::new(Vec::new()),
+            &Policy::default(),
+            None,
+            &fake::call("write", json!({"path": target, "content": "x"})),
+            &tx,
+            &cancel,
+        )
+        .await;
+        answering.await.unwrap();
+
+        assert!(!ok);
+        assert_eq!(output, "Not executed: the user interrupted the turn.");
         assert!(!target.exists());
         let _ = std::fs::remove_dir_all(dir);
     }

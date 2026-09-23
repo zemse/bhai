@@ -250,7 +250,9 @@ struct Inner {
     last_cache_break: Option<CacheBreak>,
     rate_limits: Option<RateLimits>,
     next_id: u64,
-    pending: Option<(Approval, oneshot::Sender<Answer>)>,
+    /// Calls waiting on the user, oldest first. Parallel workflow steps each park one,
+    /// so there can be several; only the front is on screen.
+    pending: VecDeque<(Approval, oneshot::Sender<Answer>)>,
 }
 
 pub struct Session {
@@ -328,7 +330,7 @@ impl Session {
                 .map_or_else(Usage::default, |j| j.total()),
             last_cache_break: inner.last_cache_break.clone(),
             rate_limits: inner.rate_limits,
-            pending: inner.pending.as_ref().map(|(approval, _)| approval.clone()),
+            pending: inner.pending.front().map(|(approval, _)| approval.clone()),
             entries: self.entries().attributed(),
         }
     }
@@ -387,12 +389,12 @@ impl Session {
         self.publish(Event::User(prompt.shown));
     }
 
-    /// Answer the pending approval, only if it is `id` when one is given, and only with
-    /// a rule it offered. Returns the id answered, or `None` if there was nothing (or
-    /// something else) to answer.
+    /// Answer the approval on screen, only if it is `id` when one is given, and only
+    /// with a rule it offered. Returns the id answered, or `None` if there was nothing
+    /// (or something else) to answer.
     pub fn answer(&self, answer: Answer, id: Option<u64>) -> Option<u64> {
         let mut inner = self.lock();
-        let (approval, _) = inner.pending.as_ref()?;
+        let (approval, _) = inner.pending.front()?;
         if id.is_some_and(|id| approval.id != id)
             || answer
                 .remember()
@@ -400,24 +402,34 @@ impl Session {
         {
             return None;
         }
-        let (approval, reply) = inner.pending.take()?;
+        let (approval, reply) = inner.pending.pop_front()?;
         let _ = reply.send(answer);
         self.publish(Event::Resolved {
             id: approval.id,
             accepted: answer.accepted(),
             remember: answer.remember(),
         });
+        // Whatever was parked behind it takes its place on screen.
+        if let Some((next, _)) = inner.pending.front() {
+            self.publish(Event::Approval {
+                id: next.id,
+                tool: next.tool.clone(),
+                command: next.command.clone(),
+                offers: next.offers.clone(),
+            });
+        }
         Some(approval.id)
     }
 
-    /// Stop the running turn, rejecting any pending approval. Returns false when idle.
+    /// Stop the running turn, rejecting every pending approval. Returns false when idle.
     pub fn interrupt(&self) -> bool {
         if !self.lock().working {
             return false;
         }
         // Cancel first so the agent does not move on to the next call once rejected.
         self.cancel.store(true, Ordering::Relaxed);
-        self.answer(Answer::Reject, None);
+        // Every parked call, not just the one on screen: parallel steps park their own.
+        while self.answer(Answer::Reject, None).is_some() {}
         self.publish(Event::Interrupted);
         // What was typed behind the turn keeps its place: an interrupt cancels the call
         // in flight, not the prompts the user has already asked for. `/queue clear`
@@ -584,15 +596,23 @@ impl Session {
                 reply,
             } => {
                 inner.next_id += 1;
-                let approval = Approval {
-                    id: inner.next_id,
-                    tool: tool.clone(),
-                    command: command.clone(),
-                    offers: offers.clone(),
-                };
-                inner.pending = Some((approval, reply));
+                let id = inner.next_id;
+                inner.pending.push_back((
+                    Approval {
+                        id,
+                        tool: tool.clone(),
+                        command: command.clone(),
+                        offers: offers.clone(),
+                    },
+                    reply,
+                ));
+                // One prompt at a time: a call parked behind another is published when
+                // that one is answered, rather than replacing it on screen unseen.
+                if inner.pending.len() > 1 {
+                    return;
+                }
                 Event::Approval {
-                    id: inner.next_id,
+                    id,
                     tool,
                     command,
                     offers,
@@ -1155,6 +1175,54 @@ mod tests {
         assert!(!session.cancel.load(Ordering::Relaxed));
         assert!(session.interrupt());
         assert!(session.cancel.load(Ordering::Relaxed));
+    }
+
+    /// Parallel workflow steps each park a call. The second must not displace the first
+    /// on screen, and neither may come back rejected without the user having decided it.
+    #[test]
+    fn two_calls_waiting_at_once_are_each_put_to_the_user() {
+        let (session, _rx) = session();
+        session.submit("go".to_string()).unwrap();
+        let mut events = session.subscribe();
+        let mut first = approval(&session);
+        let mut second = approval(&session);
+
+        // The second is parked, not shown and not dropped.
+        assert_eq!(session.state().pending.map(|a| a.id), Some(1));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            Event::Approval { id: 1, .. }
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(first.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+
+        assert_eq!(session.answer(Answer::Accept(None), Some(1)), Some(1));
+        assert_eq!(first.try_recv(), Ok(Answer::Accept(None)));
+        // Answering the first brings the second up in its place.
+        assert_eq!(session.state().pending.map(|a| a.id), Some(2));
+        assert!(matches!(events.try_recv().unwrap(), Event::Resolved { .. }));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            Event::Approval { id: 2, .. }
+        ));
+
+        assert_eq!(session.answer(Answer::Reject, Some(2)), Some(2));
+        assert_eq!(second.try_recv(), Ok(Answer::Reject));
+        assert!(session.state().pending.is_none());
+    }
+
+    #[test]
+    fn an_interrupt_rejects_every_call_that_was_waiting() {
+        let (session, _rx) = session();
+        session.submit("go".to_string()).unwrap();
+        let mut first = approval(&session);
+        let mut second = approval(&session);
+        assert!(session.interrupt());
+        assert_eq!(first.try_recv(), Ok(Answer::Reject));
+        assert_eq!(second.try_recv(), Ok(Answer::Reject));
     }
 
     #[test]
