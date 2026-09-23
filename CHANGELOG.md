@@ -4,6 +4,60 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-09-23
+
+An audit pass. 234 known failure modes for agent harnesses were collected (53 from a
+production write-up of another harness, the rest researched), split across eight lanes
+that own disjoint files, hunted, reviewed, and fixed. 89 candidates were reviewed, 9
+rejected, 45 fixed here; what is left is in `TASKS.local.md`.
+
+- A model call has a read timeout and ends on its own terminal event. A server that
+  accepted the connection and then said nothing wedged the turn with no way out:
+  `/interrupt` cannot reach a task parked on `stream.next()`. The stream is also decoded
+  a line at a time rather than a chunk at a time, so a codepoint split across a network
+  chunk is no longer replaced by `U+FFFD`, and `response.incomplete` is an outcome rather
+  than an unrecognised event retried three times at full cost.
+
+- Every backend says what its context window is. `Limits::window` only recognised a
+  `gpt-5` name prefix, so on Ollama and on any future slug compaction never ran at all.
+  The window is asked for at session start from the same place the picker reads it, and
+  Ollama is told it with `options.num_ctx`, which it was never sent.
+
+- Calls waiting on the user queue. One approval slot meant a second parallel workflow
+  step overwrote the first, and the overwritten oneshot resolved to `Reject`, so the
+  model was told the user refused a call the user had accepted.
+
+- An allow rule no longer grants every redirection target. `Bash(cargo test)` matched on
+  the command's words alone, so `cargo test > /etc/cron.d/evil` ran unprompted in ask
+  mode, and a redirect through `~` counted as inside the project. The read-only list also
+  knows that `sed 'e ...'`, `sort --compress-program`, `awk BEGIN{system()}` and `rg
+  --pre` run a program of their own, and a shell keyword or a wrapper no longer hides
+  what it is about to run.
+
+- bash caps what it keeps and stops reading when the command exits. The whole output was
+  buffered with no bound, so `yes` took the process down; `truncate` only ever bounded
+  what the model saw. A backgrounded job no longer holds the command open for the full
+  timeout. read streams, refuses what is not a regular file, and stops at a line its
+  footer names, so `/dev/zero` is not read until memory runs out.
+
+- The session file is held for one bhai at a time, and the lock is released explicitly
+  rather than by closing the handle. A flock belongs to the open file description, so a
+  process forked while the writer lived carried a copy and kept the session locked after
+  it was dropped.
+
+- A repo says what an identity does, not which model runs it, and the MCP switch and the
+  judge keys are read from the global config alone. Both ran before the trust gate, so a
+  directory could pick the model, replace the system prompt, and spawn server processes
+  before anything asked.
+
+- An MCP call is bounded and can be interrupted, its search result is trimmed like every
+  other tool output, and a tool name reaches the prompt as one line.
+
+- The transcript draws once per batch of events rather than once per event, a long word
+  is counted once rather than on every hard split, and a row ends at the space that
+  overflows it. `Editor::rows` panicked inside `terminal.draw` on a token that ended
+  exactly at the wrap column.
+
 ## 2026-09-22
 
 - Task lists and footnotes render. Both handlers were already written, and neither had
