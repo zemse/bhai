@@ -249,6 +249,9 @@ pub fn load(path: &Path) -> Result<Loaded> {
                 bail!("{}: model record {id} names no model", path.display());
             };
             (model, effort) = (switched, to);
+            // As the live switch does: encrypted reasoning belongs to the model that
+            // produced it and cannot be replayed to another one.
+            items.retain(|(item, _)| item.get("type").and_then(Value::as_str) != Some("reasoning"));
         } else {
             let Some(item) = record.get("item") else {
                 bail!("{}: record {id} has no item", path.display());
@@ -508,8 +511,30 @@ mod tests {
             (loaded.model.as_str(), loaded.effort.as_str()),
             ("ollama:gemma4:e4b", "low")
         );
-        assert_eq!(loaded.items.len(), 6, "a switch is not an item");
+        // A switch is not an item, and it drops the reasoning of the model before it.
+        assert_eq!(loaded.items.len(), 5);
         assert!(loaded.warnings.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_switch_drops_the_reasoning_the_model_before_it_produced() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+        let loaded = load(&path).unwrap();
+        assert!(loaded.items.iter().any(|item| item["type"] == "reasoning"));
+
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        writer.model("ollama:gemma4:e4b", "low", "abc").unwrap();
+        writer.append(&items()[1]).unwrap();
+        let loaded = load(&path).unwrap();
+        let reasoning = loaded
+            .items
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .count();
+        assert_eq!(reasoning, 1, "only what the model now in use produced");
+        assert_eq!(loaded.items.len(), 5);
         let _ = std::fs::remove_dir_all(dir);
     }
 
