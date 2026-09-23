@@ -967,6 +967,7 @@ impl App {
                 self.tokens_out += usage.output;
                 self.last_usage = Some(usage);
             }
+            Event::Sending(tokens) => self.speed.sending(Instant::now(), tokens),
             Event::Streaming(on) => match on {
                 true => self.speed.start(Instant::now()),
                 false => self.speed.end(Instant::now()),

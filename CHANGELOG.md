@@ -10,8 +10,14 @@ carries the shape of what is there.
   second, instead of an average over ten seconds of it. The old number took a whole
   window to answer a change in the stream and held its last value through a stall,
   which read as hung; this one moves once per reading and says zero when nothing is
-  arriving. The reading is one constant (`speed::PERIOD`), so it can be shortened to
-  200ms without anything else moving.
+  arriving. The reading is one constant (`speed::PERIOD`), now 250ms, and the tests
+  are written in readings rather than seconds so it can move again on its own.
+
+- The working row says what a call is waiting on before its first token: the size of
+  the prompt that went out and how long it has been reading, then how fast that came
+  to once the first token lands (`· 8.7k in/s · 40 tok/s`). Neither backend reports
+  progress through a prompt, so this is what there is: on an 8.7k-token prompt to a
+  local model the row sat blank for nine seconds before it.
 
 An audit pass. 234 known failure modes for agent harnesses were collected (53 from a
 production write-up of another harness, the rest researched), split across eight lanes

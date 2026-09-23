@@ -4,13 +4,18 @@
 //! seconds. It is measured on a clock that runs only while a call is streaming, so the
 //! time spent running tools, waiting for an approval or sitting idle between turns is
 //! not in it at all. What it counts is what comes out on screen.
+//!
+//! The other half of a call is the wait before it: the backend reading the prompt. No
+//! backend says how far through one it is, so there is no progress to show, only how
+//! much it was handed and how long it has been holding it. The moment the first token
+//! lands both are known, and the two of them are a rate.
 
 use std::time::{Duration, Instant};
 
 /// How much streaming one reading covers, and so how often the number changes. Shorter
 /// follows the stream more closely and swings more between chunks; the readout is
 /// scaled to a second either way, so this can move without anything else moving.
-const PERIOD: Duration = Duration::from_millis(500);
+pub(crate) const PERIOD: Duration = Duration::from_millis(250);
 
 /// The streaming clock and what arrived on it. The clock runs only between `start` and
 /// `end`, so readings carry on across calls when tool runs sit between them.
@@ -32,9 +37,19 @@ pub struct Speed {
     /// Tokens in the reading that closed last, which is the one shown. None until one
     /// has closed.
     last: Option<u64>,
+    /// The prompt of the running call and when it went out, until its first token.
+    sent: Option<(Instant, u64)>,
+    /// The prompt of the last call that answered, and how long it took to say anything.
+    read: Option<(u64, Duration)>,
 }
 
 impl Speed {
+    /// A model call went out with `tokens` of prompt behind it. Until its first token
+    /// comes back, that prompt is what the backend is working through.
+    pub fn sending(&mut self, now: Instant, tokens: u64) {
+        self.sent = Some((now, tokens));
+    }
+
     /// A model call was sent, so the clock runs again.
     pub fn start(&mut self, now: Instant) {
         self.started.get_or_insert(now);
@@ -45,6 +60,8 @@ impl Speed {
         if let Some(at) = self.started.take() {
             self.banked += now.saturating_duration_since(at);
         }
+        // A call that ended without a token was never read: an interrupt, or an error.
+        self.sent = None;
     }
 
     /// Tokens streamed out of the running call. The reasoning a call reports but never
@@ -79,6 +96,21 @@ impl Speed {
         Some(tokens as f64 / PERIOD.as_secs_f64())
     }
 
+    /// The prompt the running call is still being read, and how long that has taken so
+    /// far. Nothing once its first token has come back, and nothing between calls.
+    pub fn reading_prompt(&self, now: Instant) -> Option<(u64, Duration)> {
+        let (at, tokens) = self.sent?;
+        Some((tokens, now.saturating_duration_since(at)))
+    }
+
+    /// Prompt tokens a second over the wait for the last call's first token. It is the
+    /// whole wait, so the queue and the network are in it as well as the reading: it is
+    /// what the user sat through, not what the backend would claim for itself.
+    pub fn prompt_rate(&self) -> Option<f64> {
+        let (tokens, took) = self.read?;
+        (took > Duration::ZERO).then(|| tokens as f64 / took.as_secs_f64())
+    }
+
     /// Tokens in the readings still being counted, for tests that drive events rather
     /// than the clock.
     #[cfg(test)]
@@ -106,6 +138,9 @@ impl Speed {
         if tokens == 0 {
             return;
         }
+        if let Some((sent, prompt)) = self.sent.take() {
+            self.read = Some((prompt, now.saturating_duration_since(sent)));
+        }
         let at = self.clock(now);
         self.origin.get_or_insert(at);
         let reading = self.reading_at(at);
@@ -128,7 +163,9 @@ impl Speed {
 mod tests {
     use super::*;
 
-    /// A clock the test moves by hand.
+    /// A clock the test moves by hand, in readings rather than seconds: what the tests
+    /// are about is where a token falls relative to a reading, and that is what has to
+    /// hold when `PERIOD` changes.
     struct Clock(Instant);
 
     impl Clock {
@@ -136,13 +173,13 @@ mod tests {
             Clock(Instant::now())
         }
 
-        fn at(&self, secs: f64) -> Instant {
-            self.0 + Duration::from_secs_f64(secs)
+        fn at(&self, readings: f64) -> Instant {
+            self.0 + PERIOD.mul_f64(readings)
         }
     }
 
-    /// Readings a second, which is what the count in one is scaled by.
-    fn per_second(tokens: u64) -> Option<f64> {
+    /// What a reading carrying `tokens` reads as, once scaled to a second.
+    fn shows(tokens: u64) -> Option<f64> {
         Some(tokens as f64 / PERIOD.as_secs_f64())
     }
 
@@ -152,16 +189,16 @@ mod tests {
         let mut speed = Speed::default();
         speed.start(clock.at(0.0));
         assert_eq!(speed.rate(clock.at(0.0)), None, "nothing has streamed");
-        speed.streamed(clock.at(0.1), 10);
-        speed.streamed(clock.at(0.3), 15);
+        speed.streamed(clock.at(0.2), 10);
+        speed.streamed(clock.at(0.6), 15);
         assert_eq!(
-            speed.rate(clock.at(0.4)),
+            speed.rate(clock.at(0.8)),
             None,
             "the first one is still filling"
         );
-        // It closes at half a second, and twenty-five tokens in it is fifty a second.
-        speed.streamed(clock.at(0.6), 1);
-        assert_eq!(speed.rate(clock.at(0.6)), per_second(25));
+        // It closes, and what it carried is the number.
+        speed.streamed(clock.at(1.2), 1);
+        assert_eq!(speed.rate(clock.at(1.2)), shows(25));
     }
 
     #[test]
@@ -170,15 +207,15 @@ mod tests {
         let mut speed = Speed::default();
         speed.start(clock.at(0.0));
         speed.streamed(clock.at(0.0), 25);
-        speed.streamed(clock.at(0.5), 40);
+        speed.streamed(clock.at(1.0), 40);
         // What is shown through the second reading is what the first one carried, even
         // as the second fills: a number that moved with every frame would not be read.
         for step in 0..5 {
-            let now = clock.at(0.5 + f64::from(step) * 0.1);
-            assert_eq!(speed.rate(now), per_second(25), "at {now:?}");
+            let now = clock.at(1.0 + f64::from(step) * 0.2);
+            assert_eq!(speed.rate(now), shows(25), "part way through the second");
         }
         // The second closes on the clock alone, with no token to close it.
-        assert_eq!(speed.rate(clock.at(1.0)), per_second(40));
+        assert_eq!(speed.rate(clock.at(2.0)), shows(40));
     }
 
     #[test]
@@ -187,14 +224,14 @@ mod tests {
         let mut speed = Speed::default();
         speed.start(clock.at(0.0));
         speed.streamed(clock.at(0.0), 30);
-        assert_eq!(speed.rate(clock.at(0.5)), per_second(30));
+        assert_eq!(speed.rate(clock.at(1.0)), shows(30));
         // A reading with nothing in it is a stream writing nothing, and says so.
-        assert_eq!(speed.rate(clock.at(1.0)), per_second(0));
-        assert_eq!(speed.rate(clock.at(9.0)), per_second(0));
+        assert_eq!(speed.rate(clock.at(2.0)), shows(0));
+        assert_eq!(speed.rate(clock.at(18.0)), shows(0));
         // Writing again picks it straight back up.
-        speed.streamed(clock.at(9.1), 20);
-        speed.streamed(clock.at(9.6), 1);
-        assert_eq!(speed.rate(clock.at(9.6)), per_second(20));
+        speed.streamed(clock.at(18.2), 20);
+        speed.streamed(clock.at(19.2), 1);
+        assert_eq!(speed.rate(clock.at(19.2)), shows(20));
     }
 
     #[test]
@@ -202,11 +239,11 @@ mod tests {
         let clock = Clock::new();
         let mut speed = Speed::default();
         speed.start(clock.at(0.0));
-        // Three and a bit seconds of thinking, then twenty tokens over half a second.
-        speed.streamed(clock.at(3.3), 20);
-        // The reading runs from that first token, not from the clock's own half second,
-        // so all twenty are in it rather than the few that fell after 3.5.
-        assert_eq!(speed.rate(clock.at(3.8)), per_second(20));
+        // Six and a bit readings of thinking, then twenty tokens.
+        speed.streamed(clock.at(6.6), 20);
+        // The first reading runs from that first token, so all twenty are in it rather
+        // than only those that fell in what was left of the reading it landed in.
+        assert_eq!(speed.rate(clock.at(7.6)), shows(20));
     }
 
     #[test]
@@ -215,17 +252,21 @@ mod tests {
         let mut speed = Speed::default();
         speed.start(clock.at(0.0));
         speed.streamed(clock.at(0.0), 30);
-        speed.streamed(clock.at(0.5), 10);
-        speed.end(clock.at(0.5));
-        // A minute of tool output moves the wall clock, not the streaming one, so the
+        speed.streamed(clock.at(1.0), 10);
+        speed.end(clock.at(1.0));
+        // Minutes of tool output move the wall clock, not the streaming one, so the
         // reading it stopped in is still the one being filled.
-        assert_eq!(speed.rate(clock.at(60.0)), per_second(30));
-        speed.start(clock.at(60.0));
-        speed.streamed(clock.at(60.1), 5);
-        // Half a second of streaming has passed over the two calls, not a minute.
-        assert_eq!(speed.rate(clock.at(60.2)), per_second(30));
-        speed.streamed(clock.at(60.5), 5);
-        assert_eq!(speed.rate(clock.at(60.5)), per_second(15), "10 then 5");
+        assert_eq!(speed.rate(clock.at(500.0)), shows(30));
+        speed.start(clock.at(500.0));
+        speed.streamed(clock.at(500.2), 5);
+        assert_eq!(
+            speed.rate(clock.at(500.2)),
+            shows(30),
+            "the same reading still"
+        );
+        // One reading of streaming has passed over the two calls, not five hundred.
+        speed.streamed(clock.at(501.0), 1);
+        assert_eq!(speed.rate(clock.at(501.0)), shows(15), "10 then 5");
     }
 
     #[test]
@@ -236,12 +277,12 @@ mod tests {
         assert_eq!(speed.rate(clock.at(1.0)), None);
         speed.start(clock.at(2.0));
         speed.streamed(clock.at(2.0), 40);
-        speed.streamed(clock.at(2.5), 1);
-        assert_eq!(speed.rate(clock.at(2.5)), per_second(40));
+        speed.streamed(clock.at(3.0), 1);
+        assert_eq!(speed.rate(clock.at(3.0)), shows(40));
         // Two ends in a row, and a second start, leave the clock alone.
-        speed.end(clock.at(2.5));
+        speed.end(clock.at(3.0));
         speed.end(clock.at(9.0));
         speed.start(clock.at(9.0));
-        assert_eq!(speed.rate(clock.at(9.0)), per_second(40));
+        assert_eq!(speed.rate(clock.at(9.0)), shows(40));
     }
 }

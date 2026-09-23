@@ -100,6 +100,9 @@ pub enum AgentEvent {
     RateLimits(RateLimits),
     /// A model call is on the wire, or is over; the UI times these to say how fast the
     /// model is answering, leaving out the time tools and approvals take.
+    /// A call went out with this many tokens of prompt behind it, which is what the
+    /// wait before the first token is spent reading.
+    Sending(u64),
     Streaming(bool),
     Error(String),
     /// The turn ended on a failure rather than a reply: the model call did not get
@@ -775,6 +778,20 @@ async fn turn(
 
         // On interrupt or failure nothing is appended, so the history never holds a
         // function_call without its matching output.
+        // What the backend has to read before it can answer. Counted here rather than
+        // taken from the call's usage, which only arrives once the answer is over.
+        let counter = crate::tokens::for_model(model.name());
+        let prompt: usize = counter.count(instructions)
+            + tools
+                .iter()
+                .map(|t| counter.count(&t.to_string()))
+                .sum::<usize>()
+            + history
+                .iter()
+                .filter_map(crate::tokens::item_text)
+                .map(|text| counter.count(&text))
+                .sum::<usize>();
+        let _ = tx.send(AgentEvent::Sending(prompt as u64));
         let _ = tx.send(AgentEvent::Streaming(true));
         let answer = model
             .respond(instructions, tools, history, &mut on_delta, cancel)
@@ -1129,7 +1146,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 })),
                 // The parent's own calls are what the speed readout times, and a child's
                 // turn ends inside this call. Calls and items index its own history.
-                AgentEvent::Streaming(_)
+                AgentEvent::Sending(_)
+                | AgentEvent::Streaming(_)
                 | AgentEvent::TurnEnd
                 | AgentEvent::Call(_)
                 | AgentEvent::Item(_)

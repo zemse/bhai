@@ -819,7 +819,10 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             }
             AgentEvent::Judging(Some(call)) => println!("[judging] {call}"),
             AgentEvent::Titled(name) => println!("[title] {name}"),
-            AgentEvent::Cache(None)
+            // A probe prints what the model says, and the prompt behind it is a tui
+            // readout: the size is already in the usage it prints when the call ends.
+            AgentEvent::Sending(_)
+            | AgentEvent::Cache(None)
             | AgentEvent::Call(_)
             | AgentEvent::Item(_)
             | AgentEvent::Judging(None)

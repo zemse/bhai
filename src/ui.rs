@@ -365,8 +365,31 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Cyan),
         ));
     }
-    if let Some(rate) = app.speed.rate(Instant::now()) {
-        spans.push(Span::styled(format!(" · {rate:.0} tok/s"), dim));
+    let now = Instant::now();
+    // Before the first token there is the prompt being read. No backend says how far
+    // through one it is, so what is shown is the size of it and how long it has been:
+    // enough to tell a big prompt from a stalled call, which is what the wait is for.
+    if let Some((prompt, waited)) = app.speed.reading_prompt(now) {
+        spans.push(Span::styled(
+            format!(
+                " · reading {} in · {:.0}s",
+                compact(prompt),
+                waited.as_secs_f64()
+            ),
+            dim,
+        ));
+    } else {
+        // Once the first token is back that wait has a rate of its own, and it stays up
+        // beside the answer's: the two halves of a call are read together.
+        if let Some(prompt) = app.speed.prompt_rate() {
+            spans.push(Span::styled(
+                format!(" · {} in/s", compact(prompt as u64)),
+                dim,
+            ));
+        }
+        if let Some(rate) = app.speed.rate(now) {
+            spans.push(Span::styled(format!(" · {rate:.0} tok/s"), dim));
+        }
     }
     if !app.queued.is_empty() {
         spans.push(Span::styled(format!(" · {} queued", app.queued.len()), dim));
@@ -1633,18 +1656,46 @@ mod tests {
         assert!(!screen(&terminal).contains("tok/s"), "nothing streamed yet");
 
         // A reading of writing, twenty-five tokens in it, and one that closes it.
-        let began = Instant::now() - Duration::from_millis(600);
+        let began = Instant::now() - crate::speed::PERIOD;
         app.speed.start(began);
         app.speed.streamed(began, 25);
         app.speed.streamed(Instant::now(), 1);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
-        assert!(shown.contains("working · 50 tok/s"), "{shown}");
+        let rate = 25.0 / crate::speed::PERIOD.as_secs_f64();
+        assert!(
+            shown.contains(&format!("working · {rate:.0} tok/s")),
+            "{shown}"
+        );
 
         // It is a working-row reading, so it goes with the row.
         app.on_event(Event::TurnEnd);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!screen(&terminal).contains("tok/s"));
+    }
+
+    #[test]
+    fn the_working_row_shows_the_prompt_being_read() {
+        let mut app = App::detached();
+        app.working = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+
+        // A call goes out and says nothing for four seconds. There is no progress to be
+        // had from a backend, so what the row has to show is what is being waited on.
+        let sent = Instant::now() - Duration::from_secs(4);
+        app.on_event(Event::Sending(8725));
+        app.speed.sending(sent, 8725);
+        app.speed.start(sent);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("reading 8.7k in · 4s"), "{shown}");
+
+        // The first token ends the wait, and the wait becomes a rate of its own.
+        app.speed.streamed(Instant::now(), 10);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(!shown.contains("reading"), "{shown}");
+        assert!(shown.contains("2.2k in/s"), "{shown}");
     }
 
     #[test]
