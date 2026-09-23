@@ -4,6 +4,7 @@
 mod agent;
 mod app;
 mod auth;
+mod branch;
 mod cache;
 mod client;
 mod clipboard;
@@ -352,6 +353,7 @@ allow it.",
         workflows,
         trust_gate,
         ollama_url,
+        limits,
     )
     .await;
     release_modes(mouse, paste, keyboard);
@@ -1033,6 +1035,7 @@ async fn run(
     workflows: workflow::Found,
     trust_gate: Option<app::TrustGate>,
     ollama_url: String,
+    limits: Limits,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -1079,6 +1082,7 @@ async fn run(
     app.history = prompts;
     app.trust_gate = trust_gate;
     app.ollama_url = ollama_url;
+    app.limits = limits;
     {
         let mut entries = app.entries();
         entries.restore(history);

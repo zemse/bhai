@@ -97,10 +97,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
         let width = frame.area().width.saturating_sub(4).max(10) as usize;
         let body = wrap(&trust_text(&gate), width).len() as u16;
         let height = (body + 5).min(frame.area().height.saturating_sub(2)).max(4);
-        let [status_area, transcript_area, bottom_area] = Layout::vertical([
-            Constraint::Length(1),
+        let [transcript_area, bottom_area, status_area] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(height),
+            Constraint::Length(1),
         ])
         .areas(frame.area());
         render_status(frame, status_area, app);
@@ -114,10 +114,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
     // The `/model` picker takes the prompt's place, sized to the list it is showing.
     if let Some(height) = app.picker.as_ref().map(Picker::height) {
         let height = height.min(frame.area().height.saturating_sub(2));
-        let [status_area, transcript_area, bottom_area] = Layout::vertical([
-            Constraint::Length(1),
+        let [transcript_area, bottom_area, status_area] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(height),
+            Constraint::Length(1),
         ])
         .areas(frame.area());
         render_status(frame, status_area, app);
@@ -185,21 +185,21 @@ fn draw(frame: &mut Frame, app: &mut App) {
     };
 
     let [
-        status_area,
         transcript_area,
         children_area,
         queued_area,
         menu_area,
         working_area,
         bottom_area,
+        status_area,
     ] = Layout::vertical([
-        Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(children_height),
         Constraint::Length(queued_height),
         Constraint::Length(menu_height),
         Constraint::Length(working_height),
         Constraint::Length(approval_height),
+        Constraint::Length(1),
     ])
     .areas(frame.area());
 
@@ -291,61 +291,108 @@ fn render_queued(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
+/// What a segment of the bar gives up its room for. Everything fits on a wide
+/// terminal; on a narrow one the highest number goes first.
+const HINT: u8 = 2;
+const COUNTS: u8 = 1;
+const ALWAYS: u8 = 0;
+
+/// The bottom bar: where the session is running, how full its context is, and what is
+/// left of the rate-limit windows. It sits under the prompt so the transcript has the
+/// whole screen above it to scroll through.
+fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let dim = Style::new().fg(Color::DarkGray);
-    let mut spans = vec![
-        Span::styled(" bhai ", Style::new().fg(Color::Black).bg(Color::Cyan)),
+    let mut bar = vec![
+        (
+            ALWAYS,
+            Span::styled(" bhai ", Style::new().fg(Color::Black).bg(Color::Cyan)),
+        ),
         // The effort rides along with the model, since `/model` can change either.
-        Span::styled(
-            match crate::client::Provider::of(&app.model) {
-                crate::client::Provider::Codex => format!(" {} {} ", app.model, app.effort),
-                crate::client::Provider::Ollama => format!(" {} ", app.model),
-            },
-            dim,
+        (
+            ALWAYS,
+            Span::styled(
+                match crate::client::Provider::of(&app.model) {
+                    crate::client::Provider::Codex => format!(" {} {} ", app.model, app.effort),
+                    crate::client::Provider::Ollama => format!(" {} ", app.model),
+                },
+                dim,
+            ),
         ),
     ];
+    // Which branch the work is landing on. A checkout in another terminal moves it, so
+    // it is re-read on the tick rather than read once at startup.
+    if let Some(branch) = app.branch.name() {
+        bar.push((ALWAYS, Span::styled(format!("on {branch} "), dim)));
+    }
+    // How full the window is, from what the last call actually read: the number
+    // compaction watches, and the only one here that says how much room is left.
+    if let Some(used) = app.last_usage.map(|usage| usage.input) {
+        let percent = 100.0 * used as f64 / app.limits.window(&app.model) as f64;
+        bar.push((
+            ALWAYS,
+            Span::styled(format!("ctx {percent:.0}% "), headroom(percent)),
+        ));
+    }
     if app.tokens_in + app.tokens_out > 0 {
-        spans.push(Span::styled(
-            format!("↑{} ↓{} ", compact(app.tokens_in), compact(app.tokens_out)),
-            dim,
+        bar.push((
+            COUNTS,
+            Span::styled(
+                format!("↑{} ↓{} ", compact(app.tokens_in), compact(app.tokens_out)),
+                dim,
+            ),
         ));
     }
     if let Some(rate) = app.last_usage.and_then(|u| u.cache_rate()) {
-        spans.push(Span::styled(format!("cache {rate:.0}% "), dim));
+        bar.push((COUNTS, Span::styled(format!("cache {rate:.0}% "), dim)));
     }
     if let Some(field) = &app.cache_break {
-        spans.push(Span::styled(
-            format!("cache break: {field} "),
-            Style::new().fg(Color::Red).bold(),
+        bar.push((
+            ALWAYS,
+            Span::styled(
+                format!("cache break: {field} "),
+                Style::new().fg(Color::Red).bold(),
+            ),
         ));
     }
     if app.cache_stalled {
-        spans.push(Span::styled(
-            "cache stalled ",
-            Style::new().fg(Color::Yellow).bold(),
+        bar.push((
+            ALWAYS,
+            Span::styled("cache stalled ", Style::new().fg(Color::Yellow).bold()),
         ));
     }
     if let Some(percent) = app.cache_miss {
-        spans.push(Span::styled(
-            format!("cache miss {percent:.0}% "),
-            Style::new().fg(Color::Yellow).bold(),
+        bar.push((
+            ALWAYS,
+            Span::styled(
+                format!("cache miss {percent:.0}% "),
+                Style::new().fg(Color::Yellow).bold(),
+            ),
         ));
     }
-    app.limits_area = app.rate_limits.map(|found| {
-        let x = area.x + spans.iter().map(Span::width).sum::<usize>() as u16;
-        let segment = limit_spans(&found, app.limits_hover);
-        let width = segment.iter().map(Span::width).sum::<usize>() as u16;
-        spans.extend(segment);
-        Rect::new(x, area.y, width, 1).intersection(area)
-    });
-    spans.push(Span::styled(
-        match app.pending.is_some() {
-            true => "  y yes · n no · or click a choice",
-            // The rest of the keys live in /help rather than across the top bar.
-            false => "  / for commands",
-        },
-        dim,
+    if let Some(found) = app.rate_limits {
+        bar.extend(limit_spans(&found).into_iter().map(|span| (ALWAYS, span)));
+    }
+    bar.push((
+        HINT,
+        Span::styled(
+            match app.pending.is_some() {
+                true => "  y yes · n no · or click a choice",
+                // The rest of the keys live in /help rather than along the bar.
+                false => "  / for commands",
+            },
+            dim,
+        ),
     ));
+    // A terminal too narrow for all of it keeps the branch, the fill and the windows:
+    // the bar is read for where the session stands, not for its running totals.
+    let width = |bar: &[(u8, Span)]| bar.iter().map(|(_, span)| span.width()).sum::<usize>();
+    for level in [HINT, COUNTS] {
+        if width(&bar) <= area.width as usize {
+            break;
+        }
+        bar.retain(|(drop, _)| *drop < level);
+    }
+    let spans: Vec<Span> = bar.into_iter().map(|(_, span)| span).collect();
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -399,9 +446,9 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// `5h 42% · wk 17% `, each window coloured by how close it is to its limit; with
-/// reset times when `hover`.
-fn limit_spans(found: &RateLimits, hover: bool) -> Vec<Span<'static>> {
+/// `5h 42% (2h14m) · wk 17% (Fri 09:00) `: each window's headroom and when it comes
+/// back, coloured by how close it is to its limit.
+fn limit_spans(found: &RateLimits) -> Vec<Span<'static>> {
     let dim = Style::new().fg(Color::DarkGray);
     let now = chrono::Local::now();
     let mut spans = Vec::new();
@@ -409,20 +456,24 @@ fn limit_spans(found: &RateLimits, hover: bool) -> Vec<Span<'static>> {
         if i > 0 {
             spans.push(Span::styled("· ", dim));
         }
-        let style = if window.used_percent >= limits::ALERT {
-            Style::new().fg(Color::Red).bold()
-        } else if window.used_percent >= limits::WARN {
-            Style::new().fg(Color::Yellow)
-        } else {
-            dim
-        };
         let mut text = format!("{} {:.0}% ", window.label(), window.used_percent);
-        if let Some(at) = window.reset_label(now).filter(|_| hover) {
-            text.push_str(&format!("resets {at} "));
+        if let Some(left) = window.resets_in(now) {
+            text.push_str(&format!("({left}) "));
         }
-        spans.push(Span::styled(text, style));
+        spans.push(Span::styled(text, headroom(window.used_percent)));
     }
     spans
+}
+
+/// How a percentage used is drawn, for the context fill and the limit windows alike.
+fn headroom(used_percent: f64) -> Style {
+    if used_percent >= limits::ALERT {
+        Style::new().fg(Color::Red).bold()
+    } else if used_percent >= limits::WARN {
+        Style::new().fg(Color::Yellow)
+    } else {
+        Style::new().fg(Color::DarkGray)
+    }
 }
 
 /// `text` cut to `max` characters, with an ellipsis when it had more. Callers work out
@@ -2189,12 +2240,19 @@ mod tests {
         assert_eq!((at.x, at.y), (area.x + 12, area.y + 1));
     }
 
+    /// A window resetting in two hours, far enough off that the count of whole minutes
+    /// the bar prints cannot slip while the test runs.
     fn window(used_percent: f64, window_minutes: u64) -> limits::Window {
         limits::Window {
             used_percent,
             window_minutes: Some(window_minutes),
-            resets_at: Some(chrono::Local::now().timestamp() + 60),
+            resets_at: Some(chrono::Local::now().timestamp() + 2 * 3600 + 30),
         }
+    }
+
+    /// The bottom row, which is the status bar.
+    fn status(terminal: &Terminal<TestBackend>) -> String {
+        screen(terminal).lines().next_back().unwrap().to_string()
     }
 
     /// The status bar cell under the first character of `text`.
@@ -2202,9 +2260,10 @@ mod tests {
         terminal: &'a Terminal<TestBackend>,
         text: &str,
     ) -> &'a ratatui::buffer::Cell {
-        let row = screen(terminal).lines().next().unwrap().to_string();
+        let row = status(terminal);
         let x = row[..row.find(text).unwrap()].chars().count() as u16;
-        &terminal.backend().buffer()[(x, 0)]
+        let y = terminal.backend().buffer().area.height - 1;
+        &terminal.backend().buffer()[(x, y)]
     }
 
     #[test]
@@ -2212,7 +2271,7 @@ mod tests {
         let mut app = App::detached();
         let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert!(app.limits_area.is_none());
+        assert!(!status(&terminal).contains('%'));
 
         let cases = [
             (42.0, Color::DarkGray),
@@ -2225,12 +2284,83 @@ mod tests {
                 secondary: Some(window(17.0, 10080)),
             }));
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
-            let top = screen(&terminal);
-            let expected = format!("5h {used:.0}% · wk 17% ");
-            assert!(top.lines().next().unwrap().contains(&expected), "{top}");
+            let bar = status(&terminal);
+            // Each window says what is left of it and when it comes back.
+            let expected = format!("5h {used:.0}% (2h) · wk 17% (2h) ");
+            assert!(bar.contains(&expected), "{bar}");
             assert_eq!(status_cell(&terminal, "5h ").fg, colour);
             assert_eq!(status_cell(&terminal, "wk ").fg, Color::DarkGray);
         }
+    }
+
+    #[test]
+    fn a_narrow_bar_drops_its_totals_before_where_the_session_stands() {
+        let mut app = App::detached();
+        app.branch = crate::branch::Branch::named("side");
+        app.tokens_in = 8_200;
+        app.tokens_out = 500;
+        app.on_event(Event::RateLimits(RateLimits {
+            primary: Some(window(8.0, 300)),
+            secondary: Some(window(20.0, 10080)),
+        }));
+
+        let mut wide = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        wide.draw(|frame| render(frame, &mut app)).unwrap();
+        let bar = status(&wide);
+        assert!(
+            bar.contains("↑8.2k ↓500 ") && bar.contains("/ for commands"),
+            "{bar}"
+        );
+
+        let mut narrow = Terminal::new(TestBackend::new(50, 10)).unwrap();
+        narrow.draw(|frame| render(frame, &mut app)).unwrap();
+        let bar = status(&narrow);
+        assert!(
+            bar.contains("on side ") && bar.contains("5h 8% (2h) "),
+            "{bar}"
+        );
+        assert!(!bar.contains('↑') && !bar.contains("for commands"), "{bar}");
+    }
+
+    #[test]
+    fn a_reset_more_than_a_day_off_is_a_day_and_a_time() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        let at = chrono::Local::now() + chrono::TimeDelta::days(3);
+        app.on_event(Event::RateLimits(RateLimits {
+            primary: None,
+            secondary: Some(limits::Window {
+                used_percent: 17.0,
+                window_minutes: Some(10080),
+                resets_at: Some(at.timestamp()),
+            }),
+        }));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let bar = status(&terminal);
+        let expected = format!("wk 17% ({}) ", at.format("%a %H:%M"));
+        assert!(bar.contains(&expected), "{bar}");
+    }
+
+    #[test]
+    fn the_status_bar_says_which_branch_and_how_full_the_context_is() {
+        let mut app = App::detached();
+        app.branch = crate::branch::Branch::named("side");
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let bar = status(&terminal);
+        assert!(bar.contains("on side "), "{bar}");
+        assert!(!bar.contains("ctx "), "nothing read yet");
+
+        app.limits = crate::compact::Limits {
+            window: Some(100_000),
+            ..crate::compact::Limits::default()
+        };
+        app.on_event(Event::Usage(usage(82_000, 0, 10, 0)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let bar = status(&terminal);
+        assert!(bar.contains("ctx 82% "), "{bar}");
+        // Past the point compaction waits for, so it is not drawn as an idle number.
+        assert_eq!(status_cell(&terminal, "ctx ").fg, Color::Yellow);
     }
 
     #[test]
@@ -2245,14 +2375,8 @@ mod tests {
             detail: "shrank from 5 to 3 items".to_string(),
         })));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let top = screen(&terminal);
-        assert!(
-            top.lines()
-                .next()
-                .unwrap()
-                .contains("cache break: input[3] "),
-            "{top}"
-        );
+        let bar = status(&terminal);
+        assert!(bar.contains("cache break: input[3] "), "{bar}");
         assert_eq!(status_cell(&terminal, "cache break").fg, Color::Red);
 
         app.on_event(Event::Cache(None));
@@ -2280,7 +2404,7 @@ mod tests {
     }
 
     #[test]
-    fn the_mode_chip_sits_on_the_bottom_bar_not_the_top() {
+    fn the_mode_chip_sits_on_the_prompt_border_not_the_status_bar() {
         let mut app = App::detached();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let cases = [
@@ -2295,49 +2419,20 @@ mod tests {
                 terminal.draw(|frame| render(frame, &mut app)).unwrap();
                 let screen = screen(&terminal);
                 let chip = format!("{name} · shift+tab ");
-                let bottom = screen.lines().next_back().unwrap();
-                assert!(bottom.contains(&chip), "{screen}");
-                let top = screen.lines().next().unwrap();
-                assert!(!top.contains(name), "{screen}");
+                // The prompt's bottom border, the row above the status bar.
+                let border = screen.lines().rev().nth(1).unwrap();
+                assert!(border.contains(&chip), "{screen}");
+                assert!(!status(&terminal).contains(name), "{screen}");
 
-                let y = terminal.backend().buffer().area.height - 1;
-                let x = bottom[..bottom.find(name).unwrap()].chars().count() as u16;
+                let y = terminal.backend().buffer().area.height - 2;
+                let x = border[..border.find(name).unwrap()].chars().count() as u16;
                 assert_eq!(terminal.backend().buffer()[(x, y)].fg, colour);
             }
         }
         assert!(
-            !screen(&terminal)
-                .lines()
-                .next()
-                .unwrap()
-                .contains("shift+tab"),
-            "the top bar keeps its other hints but not the mode"
+            !status(&terminal).contains("shift+tab"),
+            "the status bar keeps its other hints but not the mode"
         );
-    }
-
-    #[test]
-    fn hovering_the_rate_limits_shows_reset_times() {
-        let mut app = App::detached();
-        app.on_event(Event::RateLimits(RateLimits {
-            primary: Some(window(10.0, 300)),
-            secondary: None,
-        }));
-        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert!(!screen(&terminal).contains("resets"));
-
-        let area = app.limits_area.unwrap();
-        assert!(app.on_mouse(left(MouseEventKind::Moved, area.x + 1, 0)));
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let top = screen(&terminal);
-        assert!(
-            top.lines().next().unwrap().contains("5h 10% resets "),
-            "{top}"
-        );
-
-        assert!(app.on_mouse(left(MouseEventKind::Moved, 0, 0)));
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert!(!screen(&terminal).contains("resets"));
     }
 
     #[test]

@@ -13,9 +13,11 @@ use std::time::{Duration, Instant};
 use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
+use crate::branch::Branch;
 use crate::client::Usage;
 use crate::clipboard;
 use crate::commands::{self, Item};
+use crate::compact::Limits;
 use crate::diff::DiffView;
 use crate::entries::Entries;
 pub use crate::entries::Entry;
@@ -223,10 +225,10 @@ pub struct App {
     /// Judged calls have been missing in a row, until one hits again.
     pub cache_stalled: bool,
     pub rate_limits: Option<RateLimits>,
-    /// The rate-limit segment of the status bar, filled in by the renderer.
-    pub limits_area: Option<Rect>,
-    /// The mouse is over the rate-limit segment, so it shows reset times.
-    pub limits_hover: bool,
+    /// The branch of the directory the session runs in, for the status bar.
+    pub branch: Branch,
+    /// When history is compacted, which is what the bar's context fill is read against.
+    pub limits: Limits,
     /// The skills in the system prompt, for `/skills`.
     pub skills: Vec<Skill>,
     /// The session's MCP servers, for `/mcp`.
@@ -301,8 +303,8 @@ impl App {
             cache_miss: None,
             cache_stalled: false,
             rate_limits: None,
-            limits_area: None,
-            limits_hover: false,
+            branch: Branch::at(std::env::current_dir().unwrap_or_default()),
+            limits: Limits::default(),
             skills: Vec::new(),
             mcp: None,
             workflows: Found::default(),
@@ -563,10 +565,7 @@ impl App {
             MouseEventKind::ScrollDown => self.wheel(WHEEL_LINES as isize),
             MouseEventKind::Moved => {
                 self.mouse_row = Some(mouse.row);
-                let at = Position::new(mouse.column, mouse.row);
-                let over = self.limits_area.is_some_and(|area| area.contains(at));
-                let changed = std::mem::replace(&mut self.limits_hover, over) != over;
-                return self.rehover() | changed;
+                return self.rehover();
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_row = Some(mouse.row);
@@ -1006,6 +1005,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        self.branch.refresh();
         if self.working {
             self.spinner = self.spinner.wrapping_add(1);
         }

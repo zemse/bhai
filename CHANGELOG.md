@@ -6,6 +6,18 @@ carries the shape of what is there.
 
 ## 2026-09-23
 
+- The status bar sits at the bottom of the screen and says where the session stands: the
+  branch it is on, how full the context window is (`ctx 34%`, from what the last call
+  read, against the window compaction measures), and each rate-limit window with the
+  time until it comes back, `5h 8% (1h9m) · wk 20% (Sun 21:47)`. A reset under a day off
+  counts down; past that it is the local weekday and time, which is what a weekly window
+  usually needs. The reset times were a hover on the top bar before, which is neither
+  where the eye is nor something anyone finds, and the bar itself was a row the
+  transcript could have been scrolling through. A terminal too narrow for all of it
+  drops the `/` hint first and then the running totals, so the branch, the fill and the
+  windows are what survive. The branch comes from `.git/HEAD` on the tick, so a checkout
+  in another terminal shows up within a couple of seconds.
+
 - An interrupt reaches the waits that never watched for one. Esc sets the flag and the
   transcript says `interrupted` at once, but the turn ran on until whatever it was
   awaiting came back, with the spinner still up: the judge deciding a call (up to its

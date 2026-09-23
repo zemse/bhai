@@ -104,11 +104,21 @@ impl Window {
         }
     }
 
-    /// When the window resets, in local time; with the weekday unless it is today.
-    pub fn reset_label(&self, now: DateTime<Local>) -> Option<String> {
+    /// How long until the window resets: `43m`, or `2h14m`. Past a day it is the local
+    /// weekday and time instead, which is how far off a weekly window usually is and
+    /// what a count of hours stops saying anything about.
+    pub fn resets_in(&self, now: DateTime<Local>) -> Option<String> {
         let at = Local.timestamp_opt(self.resets_at?, 0).single()?;
-        Some(if at.date_naive() == now.date_naive() {
-            at.format("%H:%M").to_string()
+        let minutes = (at - now).num_minutes();
+        Some(if minutes <= 0 {
+            "now".to_string()
+        } else if minutes < 60 {
+            format!("{minutes}m")
+        } else if minutes < 24 * 60 {
+            match (minutes / 60, minutes % 60) {
+                (hours, 0) => format!("{hours}h"),
+                (hours, rest) => format!("{hours}h{rest}m"),
+            }
         } else {
             at.format("%a %H:%M").to_string()
         })
@@ -249,6 +259,43 @@ mod tests {
         assert_eq!(label(Some(1440)), "24h");
         assert_eq!(label(Some(1000)), "1000m");
         assert_eq!(label(None), "?");
+    }
+
+    #[test]
+    fn a_reset_counts_down_until_it_is_a_day_off() {
+        // On a whole second, since a reset is unix seconds and the fraction would eat
+        // a minute off every count below.
+        let now = Local
+            .timestamp_opt(Local::now().timestamp(), 0)
+            .single()
+            .unwrap();
+        let in_minutes = |m: i64| {
+            Window {
+                used_percent: 0.0,
+                window_minutes: None,
+                resets_at: Some((now + chrono::TimeDelta::minutes(m)).timestamp()),
+            }
+            .resets_in(now)
+        };
+        assert_eq!(in_minutes(43).as_deref(), Some("43m"));
+        assert_eq!(in_minutes(134).as_deref(), Some("2h14m"));
+        assert_eq!(in_minutes(180).as_deref(), Some("3h"));
+        assert_eq!(in_minutes(-5).as_deref(), Some("now"));
+        // A weekly window is days off, where the clock time is the useful answer.
+        let weekly = now + chrono::TimeDelta::minutes(3 * 24 * 60);
+        assert_eq!(
+            in_minutes(3 * 24 * 60).as_deref(),
+            Some(weekly.format("%a %H:%M").to_string().as_str())
+        );
+        assert_eq!(
+            Window {
+                used_percent: 0.0,
+                window_minutes: None,
+                resets_at: None,
+            }
+            .resets_in(now),
+            None
+        );
     }
 
     #[test]
