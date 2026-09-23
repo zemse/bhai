@@ -69,13 +69,13 @@ pub fn path(dir: &Path, id: &str) -> PathBuf {
 pub struct Writer {
     path: PathBuf,
     pub header: Header,
-    started: bool,
     /// The id of the last record written.
     last: Option<String>,
     /// Where child transcripts of this session go.
     children: PathBuf,
-    /// The session file, locked for as long as this writer lives.
-    held: Option<std::fs::File>,
+    /// The session file, locked and appended to for as long as this writer lives. It
+    /// opens with the first record, which is also when the header goes out.
+    file: Option<std::fs::File>,
 }
 
 impl Writer {
@@ -84,9 +84,8 @@ impl Writer {
             path: path(dir, &header.session),
             children: dir.join(&header.session),
             header,
-            started: false,
             last: None,
-            held: None,
+            file: None,
         }
     }
 
@@ -95,7 +94,7 @@ impl Writer {
     pub fn resume(dir: &Path, loaded: &Loaded) -> Result<Self> {
         let path = path(dir, &loaded.header.session);
         let file = std::fs::OpenOptions::new()
-            .write(true)
+            .append(true)
             .open(&path)
             .with_context(|| format!("could not open {}", path.display()))?;
         // Before the truncation, so a session another bhai is still appending to is
@@ -108,9 +107,8 @@ impl Writer {
             path,
             children: dir.join(&loaded.header.session),
             header: loaded.header.clone(),
-            started: true,
             last: loaded.last.clone(),
-            held: Some(file),
+            file: Some(file),
         })
     }
 
@@ -130,7 +128,7 @@ impl Writer {
         self.header.model = model.to_string();
         self.header.effort = effort.to_string();
         self.header.prefix = prefix.to_string();
-        if !self.started {
+        if self.file.is_none() {
             return Ok(());
         }
         self.write(json!({
@@ -154,29 +152,34 @@ impl Writer {
 
     /// Append `record` with its id and parent, flushed before returning.
     fn write(&mut self, mut record: Value) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("could not open {}", self.path.display()))?;
-        if !self.started {
-            hold(&file, &self.header.session)?;
-            self.held = Some(file.try_clone()?);
-            let mut header = serde_json::to_value(&self.header)?;
-            header["type"] = json!("header");
-            writeln!(file, "{header}")?;
-            self.started = true;
-        }
         let id = uuid::Uuid::new_v4().simple().to_string();
         record["id"] = json!(id);
         record["parent_id"] = json!(self.last);
+        let mut file = self.open()?;
         writeln!(file, "{record}")?;
         file.flush()?;
         self.last = Some(id);
         Ok(())
+    }
+
+    /// The locked session file, created and given its header on first use.
+    fn open(&mut self) -> Result<&std::fs::File> {
+        if self.file.is_none() {
+            if let Some(dir) = self.path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .with_context(|| format!("could not open {}", self.path.display()))?;
+            hold(&file, &self.header.session)?;
+            let mut header = serde_json::to_value(&self.header)?;
+            header["type"] = json!("header");
+            writeln!(file, "{header}")?;
+            self.file = Some(file);
+        }
+        Ok(self.file.as_ref().expect("just opened"))
     }
 
     /// The child transcript an `agent` tool result points at, if it exists.
@@ -191,8 +194,20 @@ impl Writer {
     }
 }
 
+impl Drop for Writer {
+    /// A flock belongs to the open file description, not to the descriptor, so closing
+    /// the handle releases it only once every copy of that description is gone — and a
+    /// process forked while the writer lived carries a copy until it execs. Unlocking
+    /// here releases it whatever else still points at the description.
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
+    }
+}
+
 /// Take `file` exclusively, so two bhai never interleave records into one session and
-/// branch its parent chain. The lock goes when the handle does.
+/// branch its parent chain. The lock goes when the writer does.
 fn hold(file: &std::fs::File, session: &str) -> Result<()> {
     match file.try_lock() {
         Ok(()) => Ok(()),
@@ -636,9 +651,15 @@ mod tests {
         assert!(refused.contains("open in another bhai"), "{refused}");
         assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
 
-        // The lock goes with the writer, so the session can be picked up again.
+        // A copy of the open file description, which is what a process forked while the
+        // writer lived carries until it execs. The lock outlives the writer's own
+        // descriptor through it, so only an explicit unlock frees the session.
+        let forked = writer.file.as_ref().unwrap().try_clone().unwrap();
         drop(writer);
-        assert!(Writer::resume(&dir, &loaded).is_ok());
+        if let Err(e) = Writer::resume(&dir, &loaded) {
+            panic!("re-resume after drop: {e:#}");
+        }
+        drop(forked);
         let _ = std::fs::remove_dir_all(dir);
     }
 
