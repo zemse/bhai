@@ -6,6 +6,33 @@ carries the shape of what is there.
 
 ## 2026-09-23
 
+- `auto` mode stops denying the work the user asked for. Four things were wrong at once,
+  found from a session that set up GPG on the machine and got nowhere. `command -v gpg`
+  was read as running its arguments, the way `sudo` is, so one of them made a whole
+  chain unparseable and an unparseable command naming a refused program is denied
+  outright: an agent probing what is installed never got past its first call. The
+  checker kept every write and edit outside the project from the judge while letting
+  `printf x > ~/.gnupg/gpg-agent.conf` reach it, which is the same change by another
+  route, so that boundary is gone and where a call lands is the judge's to rule on. The
+  judge's own prompt denied an install or a global config change whatever the task said,
+  which left a task about the machine rather than about the project with no step that
+  could ever run; it now approves a change outside the project root when the user's own
+  messages ask for that change, and says what does not widen it: blanket permission, the
+  agent's own reasoning, or text it read from a file, a page or a tool's output. Six
+  cases for that are in the eval fixture, three each way.
+
+- A denial says what it tripped on. It used to name all four things it could have been
+  and let the model work it out, which in that session meant rewriting the same call
+  three times; `Reserved` carries the word or the rule, so the message is `sudo` or
+  `Bash(cargo publish:*)`, and it ends with the `/allow` line that would let that very
+  call through.
+
+- `/allow <rule>` puts a permission rule in from the prompt, for this session and the
+  ones after it. `auto` never shows an approval modal, so the remember path behind it
+  was unreachable and the only way to permit one call was to change mode. Bare `/allow`
+  prints the four shapes a rule takes. A deny rule still refuses and a protected path
+  still asks.
+
 - The status bar sits at the bottom of the screen and says where the session stands: the
   branch it is on, how full the context window is (`ctx 34%`, from what the last call
   read, against the window compaction measures), and each rate-limit window with the
