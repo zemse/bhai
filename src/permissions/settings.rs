@@ -147,12 +147,16 @@ pub fn claude(home: Option<&Path>, cwd: &Path) -> (Rules, Vec<String>) {
 }
 
 /// A Claude Code rule for a tool bhai has, MCP tools included; `None` for any other tool.
+///
+/// The name is matched case-insensitively: `Rule::parse` lowercases it anyway, so a miscased
+/// one is a rule everywhere else in bhai and dropping it here would be silent.
 fn claude_rule(text: &str) -> Option<Result<Rule, String>> {
     let name = text.split('(').next().unwrap_or_default().trim();
-    match name {
-        "Bash" | "Read" | "Edit" | "Write" => Some(Rule::parse(text)),
-        "MultiEdit" => Some(Rule::parse(&text.trim().replacen("MultiEdit", "Edit", 1))),
-        _ if name.starts_with("mcp__") => Some(Rule::parse(text)),
+    let lower = name.to_lowercase();
+    match lower.as_str() {
+        "bash" | "read" | "edit" | "write" => Some(Rule::parse(text)),
+        "multiedit" => Some(Rule::parse(&text.trim().replacen(name, "Edit", 1))),
+        _ if lower.starts_with("mcp__") => Some(Rule::parse(text)),
         _ => None,
     }
 }
@@ -265,7 +269,7 @@ mod tests {
             &home.join(".claude/settings.json"),
             json!({"permissions": {
                 "allow": ["Bash(git log:*)", "WebFetch(domain:x.com)", "mcp__github__get", "MultiEdit(src/**)"],
-                "deny": ["Read(*.pem)", "Bash(npm run test?)"],
+                "deny": ["Read(*.pem)", "Bash(npm run test?)", "bash(rm:*)", "multiedit(*)"],
             }}),
         );
         write(
@@ -290,7 +294,7 @@ mod tests {
         assert_eq!(users, [true, true, true, false]);
         let repo: Vec<bool> = rules.allow.iter().map(|r| r.repo).collect();
         assert_eq!(repo, [false, false, false, true]);
-        assert_eq!(texts(&rules.deny), ["Read(*.pem)"]);
+        assert_eq!(texts(&rules.deny), ["Read(*.pem)", "bash(rm:*)", "Edit(*)"]);
         assert_eq!(texts(&rules.ask), ["Write(docs/**)"]);
         assert_eq!(
             rules.ask[0].source,
