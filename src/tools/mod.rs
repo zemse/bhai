@@ -27,7 +27,7 @@ pub const NAMES: [&str; 6] = [
 ];
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
-const MAX_OUTPUT: usize = 20_000;
+pub(crate) const MAX_OUTPUT: usize = 20_000;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
