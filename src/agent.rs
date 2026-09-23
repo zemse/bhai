@@ -489,6 +489,9 @@ pub(crate) async fn run_with(
                                 history.retain(|item| {
                                     item.get("type").and_then(Value::as_str) != Some("reasoning")
                                 });
+                                // Earlier calls index the old history, and the new model
+                                // reads a cache of its own that is cold.
+                                (calls, monitor) = (Vec::new(), CacheMonitor::default());
                                 // Recorded, so a resume comes back on this model rather
                                 // than the one the session opened on.
                                 if let Some(writer) = &mut writer {
@@ -3080,6 +3083,10 @@ mod tests {
         ));
 
         drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        let (reply, wait) = oneshot::channel();
+        tx_control.send(Control::Context(reply)).await.unwrap();
+        assert!(wait.await.unwrap().calibration.is_some());
+
         tx_control
             .send(Control::Model {
                 model: "gpt-9".to_string(),
@@ -3088,6 +3095,11 @@ mod tests {
             })
             .await
             .unwrap();
+        // The ledger indexes the history the switch rewrote, so it goes with it.
+        let (reply, wait) = oneshot::channel();
+        tx_control.send(Control::Context(reply)).await.unwrap();
+        assert!(wait.await.unwrap().calibration.is_none());
+
         drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
 
         let bodies = fake.bodies.lock().unwrap();
