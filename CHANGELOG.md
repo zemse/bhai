@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-23
 
+- An interrupt reaches the waits that never watched for one. Esc sets the flag and the
+  transcript says `interrupted` at once, but the turn ran on until whatever it was
+  awaiting came back, with the spinner still up: the judge deciding a call (up to its
+  15 second timeout), the backoff between retries of a model call (0.5s, then 1.5s), or
+  a token refresh. Each is awaited through `client::unless_cancelled` now, which polls
+  the flag the way the stream already did. Measured on a live session, esc to the end of
+  the turn is 14-20ms; the judge case was 30s of spinner on a stopped turn.
+
 - A compaction shows the summary it folded the earlier turns into, under the notice that
   says what it cost. The summary is the context the conversation carries from there, and
   it was the one thing the transcript never said: the notice reported two numbers and the

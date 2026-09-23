@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
-use crate::client::{Client, Delta, Usage};
+use crate::client::{self, Client, Delta, Usage};
 use crate::compact::{self, Limits};
 use crate::identity::Identity;
 use crate::judge::{self, Judge, Undecided, Verdict};
@@ -1334,13 +1334,25 @@ not retry it. Try a different approach, or ask the user."
                 let _ = tx.send(AgentEvent::Judging(Some(summary.clone())));
             }
             // A verdict is final; anything else is not a third verdict, it prompts.
-            let verdict = judged(judge, policy, name, &args, &target, &detail).await;
+            // Deciding takes seconds and a verdict is worth nothing on a turn that is
+            // over, so the wait for one ends with the interrupt rather than after it.
+            let verdict = client::unless_cancelled(
+                judged(judge, policy, name, &args, &target, &detail),
+                cancel,
+            )
+            .await;
             if asking {
                 let _ = tx.send(AgentEvent::Judging(None));
             }
+            let Some(verdict) = verdict else {
+                return (
+                    "Not executed: the user interrupted the turn.".to_string(),
+                    false,
+                );
+            };
             match verdict {
                 Ok(Verdict::Approve { reason }) => {
-                    // Deciding takes seconds, so an interrupt during it still means stop.
+                    // The flag can still land in the moment the verdict does.
                     if cancel.load(Ordering::Relaxed) {
                         return (
                             "Not executed: the user interrupted the turn.".to_string(),
@@ -2400,6 +2412,71 @@ mod tests {
         assert_eq!(output, "Not executed: the user interrupted the turn.");
         assert_eq!(backend.calls.lock().unwrap().len(), 1);
         assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An interrupt while the judge is still deciding does not wait for the verdict: a
+    /// decision takes seconds, and the turn it was for is over.
+    #[tokio::test]
+    async fn an_interrupt_stops_the_wait_for_a_verdict() {
+        use crate::judge::fake::{Answers, Backend};
+        use crate::judge::{Judge, Settings};
+        use crate::permissions::{Relax, Rules, Trust};
+        use std::time::Duration;
+
+        let dir = tools::temp_dir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let policy = Policy::new(Mode::Auto, Rules::default(), None, repo.clone())
+            .with_relax(Relax {
+                writes: false,
+                commands: false,
+            })
+            .with_trust(Trust::new(&dir.join("config"), &repo));
+        policy.trust().unwrap();
+
+        // A judge that never answers, with the whole of its own timeout left to run.
+        let judge = Judge::new(
+            Backend::new(Answers::Hang),
+            repo.clone(),
+            Settings {
+                timeout: Duration::from_secs(30),
+                ..Settings::default()
+            },
+        );
+        judge.start_turn("add a unit test for the parser");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupting = tokio::spawn({
+            let cancel = Arc::clone(&cancel);
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        let target = repo.join("notes.txt");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        let (output, ok) = execute(
+            &Registry::new(Vec::new()),
+            &policy,
+            Some(&judge),
+            &fake::call("write", json!({"path": target, "content": "x"})),
+            &tx,
+            &cancel,
+        )
+        .await;
+        interrupting.await.unwrap();
+
+        assert!(!ok);
+        assert_eq!(output, "Not executed: the user interrupted the turn.");
+        assert!(!target.exists());
+        // The judge's own timeout is 30s away; the interrupt is what ended this.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

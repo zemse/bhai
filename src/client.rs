@@ -323,7 +323,14 @@ impl Client {
                 Err(Error::Retryable(e)) => {
                     last_err = Some(e);
                     if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(backoff).await;
+                        // An interrupt during the backoff means stop now, not once the
+                        // sleep the user cannot see is over.
+                        if unless_cancelled(tokio::time::sleep(backoff), cancel)
+                            .await
+                            .is_none()
+                        {
+                            bail!("interrupted");
+                        }
                         backoff *= 3;
                     }
                 }
@@ -425,7 +432,12 @@ impl Client {
         if provider == Provider::Ollama {
             return ollama::attempt(&self.http, &self.ollama_url, body, on_delta, cancel).await;
         }
-        let auth = auth::load(&self.http).await.map_err(Error::Fatal)?;
+        // A token near expiry is refreshed over the network, which is another wait an
+        // interrupt has to be able to end.
+        let auth = unless_cancelled(auth::load(&self.http), cancel)
+            .await
+            .ok_or(Error::Interrupted)?
+            .map_err(Error::Fatal)?;
 
         let resp = watched(
             self.request(&auth, body).send(),
@@ -579,6 +591,24 @@ impl Client {
             req = req.header("ChatGPT-Account-ID", account_id);
         }
         req
+    }
+}
+
+/// Await `fut` unless the turn is cancelled first; `None` when it was. The flag is
+/// polled rather than awaited, since an `AtomicBool` has nothing to wake on, and what is
+/// waited on here has no idea an interrupt is pending.
+pub(crate) async fn unless_cancelled<T>(
+    fut: impl Future<Output = T>,
+    cancel: &Arc<AtomicBool>,
+) -> Option<T> {
+    tokio::pin!(fut);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        if let Ok(done) = tokio::time::timeout(CANCEL_POLL, &mut fut).await {
+            return Some(done);
+        }
     }
 }
 
@@ -765,6 +795,23 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(true));
         let waited = watched(std::future::pending::<()>(), &cancel, "idle").await;
         assert!(matches!(waited, Err(Error::Interrupted)));
+    }
+
+    /// The retry backoff is the case: a sleep knows nothing about an interrupt, and
+    /// waiting it out is a second of a spinner the user has already asked to stop.
+    #[tokio::test]
+    async fn a_wait_that_cannot_be_cancelled_ends_with_the_interrupt() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let interrupting = tokio::spawn({
+            let cancel = Arc::clone(&cancel);
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        let slept = unless_cancelled(tokio::time::sleep(Duration::from_secs(30)), &cancel).await;
+        interrupting.await.unwrap();
+        assert!(slept.is_none());
     }
 
     #[test]
