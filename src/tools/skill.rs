@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use super::{BoxFuture, Tool, string_arg, truncate};
+use super::{BoxFuture, Tool, string_arg};
 use crate::skills;
 
 pub const NAME: &str = "skill";
@@ -47,8 +47,9 @@ impl Tool for Skill {
 
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
         Box::pin(async move {
+            // Not truncated: instructions with a hole in the middle are worse than long ones.
             match self.find(args).and_then(load) {
-                Ok(output) => (truncate(&output), true),
+                Ok(output) => (output, true),
                 Err(e) => (e, false),
             }
         })
@@ -120,6 +121,22 @@ mod tests {
         assert!(out.contains(&dir.display().to_string()), "{out}");
         assert!(out.ends_with("\n\n# PDF\nSee reference.md."), "{out}");
         assert!(!out.contains("description:"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_long_skill_arrives_whole() {
+        let (tool, dir) = tool();
+        let body = "line of instructions\n".repeat(2_000);
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: pdf\ndescription: Read PDFs.\n---\n\n{body}"),
+        )
+        .unwrap();
+        let (out, ok) = tool.execute(&json!({"name": "pdf"})).await;
+        assert!(ok, "{out}");
+        assert!(out.len() > 40_000, "{}", out.len());
+        assert!(!out.contains("bytes trimmed"), "{out}");
+        assert_eq!(out.matches("line of instructions").count(), 2_000);
     }
 
     #[tokio::test]
