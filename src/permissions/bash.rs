@@ -92,16 +92,12 @@ fn allowed(command: &Command) -> bool {
     let Some(first) = command.words.first() else {
         return true;
     };
-    if is_assignment(first) || REFUSED.contains(&basename(first)) {
+    if is_assignment(first) || runs_arguments(&command.words) {
         return false;
     }
     // A wrapper hides it otherwise: `nice -n 5 sudo id` and `env eval x` both run a
     // refused program, and only the wrapper is at the front.
-    if command
-        .unwrapped()
-        .first()
-        .is_some_and(|w| REFUSED.contains(&basename(w)))
-    {
+    if runs_arguments(command.unwrapped()) {
         return false;
     }
     // A refused program behind `find -exec` is refused too.
@@ -114,6 +110,28 @@ fn allowed(command: &Command) -> bool {
             && command.words[i + 1..]
                 .iter()
                 .any(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))
+    })
+}
+
+/// Whether the program at the front runs the words after it as a command of its own,
+/// which is what the refused list is about. `command` is the one entry with a form that
+/// does not: `command -v foo` resolves a name and prints it, the way `which` does.
+fn runs_arguments(words: &[String]) -> bool {
+    let Some(name) = words.first().map(|w| basename(w)) else {
+        return false;
+    };
+    REFUSED.contains(&name) && !(name == "command" && is_lookup(&words[1..]))
+}
+
+/// `command -v`, `-V` and `-p` in any combination, as long as one of `v` or `V` is in
+/// there: those print where a name resolves to rather than running it. Anything else,
+/// including a bare `command foo`, runs its arguments.
+fn is_lookup(args: &[String]) -> bool {
+    args.first().is_some_and(|flag| {
+        let Some(letters) = flag.strip_prefix('-').filter(|f| !f.starts_with('-')) else {
+            return false;
+        };
+        letters.chars().all(|c| "vVp".contains(c)) && letters.contains(['v', 'V'])
     })
 }
 
@@ -385,6 +403,8 @@ pub fn is_read_only(words: &[String]) -> bool {
         | "uname" | "whoami" | "id" | "uptime" | "df" | "du" | "free" | "basename" | "dirname"
         | "realpath" | "readlink" | "nl" | "cut" | "tr" | "column" | "cmp" | "diff" | "md5sum"
         | "sha256sum" | "ps" => true,
+        // Do nothing and exit; `|| true` is how a probe chain keeps going past a miss.
+        "true" | "false" => true,
         // `--pre` runs a preprocessor program, `--hostname-bin` another.
         "rg" => !has(&|a| a.starts_with("--pre") || a.starts_with("--hostname-bin")),
         // `-C` compiles a magic file, `-o` writes the listing to a file.
@@ -394,6 +414,8 @@ pub fn is_read_only(words: &[String]) -> bool {
         "date" => !has(&|a| is_short_flag(a, 's') || a.starts_with("--set")),
         // An argument sets the hostname, and `env cmd` runs cmd.
         "env" | "hostname" => args.is_empty(),
+        // Only the `-v` forms reach here; they print where a name resolves, like `which`.
+        "command" => is_lookup(args),
         // `-o` writes the sorted output to a file, `--compress-program` runs a program.
         "sort" => !has(&|a| {
             is_short_flag(a, 'o')
@@ -788,6 +810,31 @@ mod tests {
             "env eval x",
             "xargs sudo rm",
             r"find . -exec env sudo rm {} \;",
+        ] {
+            assert_eq!(parse(input), None, "{input}");
+        }
+    }
+
+    /// `command` is refused because it runs its arguments, but the `-v` forms only say
+    /// where a name resolves. An agent probing what is installed writes them by the
+    /// dozen, and one of them used to refuse the whole chain it sat in.
+    #[test]
+    fn command_dash_v_is_a_lookup_not_an_execution() {
+        for input in [
+            "command -v gpg",
+            "command -V gpg",
+            "command -pv gpg",
+            "command -v brew || true",
+            "uname -m && command -v gpg && command -v pinentry-mac",
+        ] {
+            let commands = parse(input).unwrap_or_else(|| panic!("{input}"));
+            assert!(commands.iter().all(|c| is_read_only(&c.words)), "{input}");
+        }
+        for input in [
+            "command gpg --list-keys",
+            "command -p rm -rf x",
+            "command --version",
+            "ls; command eval x",
         ] {
             assert_eq!(parse(input), None, "{input}");
         }
