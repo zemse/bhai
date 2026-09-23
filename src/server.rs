@@ -12,12 +12,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::permissions::{Answer, Mode, Remember};
-use crate::session::{Session, Submitted};
+use crate::session::{self, Session, Submitted};
 
 /// Port `--serve` listens on when none is given.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -92,16 +92,24 @@ async fn events(
 ) -> Sse<impl Stream<Item = Result<sse::Event, axum::Error>>> {
     let rx = session.subscribe();
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => return Some((sse::Event::default().json_data(&event), rx)),
-                // A slow client just misses events; the stream keeps going.
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => return None,
-            }
-        }
+        let item = sent(rx.recv().await)?;
+        let event = item
+            .map_err(axum::Error::new)
+            .and_then(|value| sse::Event::default().json_data(value));
+        Some((event, rx))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// What `/events` sends for one receive, or `None` once the session has gone away. A
+/// consumer that fell behind is told how many it missed, rather than left with a hole in
+/// the stream that reads as nothing having happened.
+fn sent(received: Result<session::Event, RecvError>) -> Option<serde_json::Result<Value>> {
+    match received {
+        Ok(event) => Some(serde_json::to_value(event)),
+        Err(RecvError::Lagged(n)) => Some(Ok(json!({ "type": "lagged", "data": n }))),
+        Err(RecvError::Closed) => None,
+    }
 }
 
 /// The child agents of the running turn, with each one's transcript.
@@ -256,6 +264,31 @@ mod tests {
     use crate::{profile, session};
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    /// A tool that streams a lot of progress can outrun a consumer that forks per line,
+    /// and the stream then jumps. It has to say so, or the gap reads as a quiet patch.
+    #[tokio::test]
+    async fn a_consumer_that_falls_behind_is_told_what_it_missed() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(2);
+        for i in 0..5 {
+            let _ = tx.send(session::Event::Text(i.to_string()));
+        }
+        assert_eq!(
+            sent(rx.recv().await).unwrap().unwrap(),
+            json!({"type": "lagged", "data": 3})
+        );
+        // The stream goes on from where the ring now starts.
+        assert_eq!(
+            sent(rx.recv().await).unwrap().unwrap(),
+            json!({"type": "text", "data": "3"})
+        );
+        drop(tx);
+        assert_eq!(
+            sent(rx.recv().await).unwrap().unwrap(),
+            json!({"type": "text", "data": "4"})
+        );
+        assert!(sent(rx.recv().await).is_none());
+    }
 
     /// Start a server on an ephemeral port in front of a fake agent that says hi, asks
     /// to run one command, and reports the decision on the returned channel.
