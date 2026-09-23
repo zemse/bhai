@@ -202,6 +202,12 @@ impl Editor {
                 // Break after the last space on the row, or mid-word if it has none.
                 let at = space.filter(|&at| at > start).unwrap_or(i);
                 rows.push(Row::new(&chars, start, at));
+                if at == i && c == ' ' {
+                    // The overflowing space is itself the break: it ends this row, and
+                    // the next one starts empty after it.
+                    (start, column, space) = (i + 1, 0, None);
+                    continue;
+                }
                 start = if chars[at] == ' ' { at + 1 } else { at };
                 column = chars[start..i].iter().copied().map(char_width).sum();
                 space = None;
@@ -474,6 +480,10 @@ mod tests {
         assert_eq!(editor("the quick brown fox").rows(10)[1].start, 10);
         // A word longer than the row is split where it runs out.
         assert_eq!(rows("abcdefgh", 3), ["abc", "def", "gh"]);
+        // A word that fills the row exactly: the space that overflows it is eaten.
+        assert_eq!(rows("abc def", 3), ["abc", "def"]);
+        assert_eq!(rows("xx abc def", 3), ["xx", "abc", "def"]);
+        assert_eq!(editor("abc def").rows(3)[1].start, 4);
         // An empty line still draws a row, and so does a trailing newline.
         assert_eq!(editor("a\n\nb").rows(10).len(), 3);
         assert_eq!(editor("a\n").rows(10).len(), 2);
