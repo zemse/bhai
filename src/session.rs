@@ -506,6 +506,17 @@ impl Session {
         out
     }
 
+    /// Add an allow rule, for `/allow`. It is the user's own, so it holds in every mode
+    /// and is saved where a remembered approval goes. `auto` mode never prompts, so this
+    /// is the only way to permit a call from the prompt rather than by changing mode:
+    /// saying "allow that" in a message reaches the model, which cannot grant it.
+    pub fn allow(&self, rule: &str) -> anyhow::Result<String> {
+        Ok(match self.policy.remember(rule)? {
+            Some(store) => format!("allowed {rule}, saved to {}", store.display()),
+            None => format!("allowed {rule} for this session"),
+        })
+    }
+
     /// Honour the repo-supplied allow rules, for `/trust`.
     pub fn trust(&self) -> anyhow::Result<String> {
         let notice = self.policy.trust()?;

@@ -49,6 +49,11 @@ pub const COMMANDS: &[Command] = &[
         help: "the rules that decide approvals",
     },
     Command {
+        name: "allow",
+        args: " <rule>",
+        help: "let a kind of call run without asking",
+    },
+    Command {
         name: "trust",
         args: "",
         help: "trust this project's settings files",

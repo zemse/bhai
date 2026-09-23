@@ -1398,9 +1398,18 @@ as-is. Try a different approach, or ask the user."
                     let _ = tx.send(AgentEvent::ToolRejected(format!(
                         "auto-denied: {summary} ({why})"
                     )));
+                    // The rule that would let this very call through, so telling the
+                    // user to ask for it is a command they can run rather than a mode
+                    // they have to go and find.
+                    let offer = match policy.offers(name, &args).prefix {
+                        Some(rule) => format!(
+                            " To permit this and calls like it, the user can run `/allow {rule}`."
+                        ),
+                        None => String::new(),
+                    };
                     return (
                         format!(
-                            "denied by auto policy: {why}, and auto mode never prompts. It did not run.{how} Try a different approach, or ask the user to run it or to switch to ask mode."
+                            "denied by auto policy: {why}, and auto mode never prompts. It did not run.{how}{offer} Try a different approach, or ask the user to run it or to switch to ask mode."
                         ),
                         false,
                     );

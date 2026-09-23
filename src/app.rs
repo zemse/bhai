@@ -42,6 +42,17 @@ const EDGE_LINES: isize = 5;
 /// Presses on one cell this close together count as a double or triple click.
 const MULTI_CLICK: Duration = Duration::from_millis(400);
 
+/// What bare `/allow` prints. The rule syntax is the config's, and the examples are the
+/// three shapes it takes rather than a grammar.
+const ALLOW_USAGE: &str = "/allow <rule> lets a kind of call run without asking, for \
+this session and every later one.
+  /allow Bash(brew install:*)     that command and anything after it
+  /allow Bash(cargo fmt)          exactly that command
+  /allow Write(~/.gnupg/**)       writing anywhere under a directory
+  /allow mcp__chrome-devtools     every tool of one MCP server
+A deny rule still refuses, and a protected path still asks. /permissions lists what is \
+set.";
+
 /// A selection over the transcript's wrapped lines, as (line, column) cells. Anchoring
 /// to the wrapped buffer rather than the screen keeps it put while the view scrolls.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1089,6 +1100,20 @@ impl App {
             self.note(Entry::Info(self.session.permissions()));
             return;
         }
+        if let Some(rest) = message.strip_prefix("/allow")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            let rule = rest.trim();
+            self.note(match rule.is_empty() {
+                true => Entry::Info(ALLOW_USAGE.to_string()),
+                false => match self.session.allow(rule) {
+                    Ok(text) => Entry::Info(text),
+                    Err(e) => Entry::Error(format!("{e:#}")),
+                },
+            });
+            return;
+        }
         if message == "/trust" || message == "/untrust" {
             self.follow = true;
             let result = match message.as_str() {
@@ -1860,6 +1885,30 @@ mod tests {
             "{:?}",
             entries.list
         );
+    }
+
+    /// `auto` mode never prompts, so a call it denies has no approval to answer. The
+    /// rule is the way to permit one from the prompt, and the deny text names it.
+    #[test]
+    fn allow_adds_a_rule_from_the_prompt_and_bare_allow_says_how() {
+        let (mut app, _user, _control) = connected();
+        let last = |app: &mut App| match app.entries().list.last() {
+            Some(Entry::Info(text) | Entry::Error(text)) => text.clone(),
+            other => panic!("{other:?}"),
+        };
+
+        app.input.set("/allow".to_string());
+        app.submit();
+        assert!(last(&mut app).starts_with("/allow <rule>"));
+
+        app.input.set("/allow Bash(brew install:*)".to_string());
+        app.submit();
+        assert!(last(&mut app).starts_with("allowed Bash(brew install:*)"));
+        assert!(app.session.permissions().contains("Bash(brew install:*)"));
+
+        app.input.set("/allow not a rule".to_string());
+        app.submit();
+        assert!(last(&mut app).contains("expected a tool name"));
     }
 
     #[tokio::test]
