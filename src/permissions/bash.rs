@@ -92,6 +92,15 @@ fn allowed(command: &Command) -> bool {
     if is_assignment(first) || REFUSED.contains(&basename(first)) {
         return false;
     }
+    // A wrapper hides it otherwise: `nice -n 5 sudo id` and `env eval x` both run a
+    // refused program, and only the wrapper is at the front.
+    if command
+        .unwrapped()
+        .first()
+        .is_some_and(|w| REFUSED.contains(&basename(w)))
+    {
+        return false;
+    }
     // A refused program behind `find -exec` is refused too.
     if !command.nested().iter().all(allowed) {
         return false;
@@ -373,8 +382,8 @@ pub fn is_read_only(words: &[String]) -> bool {
         | "uname" | "whoami" | "id" | "uptime" | "df" | "du" | "free" | "basename" | "dirname"
         | "realpath" | "readlink" | "nl" | "cut" | "tr" | "column" | "cmp" | "diff" | "md5sum"
         | "sha256sum" | "ps" => true,
-        // `--pre` runs a preprocessor program.
-        "rg" => !has(&|a| a.starts_with("--pre")),
+        // `--pre` runs a preprocessor program, `--hostname-bin` another.
+        "rg" => !has(&|a| a.starts_with("--pre") || a.starts_with("--hostname-bin")),
         // `-C` compiles a magic file, `-o` writes the listing to a file.
         "file" => !has(&|a| is_short_flag(a, 'C')),
         "tree" => !has(&|a| is_short_flag(a, 'o')),
@@ -382,8 +391,12 @@ pub fn is_read_only(words: &[String]) -> bool {
         "date" => !has(&|a| is_short_flag(a, 's') || a.starts_with("--set")),
         // An argument sets the hostname, and `env cmd` runs cmd.
         "env" | "hostname" => args.is_empty(),
-        // `-o` writes the sorted output to a file.
-        "sort" => !has(&|a| is_short_flag(a, 'o') || a.starts_with("--output")),
+        // `-o` writes the sorted output to a file, `--compress-program` runs a program.
+        "sort" => !has(&|a| {
+            is_short_flag(a, 'o')
+                || a.starts_with("--output")
+                || a.starts_with("--compress-program")
+        }),
         // A second operand is the file the output goes to.
         "uniq" => args.iter().filter(|a| !a.starts_with('-')).count() <= 1,
         // `-f` runs a filter program this cannot see.
@@ -434,15 +447,17 @@ pub fn is_read_only(words: &[String]) -> bool {
 }
 
 /// `sed` only reads when it edits no file in place, its script is one this can see, and
-/// that script has no `w` or `W` command writing a file.
+/// that script has no `w` or `W` command writing a file, nor an `e` running one.
 fn sed_reads_only(args: &[String]) -> bool {
-    // `-l` takes the next word as its line length, which would hide the script.
+    // `-l` takes the next word as its line length, which would hide the script; so does
+    // `--line-length` written without an `=`.
     let unseen = |a: &String| {
         is_short_flag(a, 'i')
             || is_short_flag(a, 'f')
             || is_short_flag(a, 'l')
             || a.starts_with("--in-place")
             || a.starts_with("--file")
+            || a.starts_with("--line-length")
     };
     if args.iter().any(unseen) {
         return false;
@@ -465,8 +480,9 @@ fn sed_reads_only(args: &[String]) -> bool {
             scripts.push(arg);
         }
     }
-    // Telling a `w` command from a `w` inside a pattern needs a sed parser, so any is enough.
-    !scripts.is_empty() && scripts.iter().all(|s| !s.contains(['w', 'W']))
+    // Telling a `w` command from a `w` inside a pattern needs a sed parser, so any is
+    // enough; `e` runs a shell command in GNU sed and is refused the same way.
+    !scripts.is_empty() && scripts.iter().all(|s| !s.contains(['w', 'W', 'e']))
 }
 
 /// `awk` only reads when its program is one this can see and that program neither shells
@@ -482,8 +498,13 @@ fn awk_reads_only(args: &[String]) -> bool {
             || arg.starts_with("--include")
             || arg.starts_with("-l")
             || arg.starts_with("--load")
+            // `-e` gives another program, and only the first one is checked below;
+            // gawk's `-E` reads one from a file.
+            || arg.starts_with("-e")
+            || arg.starts_with("-E")
+            || arg.starts_with("--exec")
         {
-            // The program comes from a file this cannot see.
+            // The program comes from somewhere this cannot see.
             return false;
         }
         // `-F sep` takes the next word, which would otherwise look like the program.
@@ -493,8 +514,12 @@ fn awk_reads_only(args: &[String]) -> bool {
             program = Some(arg);
         }
     }
-    // `system(` runs a shell command, `>` writes a file and `|` pipes into one.
-    program.is_some_and(|p| !p.contains("system(") && !p.contains(['>', '|']))
+    // `system(` runs a shell command, `>` writes a file and `|` pipes into one. The
+    // whitespace comes out first, since `system ("id")` is the same call.
+    program.is_some_and(|p| {
+        let tight: String = p.chars().filter(|c| !c.is_whitespace()).collect();
+        !tight.contains("system(") && !p.contains(['>', '|'])
+    })
 }
 
 /// The directory a `cd` moves to, for the only shape this can follow: one operand, no
@@ -570,6 +595,14 @@ pub fn mentions_protected(command: &Command) -> bool {
 /// put to the auto-approval judge rather than denied outright. The split is deliberately
 /// blunt: it looks inside substitutions and quotes, because it cannot tell them apart.
 pub fn mentions_reserved(input: &str) -> bool {
+    // A second pass with the quoting taken out, since `$('s'udo rm /)` and `$(su\do id)`
+    // are the same word to the shell. Both passes count: removing the quotes can also
+    // join two words that were never one.
+    let unquoted: String = input.chars().filter(|c| !"'\"\\".contains(*c)).collect();
+    names_reserved(input) || names_reserved(&unquoted)
+}
+
+fn names_reserved(input: &str) -> bool {
     input
         .split(|c: char| c.is_whitespace() || "'\"`$();|&<>{}".contains(c))
         .filter(|word| !word.is_empty())
@@ -636,6 +669,10 @@ mod tests {
             "cat ${DIR}/.env",
             "cat $HOME/.e*",
             "git --git-dir=$D/.git log",
+            // Quoting and a backslash spell the same word to the shell.
+            "ls $('s'udo rm -rf /)",
+            "echo $(\\sudo id)",
+            "echo $(su\\do id)",
         ] {
             assert!(mentions_reserved(reserved), "{reserved}");
         }
@@ -730,6 +767,12 @@ mod tests {
             "ls; command eval x",
             r"find . -exec sudo rm -rf / \;",
             r"find . -execdir eval x \;",
+            // A wrapper in front of a refused program does not make it one of its own.
+            "timeout 5 sudo rm x",
+            "nice -n 5 sudo id",
+            "env eval x",
+            "xargs sudo rm",
+            r"find . -exec env sudo rm {} \;",
         ] {
             assert_eq!(parse(input), None, "{input}");
         }
@@ -978,6 +1021,19 @@ mod tests {
             "git remote add o u",
             "git config user.name x",
             "cargo metadata --config x",
+            // Flags whose argument is another program to run.
+            "sort --compress-program=/bin/sh x",
+            "rg --hostname-bin /bin/sh foo",
+            "awk -E prog.awk x",
+            // A long option written without an `=` eats the next word, so the checker
+            // would read the line length as the script.
+            "sed --line-length 5 s/a/b/w out x",
+            // Only the first program is checked, so a second one must not be allowed.
+            r#"awk -e '{print}' -e 'BEGIN{system("id")}' x"#,
+            // GNU sed's `e` runs a shell command.
+            "sed 1e/bin/sh x",
+            // `system (` is the same call as `system(`.
+            r#"awk '{system ("rm x")}' x"#,
         ] {
             assert!(!read_only(input), "{input}");
         }
