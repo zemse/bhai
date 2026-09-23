@@ -1098,30 +1098,16 @@ async fn run(
         let Some(event) = rx_event.recv().await else {
             break;
         };
-        dirty = match event {
-            Event::Key(key) => {
-                app.on_key(key);
-                true
-            }
-            Event::Mouse(mouse) => app.on_mouse(mouse),
-            Event::Paste(text) => {
-                app.on_paste(&text);
-                true
-            }
-            Event::Session(event) => {
-                // The terminal is written to from the thread that draws it, never from
-                // the task that named the session.
-                if let session::Event::Titled(name) = &event {
-                    title::set(&title::compose(&root, Some(name)));
-                }
-                app.on_event(event);
-                true
-            }
-            Event::Tick => {
-                app.tick();
-                true
-            }
-        };
+        dirty = apply(&mut app, event, &root);
+        // Whatever else is already waiting is applied before the next draw. A streaming
+        // turn sends an event per delta, and a frame per delta is a frame wasted:
+        // rendering the transcript costs the same however little of it changed.
+        while !app.quit {
+            let Ok(event) = rx_event.try_recv() else {
+                break;
+            };
+            dirty |= apply(&mut app, event, &root);
+        }
         // `/mouse` hands the pointer back to the terminal, and takes it again.
         if app.mouse != captured {
             captured = set_capture(app.mouse);
@@ -1135,9 +1121,58 @@ async fn run(
     Ok(())
 }
 
+/// Apply one event to the view; returns whether it has to be drawn again.
+fn apply(app: &mut App, event: Event, root: &std::path::Path) -> bool {
+    match event {
+        Event::Key(key) => {
+            app.on_key(key);
+            true
+        }
+        Event::Mouse(mouse) => app.on_mouse(mouse),
+        Event::Paste(text) => {
+            app.on_paste(&text);
+            true
+        }
+        Event::Session(event) => {
+            // The terminal is written to from the thread that draws it, never from the
+            // task that named the session.
+            if let session::Event::Titled(name) = &event {
+                title::set(&title::compose(root, Some(name)));
+            }
+            app.on_event(event);
+            true
+        }
+        Event::Tick => {
+            app.tick();
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The draw loop applies a whole batch and then draws once, so `apply` says whether
+    /// the view changed and the batch takes the union.
+    #[test]
+    fn a_batch_of_events_is_one_redraw() {
+        let mut app = App::detached();
+        let root = std::path::PathBuf::new();
+        let batch = vec![
+            Event::Session(session::Event::User("go".to_string())),
+            Event::Session(session::Event::Text("hi".to_string())),
+            Event::Tick,
+            Event::Session(session::Event::TurnEnd),
+        ];
+        let dirty = batch
+            .into_iter()
+            .map(|event| apply(&mut app, event, &root))
+            .fold(false, |dirty, next| dirty | next);
+        // One draw covers the batch, and every event in it has already been applied.
+        assert!(dirty);
+        assert!(!app.working);
+    }
 
     fn parse(args: &[&str]) -> Result<(Option<u16>, bool)> {
         parse_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
