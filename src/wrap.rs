@@ -50,8 +50,10 @@ pub fn joined(text: &str, width: usize) -> Vec<(String, Join)> {
         let mut line = String::new();
         for word in paragraph.split(' ') {
             let mut word = word;
+            // Counted once: re-measuring the rest of the word each pass is quadratic.
+            let mut left = word.chars().count();
             // A single word longer than the line gets hard-split.
-            while word.chars().count() > width {
+            while left > width {
                 if !line.is_empty() {
                     out.push((std::mem::take(&mut line), join));
                     join = Join::Space;
@@ -60,9 +62,10 @@ pub fn joined(text: &str, width: usize) -> Vec<(String, Join)> {
                 out.push((word[..split].to_string(), join));
                 join = Join::Split;
                 word = &word[split..];
+                left -= width;
             }
             let extra = if line.is_empty() { 0 } else { 1 };
-            if line.chars().count() + extra + word.chars().count() > width {
+            if line.chars().count() + extra + left > width {
                 out.push((std::mem::take(&mut line), join));
                 join = Join::Space;
             } else if extra == 1 {
@@ -105,6 +108,21 @@ mod tests {
     #[test]
     fn wrap_hard_splits_a_long_word() {
         assert_eq!(wrap("abcdefgh", 3), vec!["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn wrap_splits_a_long_word_into_whole_rows() {
+        let word = "\u{e9}".repeat(1000);
+        let wrapped = wrap(&word, 7);
+        assert_eq!(wrapped.len(), 1000_usize.div_ceil(7));
+        assert!(
+            wrapped[..wrapped.len() - 1]
+                .iter()
+                .all(|row| row.chars().count() == 7)
+        );
+        assert_eq!(wrapped.concat(), word);
+        // A word that divides evenly leaves no short row behind.
+        assert_eq!(wrap(&"x".repeat(12), 4), vec!["xxxx", "xxxx", "xxxx"]);
     }
 
     #[test]
