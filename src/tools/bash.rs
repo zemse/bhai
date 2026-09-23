@@ -16,6 +16,13 @@ pub const NAME: &str = "bash";
 const TIMEOUT: Duration = Duration::from_secs(120);
 /// How often live output reaches the UI, and how soon an interrupt is noticed.
 const TICK: Duration = Duration::from_millis(50);
+/// How long the pipes are drained after the command itself has exited. A backgrounded
+/// grandchild inherits them and holds them open, so waiting for the end of file waits
+/// for that job instead of for the command.
+const DRAIN: Duration = Duration::from_millis(100);
+/// Bytes kept from each end of each stream. Two streams at twice this is what
+/// `format_output` may pass on, which is [`super::MAX_OUTPUT`].
+const KEEP: usize = super::MAX_OUTPUT / 4;
 
 pub struct Bash;
 
@@ -66,7 +73,8 @@ fn tool_schema() -> Value {
         "description": "Run a shell command with `bash -lc` in the current working directory and \
     return its combined stdout and stderr plus the exit code. The user approves every command \
     before it runs; a rejected command does not execute. Use absolute paths. Commands time out \
-    after 120 seconds, so avoid anything interactive or long-running.",
+    after 120 seconds, so avoid anything interactive or long-running. A job sent to the \
+    background must redirect its output to a file, since it inherits this command's own.",
         "strict": false,
         "parameters": {
             "type": "object",
@@ -104,44 +112,100 @@ async fn run(command: &str, live: Live<'_>) -> String {
         Err(e) => return format!("Could not start the command: {e}"),
         Ok(child) => child,
     };
-    let group = child.id();
-
-    let (stdout, stderr, status) =
-        match tokio::time::timeout(TIMEOUT, collect(&mut child, live)).await {
-            Err(_) => {
-                kill_group(group);
-                return format!(
-                    "Command timed out after {}s and was killed. Run something shorter, or send it \
-to the background and poll for the result.",
-                    TIMEOUT.as_secs()
-                );
-            }
-            Ok(Err(e)) => return format!("Could not start the command: {e}"),
-            Ok(Ok(collected)) => collected,
-        };
-    format_output(&stdout, &stderr, status)
+    let (stdout, stderr, status) = match collect(&mut child, live).await {
+        Err(e) => return format!("Could not start the command: {e}"),
+        Ok(collected) => collected,
+    };
+    match status {
+        Some(status) => format_output(&stdout, &stderr, status),
+        // What it printed before the clock ran out is still what it was doing.
+        None => format!(
+            "Command timed out after {}s and was killed. Run something shorter, or send it to \
+the background with its output redirected to a file and poll that.\n{}",
+            TIMEOUT.as_secs(),
+            truncate(&body(&stdout, &stderr))
+        ),
+    }
 }
 
-/// Read both pipes to the end, passing output on at most every `TICK`, and kill the
-/// process group once the turn is interrupted.
-async fn collect(child: &mut Child, live: Live<'_>) -> io::Result<(Vec<u8>, Vec<u8>, ExitStatus)> {
+/// Output kept from one stream: the first [`KEEP`] bytes and the last [`KEEP`], with
+/// what fell between them counted. Unbounded, a runaway command fills memory until the
+/// process dies and nobody reads a word of it.
+#[derive(Default)]
+struct Kept {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    dropped: usize,
+}
+
+impl Kept {
+    fn push(&mut self, bytes: &[u8]) {
+        let room = KEEP.saturating_sub(self.head.len()).min(bytes.len());
+        let (head, rest) = bytes.split_at(room);
+        self.head.extend_from_slice(head);
+        self.tail.extend(rest.iter().copied());
+        if self.tail.len() > KEEP {
+            let over = self.tail.len() - KEEP;
+            self.tail.drain(..over);
+            self.dropped += over;
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut out = self.head.clone();
+        if self.dropped > 0 {
+            let marker = format!("\n\n[... {} bytes trimmed ...]\n\n", self.dropped);
+            out.extend_from_slice(marker.as_bytes());
+        }
+        out.extend(self.tail.iter().copied());
+        out
+    }
+}
+
+/// Read both pipes, passing output on at most every `TICK`, until the command exits or
+/// the clock runs out, killing the process group in either of the latter cases. The
+/// status is `None` when the command timed out. Reading is bounded twice over: the pipes
+/// are only drained for `DRAIN` once the command itself is gone, since a backgrounded
+/// grandchild inherits them and never closes them, and what is kept is capped.
+async fn collect(
+    child: &mut Child,
+    live: Live<'_>,
+) -> io::Result<(Kept, Kept, Option<ExitStatus>)> {
     let group = child.id();
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
-    let (mut stdout, mut stderr, mut pending) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut stdout, mut stderr) = (Kept::default(), Kept::default());
+    let mut pending = Vec::new();
     let mut tick = tokio::time::interval(TICK);
     let (mut out_buf, mut err_buf) = ([0u8; 8192], [0u8; 8192]);
+    let over = tokio::time::Instant::now() + TIMEOUT;
+    let mut status = None;
+    let mut drained_by = None;
+    let mut timed_out = false;
     while out_pipe.is_some() || err_pipe.is_some() {
+        let now = tokio::time::Instant::now();
+        if now >= over {
+            kill_group(group);
+            timed_out = true;
+            break;
+        }
+        if drained_by.is_some_and(|at| now >= at) {
+            break;
+        }
         tokio::select! {
             read = read_some(&mut out_pipe, &mut out_buf) => {
                 let n = read?;
-                stdout.extend_from_slice(&out_buf[..n]);
+                stdout.push(&out_buf[..n]);
                 pending.extend_from_slice(&out_buf[..n]);
             }
             read = read_some(&mut err_pipe, &mut err_buf) => {
                 let n = read?;
-                stderr.extend_from_slice(&err_buf[..n]);
+                stderr.push(&err_buf[..n]);
                 pending.extend_from_slice(&err_buf[..n]);
+            }
+            exit = child.wait(), if status.is_none() => {
+                status = Some(exit?);
+                drained_by = Some(tokio::time::Instant::now() + DRAIN);
             }
             _ = tick.tick() => {
                 if live.cancel.load(Ordering::Relaxed) {
@@ -153,7 +217,11 @@ async fn collect(child: &mut Child, live: Live<'_>) -> io::Result<(Vec<u8>, Vec<
         }
     }
     flush(&mut pending, live.progress);
-    let status = child.wait().await?;
+    let status = match (timed_out, status) {
+        (true, _) => None,
+        (false, Some(status)) => Some(status),
+        (false, None) => Some(child.wait().await?),
+    };
     Ok((stdout, stderr, status))
 }
 
@@ -193,11 +261,10 @@ fn kill_group(group: Option<u32>) {
     }
 }
 
-/// The result the model sees: exit status, then stdout, then stderr.
-fn format_output(stdout: &[u8], stderr: &[u8], status: ExitStatus) -> String {
-    let mut body = String::new();
-    body.push_str(&String::from_utf8_lossy(stdout));
-    let stderr = String::from_utf8_lossy(stderr);
+/// What the command printed: stdout, then stderr.
+fn body(stdout: &Kept, stderr: &Kept) -> String {
+    let mut body = String::from_utf8_lossy(&stdout.bytes()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr.bytes()).into_owned();
     if !stderr.is_empty() {
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
@@ -207,11 +274,15 @@ fn format_output(stdout: &[u8], stderr: &[u8], status: ExitStatus) -> String {
     if body.trim().is_empty() {
         body.push_str("(no output)");
     }
+    body
+}
 
+/// The result the model sees: exit status, then stdout, then stderr.
+fn format_output(stdout: &Kept, stderr: &Kept, status: ExitStatus) -> String {
     let code = status
         .code()
         .map_or_else(|| "killed by signal".to_string(), |c| c.to_string());
-    format!("exit code: {code}\n{}", truncate(&body))
+    format!("exit code: {code}\n{}", truncate(&body(stdout, stderr)))
 }
 
 #[cfg(test)]
@@ -285,9 +356,14 @@ mod tests {
             .arg(command)
             .output()
             .unwrap();
+        let kept = |bytes: &[u8]| {
+            let mut kept = Kept::default();
+            kept.push(bytes);
+            kept
+        };
         assert_eq!(
             out,
-            format_output(&plain.stdout, &plain.stderr, plain.status)
+            format_output(&kept(&plain.stdout), &kept(&plain.stderr), plain.status)
         );
         assert_eq!(out, "exit code: 0\na\nb\ne");
     }
@@ -316,5 +392,34 @@ mod tests {
             "the background job outlived the interrupt"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A backgrounded job inherits both pipes, so waiting for the end of file waits for
+    /// that job. The command's own exit is what ends the read.
+    #[tokio::test]
+    async fn a_backgrounded_job_does_not_hold_the_command_open() {
+        let start = Instant::now();
+        let out = run("printf 'quick\\n'; (sleep 3; printf 'late\\n') &", quiet()).await;
+        assert!(start.elapsed() < Duration::from_secs(2), "{out}");
+        assert!(out.starts_with("exit code: 0\nquick\n"), "{out}");
+    }
+
+    #[test]
+    fn output_past_the_cap_keeps_both_ends_and_counts_the_middle() {
+        let mut kept = Kept::default();
+        // In chunks, as the pipe delivers it.
+        for _ in 0..(KEEP * 3 / 100) {
+            kept.push(&b"x".repeat(100));
+        }
+        kept.push(b"tail");
+        let out = kept.bytes();
+        assert!(out.len() < KEEP * 3, "{}", out.len());
+        assert!(out.ends_with(b"tail"), "the last bytes are kept");
+        assert!(kept.dropped > 0);
+        assert!(String::from_utf8_lossy(&out).contains(&format!("{} bytes trimmed", kept.dropped)));
+        // Under the cap nothing is touched.
+        let mut small = Kept::default();
+        small.push(b"a\nb\n");
+        assert_eq!(small.bytes(), b"a\nb\n");
     }
 }
