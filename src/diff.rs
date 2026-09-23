@@ -302,16 +302,26 @@ fn load_files(dir: &Path) -> Result<(PathBuf, Vec<FileChange>)> {
     let mut files = parse_status(&status);
     for file in &mut files {
         if file.untracked() {
-            file.added = std::fs::read(root.join(&file.path))
-                .ok()
-                .filter(|bytes| !bytes.contains(&0))
-                .map(|bytes| String::from_utf8_lossy(&bytes).lines().count() as u64);
+            file.added = untracked_added(&root.join(&file.path));
         } else if let Some(&(added, removed)) = counts.get(&file.path) {
             file.added = added;
             file.removed = removed;
         }
     }
     Ok((root, files))
+}
+
+/// An untracked file's line count. `None` for a binary file, or one over the size the
+/// pane will show anyway, which is not read at all — the status walk reaches every
+/// untracked leaf, so a stray dataset or core dump would be loaded whole.
+fn untracked_added(path: &Path) -> Option<u64> {
+    if std::fs::metadata(path).ok()?.len() > MAX_UNTRACKED_BYTES {
+        return None;
+    }
+    std::fs::read(path)
+        .ok()
+        .filter(|bytes| !bytes.contains(&0))
+        .map(|bytes| String::from_utf8_lossy(&bytes).lines().count() as u64)
 }
 
 fn base(root: &Path) -> &'static str {
@@ -493,6 +503,22 @@ mod tests {
             ]
         );
         assert_eq!(untracked_lines(b"a\0b").len(), 1);
+    }
+
+    #[test]
+    fn an_untracked_file_is_counted_only_under_the_size_limit() {
+        let dir = crate::tools::temp_dir();
+        std::fs::write(dir.join("small.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.join("binary.bin"), b"a\0b").unwrap();
+        std::fs::write(
+            dir.join("big.bin"),
+            vec![b'\n'; MAX_UNTRACKED_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert_eq!(untracked_added(&dir.join("small.txt")), Some(2));
+        assert_eq!(untracked_added(&dir.join("binary.bin")), None);
+        assert_eq!(untracked_added(&dir.join("big.bin")), None);
+        assert_eq!(untracked_added(&dir.join("gone.txt")), None);
     }
 
     fn view() -> DiffView {
