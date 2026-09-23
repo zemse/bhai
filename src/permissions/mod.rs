@@ -78,6 +78,50 @@ impl Rules {
     }
 }
 
+/// Why a call is the user's to approve and never the judge's. `auto` mode denies every
+/// one of them without prompting, so which it was is what the agent is told: a denial
+/// that names all of the causes at once is one the model can only answer by guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reserved {
+    /// A path, or a word of a command, only the user may approve.
+    Protected(String),
+    /// An ask rule the user set, by its text.
+    Asked(String),
+    /// A command the tokenizer could not read, by the word that runs code in it.
+    RunsCode(String),
+    /// The judge does not run here at all: this is not `auto`, or the project is not
+    /// trusted. Neither reaches the agent, since `auto` implies a trusted project and
+    /// every other mode prompts.
+    Untrusted,
+}
+
+impl Reserved {
+    /// What the denial says it was.
+    pub fn why(&self) -> String {
+        match self {
+            Reserved::Protected(what) => {
+                format!("only the user may approve a call naming {what}")
+            }
+            Reserved::Asked(rule) => format!("the user's rule {rule} keeps this one for them"),
+            Reserved::RunsCode(word) => {
+                format!("the permission checker cannot read a command holding `{word}`")
+            }
+            Reserved::Untrusted => "this project is not trusted".to_string(),
+        }
+    }
+
+    /// What the agent can do about it, if anything.
+    pub fn how(&self) -> &'static str {
+        match self {
+            Reserved::RunsCode(_) => {
+                " It reads that as running whatever follows it, so it cannot tell what the \
+command would do. Without it, or split into separate commands, the same work may go through."
+            }
+            _ => "",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     /// Run without prompting; the reason is shown in the transcript.
@@ -277,12 +321,18 @@ impl Policy {
             .check(tool, args, needs_approval)
     }
 
-    /// Whether a call the rules left at `Ask` may go to the auto-approval judge. Only in
-    /// `auto` mode in a trusted project, and never for what the user must decide
-    /// themselves: a protected path, a write or edit outside the project, or a command
-    /// the tokenizer refuses, which is how `sudo` and everything it cannot read are kept
-    /// out. `auto` never prompts, so in that mode those are denied rather than asked.
-    pub fn judgeable(&self, tool: &str, args: &Value) -> bool {
+    /// Whether a call the rules left at `Ask` may go to the auto-approval judge, and
+    /// what keeps it from the judge when it may not. Only in `auto` mode in a trusted
+    /// project, and never for what the user must decide themselves: a protected path, an
+    /// ask rule they set, or a command the tokenizer refuses, which is how `sudo` and
+    /// everything it cannot read are kept out. `auto` never prompts, so in that mode
+    /// those are denied rather than asked.
+    ///
+    /// Where the call would land is not one of those. The judge rules on that, against
+    /// what the user asked for: a shell redirect anywhere on the machine already reached
+    /// it, so keeping the `write` that does the same thing from it decided nothing and
+    /// left a task about the machine with no way through at all.
+    pub fn judgeable(&self, tool: &str, args: &Value) -> Result<(), Reserved> {
         let rules = self.rules();
         self.checker(&rules, self.mode()).judgeable(tool, args)
     }
@@ -687,24 +737,32 @@ impl Checker<'_> {
     }
 
     /// See `Policy::judgeable`.
-    fn judgeable(&self, tool: &str, args: &Value) -> bool {
+    fn judgeable(&self, tool: &str, args: &Value) -> Result<(), Reserved> {
         if !self.relaxed() {
-            return false;
+            return Err(Reserved::Untrusted);
         }
         let text = |key| args.get(key).and_then(Value::as_str);
         // An ask rule is the user saying they want to see this one. The judge waving it
         // through would leave the rule tightening nothing in the mode that needs it.
-        let asked = |rules: &[Rule], path: &Path| {
-            rules
+        let asked = |path: &Path| {
+            self.rules
+                .ask
                 .iter()
-                .any(|r| r.applies_to(tool) && r.matches_path(path, self.base, true))
+                .find(|r| r.applies_to(tool) && r.matches_path(path, self.base, true))
+                .map(|r| Reserved::Asked(r.text.clone()))
         };
         match tool {
             "bash" => {
                 let command = text("command").unwrap_or_default();
                 match bash::parse(command) {
-                    Some(commands) => !commands.iter().any(|c| {
-                        bash::mentions_protected(c) || self.find_loose(&self.rules.ask, c).is_some()
+                    Some(commands) => commands.iter().try_for_each(|c| {
+                        if let Some(word) = bash::protected_mention(c) {
+                            return Err(Reserved::Protected(word));
+                        }
+                        match self.find_loose(&self.rules.ask, c) {
+                            Some(rule) => Err(Reserved::Asked(rule.text)),
+                            None => Ok(()),
+                        }
                     }),
                     // A command the tokenizer could not take apart is still the judge's
                     // to rule on: it reads the text as written, and a variable or a
@@ -713,28 +771,35 @@ impl Checker<'_> {
                     // or as someone else, or one naming a protected path, since the
                     // shape those hide behind is the reason they are the user's alone.
                     None => {
-                        !bash::mentions_reserved(command)
-                            && self.find_raw(&self.rules.ask, command).is_none()
+                        if let Some(rule) = self.find_raw(&self.rules.ask, command) {
+                            return Err(Reserved::Asked(rule.text));
+                        }
+                        match bash::reserved(command) {
+                            Some(bash::Reserved::Program(word)) => Err(Reserved::RunsCode(word)),
+                            Some(bash::Reserved::Path(word)) => Err(Reserved::Protected(word)),
+                            None => Ok(()),
+                        }
                     }
                 }
             }
-            // Reading outside the project is the judge's to rule on, and so is a
-            // scratch file; a protected path is the user's alone, and so is a write
-            // anywhere else on the machine.
+            // A protected path is the user's alone. Everywhere else, including the rest
+            // of the machine, is the judge's to rule on against what the user asked for.
             "read" | "write" | "edit" => match text("path") {
                 Some(path) => {
                     let path = Path::new(path);
-                    !rules::is_protected(path, self.base.home)
-                        && !asked(&self.rules.ask, path)
-                        && (tool == "read"
-                            || rules::is_inside(path, self.base.cwd)
-                            || rules::is_scratch(path))
+                    match rules::is_protected(path, self.base.home) {
+                        true => Err(Reserved::Protected(path.display().to_string())),
+                        false => asked(path).map_or(Ok(()), Err),
+                    }
                 }
-                None => false,
+                None => Err(Reserved::Protected("no path".to_string())),
             },
             // An MCP server the user has not approved is never connected, so an
             // `mcp_call` that gets this far names one they did approve.
-            _ => !self.rules.ask.iter().any(|r| r.applies_to(tool)),
+            _ => match self.rules.ask.iter().find(|r| r.applies_to(tool)) {
+                Some(rule) => Err(Reserved::Asked(rule.text.clone())),
+                None => Ok(()),
+            },
         }
     }
 
@@ -1471,32 +1536,72 @@ mod tests {
         let path = |tool: &str, path: &PathBuf| p.judgeable(tool, &json!({ "path": path }));
 
         // An untrusted project never reaches it, however harmless the call.
-        assert!(!command("cargo clippy"));
+        assert_eq!(command("cargo clippy"), Err(Reserved::Untrusted));
         p.trust().unwrap();
-        assert!(command("cargo clippy"));
-        assert!(path("write", &repo.join("src/a.rs")));
+        assert!(command("cargo clippy").is_ok());
+        assert!(path("write", &repo.join("src/a.rs")).is_ok());
 
-        // The categories that always reach the user instead.
-        assert!(!command("sudo cargo clippy"), "sudo");
-        assert!(!command("cat .env"), "protected path");
-        assert!(!path("write", &PathBuf::from("/etc/hosts")), "outside");
-        assert!(!path("edit", &repo.join(".env")), "protected");
-        assert!(!p.judgeable("write", &json!({})), "no path");
+        // The categories that always reach the user instead, each naming what it was.
+        assert_eq!(
+            command("sudo cargo clippy"),
+            Err(Reserved::RunsCode("sudo".to_string()))
+        );
+        assert_eq!(
+            command("cat .env"),
+            Err(Reserved::Protected(".env".to_string()))
+        );
+        assert_eq!(
+            path("edit", &repo.join(".env")),
+            Err(Reserved::Protected(repo.join(".env").display().to_string()))
+        );
+        assert!(p.judgeable("write", &json!({})).is_err(), "no path");
+
+        // Where the call lands is the judge's to rule on, not a category of its own:
+        // the redirect that writes the same file already reached it.
+        assert!(
+            path("write", &PathBuf::from("/etc/hosts")).is_ok(),
+            "outside"
+        );
+        assert!(
+            command("echo x > /etc/hosts").is_ok(),
+            "the same by redirect"
+        );
 
         // A command the tokenizer cannot take apart is the judge's, unless its text
         // names one of those categories, which is all that can be read off it.
-        assert!(command("cat $HOME/.cargo/config.toml"), "an expansion");
-        assert!(command(
-            "cd $(git rev-parse --show-toplevel) && cargo build"
-        ));
-        assert!(command("for f in src/*.rs; do wc -l $f; done"), "a loop");
-        assert!(!command("ls $(sudo rm x)"), "sudo behind a substitution");
         assert!(
-            !command("sh -c \"$SCRIPT\""),
+            command("cat $HOME/.cargo/config.toml").is_ok(),
+            "an expansion"
+        );
+        assert!(command("cd $(git rev-parse --show-toplevel) && cargo build").is_ok());
+        assert!(
+            command("for f in src/*.rs; do wc -l $f; done").is_ok(),
+            "a loop"
+        );
+        assert_eq!(
+            command("ls $(sudo rm x)"),
+            Err(Reserved::RunsCode("sudo".to_string())),
+            "sudo behind a substitution"
+        );
+        assert_eq!(
+            command("sh -c \"$SCRIPT\""),
+            Err(Reserved::RunsCode("sh".to_string())),
             "a shell reading its argument"
         );
-        assert!(!command("cat $HOME/.ssh/id_ed25519"), "a protected path");
-        assert!(!command("cat $HOME/.e*"), "a glob that may reach one");
+        assert!(
+            matches!(
+                command("cat $HOME/.ssh/id_ed25519"),
+                Err(Reserved::Protected(_))
+            ),
+            "a protected path"
+        );
+        assert!(
+            matches!(command("cat $HOME/.e*"), Err(Reserved::Protected(_))),
+            "a glob that may reach one"
+        );
+        // A probe of what is installed, which `command` in the refused list used to take
+        // the whole chain down with.
+        assert!(command("command -v gpg || true").is_ok(), "a lookup");
 
         // An ask rule is the user saying they want to see it, so the judge does not get
         // to wave it through in the one mode where nothing else would stop it.
@@ -1515,24 +1620,60 @@ mod tests {
         )
         .with_trust(Trust::new(&dir.join("config"), &repo));
         asking.trust().unwrap();
-        assert!(asking.judgeable("bash", &json!({"command": "cargo clippy"})));
-        assert!(!asking.judgeable("bash", &json!({"command": "git log -p"})));
-        assert!(!asking.judgeable("bash", &json!({"command": "cargo publish"})));
-        assert!(!asking.judgeable("bash", &json!({"command": "cargo publish $CRATE"})));
-        assert!(!asking.judgeable("write", &json!({"path": repo.join("gen/x.rs")})));
-        assert!(asking.judgeable("write", &json!({"path": repo.join("src/x.rs")})));
+        let asked = |rule: &str| Err(Reserved::Asked(rule.to_string()));
+        assert!(
+            asking
+                .judgeable("bash", &json!({"command": "cargo clippy"}))
+                .is_ok()
+        );
+        assert_eq!(
+            asking.judgeable("bash", &json!({"command": "git log -p"})),
+            asked("Bash(git log -p:*)")
+        );
+        assert_eq!(
+            asking.judgeable("bash", &json!({"command": "cargo publish"})),
+            asked("Bash(cargo publish:*)")
+        );
+        assert_eq!(
+            asking.judgeable("bash", &json!({"command": "cargo publish $CRATE"})),
+            asked("Bash(cargo publish:*)")
+        );
+        assert_eq!(
+            asking.judgeable("write", &json!({"path": repo.join("gen/x.rs")})),
+            asked("Write(gen/**)")
+        );
+        assert!(
+            asking
+                .judgeable("write", &json!({"path": repo.join("src/x.rs")}))
+                .is_ok()
+        );
 
         // What the judge is there to rule on: a scratch file, and reading outside.
-        assert!(path("write", &dir.join("outside/x.rs")), "scratch");
-        assert!(path("write", &PathBuf::from("/tmp/notes.json")), "scratch");
-        assert!(command("cargo test > /tmp/out.txt"), "a scratch redirect");
-        assert!(path("read", &PathBuf::from("/etc/hosts")), "read outside");
-        assert!(!path("read", &repo.join(".env")), "read protected");
+        assert!(path("write", &dir.join("outside/x.rs")).is_ok(), "scratch");
+        assert!(
+            path("write", &PathBuf::from("/tmp/notes.json")).is_ok(),
+            "scratch"
+        );
+        assert!(
+            command("cargo test > /tmp/out.txt").is_ok(),
+            "a scratch redirect"
+        );
+        assert!(
+            path("read", &PathBuf::from("/etc/hosts")).is_ok(),
+            "read outside"
+        );
+        assert!(
+            matches!(
+                path("read", &repo.join(".env")),
+                Err(Reserved::Protected(_))
+            ),
+            "read protected"
+        );
 
         // Neither other mode ever asks the judge, trusted or not.
         for mode in [Mode::Ask, Mode::Bypass] {
             p.set_mode(mode);
-            assert!(!command("cargo clippy"), "{mode}");
+            assert_eq!(command("cargo clippy"), Err(Reserved::Untrusted), "{mode}");
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

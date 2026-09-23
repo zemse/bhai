@@ -422,15 +422,6 @@ fn follow_links(path: &Path) -> PathBuf {
 }
 
 /// Files the agent may never change without asking, whatever the mode or rules say.
-/// Whether `path` is scratch: inside the system temp directory, or inside `/tmp` where
-/// that is somewhere else. A scratch file is not the machine, so `auto` lets the judge
-/// rule on one rather than holding it for the user. Only an absolute path counts, since
-/// a relative one belongs to whatever directory the call runs in.
-pub fn is_scratch(path: &Path) -> bool {
-    path.is_absolute()
-        && (is_inside(path, &std::env::temp_dir()) || is_inside(path, Path::new("/tmp")))
-}
-
 pub fn is_protected(path: &Path, home: Option<&Path>) -> bool {
     let parts: Vec<String> = components(path).iter().map(|p| p.to_lowercase()).collect();
     let name = parts.last().map(String::as_str).unwrap_or_default();

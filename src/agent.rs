@@ -1329,7 +1329,7 @@ not retry it. Try a different approach, or ask the user."
         Decision::Ask => {
             let (target, detail) = judge::target(name, &args, &summary);
             // Deciding takes a few seconds, so the UI says what it is waiting on.
-            let asking = judge.is_some() && policy.judgeable(name, &args);
+            let asking = judge.is_some() && policy.judgeable(name, &args).is_ok();
             if asking {
                 let _ = tx.send(AgentEvent::Judging(Some(summary.clone())));
             }
@@ -1381,22 +1381,19 @@ as-is. Try a different approach, or ask the user."
                 // the turn on a modal.
                 Err(undecided) if policy.mode() == Mode::Auto => {
                     let (why, how) = match undecided {
-                        Undecided::Unanswered => ("the judge could not decide it", ""),
-                        // Saying which of the three it is would take the checker apart
-                        // for the model; naming all three lets it see which it tripped.
-                        Undecided::Unjudgeable => (
-                            "only the user may approve this one",
-                            " It names a protected path, writes outside the project and its scratch directories, matches an ask rule the user set, or is a command the permission checker cannot read, such as one holding an expansion, a subshell or an unquoted heredoc. Written plainer it may go through.",
-                        ),
+                        Undecided::Unanswered => ("the judge could not decide it".to_string(), ""),
+                        // Which one it was, and the word it tripped on. Naming every
+                        // cause at once left the model rewriting the call at random.
+                        Undecided::Unjudgeable(reserved) => (reserved.why(), reserved.how()),
                         Undecided::TooLong => (
-                            "it is too long to put to the judge in full",
+                            "it is too long to put to the judge in full".to_string(),
                             " Broken into shorter commands, each one may go through.",
                         ),
                         Undecided::Budget => (
-                            "this turn has spent its judged calls",
+                            "this turn has spent its judged calls".to_string(),
                             " The budget refills on the user's next message, so this is the moment to stop and say what is left to do.",
                         ),
-                        Undecided::Off => ("no judge is running in this session", ""),
+                        Undecided::Off => ("no judge is running in this session".to_string(), ""),
                     };
                     let _ = tx.send(AgentEvent::ToolRejected(format!(
                         "auto-denied: {summary} ({why})"
@@ -1459,9 +1456,9 @@ async fn judged(
     detail: &str,
 ) -> Result<Verdict, Undecided> {
     let judge = judge.ok_or(Undecided::Off)?;
-    if !policy.judgeable(name, args) {
-        return Err(Undecided::Unjudgeable);
-    }
+    policy
+        .judgeable(name, args)
+        .map_err(Undecided::Unjudgeable)?;
     judge.decide(name, target, detail).await
 }
 

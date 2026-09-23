@@ -605,12 +605,35 @@ fn is_short_flag(arg: &str, flag: char) -> bool {
 /// Whether any word, or anything a redirection would write, names a protected path or
 /// may glob into one.
 pub fn mentions_protected(command: &Command) -> bool {
-    command.dot_glob
-        || command
-            .words
-            .iter()
-            .chain(&command.writes)
-            .any(|word| protected_word(word))
+    protected_mention(command).is_some()
+}
+
+/// Which word made `mentions_protected` true, for the denial that has to say what it
+/// tripped on. A glob the tokenizer flagged has had its quoting removed by the time the
+/// words are here, so a word is not always there to point at and the shape is named
+/// instead.
+pub fn protected_mention(command: &Command) -> Option<String> {
+    let word = command
+        .words
+        .iter()
+        .chain(&command.writes)
+        .find(|word| protected_word(word));
+    match (word, command.dot_glob) {
+        (Some(word), _) => Some(word.clone()),
+        (None, true) => Some("a glob over a dot name".to_string()),
+        (None, false) => None,
+    }
+}
+
+/// What in a command this parser could not read keeps it for the user, and which word
+/// it was. The word is what the agent is told: a denial it cannot locate is one it can
+/// only answer by rewriting the command at random.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reserved {
+    /// A program that runs its arguments as shell code, or as someone else.
+    Program(String),
+    /// A word naming a protected path, or a glob that could reach one.
+    Path(String),
 }
 
 /// Whether the raw text of a command this parser could not read names anything only the
@@ -619,12 +642,12 @@ pub fn mentions_protected(command: &Command) -> bool {
 /// command whose shape is unknown, and it is what decides whether such a command may be
 /// put to the auto-approval judge rather than denied outright. The split is deliberately
 /// blunt: it looks inside substitutions and quotes, because it cannot tell them apart.
-pub fn mentions_reserved(input: &str) -> bool {
+pub fn reserved(input: &str) -> Option<Reserved> {
     // A second pass with the quoting taken out, since `$('s'udo rm /)` and `$(su\do id)`
     // are the same word to the shell. Both passes count: removing the quotes can also
     // join two words that were never one.
     let unquoted: String = input.chars().filter(|c| !"'\"\\".contains(*c)).collect();
-    names_reserved(input) || names_reserved(&unquoted)
+    names_reserved(input).or_else(|| names_reserved(&unquoted))
 }
 
 /// The words of a command this parser could not read, split the same blunt way and with
@@ -642,13 +665,14 @@ fn blunt_split(input: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
-fn names_reserved(input: &str) -> bool {
-    blunt_split(input).any(|word| {
+fn names_reserved(input: &str) -> Option<Reserved> {
+    blunt_split(input).find_map(|word| {
         let name = basename(word);
-        REFUSED.contains(&name)
-            || SHELLS.contains(&name)
-            || protected_word(word)
-            || (word.contains(['*', '?', '[']) && word.split('/').any(dot_name))
+        if REFUSED.contains(&name) || SHELLS.contains(&name) {
+            return Some(Reserved::Program(name.to_string()));
+        }
+        let globs_a_dot_name = word.contains(['*', '?', '[']) && word.split('/').any(dot_name);
+        (protected_word(word) || globs_a_dot_name).then(|| Reserved::Path(word.to_string()))
     })
 }
 
@@ -696,9 +720,9 @@ mod tests {
             "echo \"$(date)\" >> notes.md",
         ] {
             assert!(parse(tame).is_none(), "{tame}");
-            assert!(!mentions_reserved(tame), "{tame}");
+            assert!(reserved(tame).is_none(), "{tame}");
         }
-        for reserved in [
+        for word in [
             "ls $(sudo rm x)",
             "sh -c \"$SCRIPT\"",
             "eval \"$CMD\"",
@@ -711,7 +735,7 @@ mod tests {
             "echo $(\\sudo id)",
             "echo $(su\\do id)",
         ] {
-            assert!(mentions_reserved(reserved), "{reserved}");
+            assert!(reserved(word).is_some(), "{word}");
         }
     }
     fn words(input: &str) -> Option<Vec<Vec<String>>> {
