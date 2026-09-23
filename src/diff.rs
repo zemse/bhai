@@ -17,6 +17,8 @@ use ratatui::widgets::{Block, Paragraph};
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// Untracked files larger than this are not shown.
 const MAX_UNTRACKED_BYTES: u64 = 1 << 20;
+/// A tracked file changing more lines than this has its diff refused, not run.
+const MAX_DIFF_LINES: u64 = 50_000;
 /// Tabs are expanded, since the terminal buffer drops them.
 const TAB: &str = "    ";
 /// Width of the file list column.
@@ -343,6 +345,10 @@ fn file_diff(root: &Path, file: &FileChange) -> Result<Vec<(LineKind, String)>> 
         }
         return Ok(untracked_lines(&std::fs::read(path)?));
     }
+    // numstat already counted the changed lines, so the diff is refused without running it.
+    if file.added.unwrap_or(0) + file.removed.unwrap_or(0) > MAX_DIFF_LINES {
+        return Ok(vec![(LineKind::Header, "diff too large to show".into())]);
+    }
     let mut args = vec!["diff", "-M", base(root), "--"];
     args.extend(file.from.as_deref());
     args.push(&file.path);
@@ -519,6 +525,21 @@ mod tests {
         assert_eq!(untracked_added(&dir.join("binary.bin")), None);
         assert_eq!(untracked_added(&dir.join("big.bin")), None);
         assert_eq!(untracked_added(&dir.join("gone.txt")), None);
+    }
+
+    #[test]
+    fn a_huge_tracked_diff_is_refused_without_running_git() {
+        // The root does not exist, so any git call would fail rather than return this.
+        let root = crate::tools::temp_dir().join("gone");
+        let mut file = change(" M", "data.csv", None);
+        file.added = Some(MAX_DIFF_LINES);
+        file.removed = Some(1);
+        assert_eq!(
+            file_diff(&root, &file).unwrap(),
+            vec![(LineKind::Header, "diff too large to show".to_string())]
+        );
+        file.added = Some(2);
+        assert!(file_diff(&root, &file).is_err());
     }
 
     fn view() -> DiffView {
