@@ -267,6 +267,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_answer_with_no_text_in_it_is_not_an_answer() {
+        let fake = Fake::new(vec![vec![say("")]]);
+        let (agent, _rx) = tool(&fake, false);
+        let args = json!({"description": "say nothing", "prompt": "go"});
+        let (out, ok) = agent.execute(&args).await;
+        assert!(!ok);
+        assert!(
+            out.ends_with(
+                "(general) failed after 1 steps, 10/2 tokens: ended without a final message"
+            ),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&agent.transcripts);
+    }
+
+    #[tokio::test]
     async fn an_interrupt_fails_the_child() {
         let fake = Fake::new(vec![vec![call("read", json!({"path": "/etc/hosts"}))]]);
         let (agent, _rx) = tool(&fake, true);

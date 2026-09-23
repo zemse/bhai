@@ -1244,7 +1244,9 @@ fn final_text(history: &[Value]) -> Option<String> {
         .flatten()
         .filter_map(|p| p.get("text").and_then(Value::as_str))
         .collect();
-    Some(text.join("\n"))
+    // A message with no text in it is no answer: reporting one would hand the parent a
+    // successful child with an empty body.
+    Some(text.join("\n")).filter(|text| !text.trim().is_empty())
 }
 
 /// Returns the tool output and whether it counts as a success.
