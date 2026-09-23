@@ -243,7 +243,9 @@ allow it.",
             policy.mode()
         ));
     }
-    if identity.name != identity::DEFAULT {
+    // A project file replacing `general` is silent otherwise, and what it says is the
+    // system prompt of every turn.
+    if identity.name != identity::DEFAULT || identity.source.starts_with("./") {
         notices.insert(
             0,
             format!("identity: {} ({})", identity.name, identity.source),

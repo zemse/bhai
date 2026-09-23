@@ -219,11 +219,18 @@ pub fn discover(roots: &Roots) -> Vec<Identity> {
         roots_list.extend(HOME_DIRS.map(|d| home.join(d)));
     }
     let project = instructions::project_root(&roots.cwd);
+    let home_roots = roots_list.len();
     roots_list.extend(PROJECT_DIRS.map(|d| project.join(d)));
 
     let mut found = vec![general(), router()];
-    for root in roots_list {
-        for identity in scan(&root, &instructions::label(&root, roots)) {
+    for (at, root) in roots_list.into_iter().enumerate() {
+        for mut identity in scan(&root, &instructions::label(&root, roots)) {
+            // A repo may say what an identity does, but not which model runs it: the
+            // config's own model can only be set by the user, and Claude Code repos ship
+            // agent files naming models no backend here serves.
+            if at >= home_roots {
+                (identity.model, identity.effort) = (None, None);
+            }
             match found.iter_mut().find(|i| i.name == identity.name) {
                 Some(slot) => *slot = identity,
                 None => found.push(identity),
@@ -520,10 +527,13 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         f.write("home/.claude/agents/a.md", &file("one", "claude global"));
         f.write("home/.claude/agents/b.md", &file("two", "claude global"));
         f.write("home/.claude/agents/notes.txt", &file("three", "ignored"));
-        f.write("home/.config/bhai/agents/a.md", &file("one", "bhai global"));
+        f.write(
+            "home/.config/bhai/agents/a.md",
+            "---\nname: one\ndescription: bhai global\nmodel: gpt-5.5\n---\n",
+        );
         f.write(
             "home/repo/.claude/agents/x.md",
-            &file("two", "claude project"),
+            "---\nname: two\ndescription: claude project\nmodel: sonnet\n---\n",
         );
         f.write(
             "home/repo/.bhai/agents/y.md",
@@ -531,6 +541,12 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         );
 
         let found = discover(&f.roots);
+        // A project file says what an identity does, never which model runs it: the one
+        // in the config can only be set by the user, and Claude Code repos ship agent
+        // files naming models no backend here serves.
+        let by = |name: &str| found.iter().find(|i| i.name == name).unwrap();
+        assert_eq!(by("one").model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(by("two").model, None);
         let rows: Vec<_> = found
             .iter()
             .map(|i| (i.name.as_str(), i.description.as_str(), i.source.as_str()))
