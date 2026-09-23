@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-23
 
+- The tok/s readout is what the last half second of streaming carried, scaled to a
+  second, instead of an average over ten seconds of it. The old number took a whole
+  window to answer a change in the stream and held its last value through a stall,
+  which read as hung; this one moves once per reading and says zero when nothing is
+  arriving. The reading is one constant (`speed::PERIOD`), so it can be shortened to
+  200ms without anything else moving.
+
 An audit pass. 234 known failure modes for agent harnesses were collected (53 from a
 production write-up of another harness, the rest researched), split across eight lanes
 that own disjoint files, hunted, reviewed, and fixed. 89 candidates were reviewed, 9

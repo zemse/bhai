@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use std::collections::HashSet;
 use std::ops::Range;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::app::{App, Entry, TrustGate};
 use crate::client::Usage;
@@ -365,7 +365,7 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(Color::Cyan),
         ));
     }
-    if let Some(rate) = app.speed.rate() {
+    if let Some(rate) = app.speed.rate(Instant::now()) {
         spans.push(Span::styled(format!(" · {rate:.0} tok/s"), dim));
     }
     if !app.queued.is_empty() {
@@ -1632,11 +1632,11 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!screen(&terminal).contains("tok/s"), "nothing streamed yet");
 
-        // Four seconds of writing, two hundred tokens over them.
-        let began = Instant::now() - Duration::from_secs(4);
+        // A reading of writing, twenty-five tokens in it, and one that closes it.
+        let began = Instant::now() - Duration::from_millis(600);
         app.speed.start(began);
-        app.speed.streamed(began, 1);
-        app.speed.streamed(Instant::now(), 200);
+        app.speed.streamed(began, 25);
+        app.speed.streamed(Instant::now(), 1);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
         assert!(shown.contains("working · 50 tok/s"), "{shown}");
