@@ -501,9 +501,23 @@ pub fn is_secret_name(part: &str) -> bool {
             .is_some_and(|(_, ext)| SECRET_EXTENSIONS.contains(&ext))
 }
 
-/// Two adjacent components that name credentials only together.
+/// Two adjacent components that name credentials only together. `.claude` and `.codex`
+/// hold the user's own working files beside their credentials, so the credential is named
+/// rather than the directory: the agent has skills and instructions to read in there.
 pub fn is_secret_pair(pair: &[&str]) -> bool {
     SECRET_PAIRS.iter().any(|p| pair == p)
+        || matches!(pair, [".codex" | ".claude", name]
+            if *name == "auth.json"
+                || *name == ".credentials.json"
+                || (name.starts_with("settings") && name.ends_with(".json")))
+}
+
+/// A `.env` name that carries no secret: the checked-in template beside the real one.
+pub fn is_env_template(name: &str) -> bool {
+    matches!(
+        name.rsplit_once('.').map(|(_, ext)| ext),
+        Some("example" | "sample" | "template" | "dist" | "defaults")
+    )
 }
 
 /// Files the agent may never change without asking, whatever the mode or rules say.
@@ -515,7 +529,7 @@ pub fn is_protected(path: &Path, home: Option<&Path>) -> bool {
         || parts
             .windows(2)
             .any(|w| is_secret_pair(&[w[0].as_str(), w[1].as_str()]))
-        || name.starts_with(".env")
+        || (name.starts_with(".env") && !is_env_template(name))
         || parts.ends_with(&[".bhai".to_string(), "config.toml".to_string()])
         || parts.ends_with(&[".bhai".to_string(), "settings.local.json".to_string()])
         || (parent == Some(".claude") && name.starts_with("settings") && name.ends_with(".json"))
@@ -526,14 +540,7 @@ pub fn is_protected(path: &Path, home: Option<&Path>) -> bool {
         return false;
     };
     let home: Vec<String> = components(home).iter().map(|p| p.to_lowercase()).collect();
-    [
-        &[".ssh"][..],
-        &[".codex"],
-        &[".claude"],
-        &[".config", "bhai"],
-    ]
-    .iter()
-    .any(|dir| {
+    [&[".ssh"][..], &[".config", "bhai"]].iter().any(|dir| {
         let mut prefix = home.clone();
         prefix.extend(dir.iter().map(|d| d.to_string()));
         parts.starts_with(&prefix)
@@ -784,7 +791,12 @@ mod tests {
             "/home/u/repo/sub/.env.local",
             "/home/u/.ssh/authorized_keys",
             "/home/u/.codex/auth.json",
-            "/home/u/.claude/CLAUDE.md",
+            "/home/u/.claude/.credentials.json",
+            "/home/u/.claude/settings.json",
+            "/home/u/.aws/credentials",
+            "/home/u/.netrc",
+            "/home/u/keys/id_ed25519",
+            "/home/u/certs/server.pem",
             "/home/u/.config/bhai/config.toml",
             "/home/u/repo/.bhai/config.toml",
             "/home/u/repo/.bhai/settings.local.json",
@@ -799,6 +811,12 @@ mod tests {
             "/home/u/repo/.claude/agents/x.md",
             "/home/u/repo/.bhai/debug/x.json",
             "/home/u/.config/other",
+            // Working files, not credentials: the agent reads its own instructions.
+            "/home/u/.claude/CLAUDE.md",
+            "/home/u/.claude/skills/x/SKILL.md",
+            "/home/u/.codex/config.toml",
+            "/home/u/repo/.env.example",
+            "/home/u/repo/.env.sample",
         ] {
             assert!(!is_protected(Path::new(path), home), "{path}");
         }

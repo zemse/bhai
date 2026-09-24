@@ -6,6 +6,15 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A protected path is a credential, not a directory the user works in. `~/.claude` and
+  `~/.codex` hold the agent's own instructions, skills and prompts beside their
+  credentials, so only `auth.json`, `.credentials.json` and `settings*.json` in them are
+  protected now; `.env.example` and its `.sample`, `.template`, `.dist` and `.defaults`
+  spellings are templates, not secrets; and a glob counts as reaching a hidden name only
+  when the glob is inside the dot name itself, so `ls ~/.config/*` and `rm -rf .venv/*`
+  are ordinary calls again. In `auto`, which never prompts, each of these was a denial
+  the judge never saw.
+
 - A credential file is protected against a read, not only against a write. The read tool
   answers a protected path the way `cat` always has, so the cheaper of the two is no
   longer the way around it, and what counts as one now covers `.netrc`, `.pgpass`,

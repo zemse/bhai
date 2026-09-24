@@ -344,7 +344,7 @@ impl Tokenizer {
             return;
         }
         let word = std::mem::take(&mut self.word);
-        if self.glob && word.split('/').any(dot_name) {
+        if self.glob && globs_a_dot_name(&word) {
             self.current.dot_glob = true;
         }
         self.current.words.push(word);
@@ -777,12 +777,19 @@ fn names_reserved(input: &str) -> Option<Reserved> {
         if !lookup && (REFUSED.contains(&name) || SHELLS.contains(&name)) {
             return Some(Reserved::Program(name.to_string()));
         }
-        let globs_a_dot_name = word.contains(['*', '?', '[']) && word.split('/').any(dot_name);
-        (protected_word(word) || globs_a_dot_name).then(|| Reserved::Path(word.to_string()))
+        (protected_word(word) || globs_a_dot_name(word)).then(|| Reserved::Path(word.to_string()))
     })
 }
 
-/// A path component that is a dot name, so a glob over it may reach a hidden file.
+/// A word whose glob sits inside a dot name, so it may expand to a hidden file. A glob
+/// beside a literal dot name (`.config/*`) reaches none: a bare `*` does not match a
+/// leading dot, so what it expands to is what is written.
+fn globs_a_dot_name(word: &str) -> bool {
+    word.split('/')
+        .any(|part| dot_name(part) && part.contains(['*', '?', '[']))
+}
+
+/// A path component that is a dot name.
 fn dot_name(part: &str) -> bool {
     part.starts_with('.') && part != "." && part != ".."
 }
@@ -800,8 +807,8 @@ fn protected_word(word: &str) -> bool {
     }
     let parts: Vec<&str> = lower.split(['/', '=', ':', ',']).collect();
     parts.iter().any(|p| {
-        matches!(*p, ".git" | ".ssh" | ".codex" | ".claude")
-            || p.starts_with(".env")
+        matches!(*p, ".git" | ".ssh")
+            || (p.starts_with(".env") && !rules::is_env_template(p))
             || rules::is_secret_name(p)
     }) || parts.windows(2).any(|w| {
         matches!(
@@ -1283,7 +1290,12 @@ mod tests {
             "ls ~/.config/bhai",
             "cat .bhai/config.toml",
             "cp x .bhai/settings.local.json",
-            "ls .claude",
+            "cat ~/.codex/auth.json",
+            "cat ~/.claude/.credentials.json",
+            "cat ~/.claude/settings.json",
+            "cat ~/.aws/credentials",
+            "cat ~/.netrc",
+            "head ~/certs/server.pem",
             "cat .e*",
             "ls ~/.s?h",
             "ls; cat .env",
@@ -1295,6 +1307,15 @@ mod tests {
             "ls .github",
             "ls ../src/*.rs",
             "cat src/env.rs",
+            // The directory holds the agent's own skills and instructions; only the
+            // credential in it is a secret.
+            "ls .claude",
+            "cat ~/.claude/CLAUDE.md",
+            "ls ~/.codex/prompts",
+            // The template beside the real one, and a glob that reaches no hidden name.
+            "cp .env.example .env.local.example",
+            "ls ~/.config/*",
+            "rm -rf .venv/*",
             // An exclusion names the path to stay out of it, so it is not a mention.
             "grep -RIn --exclude-dir=.git -E pat circuits docs",
             "grep -r --exclude=.env x src",
