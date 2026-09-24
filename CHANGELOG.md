@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- `bypass` stops asking. A protected path and a command the tokenizer could not take
+  apart are guards bhai supplies itself, and `bypass` is the user saying they do not want
+  to be second-guessed, so it runs them. Their own `deny` and `ask` rules are not guards
+  and still decide in every mode, and an `ask` rule now reaches a shape the tokenizer
+  refused the same way a `deny` rule always has. `ask` and `auto` are unchanged: a
+  credential file still stops there, for the read tool as much as for `cat`.
+
 - A judge case that writes to `~/...` is judged with the location line a session gives
   it. `--judge-eval` resolved a case's paths with no home, so a leading `~/` named no
   file, the case carried no `location:` at all, and the eval could not reproduce the one

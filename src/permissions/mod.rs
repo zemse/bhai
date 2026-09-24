@@ -675,7 +675,7 @@ impl Checker<'_> {
         // a protected path puts it in the transcript, which is the thing being protected
         // against. `cat` on the same file has always asked; this is the read tool
         // answering the same way.
-        if rules::is_protected(path, base.home) {
+        if self.guarded() && rules::is_protected(path, base.home) {
             return Decision::Ask;
         }
         if !needs_approval {
@@ -704,10 +704,17 @@ impl Checker<'_> {
             // Unparseable, so it is never allowed. A rule for every command decides it,
             // and so does a worded one over the raw text: the words the user denied are
             // still in there, whatever shape the tokenizer could not read.
+            // An ask rule reaches it the same way a deny rule does: matching too much is
+            // safe where the answer can only be deny or ask. Without this the shape the
+            // tokenizer refused would be the one way past a rule the user wrote.
+            let asked = asked_as_text
+                || any(&self.rules.ask).is_some()
+                || self.find_raw(&self.rules.ask, command).is_some();
             return match any(&self.rules.deny).or_else(|| self.find_raw(&self.rules.deny, command))
             {
                 Some(rule) => denied(&rule),
-                None => Decision::Ask,
+                None if asked => Decision::Ask,
+                None => self.fallback(None),
             };
         };
         for c in &commands {
@@ -716,10 +723,13 @@ impl Checker<'_> {
             }
         }
         if asked_as_text
-            || commands.iter().any(|c| {
-                self.find_loose(&self.rules.ask, c).is_some() || bash::mentions_protected(c)
-            })
+            || commands
+                .iter()
+                .any(|c| self.find_loose(&self.rules.ask, c).is_some())
         {
+            return Decision::Ask;
+        }
+        if self.guarded() && commands.iter().any(bash::mentions_protected) {
             return Decision::Ask;
         }
 
@@ -882,6 +892,14 @@ impl Checker<'_> {
                 None => Ok(()),
             },
         }
+    }
+
+    /// Whether the guards bhai supplies itself apply: a protected path, a command the
+    /// tokenizer could not take apart. `bypass` is the user saying they do not want to be
+    /// second-guessed, so it drops them. Their own deny and ask rules are not guards and
+    /// stand in every mode.
+    fn guarded(&self) -> bool {
+        self.mode != Mode::Bypass
     }
 
     /// Whether `auto` mode's relaxations apply. They run the project's own code, so they
@@ -1197,7 +1215,8 @@ mod tests {
             (&bypass, "npm test", allowed("bypass mode")),
             (&bypass, "ls", allowed("read-only")),
             (&bypass, "rm x", deny_rm),
-            (&bypass, "cat ~/.ssh/id_rsa", Decision::Ask),
+            (&bypass, "cat ~/.ssh/id_rsa", allowed("read-only")),
+            (&ask_mode, "cat ~/.ssh/id_rsa", Decision::Ask),
             // A redirect is a write, so the program on its left is not read-only.
             (&bypass, "echo x > out", allowed("bypass mode")),
             (&auto, "echo x > out", Decision::Ask),
@@ -1354,7 +1373,14 @@ mod tests {
             bash(&worded, "curl $URL"),
             Decision::Deny("deny rule Bash(curl:*)".to_string())
         );
-        assert_eq!(bash(&worded, "ls $(x)"), Decision::Ask);
+        // No rule names it, and `bypass` does not keep a shape it could not read for
+        // the user; `ask` and `auto` still do.
+        assert_eq!(bash(&worded, "ls $(x)"), allowed("bypass mode"));
+        let asking = policy(Mode::Ask, &[], &["Bash(rm:*)"], &[]);
+        assert_eq!(bash(&asking, "ls $(x)"), Decision::Ask);
+        // An ask rule the user wrote is not a guard, so it still asks in `bypass`.
+        let asked = policy(Mode::Bypass, &[], &[], &["Bash(ls:*)"]);
+        assert_eq!(bash(&asked, "ls $(x)"), Decision::Ask);
     }
 
     #[test]
@@ -1412,11 +1438,24 @@ mod tests {
                 "/home/u/repo/secrets/k",
                 Decision::Deny("deny rule Edit(secrets/**)".to_string()),
             ),
-            // Allow rules never open protected paths.
+            // Allow rules never open protected paths, and `ask` and `auto` keep them for
+            // the user. `bypass` drops the guard: the user said not to be asked.
             (&auto, "write", "/home/u/repo/.git/config", Decision::Ask),
-            (&bypass, "write", "/home/u/repo/.git/config", Decision::Ask),
-            (&bypass, "edit", "/home/u/.ssh/config", Decision::Ask),
-            (&bypass, "edit", "/home/u/repo/.env", Decision::Ask),
+            (&ask_mode, "edit", "/home/u/.ssh/config", Decision::Ask),
+            (&auto, "edit", "/home/u/repo/.env", Decision::Ask),
+            (
+                &bypass,
+                "write",
+                "/home/u/repo/.git/config",
+                allowed("rule Write(.git/**)"),
+            ),
+            (
+                &bypass,
+                "edit",
+                "/home/u/.ssh/config",
+                allowed("bypass mode"),
+            ),
+            (&bypass, "edit", "/home/u/repo/.env", allowed("bypass mode")),
             (
                 &bypass,
                 "edit",
@@ -1428,8 +1467,8 @@ mod tests {
             // Reads skip approval, but not on a protected path: the read is what puts
             // the file in the transcript.
             (&ask_mode, "read", "/home/u/repo/.env", Decision::Ask),
-            (&bypass, "read", "/home/u/.ssh/id_rsa", Decision::Ask),
             (&auto, "read", "/home/u/.aws/credentials", Decision::Ask),
+            (&bypass, "read", "/home/u/.ssh/id_rsa", allowed("")),
             (&ask_mode, "read", "/home/u/repo/src/main.rs", allowed("")),
             (
                 &ask_mode,
@@ -1482,7 +1521,9 @@ mod tests {
             "/home/u/.netrc",
             "/home/u/certs/server.pem",
         ];
-        for mode in Mode::ALL {
+        // `bypass` is the user saying they do not want to be asked, so the guarantee is
+        // over the modes that weigh a call at all.
+        for mode in [Mode::Ask, Mode::Auto] {
             let policy = trusted(mode);
             for command in commands {
                 assert!(
@@ -1490,11 +1531,7 @@ mod tests {
                     "{command} in {mode}"
                 );
             }
-            // An environment dump names no file, so only the modes that weigh a call
-            // at all can stop it; `bypass` allows it the way it allows anything else.
-            if mode != Mode::Bypass {
-                assert_eq!(bash(&policy, "env"), Decision::Ask, "env in {mode}");
-            }
+            assert_eq!(bash(&policy, "env"), Decision::Ask, "env in {mode}");
             for path in paths {
                 assert_eq!(
                     file(&policy, "read", path),
