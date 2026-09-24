@@ -697,7 +697,8 @@ impl App {
             .filter(|area| area.contains(Position::new(x, y)))?;
         let last = self.lines.len().checked_sub(1)?;
         let line = (self.scroll + (y - area.y) as usize).min(last);
-        Some((line, (x - area.x) as usize))
+        let column = (x - area.x) as usize;
+        Some((line, crate::wrap::char_at(&self.lines[line], column)))
     }
 
     /// Presses in a row on the same cell: 1, 2 or 3, then round again.
@@ -724,7 +725,10 @@ impl App {
         let column = match y {
             _ if y < area.y => 0,
             _ if y >= area.bottom() => self.lines[line].chars().count(),
-            _ => x.clamp(area.x, area.right()).saturating_sub(area.x) as usize,
+            _ => crate::wrap::char_at(
+                &self.lines[line],
+                x.clamp(area.x, area.right()).saturating_sub(area.x) as usize,
+            ),
         };
         Some((line, column))
     }
@@ -2221,6 +2225,22 @@ mod tests {
         app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.input.value(), "x");
         assert_eq!(app.input.selection(), None);
+    }
+
+    /// A click arrives as a column. With a two-column character on the line, the column
+    /// and the character index part ways, and a selection read at the column takes the
+    /// wrong text.
+    #[test]
+    fn a_click_on_a_wide_character_selects_that_character() {
+        let mut app = transcript(&["私はねこです", "one two"]);
+        // Columns 2 and 3 are both the second character.
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 2, 0));
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 3, 0));
+        assert_eq!(app.selected_text().as_deref(), Some("は"));
+        // Across the whole row and onto the next line.
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 2, 1));
+        assert_eq!(app.selected_text().as_deref(), Some("私はねこです\none"));
     }
 
     /// A consumer that falls behind has events dropped, not delayed. Everything the

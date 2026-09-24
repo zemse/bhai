@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- Text with wide characters in it wraps and selects where it is drawn. Rows were measured
+  in characters, so a line of CJK or emoji was wrapped at half the columns it takes and ran
+  past the edge of the view, and a click mapped its column straight to a character index, so
+  a drag took the wrong text. The transcript wrap, the markdown wrap, the ground behind a
+  user message and the mermaid fit check now measure columns, and a click or drag lands on
+  the character it is over. `unicode-width` is a direct dependency, at the version the
+  lockfile already had.
+
 - A TUI that falls behind the event stream catches up instead of staying wrong. Events are
   dropped, not delayed, when the channel overflows, so the spinner, the pending approval,
   the queue and the mode chip could all sit at whatever the last event they saw said. A

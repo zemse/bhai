@@ -834,7 +834,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> 
         };
         let mut row = format!("{lead}{wrapped}");
         if ground {
-            let pad = width.saturating_sub(row.chars().count());
+            let pad = width.saturating_sub(crate::wrap::width(&row));
             row.push_str(&" ".repeat(pad));
         }
         lines.push(Line::from(Span::styled(row, style)));

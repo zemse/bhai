@@ -35,6 +35,40 @@ fn marked(c: char) -> bool {
     matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{e0000}'..='\u{e007f}')
 }
 
+/// The columns `text` takes on screen. A CJK character or an emoji is two columns wide
+/// and one character long, so counting characters wraps such a line short of the view and
+/// draws it past the edge of it.
+pub fn width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// The byte offset where `text` reaches `columns` on screen, never inside a character.
+/// A row can end a column short: a two-column character does not straddle the edge.
+fn split_at_width(text: &str, columns: usize) -> usize {
+    let mut used = 0;
+    for (at, c) in text.char_indices() {
+        let next = used + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if next > columns {
+            return at;
+        }
+        used = next;
+    }
+    text.len()
+}
+
+/// The character `column` falls on, for a click or a drag: a two-column character is one
+/// character wherever in it the pointer landed.
+pub fn char_at(text: &str, column: usize) -> usize {
+    let mut used = 0;
+    for (index, c) in text.chars().enumerate() {
+        used += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used > column {
+            return index;
+        }
+    }
+    text.chars().count()
+}
+
 /// How a row joins the one above it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Join {
@@ -81,40 +115,41 @@ pub fn joined(text: &str, width: usize) -> Vec<(String, Join)> {
         // The row being built starts the paragraph, so the text's own newline is its break.
         let mut join = Join::Newline;
         let mut line = String::new();
+        // The row's own width, kept as it is built: re-measuring it per word is quadratic.
+        let mut line_width = 0;
         for word in paragraph.split(' ') {
             let mut word = word;
-            // Counted once: re-measuring the rest of the word each pass is quadratic.
-            let mut left = word.chars().count();
+            // Measured once, then kept by what each split takes off it.
+            let mut left = self::width(word);
             // A single word longer than the line gets hard-split.
             while left > width {
                 if !line.is_empty() {
                     out.push((std::mem::take(&mut line), join));
+                    line_width = 0;
                     join = Join::Space;
                 }
-                let split = char_index(word, width);
+                let split = split_at_width(word, width);
+                let taken = self::width(&word[..split]);
                 out.push((word[..split].to_string(), join));
                 join = Join::Split;
                 word = &word[split..];
-                left -= width;
+                left -= taken;
             }
             let extra = if line.is_empty() { 0 } else { 1 };
-            if line.chars().count() + extra + left > width {
+            if line_width + extra + left > width {
                 out.push((std::mem::take(&mut line), join));
+                line_width = 0;
                 join = Join::Space;
             } else if extra == 1 {
                 line.push(' ');
+                line_width += 1;
             }
             line.push_str(word);
+            line_width += left;
         }
         out.push((line, join));
     }
     out
-}
-
-fn char_index(s: &str, chars: usize) -> usize {
-    s.char_indices()
-        .nth(chars)
-        .map_or(s.len(), |(index, _)| index)
 }
 
 #[cfg(test)]
@@ -161,6 +196,28 @@ mod tests {
     #[test]
     fn wrap_handles_multibyte_text() {
         assert_eq!(wrap("héllo wörld", 5), vec!["héllo", "wörld"]);
+    }
+
+    /// A row is as many columns as the view is wide, not as many characters. A CJK
+    /// character is two columns, so counting characters draws it past the edge.
+    #[test]
+    fn a_wide_character_is_wrapped_by_the_columns_it_takes() {
+        // Four characters, eight columns: two per row at a width of five.
+        assert_eq!(wrap("私はねこです", 5), ["私は", "ねこ", "です"]);
+        assert!(wrap("私はねこです", 5).iter().all(|row| width(row) <= 5));
+        // Words are still words: one too wide for the row is split, the rest wraps.
+        assert_eq!(wrap("a 日本語", 4), ["a", "日本", "語"]);
+        assert_eq!(width("日本語"), 6);
+        assert_eq!(width("abc"), 3);
+        // Nothing is lost by the split.
+        let text = "図書館で本を読む";
+        assert_eq!(wrap(text, 7).concat(), text);
+        // A column lands on the character it is drawn over, not on its index.
+        assert_eq!(char_at("私はねこ", 0), 0);
+        assert_eq!(char_at("私はねこ", 1), 0);
+        assert_eq!(char_at("私はねこ", 2), 1);
+        assert_eq!(char_at("私はねこ", 99), 4);
+        assert_eq!(char_at("abc", 2), 2);
     }
 
     #[test]

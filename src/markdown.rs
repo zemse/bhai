@@ -313,7 +313,7 @@ impl Renderer {
         let Some(lines) = mermaid::render(source) else {
             return false;
         };
-        if lines.iter().any(|l| l.chars().count() > width) {
+        if lines.iter().any(|l| crate::wrap::width(l) > width) {
             return false;
         }
         for line in lines {
@@ -468,30 +468,63 @@ fn wrap(cells: &[Cell], width: usize) -> Vec<(Vec<Cell>, Join)> {
     // The first line of a block stands under whatever the caller put above it.
     let mut join = Join::Newline;
     let mut pos: usize = 0;
+    let mut line_width = 0;
     for word in cells.split(|(c, _)| *c == ' ') {
         let space = pos.checked_sub(1).map(|i| cells[i]);
         pos += word.len() + 1;
         let mut word = word;
-        while word.len() > width {
+        let mut left = cells_width(word);
+        while left > width {
             if !line.is_empty() {
                 out.push((std::mem::take(&mut line), join));
+                line_width = 0;
                 join = Join::Space;
             }
-            out.push((word[..width].to_vec(), join));
+            let split = cells_split(word, width);
+            let taken = cells_width(&word[..split]);
+            out.push((word[..split].to_vec(), join));
             join = Join::Split;
-            word = &word[width..];
+            word = &word[split..];
+            left -= taken;
         }
         let extra = usize::from(!line.is_empty());
-        if line.len() + extra + word.len() > width {
+        if line_width + extra + left > width {
             out.push((std::mem::take(&mut line), join));
+            line_width = 0;
             join = Join::Space;
         } else if let Some(space) = space.filter(|_| extra == 1) {
             line.push(space);
+            line_width += 1;
         }
         line.extend_from_slice(word);
+        line_width += left;
     }
     out.push((line, join));
     out
+}
+
+/// The columns these cells take on screen; one cell is one character, which may be two
+/// columns wide.
+fn cells_width(cells: &[Cell]) -> usize {
+    cells.iter().map(|(c, _)| char_width(*c)).sum()
+}
+
+/// How many cells reach `columns` on screen, never leaving a two-column character
+/// straddling the edge.
+fn cells_split(cells: &[Cell], columns: usize) -> usize {
+    let mut used = 0;
+    for (i, (c, _)) in cells.iter().enumerate() {
+        let next = used + char_width(*c);
+        if next > columns {
+            return i;
+        }
+        used = next;
+    }
+    cells.len()
+}
+
+fn char_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
 #[cfg(test)]
