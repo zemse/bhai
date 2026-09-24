@@ -34,6 +34,28 @@ pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 const MAX_ATTEMPTS: usize = 3;
 
+/// Whether `model` takes an effort change as a `configuration_update` input item, which
+/// leaves the request's own `reasoning.effort`, and so the cached prefix, as it was. The
+/// GPT-6 family only: on any other model the effort is part of the rendered prefix.
+pub fn takes_effort_updates(model: &str) -> bool {
+    model == "gpt-6" || model.starts_with("gpt-6-") || model.starts_with("gpt-6.")
+}
+
+/// The item that puts a conversation on `effort` from the next response on.
+pub fn effort_update(effort: &str) -> Value {
+    json!({ "type": "configuration_update", "reasoning": { "effort": effort } })
+}
+
+/// The effort the last `configuration_update` in `history` put the conversation on.
+pub fn announced_effort(history: &[Value]) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("configuration_update"))
+        .and_then(|item| item.pointer("/reasoning/effort"))
+        .and_then(Value::as_str)
+}
+
 /// Where a session's inference runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -125,7 +147,10 @@ pub struct Client {
     /// The prompt cache key; the session id unless this is a child's client.
     cache_key: String,
     model: String,
+    /// The request's `reasoning.effort`, which stays put on a model that takes updates.
     effort: String,
+    /// The effort a `configuration_update` puts the conversation on, where it differs.
+    in_force: Option<String>,
     /// Where the Ollama server is, for a model served by one.
     ollama_url: String,
     /// The configured context window, when one is set; what Ollama is asked to hold.
@@ -151,6 +176,7 @@ impl Client {
             session_id,
             model,
             effort,
+            in_force: None,
             ollama_url: choice
                 .ollama_url
                 .clone()
@@ -206,14 +232,25 @@ impl Client {
     pub fn with_overrides(mut self, model: Option<String>, effort: Option<String>) -> Self {
         self.model = model.unwrap_or(self.model);
         self.effort = effort.unwrap_or(self.effort);
+        self.in_force = None;
+        self
+    }
+
+    /// Run at `effort` by `configuration_update`, keeping the request's own effort.
+    pub fn with_effort_in_force(mut self, effort: Option<String>) -> Self {
+        self.in_force = effort.filter(|effort| *effort != self.effort);
         self
     }
 
     /// The same session on another model, for `/model`. The guard is shared with the
     /// client this came from, and a different model reads a different cached prefix, so
     /// the switch forgets the last request rather than reporting it as a break. An
-    /// effort alone changes only the `reasoning` field, so it is forgotten the same way.
+    /// effort alone changes only the `reasoning` field, so it is forgotten the same way,
+    /// unless the model takes the change as an update, which leaves the request alone.
     pub fn switch(&self, model: &str, effort: &str) -> Self {
+        if model == self.model && takes_effort_updates(model) {
+            return self.clone().with_effort_in_force(Some(effort.to_string()));
+        }
         let reason = match model == self.model {
             true => "the effort changed",
             false => "the model changed",
@@ -236,6 +273,11 @@ impl Client {
 
     pub fn effort(&self) -> &str {
         &self.effort
+    }
+
+    /// The effort the model runs at: an update's, else the request's.
+    pub fn effort_in_force(&self) -> &str {
+        self.in_force.as_deref().unwrap_or(&self.effort)
     }
 
     /// Continue session `id`, so the prompt cache key stays the same. Call before
@@ -274,8 +316,11 @@ impl Client {
     /// The client for a child running as `identity`: its overrides, and a cache key of
     /// its own so children of one identity share a cached prefix.
     pub fn for_child(&self, identity: &crate::identity::Identity) -> Self {
+        // A child's conversation is its own, so it asks for the parent's effort outright.
+        let effort = self.effort_in_force().to_string();
         let mut child = self
             .clone()
+            .with_overrides(None, Some(effort))
             .with_overrides(identity.model.clone(), identity.effort.clone());
         child.cache_key = format!("{}-{}", self.session_id, identity.name);
         let strict = self
@@ -870,6 +915,59 @@ mod tests {
         parent.guard.lock().unwrap().check(&body).unwrap();
         let other = request_body("m", "e", "k", "changed", &[], &[]);
         assert_eq!(child.guard.lock().unwrap().check(&other).unwrap(), None);
+    }
+
+    #[test]
+    fn only_the_gpt6_family_takes_effort_updates() {
+        for model in ["gpt-6", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1"] {
+            assert!(takes_effort_updates(model), "{model}");
+        }
+        for model in ["gpt-5.6-sol", "gpt-5.5", "gpt-60", "ollama:gpt-6-sol"] {
+            assert!(!takes_effort_updates(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn the_last_update_is_the_effort_announced() {
+        let say = json!({"type": "message", "role": "user", "content": []});
+        assert_eq!(announced_effort(std::slice::from_ref(&say)), None);
+        let history = [
+            effort_update("high"),
+            say.clone(),
+            effort_update("low"),
+            say,
+        ];
+        assert_eq!(announced_effort(&history), Some("low"));
+    }
+
+    #[test]
+    fn a_gpt6_effort_change_keeps_the_request_and_its_guard() {
+        let client = Client::new(&Choice::default())
+            .unwrap()
+            .with_overrides(Some("gpt-6-sol".to_string()), Some("medium".to_string()));
+        let body = request_body("gpt-6-sol", "medium", "k", "i", &[], &[]);
+        client.guard.lock().unwrap().check(&body).unwrap();
+        let switched = client.switch("gpt-6-sol", "xhigh");
+        assert_eq!(
+            (switched.effort(), switched.effort_in_force()),
+            ("medium", "xhigh")
+        );
+        // Not reset: the next request is checked against the last one as usual.
+        let next = request_body(
+            "gpt-6-sol",
+            "medium",
+            "k",
+            "i",
+            &[],
+            &[effort_update("xhigh")],
+        );
+        assert_eq!(switched.guard.lock().unwrap().check(&next).unwrap(), None);
+        // A child's conversation is its own, so it asks for the effort outright.
+        let child = switched.for_child(&crate::identity::Identity::default());
+        assert_eq!(
+            (child.effort(), child.effort_in_force()),
+            ("xhigh", "xhigh")
+        );
     }
 
     #[test]

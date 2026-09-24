@@ -326,10 +326,14 @@ pub fn load(path: &Path) -> Result<Loaded> {
                 bail!("{}: model record {id} names no model", path.display());
             };
             // As the live switch does: encrypted reasoning belongs to the model that
-            // produced it and cannot be replayed to another one. An effort alone keeps it.
+            // produced it and cannot be replayed to another one, and an effort update
+            // to the model it was sent to. An effort alone keeps both.
             if switched != model {
                 items.retain(|(item, _)| {
-                    item.get("type").and_then(Value::as_str) != Some("reasoning")
+                    !matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("reasoning" | "configuration_update")
+                    )
                 });
             }
             (model, effort) = (switched, to);
@@ -769,6 +773,30 @@ mod tests {
             .filter(|item| item["type"] == "reasoning")
             .count();
         assert_eq!(reasoning, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_switch_drops_the_effort_updates_sent_to_the_model_before_it() {
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("s1"));
+        writer
+            .append(&crate::client::effort_update("xhigh"))
+            .unwrap();
+        writer.append(&items()[0]).unwrap();
+        drop(writer);
+        let loaded = load(&path(&dir, "s1")).unwrap();
+        assert_eq!(
+            crate::client::announced_effort(&loaded.items),
+            Some("xhigh")
+        );
+
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        writer.model("gpt-5.5", "low", "abc").unwrap();
+        writer.append(&items()[0]).unwrap();
+        let loaded = load(&path(&dir, "s1")).unwrap();
+        assert_eq!(crate::client::announced_effort(&loaded.items), None);
+        assert_eq!(loaded.items.len(), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

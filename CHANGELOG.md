@@ -6,6 +6,16 @@ carries the shape of what is there.
 
 ## 2026-09-25
 
+- An effort change on a GPT-6 model (`gpt-6`, `gpt-6-*`, `gpt-6.*`) keeps the prompt
+  cache. The request's `reasoning.effort` stays what the conversation opened on, and the
+  change goes into the history as a `configuration_update` item just before the next
+  message; a compaction, a `/clear` or a resume that lost the last one announces it again,
+  and children run at the effort in force. On every other Codex model the effort is part
+  of the cached prefix, so a change is refused while the cache is warm and goes through
+  once it has expired, after `/clear`, or right after a compaction.
+- The status bar says `cache expired: /clear to save ~86k tokens` once the last call is
+  older than the cache lasts, and `$cache_expired` puts it in a template.
+
 - A denial in `auto` on a chained command names the rules that would cover it. One rule
   cannot cover `a && b`, so the offer was empty for every chain, and `auto` never prompts:
   the user was told to switch modes with nothing they could run instead. It now reads

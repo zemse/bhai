@@ -270,14 +270,23 @@ pub enum Submitted {
 pub enum SubmitError {
     Busy,
     Closed,
+    /// An effort change would re-read the whole conversation uncached; the cache goes
+    /// cold on its own after this long.
+    CacheWarm(Duration),
 }
 
 impl fmt::Display for SubmitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            SubmitError::Busy => "a turn is already running",
-            SubmitError::Closed => "the agent is not accepting messages",
-        })
+        match self {
+            SubmitError::Busy => f.write_str("a turn is already running"),
+            SubmitError::Closed => f.write_str("the agent is not accepting messages"),
+            SubmitError::CacheWarm(left) => write!(
+                f,
+                "this model caches per effort, so a change now re-reads the whole conversation uncached. It goes through once the cache expires in {}m{:02}s, or after /clear; a gpt-6 model changes effort without the miss",
+                left.as_secs() / 60,
+                left.as_secs() % 60
+            ),
+        }
     }
 }
 
@@ -290,6 +299,8 @@ struct Inner {
     calls: u64,
     children: Usage,
     last_usage: Option<Usage>,
+    /// When the conversation's last call finished, while its cached prefix may be warm.
+    last_call: Option<Instant>,
     last_cache_break: Option<CacheBreak>,
     rate_limits: Option<RateLimits>,
     next_id: u64,
@@ -506,6 +517,9 @@ impl Session {
         if inner.working {
             return Err(SubmitError::Busy);
         }
+        if let Some(left) = self.effort_miss(&model, &effort, inner.last_call) {
+            return Err(SubmitError::CacheWarm(left));
+        }
         self.tx_control
             .try_send(Control::Model {
                 model: model.clone(),
@@ -516,6 +530,41 @@ impl Session {
         *self.model.lock().unwrap_or_else(|e| e.into_inner()) = (model.clone(), effort.clone());
         self.publish(Event::Model { model, effort });
         Ok(())
+    }
+
+    /// Tokens the next message would re-read uncached, once the last call is older than
+    /// the cache lasts: what a `/clear` saves, if the conversation is done with.
+    pub fn cold_tokens(&self) -> Option<u64> {
+        let inner = self.lock();
+        let expired = inner
+            .last_call
+            .is_some_and(|at| at.elapsed() >= crate::cache::CACHE_TTL);
+        match expired && !inner.working {
+            true => inner.last_usage.map(|usage| usage.input).filter(|n| *n > 0),
+            false => None,
+        }
+    }
+
+    /// How long the cached prefix may stay warm, when putting the current model on
+    /// `effort` would re-read it all: a Codex model outside the GPT-6 family renders the
+    /// effort ahead of the conversation. `None` when the change costs nothing.
+    fn effort_miss(
+        &self,
+        model: &str,
+        effort: &str,
+        last_call: Option<Instant>,
+    ) -> Option<Duration> {
+        let (current, now) = self.model();
+        if model != current
+            || effort == now
+            || crate::client::Provider::of(model) != crate::client::Provider::Codex
+            || crate::client::takes_effort_updates(model)
+        {
+            return None;
+        }
+        crate::cache::CACHE_TTL
+            .checked_sub(last_call?.elapsed())
+            .filter(|left| !left.is_zero())
     }
 
     /// Switch the permission mode. The prompt and tools stay as they are.
@@ -708,6 +757,7 @@ impl Session {
             AgentEvent::Usage(usage) => {
                 add(&mut inner.total, usage);
                 inner.last_usage = Some(usage);
+                inner.last_call = Some(Instant::now());
                 Event::Usage(usage)
             }
             AgentEvent::ChildUsage(usage) => {
@@ -756,8 +806,15 @@ impl Session {
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Judging(what) => Event::Judging(what),
             AgentEvent::Titled(name) => Event::Titled(name),
-            AgentEvent::Compacted { notice, summary } => Event::Compacted { notice, summary },
-            AgentEvent::Cleared => Event::Cleared,
+            // Either way the next call reads a history the cache has never seen.
+            AgentEvent::Compacted { notice, summary } => {
+                inner.last_call = None;
+                Event::Compacted { notice, summary }
+            }
+            AgentEvent::Cleared => {
+                inner.last_call = None;
+                Event::Cleared
+            }
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnFailed(s) => Event::TurnFailed(s),
             // The agent is working again without anything having been typed, so the
@@ -1523,5 +1580,81 @@ mod tests {
         assert_eq!(state.last_usage, Some(usage(4, 2, 2, 0)));
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["children"]["input"], 11);
+    }
+
+    /// A session on `model`, with the control end kept open so a switch goes through.
+    fn on(model: &str) -> (Arc<Session>, mpsc::Receiver<Control>) {
+        let (tx_user, _) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(4);
+        let session = Session::new(
+            model.to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            Arc::new(Cancel::default()),
+            Arc::new(Policy::default()),
+            None,
+        );
+        (session, rx_control)
+    }
+
+    fn called(session: &Session, input: u64) {
+        session.on_agent(AgentEvent::Usage(Usage {
+            input,
+            ..Usage::default()
+        }));
+    }
+
+    #[test]
+    fn an_effort_change_waits_for_a_warm_cache_unless_the_model_takes_updates() {
+        let (session, _control) = on("gpt-5.6-sol");
+        // Nothing sent yet, so nothing is cached to lose.
+        assert_eq!(
+            session.set_model("gpt-5.6-sol".into(), "high".into(), None),
+            Ok(())
+        );
+        called(&session, 90_000);
+        let refused = session.set_model("gpt-5.6-sol".into(), "low".into(), None);
+        assert!(
+            matches!(refused, Err(SubmitError::CacheWarm(_))),
+            "{refused:?}"
+        );
+        assert_eq!(session.model().1, "high");
+        // Another model is a switch the user chose, not an effort change.
+        assert_eq!(
+            session.set_model("gpt-5.5".into(), "low".into(), None),
+            Ok(())
+        );
+        called(&session, 90_000);
+        session.on_agent(AgentEvent::Cleared);
+        assert_eq!(
+            session.set_model("gpt-5.5".into(), "high".into(), None),
+            Ok(())
+        );
+
+        let (session, _control) = on("gpt-6-sol");
+        called(&session, 90_000);
+        assert_eq!(
+            session.set_model("gpt-6-sol".into(), "xhigh".into(), None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_expired_cache_says_what_a_clear_saves() {
+        let (session, _control) = on("gpt-5.6-sol");
+        assert_eq!(session.cold_tokens(), None);
+        called(&session, 86_000);
+        assert_eq!(session.cold_tokens(), None, "still warm");
+        session.lock().last_call = Some(Instant::now() - crate::cache::CACHE_TTL);
+        assert_eq!(session.cold_tokens(), Some(86_000));
+        // The same age no longer holds the effort back either.
+        assert_eq!(
+            session.set_model("gpt-5.6-sol".into(), "low".into(), None),
+            Ok(())
+        );
+        session.on_agent(AgentEvent::Cleared);
+        assert_eq!(session.cold_tokens(), None);
     }
 }

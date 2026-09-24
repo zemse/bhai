@@ -375,6 +375,15 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ));
     }
+    if let Some(tokens) = app.cold_tokens() {
+        bar.push((
+            ALWAYS,
+            Span::styled(
+                format!("cache expired: /clear to save ~{} tokens ", compact(tokens)),
+                Style::new().fg(Color::Yellow),
+            ),
+        ));
+    }
     if let Some(found) = app.rate_limits {
         bar.extend(limit_spans(&found).into_iter().map(|span| (ALWAYS, span)));
     }

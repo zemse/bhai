@@ -138,7 +138,7 @@ pub const MIN_CACHED: u64 = 1024;
 /// Cached prefixes grow in steps of this many tokens.
 const CACHE_STEP: u64 = 128;
 /// A call this long after the previous one may find its prefix evicted.
-const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+pub const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// A hit ratio below this is a miss.
 const MISS_RATIO: f64 = 0.5;
 /// A call sending fewer tokens than this is never judged: the backend takes about ten

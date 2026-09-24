@@ -41,6 +41,10 @@ pub const VARIABLES: &[(&str, &str)] = &[
         "a cache break, a stall or a miss, while there is one",
     ),
     (
+        "cache_expired",
+        "`cache expired: /clear to save ~86k tokens`, once the cache has likely lapsed",
+    ),
+    (
         "limits",
         "every rate-limit window with its reset, as `5h 42% (2h14m) · wk 17% (Fri 09:00)`",
     ),
@@ -473,6 +477,16 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
         (None, false, None) => Value::default(),
     };
     set("cache_alert", cache_alert);
+    set(
+        "cache_expired",
+        match app.cold_tokens() {
+            Some(tokens) => Value {
+                text: format!("cache expired: /clear to save ~{} tokens", compact(tokens)),
+                alert: Some(Style::new().fg(Color::Yellow)),
+            },
+            None => Value::default(),
+        },
+    );
     let limits = app.rate_limits.unwrap_or_default();
     let now = chrono::Local::now();
     set("limits", all_limits(&limits, now));

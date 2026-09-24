@@ -215,6 +215,12 @@ pub trait Model: Send + Sync {
     /// The model's name, which picks its tokenizer.
     fn name(&self) -> &str;
 
+    /// The request's effort and the one the model runs at, for a model that takes an
+    /// effort change as a `configuration_update`; `None` for any other.
+    fn effort_updates(&self) -> Option<(&str, &str)> {
+        None
+    }
+
     /// Whether `--strict-cache` is on, so a cache warning must stop for the user.
     fn strict_cache(&self) -> bool {
         false
@@ -257,6 +263,11 @@ impl Model for Client {
 
     fn name(&self) -> &str {
         self.model()
+    }
+
+    fn effort_updates(&self) -> Option<(&str, &str)> {
+        crate::client::takes_effort_updates(self.model())
+            .then(|| (self.effort(), self.effort_in_force()))
     }
 
     fn strict_cache(&self) -> bool {
@@ -621,19 +632,27 @@ pub(crate) async fn run_with(
                     // model thought is dropped: encrypted reasoning belongs to the model
                     // that produced it and cannot be replayed to another one. An effort
                     // alone keeps the model and its history, but the backend caches per
-                    // effort, so the next call is cold all the same.
+                    // effort, so the next call is cold all the same, unless the model
+                    // takes the change as an update the next turn puts in the history.
                     Control::Model { model: name, effort, window } => {
                         let same = name == model.name();
+                        let updates = same && model.effort_updates().is_some();
                         match model.switch(&name, &effort) {
                             Some(switched) => {
                                 model = switched;
+                                // Children run at the effort in force.
                                 registry = build(&model);
+                                if updates {
+                                    continue;
+                                }
                                 if !same {
                                     tokenizer = tokens::for_model(model.name());
                                     limits.window = configured_window.or(window);
                                     history.retain(|item| {
-                                        item.get("type").and_then(Value::as_str)
-                                            != Some("reasoning")
+                                        !matches!(
+                                            item.get("type").and_then(Value::as_str),
+                                            Some("reasoning" | "configuration_update")
+                                        )
                                     });
                                     // Earlier calls index the old history, and the new
                                     // model reads a cache of its own that is cold.
@@ -703,6 +722,12 @@ pub(crate) async fn run_with(
             // A retry adds nothing: it runs the turn the history already describes.
             Next::Retry | Next::Compact => (None, None),
         };
+        // Just before what opens the turn, which is where the API takes an update.
+        if (landed.is_some() || message.is_some())
+            && let Some(update) = effort_change(model.as_ref(), &history)
+        {
+            history.push(update);
+        }
         if let Some(result) = landed {
             // An interrupted session does not start working again on its own. The report
             // still joins the history, so the next message the user sends reads it.
@@ -844,6 +869,15 @@ pub(crate) async fn run_with(
         }
         let _ = tx.send(AgentEvent::TurnEnd);
     }
+}
+
+/// The update a model that takes them needs before the next turn: the effort it runs at,
+/// when the history does not already put it there. Worked out from the history each time,
+/// so a compaction, a `/clear` or a resume that lost the last one announces it again.
+fn effort_change(model: &dyn Model, history: &[Value]) -> Option<Value> {
+    let (request, in_force) = model.effort_updates()?;
+    let announced = crate::client::announced_effort(history).unwrap_or(request);
+    (announced != in_force).then(|| crate::client::effort_update(in_force))
 }
 
 /// How one turn ended: the model calls it made, whether its step budget was spent, and
@@ -1892,6 +1926,8 @@ pub mod fake {
         /// under another pair, as the real client does.
         pub model: String,
         pub effort: String,
+        /// The effort an update put it on, as the real client keeps it.
+        in_force: Option<String>,
         conversation: String,
         key: String,
         guard: Arc<Mutex<CacheGuard>>,
@@ -1914,6 +1950,7 @@ pub mod fake {
                 resets: Arc::default(),
                 model: "fake".to_string(),
                 effort: "medium".to_string(),
+                in_force: None,
                 conversation: "parent".to_string(),
                 key: "sess".to_string(),
                 guard: Arc::new(Mutex::new(CacheGuard::new("parent", None, false))),
@@ -2080,9 +2117,16 @@ pub mod fake {
         }
 
         fn switch(&self, model: &str, effort: &str) -> Option<Arc<dyn Model>> {
+            if model == self.model && crate::client::takes_effort_updates(model) {
+                return Some(Arc::new(Self {
+                    in_force: (effort != self.effort).then(|| effort.to_string()),
+                    ..self.clone()
+                }));
+            }
             let switched = Self {
                 model: model.to_string(),
                 effort: effort.to_string(),
+                in_force: None,
                 ..self.clone()
             };
             switched.reset(match model == self.model {
@@ -2094,6 +2138,13 @@ pub mod fake {
 
         fn name(&self) -> &str {
             &self.model
+        }
+
+        fn effort_updates(&self) -> Option<(&str, &str)> {
+            crate::client::takes_effort_updates(&self.model).then(|| {
+                let in_force = self.in_force.as_deref().unwrap_or(&self.effort);
+                (self.effort.as_str(), in_force)
+            })
         }
 
         fn strict_cache(&self) -> bool {
@@ -4153,6 +4204,118 @@ mod tests {
             .map(|(_, _, reason)| reason.clone())
             .collect();
         assert_eq!(reasons, ["the effort changed"]);
+    }
+
+    /// A GPT-6 fake running `script`, with the channels to drive it.
+    fn gpt6(
+        script: Vec<Vec<Value>>,
+    ) -> (
+        fake::Fake,
+        mpsc::Sender<String>,
+        mpsc::Sender<Control>,
+        mpsc::UnboundedReceiver<AgentEvent>,
+        Arc<Cancel>,
+    ) {
+        let mut fake = fake::Fake::new(script);
+        fake.model = "gpt-6-sol".to_string();
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        (fake, tx_user, tx_control, rx, cancel)
+    }
+
+    fn effort(effort: &str) -> Control {
+        Control::Model {
+            model: "gpt-6-sol".to_string(),
+            effort: effort.to_string(),
+            window: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gpt6_effort_change_is_an_update_that_keeps_the_prefix() {
+        use fake::say;
+
+        let script = ["one", "two", "three", "four"]
+            .map(|s| vec![say(s)])
+            .to_vec();
+        let (fake, tx_user, tx_control, mut rx, cancel) = gpt6(script);
+
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        tx_control.send(effort("xhigh")).await.unwrap();
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+        // Twice before a message: only the last one goes in, since the API refuses two
+        // updates side by side.
+        tx_control.send(effort("low")).await.unwrap();
+        tx_control.send(effort("medium")).await.unwrap();
+        drive(&tx_user, &mut rx, &cancel, "fourth", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        let input = |i: usize| bodies[i].1["input"].as_array().unwrap().clone();
+        for (_, body) in bodies.iter() {
+            assert_eq!(
+                body["reasoning"]["effort"], "medium",
+                "the request keeps its effort"
+            );
+        }
+        let updates = |items: &[Value]| {
+            items
+                .iter()
+                .filter(|item| item["type"] == "configuration_update")
+                .map(|item| item["reasoning"]["effort"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let second = input(1);
+        assert_eq!(second[..input(0).len()], input(0)[..]);
+        assert_eq!(
+            second[second.len() - 2],
+            crate::client::effort_update("xhigh")
+        );
+        assert_eq!(
+            updates(&input(2)),
+            ["xhigh"],
+            "announced once, not every turn"
+        );
+        // Back to the request's own effort still takes an update: the history says xhigh.
+        assert_eq!(updates(&input(3)), ["xhigh", "medium"]);
+        // Every request extends the one before it, so nothing broke or reset the cache.
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        assert!(fake.resets.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cleared_history_announces_the_effort_again() {
+        use fake::say;
+
+        let (fake, tx_user, tx_control, mut rx, cancel) =
+            gpt6(vec![vec![say("one")], vec![say("two")]]);
+        tx_control.send(effort("high")).await.unwrap();
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        tx_control.send(Control::Clear).await.unwrap();
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        let sent = bodies[1].1["input"].as_array().unwrap();
+        assert_eq!(sent[0], crate::client::effort_update("high"));
+        assert_eq!(sent[1]["content"][0]["text"], "second");
     }
 
     /// A session that misses the cache on every judged call, one call per script step,

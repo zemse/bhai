@@ -1380,17 +1380,27 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         self.switch_model(self.model.clone(), rest.to_string(), None);
     }
 
+    /// Tokens the next message would re-read now that the cache has likely lapsed.
+    pub fn cold_tokens(&self) -> Option<u64> {
+        self.session.cold_tokens()
+    }
+
     /// Put the session on `model`, and say so.
     fn switch_model(&mut self, model: String, effort: String, window: Option<u64>) {
         let notice = match model == self.model {
-            true => format!(
-                "effort: {effort}. The model and its thinking stay; the backend caches per effort, so the next call starts the prompt cache again."
-            ),
+            true => match crate::client::takes_effort_updates(&model) {
+                true => format!(
+                    "effort: {effort}. It goes in as an update before the next message, so the prompt cache stays."
+                ),
+                false => format!(
+                    "effort: {effort}. This model caches per effort, and its cache had already gone cold, so nothing is lost."
+                ),
+            },
             false => model_notice(&model, &effort),
         };
         match self.session.set_model(model, effort, window) {
             Ok(()) => self.note(Entry::Info(notice)),
-            Err(e) => self.note(Entry::Error(format!("cannot switch models: {e}"))),
+            Err(e) => self.note(Entry::Error(format!("cannot switch: {e}"))),
         }
     }
 

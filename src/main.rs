@@ -201,7 +201,21 @@ async fn main() -> Result<()> {
             .with_overrides(Some(loaded.model.clone()), Some(loaded.effort.clone()))
             .with_session(&loaded.header.session);
     }
-    let client = client.with_overrides(args.model.clone(), args.effort.clone());
+    // On a model that takes effort updates, the history's last one is the effort in
+    // force, and `--effort` becomes the next one rather than a new request effort.
+    let updates = client::takes_effort_updates(client.model())
+        && args
+            .model
+            .as_ref()
+            .is_none_or(|model| model == client.model());
+    let client = match (&resumed, updates) {
+        (Some(loaded), true) => {
+            let announced = client::announced_effort(&loaded.items).map(str::to_string);
+            client.with_effort_in_force(args.effort.clone().or(announced))
+        }
+        (None, true) => client.with_overrides(None, args.effort.clone()),
+        (_, false) => client.with_overrides(args.model.clone(), args.effort.clone()),
+    };
     let client = client
         .strict_cache(args.strict_cache)
         .with_window(limits.window)
@@ -234,7 +248,7 @@ async fn main() -> Result<()> {
                 loaded.header.session,
                 loaded.items.len(),
                 client.model(),
-                client.effort()
+                client.effort_in_force()
             ));
             warnings.extend(loaded.warnings.iter().map(|w| format!("warning: {w}")));
             Saved {
@@ -722,7 +736,7 @@ fn start(
     });
     let session = Session::new(
         client.model().to_string(),
-        client.effort().to_string(),
+        client.effort_in_force().to_string(),
         prompt.identity.name.clone(),
         tx_user,
         tx_control,
