@@ -89,8 +89,12 @@ pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
 
 /// A name with `__` would make `mcp__server__tool` ambiguous, so it never starts.
 fn add(found: &mut Vec<Server>, mut server: Server) {
+    // `mcp__server__tool` is split on the first `__` after the prefix, so a name holding
+    // one, or ending in the `_` the separator would complete, names the wrong tool.
     if server.name.contains("__") {
         server.skip = Some("invalid name (contains __)".to_string());
+    } else if server.name.ends_with('_') {
+        server.skip = Some("invalid name (ends with _)".to_string());
     }
     match found.iter_mut().find(|s| s.name == server.name) {
         Some(slot) => *slot = server,
@@ -289,6 +293,7 @@ mod tests {
         let bhai = BTreeMap::from([
             ("b".to_string(), bhai_server("b-bhai")),
             ("p__q".to_string(), bhai_server("pq")),
+            ("trailing_".to_string(), bhai_server("trailing")),
         ]);
         let roots = Roots {
             home: Some(home),
@@ -302,13 +307,29 @@ mod tests {
         assert_eq!(
             names,
             [
-                "a", "b", "new", "nourl", "off", "ok", "p__q", "sse", "unset", "untyped", "web",
+                "a",
+                "b",
+                "new",
+                "nourl",
+                "off",
+                "ok",
+                "p__q",
+                "sse",
+                "trailing_",
+                "unset",
+                "untyped",
+                "web",
                 "x__y"
             ]
         );
         let invalid = Some("invalid name (contains __)".to_string());
         assert_eq!(get("p__q").skip, invalid);
         assert_eq!(get("x__y").skip, invalid);
+        // `mcp__trailing___tool` would split as server `trailing`, tool `_tool`.
+        assert_eq!(
+            get("trailing_").skip,
+            Some("invalid name (ends with _)".to_string())
+        );
         assert_eq!(get("b").command, "b-bhai");
         assert_eq!(get("b").source, "~/.config/bhai/config.toml");
         assert!(get("ok").skip.is_none());

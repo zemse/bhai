@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- What a file or a server can put in the system prompt is bounded. An instruction file over
+  64 KiB is skipped and said instead of loaded, since the prompt is a prefix every call of
+  the session pays for. MCP server and tool names in the listing lose their control
+  characters and are cut at 64 characters, so a server cannot write extra lines into a
+  section whose shape is one line per server. A server whose name ends in `_` is refused
+  like one containing `__`: both break the `mcp__server__tool` split and would name the
+  wrong tool.
+
 - A skill name reaches the prompt as one short line, and a shadowed skill is named at
   startup. A `name:` written as a YAML block put its own lines in the listing, so a skill
   file could write whatever it liked where the listing's shape is; the name is now collapsed

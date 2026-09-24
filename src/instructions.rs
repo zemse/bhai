@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
+/// The most one instruction file may put in the system prompt. Roughly 16k tokens, which is
+/// already a large share of a window, and the prompt is a prefix every call of the session
+/// pays for.
+const MAX_FILE: usize = 64 * 1024;
+
 /// Project instruction files looked for in each directory, in this order.
 const PROJECT_FILES: [&str; 5] = [
     "AGENTS.md",
@@ -102,7 +107,7 @@ pub fn load(config: &Config, roots: &Roots) -> Loaded {
                 .push(format!("skipped {label} (outside project)"));
             continue;
         }
-        let Some(file) = read(&candidate.path, roots, &mut seen) else {
+        let Some(file) = read(&candidate.path, roots, &mut seen, &mut loaded.skipped) else {
             continue;
         };
         let allowed = allowed_roots(&candidate);
@@ -128,12 +133,12 @@ pub fn load(config: &Config, roots: &Roots) -> Loaded {
                     .push(format!("skipped import {written} ({reason})"));
             }
         }
+        let imported: Vec<File> = imports
+            .iter()
+            .filter_map(|import| read(import, roots, &mut seen, &mut loaded.skipped))
+            .collect();
         loaded.files.push(file);
-        loaded.files.extend(
-            imports
-                .iter()
-                .filter_map(|import| read(import, roots, &mut seen)),
-        );
+        loaded.files.extend(imported);
     }
     loaded
 }
@@ -205,14 +210,29 @@ fn project_dirs(cwd: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Read a file not seen before. Missing, unreadable and empty files are skipped.
-fn read(path: &Path, roots: &Roots, seen: &mut HashSet<PathBuf>) -> Option<File> {
+/// Read a file not seen before. Missing, unreadable and empty files are skipped; one over
+/// `MAX_FILE` is skipped and said, since it is the prompt every call pays for.
+fn read(
+    path: &Path,
+    roots: &Roots,
+    seen: &mut HashSet<PathBuf>,
+    skipped: &mut Vec<String>,
+) -> Option<File> {
     let canonical = path.canonicalize().ok()?;
     if !canonical.is_file() || !seen.insert(canonical) {
         return None;
     }
     let content = std::fs::read_to_string(path).ok()?;
     if content.trim().is_empty() {
+        return None;
+    }
+    if content.len() > MAX_FILE {
+        skipped.push(format!(
+            "skipped {} ({} KiB, over the {} KiB an instruction file may be)",
+            label(path, roots),
+            content.len() / 1024,
+            MAX_FILE / 1024
+        ));
         return None;
     }
     Some(File {
@@ -397,6 +417,27 @@ mod tests {
         let labels: Vec<_> = loaded.files.iter().map(|f| f.label.as_str()).collect();
         assert_eq!(labels, ["./CLAUDE.md", "./docs/style.md", "~/repo/top.md"]);
         assert!(loaded.skipped.is_empty());
+    }
+
+    /// The prompt is a prefix every call of the session pays for, so one file cannot be
+    /// the whole window. An import over the cap is refused the same way.
+    #[test]
+    fn a_file_over_the_cap_is_skipped_and_said() {
+        let f = Fixture::new();
+        let big = "x".repeat(MAX_FILE + 1);
+        f.write("home/repo/sub/CLAUDE.md", "intro\n@big.md\n");
+        f.write("home/repo/sub/big.md", &big);
+        f.write("home/repo/AGENTS.md", &big);
+        let loaded = load(&project_only(), &f.roots);
+        let labels: Vec<_> = loaded.files.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, ["./CLAUDE.md"]);
+        assert_eq!(
+            loaded.skipped,
+            [
+                "skipped ~/repo/AGENTS.md (64 KiB, over the 64 KiB an instruction file may be)",
+                "skipped ./big.md (64 KiB, over the 64 KiB an instruction file may be)",
+            ]
+        );
     }
 
     #[test]
