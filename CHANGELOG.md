@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- `bhai sessions prune [n]` deletes all but the `n` newest sessions, 20 by default, with
+  their child transcripts; a session another bhai has open is left where it is. Nothing
+  prunes on its own, since the transcripts are the debug record. The exit hint also stopped
+  parsing every session in the directory to work out whether this one is the newest, which
+  it did on every exit and inside the panic hook; it reads modification times instead.
+
 - A transcript past 65535 rows scrolls to its end instead of wrapping back to its top. The
   view is now drawn from the rows below the scroll rather than through the widget's own
   `u16` offset, which also stops it walking every row it is not drawing.

@@ -84,6 +84,18 @@ async fn main() -> Result<()> {
     }
     if args.first().is_some_and(|a| a == "sessions") {
         let dir = std::env::current_dir()?.join(sessions::DIR);
+        // `prune [n]` is the only way sessions are ever deleted: they are the debug record,
+        // so nothing removes one on its own.
+        if args.get(1).is_some_and(|a| a == "prune") {
+            let keep = match args.get(2) {
+                Some(n) => n
+                    .parse()
+                    .with_context(|| format!("`{n}` is not a number of sessions to keep"))?,
+                None => sessions::PRUNE_KEEP,
+            };
+            print!("{}", sessions::prune_report(&sessions::prune(&dir, keep)));
+            return Ok(());
+        }
         print!("{}", sessions::report(&sessions::list(&dir)));
         return Ok(());
     }
@@ -123,7 +135,7 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [sessions] [--probe [prompt]] [--cache-check] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [sessions [prune [n]]] [--probe [prompt]] [--cache-check] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }

@@ -1,6 +1,7 @@
 //! Saved sessions: each session's history as append-only JSONL under
 //! `.bhai/sessions/<id>.jsonl`, a header line first, so `--resume` can continue it.
 
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -487,12 +488,106 @@ pub fn exit_hint(dir: &Path, id: &str) -> Option<String> {
     if items == 0 {
         return None;
     }
-    // The newest that loads, since that is the one a bare `--resume` picks.
-    let newest = list(dir)
-        .iter()
-        .find(|s| s.details.is_ok())
-        .is_some_and(|s| s.id == id);
+    // By modification time, not by loading every session: this runs on every exit and
+    // inside the panic hook, and a directory of long sessions is a lot of JSON to parse
+    // for one boolean. A bare `--resume` picks the newest that loads, so a newer file
+    // that will not load makes this name the id a bare `--resume` would have found
+    // anyway. That is the safe side of the difference.
+    let newest = newest(dir).is_some_and(|path| path == self::path(dir, id));
     Some(hint(id, items, newest))
+}
+
+/// The most recently written session file under `dir`, read from the directory alone.
+fn newest(dir: &Path) -> Option<PathBuf> {
+    files(dir)
+        .into_iter()
+        .max_by_key(|(_, at)| *at)
+        .map(|(p, _)| p)
+}
+
+/// Every session file under `dir` with the time it was last written.
+fn files(dir: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
+        .filter_map(|path| {
+            let at = std::fs::metadata(&path).ok()?.modified().ok()?;
+            Some((path, at))
+        })
+        .collect()
+}
+
+/// Sessions `bhai sessions prune` keeps when it is not told a number.
+pub const PRUNE_KEEP: usize = 20;
+
+/// What a prune did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Pruned {
+    /// Sessions removed, oldest first.
+    pub removed: Vec<String>,
+    pub kept: usize,
+    /// Sessions another bhai has open, which were left alone.
+    pub skipped: Vec<String>,
+}
+
+/// Delete all but the `keep` most recently written sessions, with their child transcripts.
+/// Age is the only criterion: a session that will not load is as prunable as any other.
+pub fn prune(dir: &Path, keep: usize) -> Pruned {
+    let mut files = files(dir);
+    files.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    let mut pruned = Pruned {
+        kept: files.len().min(keep),
+        ..Pruned::default()
+    };
+    for (path, _) in files.into_iter().skip(keep) {
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // Deleting a locked file succeeds on unix, so the lock is checked first: a session
+        // another bhai is still appending to is left where it is.
+        let open = std::fs::File::open(&path)
+            .ok()
+            .is_some_and(|file| file.try_lock().is_err());
+        if open {
+            pruned.skipped.push(id);
+            pruned.kept += 1;
+            continue;
+        }
+        if std::fs::remove_file(&path).is_err() {
+            pruned.skipped.push(id);
+            pruned.kept += 1;
+            continue;
+        }
+        let children = dir.join(&id);
+        if children.is_dir() {
+            let _ = std::fs::remove_dir_all(&children);
+        }
+        pruned.removed.push(id);
+    }
+    pruned
+}
+
+/// What `bhai sessions prune` prints.
+pub fn prune_report(pruned: &Pruned) -> String {
+    let mut out = String::new();
+    for id in &pruned.removed {
+        let _ = writeln!(out, "pruned {id}");
+    }
+    for id in &pruned.skipped {
+        let _ = writeln!(out, "kept {id}: open in another bhai");
+    }
+    let _ = writeln!(
+        out,
+        "kept {}, removed {}",
+        pruned.kept,
+        pruned.removed.len()
+    );
+    out
 }
 
 /// The text of a user message item.
@@ -799,6 +894,56 @@ mod tests {
             .unwrap();
         assert_eq!(exit_hint(&dir, "s1").unwrap(), hint("s1", 5, false));
         assert_eq!(exit_hint(&dir, "s2").unwrap(), hint("s2", 1, true));
+        // A newer file that will not load is not what a bare `--resume` would pick, so the
+        // hint naming the id is the wordy answer rather than the wrong one.
+        std::fs::write(dir.join("broken.jsonl"), "{ not json\n").unwrap();
+        assert_eq!(exit_hint(&dir, "s2").unwrap(), hint("s2", 1, false));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Sessions are the debug record, so nothing deletes one on its own; `prune` is asked
+    /// for, takes the oldest first, and leaves alone what another bhai has open.
+    #[test]
+    fn prune_keeps_the_newest_and_leaves_an_open_session_alone() {
+        let dir = temp_dir();
+        let mut paths = Vec::new();
+        for (i, id) in ["s1", "s2", "s3", "s4"].iter().enumerate() {
+            let path = write(&dir, id, &items()[..1]);
+            let at = std::time::SystemTime::now() - std::time::Duration::from_secs(100 - i as u64);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+            paths.push(path);
+        }
+        // A child transcript goes with the session it belongs to.
+        let children = dir.join("s1");
+        std::fs::create_dir_all(&children).unwrap();
+        std::fs::write(children.join("child-a.jsonl"), "{}\n").unwrap();
+        // s2 is open in another bhai.
+        let held = std::fs::File::open(&paths[1]).unwrap();
+        held.lock().unwrap();
+
+        let pruned = prune(&dir, 2);
+        assert_eq!(pruned.removed, ["s1"]);
+        assert_eq!(pruned.skipped, ["s2"]);
+        assert_eq!(pruned.kept, 3);
+        assert!(!paths[0].exists() && !children.exists());
+        assert!(paths.iter().skip(1).all(|p| p.exists()));
+        assert!(prune_report(&pruned).contains("kept s2: open in another bhai"));
+        assert!(prune_report(&pruned).ends_with("kept 3, removed 1\n"));
+
+        // Fewer sessions than the number to keep is nothing to do.
+        assert_eq!(
+            prune(&dir, 20),
+            Pruned {
+                kept: 3,
+                ..Pruned::default()
+            }
+        );
+        drop(held);
         let _ = std::fs::remove_dir_all(dir);
     }
 
