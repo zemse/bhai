@@ -83,7 +83,12 @@ back: what you have already read, or could read in a few calls, is cheaper to do
 It is held to what the permission rules allow outright, so it may be refused a call you \
 would have been given. Pick the identity whose tools and skills fit the task; one with \
 no model of its own runs on yours, at your effort. Do not delegate edits that depend on \
-each other.\n",
+each other.\n\nA child runs detached: the call hands back its id and returns at once, and \
+the report arrives later as a message. Start everything you want running in one go rather \
+than one at a time, then either carry on with work that does not depend on them or say \
+what you have started and stop. The user has the session back either way, and a report \
+that lands while you are idle starts a turn of its own, so there is nothing to wait for \
+and nothing to poll.\n",
         );
         for identity in listed {
             let _ = write!(self.text, "\n- {}: {}", identity.name, identity.description);

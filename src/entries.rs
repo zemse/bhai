@@ -79,6 +79,11 @@ impl Entries {
             // in the queue is shown above the prompt box instead, where the eye that
             // typed it already is, and where it is plainly not part of the history yet.
             Event::User(message) => self.push(Entry::User(message.clone())),
+            // Nothing was typed: the reports themselves follow, as the tool results
+            // they are, so this only says why the agent started working again.
+            Event::Resumed(what) => {
+                self.push(Entry::Info(format!("resumed on a child's report: {what}")))
+            }
             Event::Queued { .. } => {}
             Event::Text(delta) => self.append(delta, Stream::Assistant),
             Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
@@ -151,7 +156,13 @@ impl Entries {
             let entry = match item["type"].as_str() {
                 Some("message") if item["role"] == "user" => match summarised(&text("content")) {
                     Some(summary) => Entry::Summary(summary),
-                    None => Entry::User(text("content")),
+                    // A child's report is carried in a user message, since the call that
+                    // started the child was answered long before. It is not something
+                    // the user said, so it is not shown as one.
+                    None => match reported(&text("content")) {
+                        Some(report) => Entry::Output(report),
+                        None => Entry::User(text("content")),
+                    },
                 },
                 Some("message") => Entry::Assistant(text("content")),
                 Some("reasoning") if !text("summary").is_empty() => {
@@ -386,6 +397,13 @@ impl Entry {
             None => line.to_string(),
         }
     }
+}
+
+/// The report inside a message carrying a finished child's result, without the line
+/// that marks it as one.
+fn reported(text: &str) -> Option<String> {
+    let rest = text.strip_prefix(crate::agent::CHILD_RESULT)?;
+    Some(rest.trim_start().to_string())
 }
 
 /// The summary inside a folded user message, without the line that marks it as one.

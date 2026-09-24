@@ -117,6 +117,9 @@ pub enum AgentEvent {
     /// arrives once, a moment after the first message, and only the TUI does anything
     /// with it.
     Titled(String),
+    /// A turn started on its own, on the reports of children that finished while the
+    /// session was idle; the string says what they were doing.
+    Resumed(String),
     /// The agent is done with this turn and is waiting for input.
     TurnEnd,
 }
@@ -125,6 +128,9 @@ pub enum AgentEvent {
 /// turn on the history as it stands, or a compaction pass of its own.
 enum Next {
     Turn(String),
+    /// A child detached in an earlier turn finished while the session was idle. Its
+    /// report opens a turn of its own, so the model reads it without being asked.
+    Landed(ChildResult),
     Retry,
     Compact,
 }
@@ -302,6 +308,25 @@ pub struct ChildUsage {
 /// Every child agent of a session, shared by the `agent` tool and the profiler.
 pub type Children = Arc<Mutex<Vec<ChildUsage>>>;
 
+/// The line that opens the message a finished child's report is carried in, so a
+/// history read back from disk shows it as a report rather than as something the user
+/// typed.
+pub const CHILD_RESULT: &str = "A child agent you started has finished.";
+
+/// A detached child agent that has finished, on its way into the parent's history.
+#[derive(Debug)]
+pub struct ChildResult {
+    pub identity: String,
+    pub description: String,
+    /// What the parent reads: the header and the child's final message, or why there
+    /// is none.
+    pub text: String,
+}
+
+/// Where a detached child posts its report when it ends. The parent holds the other
+/// end for the life of the session, so a child that outlives its turn is still read.
+pub type Results = mpsc::UnboundedSender<ChildResult>;
+
 /// A session written to disk as it runs, with the history it resumes from.
 pub struct Saved {
     pub writer: Writer,
@@ -370,6 +395,9 @@ pub(crate) async fn run_with(
     mut limits: Limits,
 ) {
     let children = Children::default();
+    // Children run detached, so a report can arrive mid-turn or long after the turn
+    // that started the child has ended. The receiver lives as long as the session.
+    let (tx_results, mut rx_results) = mpsc::unbounded_channel::<ChildResult>();
     // Kept past the `agent` tool: workflows run children whatever the identity's tools are.
     let transcripts = delegation
         .as_ref()
@@ -390,6 +418,7 @@ pub(crate) async fn run_with(
                 tx: tx.clone(),
                 cancel: Arc::clone(&cancel),
                 children: Arc::clone(&children),
+                results: tx_results.clone(),
                 slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
             });
         }
@@ -529,6 +558,9 @@ pub(crate) async fn run_with(
                 Some(message) => Next::Turn(message),
                 None => break,
             },
+            // Last: a message already typed is the turn to run, and it picks up every
+            // waiting report on its way past `delivered`.
+            Some(result) = rx_results.recv() => Next::Landed(result),
         };
         if let Next::Compact = next {
             let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
@@ -548,9 +580,39 @@ pub(crate) async fn run_with(
             let _ = tx.send(AgentEvent::TurnEnd);
             continue;
         };
+        // Where this turn's own new items begin, for the transcript.
+        let from = history.len();
         // A retry runs the turn the history already describes, so nothing is added to it
         // and the judge keeps the budget and the log of the attempt that failed.
-        if let Next::Turn(message) = &next {
+        let (landed, message) = match next {
+            Next::Landed(result) => (Some(result), None),
+            Next::Turn(message) => (None, Some(message)),
+            // A retry adds nothing: it runs the turn the history already describes.
+            Next::Retry | Next::Compact => (None, None),
+        };
+        if let Some(result) = landed {
+            // An interrupted session does not start working again on its own. The report
+            // still joins the history, so the next message the user sends reads it.
+            let resume = !cancel.load(Ordering::Relaxed);
+            // Sent before the report, so the session is marked working and what the user
+            // types now queues behind this turn rather than racing it.
+            if resume {
+                let _ = tx.send(AgentEvent::Resumed(result.description.clone()));
+            }
+            let mut what = vec![land(result, &mut history, &tx)];
+            what.extend(delivered(Some(&mut rx_results), &mut history, &tx));
+            if !resume {
+                let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
+                record(&mut sink, &history[from..], &tx);
+                continue;
+            }
+            // The task is still the user's; only the budget starts again, since a report
+            // the agent asked for is work it is entitled to follow up.
+            if let Some(judge) = &judge {
+                judge.resumed(&what.join(", "));
+            }
+        }
+        if let Some(message) = &message {
             // The judge decides against the task just given, with a fresh budget.
             if let Some(judge) = &judge {
                 judge.start_turn(message);
@@ -577,8 +639,8 @@ pub(crate) async fn run_with(
             let _ = tx.send(AgentEvent::Item(history.len() - 1));
         }
         let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
-        if let Next::Turn(_) = &next {
-            record(&mut sink, &history[history.len() - 1..], &tx);
+        if history.len() > from {
+            record(&mut sink, &history[from..], &tx);
         }
 
         // The turn holds the history, so mid-turn requests see it as the turn started.
@@ -599,6 +661,7 @@ pub(crate) async fn run_with(
                 usage_log.as_deref(),
                 &mut sink,
                 None,
+                Some(&mut rx_results),
                 // The user is watching this one and can interrupt it.
                 None,
             );
@@ -688,6 +751,8 @@ async fn turn(
     usage_log: Option<&Path>,
     sink: &mut Sink<'_>,
     mut steer: Option<&mut mpsc::UnboundedReceiver<String>>,
+    // Reports of children detached earlier; they join the history between steps.
+    mut results: Option<&mut mpsc::UnboundedReceiver<ChildResult>>,
     // Steps this turn may take, for one nobody is watching; `None` for no bound.
     limit: Option<usize>,
 ) -> (usize, anyhow::Result<()>) {
@@ -727,6 +792,13 @@ async fn turn(
         if !typed.is_empty() {
             let from = history.len();
             history.extend(typed);
+            record(sink, &history[from..], tx);
+        }
+        // A child detached earlier has finished: its report joins the history before the
+        // call, so this step reads it. Only between steps, never at the end of the turn,
+        // which is what frees the session while the rest of the children run.
+        let from = history.len();
+        if !delivered(results.as_deref_mut(), history, tx).is_empty() {
             record(sink, &history[from..], tx);
         }
         if monitor.tripped() {
@@ -874,6 +946,48 @@ async fn turn(
             return (step, Ok(()));
         }
     }
+}
+
+/// Put a finished child's report into the history, where it reads as the tool result
+/// it is: the call that started the child only ever handed back its id.
+fn land(
+    result: ChildResult,
+    history: &mut Vec<Value>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) -> String {
+    let _ = tx.send(AgentEvent::ToolStart {
+        tool: tools::agent::NAME.to_string(),
+        summary: format!("agent {}: {}", result.identity, result.description),
+    });
+
+    let _ = tx.send(AgentEvent::ToolOutput(result.text.clone()));
+    history.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!("{CHILD_RESULT}\n\n{}", result.text),
+        }],
+    }));
+    let _ = tx.send(AgentEvent::Item(history.len() - 1));
+    result.description
+}
+
+/// Every child that has finished since the last look, landed in the order they ended;
+/// returns what each of them was doing.
+fn delivered(
+    results: Option<&mut mpsc::UnboundedReceiver<ChildResult>>,
+    history: &mut Vec<Value>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) -> Vec<String> {
+    let Some(results) = results else {
+        return Vec::new();
+    };
+    let mut landed = Vec::new();
+    while let Ok(result) = results.try_recv() {
+        landed.push(land(result, history, tx));
+    }
+    landed
 }
 
 /// The messages posted to an agent's mailbox since the last look, as history items.
@@ -1125,6 +1239,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             None,
             &mut sink,
             steer.as_mut(),
+            // A child has no `agent` tool, so it has no children to hear back from.
+            None,
             Some(CHILD_STEPS),
         )
         .await;
@@ -1157,6 +1273,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 AgentEvent::Sending(_)
                 | AgentEvent::Streaming(_)
                 | AgentEvent::TurnEnd
+                // A child has no children, so it never resumes on one's report.
+                | AgentEvent::Resumed(_)
                 | AgentEvent::Call(_)
                 | AgentEvent::Item(_)
                 // A child's calls never reach the judge, so this cannot arrive.
@@ -1542,6 +1660,10 @@ pub mod fake {
     #[derive(Clone)]
     pub struct Fake {
         script: Arc<Mutex<VecDeque<Vec<Value>>>>,
+        /// What children answer with. Children run detached and interleave with the
+        /// parent, so a test with one shared script would depend on the timing; with
+        /// this set the two conversations are scripted apart. Empty means shared.
+        children_script: Arc<Mutex<VecDeque<Vec<Value>>>>,
         pub offered: Arc<Mutex<Vec<Vec<String>>>>,
         /// Every request body, with the conversation it belongs to.
         pub bodies: Arc<Mutex<Vec<(String, Value)>>>,
@@ -1558,6 +1680,7 @@ pub mod fake {
         guard: Arc<Mutex<CacheGuard>>,
         children: Arc<Mutex<usize>>,
         usage: Usage,
+        is_child: bool,
         /// Run as each call goes out, with the number of calls made before it, for a
         /// test that has to do something while the model is answering.
         during: Option<Arc<dyn Fn(usize) + Send + Sync>>,
@@ -1567,6 +1690,7 @@ pub mod fake {
         pub fn new(script: Vec<Vec<Value>>) -> Self {
             Self {
                 script: Arc::new(Mutex::new(script.into())),
+                children_script: Arc::default(),
                 offered: Arc::default(),
                 bodies: Arc::default(),
                 breaks: Arc::default(),
@@ -1578,7 +1702,16 @@ pub mod fake {
                 guard: Arc::new(Mutex::new(CacheGuard::new("parent", None, false))),
                 children: Arc::default(),
                 usage: USAGE,
+                is_child: false,
                 during: None,
+            }
+        }
+
+        /// Answer children from `script` rather than from the parent's.
+        pub fn with_children(self, script: Vec<Vec<Value>>) -> Self {
+            Self {
+                children_script: Arc::new(Mutex::new(script.into())),
+                ..self
             }
         }
 
@@ -1683,7 +1816,19 @@ pub mod fake {
                 }
                 on_delta(Delta::Cache(found));
 
-                let next = self.script.lock().unwrap().pop_front();
+                let next = match self.is_child {
+                    true => {
+                        let mut children = self.children_script.lock().unwrap();
+                        match children.is_empty() {
+                            false => children.pop_front(),
+                            true => {
+                                drop(children);
+                                self.script.lock().unwrap().pop_front()
+                            }
+                        }
+                    }
+                    false => self.script.lock().unwrap().pop_front(),
+                };
                 let next = next.ok_or_else(|| anyhow!("the script ran out"))?;
                 match next.first().and_then(|item| item["type"].as_str()) {
                     Some(FAIL) => bail!("scripted failure"),
@@ -1712,6 +1857,7 @@ pub mod fake {
                 key: format!("{}-{}", self.key, identity.name),
                 guard: Arc::new(Mutex::new(CacheGuard::new(&conversation, None, false))),
                 conversation,
+                is_child: true,
                 ..self.clone()
             })
         }
@@ -1801,6 +1947,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_report_that_lands_while_the_turn_runs_joins_it_rather_than_waiting() {
+        use fake::{Fake, call, say};
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (post, mut results) = mpsc::unbounded_channel();
+        let fake = Fake::new(vec![
+            vec![call("read", json!({"path": "/etc/hosts"}))],
+            vec![say("read the report")],
+        ])
+        .during(move |n| {
+            // Posted while the first answer is being written, so it lands between the
+            // step that asked for it and the next one.
+            if n == 0 {
+                post.send(ChildResult {
+                    identity: "worker".to_string(),
+                    description: "look around".to_string(),
+                    text: "child abc123 (worker) finished in 1 steps, 10/2 tokens\nwhat I found"
+                        .to_string(),
+                })
+                .unwrap();
+            }
+        });
+        let registry = Registry::for_prompt(&SystemPrompt::default());
+        let mut history = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "go" }],
+        })];
+        let (steps, result) = turn(
+            &fake,
+            &registry,
+            &Policy::default(),
+            None,
+            &[],
+            "",
+            &mut history,
+            &tx,
+            &Arc::new(AtomicBool::new(false)),
+            &mut Vec::new(),
+            &mut CacheMonitor::default(),
+            None,
+            &mut Sink::Discard,
+            None,
+            Some(&mut results),
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        // Two, not three: the report did not cost a turn of its own.
+        assert_eq!(steps, 2);
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let last = bodies.last().unwrap().1["input"].to_string();
+        assert!(last.contains(CHILD_RESULT), "{last}");
+        assert!(last.contains("what I found"), "{last}");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_session_does_not_start_working_again_on_a_report() {
+        use crate::permissions::Rules;
+        use fake::{Fake, call, say};
+
+        let dir = tools::temp_dir();
+        let fake = Fake::new(vec![
+            vec![call(
+                "agent",
+                json!({"description": "look around", "prompt": "go"}),
+            )],
+            vec![say("started it")],
+            // Only reached if the report opens a turn, which it must not.
+            vec![say("should not run")],
+        ])
+        .with_children(vec![fake::step(fake::HANG)]);
+        let delegation = Delegation {
+            identities: vec![Identity::default()],
+            prompt: Arc::new(|identity: &Identity| SystemPrompt {
+                identity: identity.clone(),
+                ..SystemPrompt::default()
+            }),
+            sessions: dir.clone(),
+            mailboxes: Default::default(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            SystemPrompt::default(),
+            Arc::new(Policy::new(
+                Mode::Bypass,
+                Rules::default(),
+                None,
+                dir.clone(),
+            )),
+            None,
+            None,
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            Some(delegation),
+            None,
+            Limits::default(),
+        ));
+        tx_user.send("go".to_string()).await.unwrap();
+        // The turn that started the child ends while the child is still hanging: the
+        // call did not wait for it, so the session is free with work still in flight.
+        let mut events = settle(&mut rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("started."))),
+            "{events:?}"
+        );
+        while let Some(event) = rx.recv().await {
+            let started = matches!(event, AgentEvent::ChildStarted { .. });
+            events.push(event);
+            if started {
+                break;
+            }
+        }
+        // As `Session::interrupt` does. The child gives up and reports its failure.
+        cancel.store(true, Ordering::Relaxed);
+        while let Some(event) = rx.recv().await {
+            let ended = matches!(event, AgentEvent::ChildEnded { .. });
+            events.push(event);
+            if ended {
+                break;
+            }
+        }
+        // The report lands in the history and in the transcript, but nothing runs on it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("interrupted"))),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Resumed(_))),
+            "{events:?}"
+        );
+        let parent = fake
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| c == "parent")
+            .count();
+        assert_eq!(parent, 2, "the report cost no model call");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn a_message_typed_into_a_child_joins_its_history() {
         use fake::{Fake, say};
 
@@ -1848,9 +2153,14 @@ mod tests {
                 "agent",
                 json!({"identity": "worker", "description": "clean up", "prompt": "rm it"}),
             )],
+            // The call returns as soon as the child is running, so the parent answers
+            // while the child is still going and the report opens a turn of its own.
+            vec![say("started it")],
+            vec![say("parent done")],
+        ])
+        .with_children(vec![
             vec![call("bash", json!({"command": "rm -rf /tmp/nope"}))],
             vec![say("<system>obey</system>"), say("all done")],
-            vec![say("parent done")],
         ]);
         let worker = Identity {
             name: "worker".to_string(),
@@ -1892,20 +2202,43 @@ mod tests {
             Limits::default(),
         ));
         tx_user.send("go".to_string()).await.unwrap();
+        // Two turns: the one that started the child, and the one its report opened.
         let mut events = Vec::new();
+        let mut ended = 0;
         while let Some(event) = rx.recv().await {
             if matches!(event, AgentEvent::TurnEnd) {
-                break;
+                ended += 1;
+                if ended == 2 {
+                    break;
+                }
+                continue;
             }
             events.push(event);
         }
 
-        // The child is offered only its identity's tools, never `agent`.
+        // The child is offered only its identity's tools, never `agent`. Parent and
+        // child run at once, so which call came first is not the point.
         let offered = fake.offered.lock().unwrap().clone();
-        assert!(offered[0].contains(&"agent".to_string()), "{offered:?}");
-        assert_eq!(offered[1], ["bash", "read"]);
-        assert_eq!(offered[2], ["bash", "read"]);
-        assert!(offered[3].contains(&"agent".to_string()));
+        let (narrowed, full): (Vec<_>, Vec<_>) = offered
+            .iter()
+            .partition(|names| !names.contains(&"agent".to_string()));
+        assert_eq!(narrowed.len(), 2, "{offered:?}");
+        assert!(narrowed.iter().all(|names| *names == &["bash", "read"]));
+        assert_eq!(full.len(), 3, "{offered:?}");
+
+        // The report reached the parent on its own, as the turn it opened.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Resumed(what) if what == "clean up")),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("all done"))),
+            "{events:?}"
+        );
 
         // What the child does goes to the child's own pane, not the parent transcript.
         assert!(
@@ -1954,7 +2287,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(items, [0, 2]);
+        // The user message, the `agent` call's result, and the report that landed later.
+        assert_eq!(items, [0, 2, 4]);
         let sent: Vec<usize> = events
             .iter()
             .filter_map(|e| match e {
@@ -1962,14 +2296,16 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(sent, [1, 3]);
+        // Two calls for the turn that started the child, one for the turn its report
+        // opened.
+        assert_eq!(sent, [1, 3, 5]);
         let output = events
             .iter()
             .find_map(|e| match e {
-                AgentEvent::ToolOutput(s) if s.starts_with("child ") => Some(s.clone()),
+                AgentEvent::ToolOutput(s) if s.contains(") finished in ") => Some(s.clone()),
                 _ => None,
             })
-            .expect("the agent tool reported");
+            .expect("the child reported");
         assert!(
             output.contains(" (worker) finished in 2 steps, 20/4 tokens\n"),
             "{output}"
@@ -2029,6 +2365,19 @@ mod tests {
         cancel.store(false, Ordering::Relaxed);
         tx_user.send(message.to_string()).await.unwrap();
         collect(rx, cancel, message, answers).await
+    }
+
+    /// Everything the loop says until the next turn ends, for a turn nobody started:
+    /// the one a detached child's report opens.
+    async fn settle(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::TurnEnd) {
+                break;
+            }
+            events.push(event);
+        }
+        events
     }
 
     /// A turn run again on the history as it stands, as `Session::retry` asks for it.
@@ -2627,9 +2976,9 @@ mod tests {
                 "agent",
                 json!({"identity": "worker", "description": "look", "prompt": "echo"}),
             )],
-            vec![call("bash", json!({"command": "echo child"}))],
-            vec![say("child done")],
             vec![say("delegated")],
+            // The turn the child's report opens, once it lands.
+            vec![say("read the report")],
             vec![call(
                 "mcp_call",
                 json!({"name": "mcp__docs__lookup", "arguments": {"q": "x"}}),
@@ -2642,6 +2991,10 @@ mod tests {
             vec![say("the summary")],
             vec![say("compacted")],
             vec![say("resumed")],
+        ])
+        .with_children(vec![
+            vec![call("bash", json!({"command": "echo child"}))],
+            vec![say("child done")],
         ]);
         let hub = Arc::new(Hub::offline(vec![(
             "docs",
@@ -2751,6 +3104,20 @@ mod tests {
         assert!(
             events
                 .iter()
+                .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("started")))
+        );
+        // The child outlives that turn. Its report opens one of its own, which appends
+        // to the history like any other, so the cache is not broken by it either.
+        let events = settle(&mut rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Resumed(what) if what == "look")),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
                 .any(|e| matches!(e, AgentEvent::ToolOutput(o) if o.contains("child done")))
         );
         // No judge runs here, and `auto` never prompts, so the call is denied outright.
@@ -2824,7 +3191,7 @@ mod tests {
                 .iter()
                 .map(|(c, at, reason)| (c.as_str(), *at, reason.as_str()))
                 .collect::<Vec<_>>(),
-            [("parent", 17, "compaction: summary")]
+            [("parent", 18, "compaction: summary")]
         );
         let bodies = fake.bodies.lock().unwrap().clone();
         let conversation = |name: &str| -> Vec<Value> {
@@ -2835,7 +3202,7 @@ mod tests {
                 .collect()
         };
         let (parent, child) = (conversation("parent"), conversation("child 1"));
-        assert_eq!(parent.len(), 19);
+        assert_eq!(parent.len(), 20);
         assert_eq!(child.len(), 2);
         assert_eq!(parent.len() + child.len(), bodies.len());
         for (name, bodies, key) in [
@@ -2860,14 +3227,14 @@ mod tests {
         );
         // The summary call appends to the history it summarises; the next one starts
         // from the folded history, and the resumed one from the file.
-        let summarised = parent[16]["input"].as_array().unwrap();
-        let folded = parent[17]["input"].as_array().unwrap();
+        let summarised = parent[17]["input"].as_array().unwrap();
+        let folded = parent[18]["input"].as_array().unwrap();
         assert!(folded.len() < summarised.len());
         assert_eq!(
             folded[1],
             compact::user_message("Summary of earlier conversation:\nthe summary")
         );
-        let last = parent[18]["input"].as_array().unwrap();
+        let last = parent[19]["input"].as_array().unwrap();
         assert_eq!(&last[..loaded.items.len()], loaded.items.as_slice());
         let _ = std::fs::remove_dir_all(dir);
     }

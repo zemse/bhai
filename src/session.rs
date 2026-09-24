@@ -28,6 +28,10 @@ const EVENT_BUFFER: usize = 4096;
 pub enum Event {
     /// A user message was accepted and a turn started.
     User(String),
+    /// A turn started on its own, on the reports of children that finished while the
+    /// session was idle; the string says what they were doing. Nothing was typed, so
+    /// the transcript shows the reports, not a message.
+    Resumed(String),
     /// What this session is working on, in a few words. The TUI puts it in the
     /// terminal's title; nothing else has a use for it.
     Titled(String),
@@ -429,9 +433,12 @@ impl Session {
         Some(approval.id)
     }
 
-    /// Stop the running turn, rejecting every pending approval. Returns false when idle.
+    /// Stop the running turn and every child still running, rejecting every pending
+    /// approval. Returns false when there was nothing to stop.
     pub fn interrupt(&self) -> bool {
-        if !self.lock().working {
+        // A child detached in an earlier turn outlives it, so an idle session can still
+        // have work in flight to stop.
+        if !self.lock().working && !self.child_running() {
             return false;
         }
         // Cancel first so the agent does not move on to the next call once rejected.
@@ -708,6 +715,13 @@ impl Session {
             AgentEvent::Cleared => Event::Cleared,
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnFailed(s) => Event::TurnFailed(s),
+            // The agent is working again without anything having been typed, so the
+            // session says so: what the user sends now queues behind it, as it would
+            // behind any other turn.
+            AgentEvent::Resumed(what) => {
+                inner.working = true;
+                Event::Resumed(what)
+            }
             AgentEvent::TurnEnd => {
                 // The session keeps working while queued prompts wait behind the turn.
                 inner.working = !inner.queue.is_empty();
@@ -733,8 +747,11 @@ impl Session {
     fn route(&self, event: &Event) {
         let mut children = self.panes();
         match event {
-            // The panel lists the running turn's children, so a new turn starts empty.
-            Event::User(_) => children.clear(),
+            // The panel lists what is running and what this turn started, so a new turn
+            // clears the finished rows and leaves the children still going.
+            Event::User(_) | Event::Resumed(_) => {
+                children.retain(|pane| pane.row.state == ChildState::Running)
+            }
             Event::ChildStarted {
                 id,
                 identity,
@@ -802,6 +819,13 @@ impl Session {
             event: Box::new(Event::User(text)),
         });
         Ok(())
+    }
+
+    /// Whether any child agent is still running, detached from the turn that started it.
+    pub fn child_running(&self) -> bool {
+        self.panes()
+            .iter()
+            .any(|pane| pane.row.state == ChildState::Running)
     }
 
     /// The child agents of the running turn, for the panel.
@@ -943,14 +967,43 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_lists_the_running_turns_children() {
+    fn a_new_turn_clears_the_finished_panes_and_keeps_the_running_ones() {
         let (session, _rx) = session();
         child(&session, "a1", "count the files");
+        child(&session, "b2", "read the docs");
+        session.on_agent(AgentEvent::ChildEnded {
+            id: "a1".to_string(),
+            ok: true,
+        });
+        assert!(session.child_running());
         session.publish(Event::User("something else".to_string()));
+        let rows = session.children();
+        assert_eq!(rows.len(), 1, "the child that finished is gone");
+        assert_eq!(rows[0].id, "b2", "the one still running is not");
+
+        session.on_agent(AgentEvent::ChildEnded {
+            id: "b2".to_string(),
+            ok: true,
+        });
+        assert!(!session.child_running());
+        session.publish(Event::User("and again".to_string()));
+        assert!(session.children().is_empty());
+    }
+
+    #[test]
+    fn an_idle_session_with_a_child_still_running_can_be_interrupted() {
+        let (session, _rx) = session();
+        assert!(!session.interrupt(), "nothing running, nothing to stop");
+        child(&session, "a1", "count the files");
         assert!(
-            session.children().is_empty(),
-            "a new turn starts with an empty panel"
+            session.interrupt(),
+            "the detached child is still work in flight"
         );
+        session.on_agent(AgentEvent::ChildEnded {
+            id: "a1".to_string(),
+            ok: false,
+        });
+        assert!(!session.interrupt());
     }
 
     #[test]

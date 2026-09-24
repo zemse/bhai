@@ -426,7 +426,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('c') if ctrl => {
-                if self.working {
+                if self.busy() {
                     self.interrupt();
                 } else {
                     self.quit = true;
@@ -436,7 +436,7 @@ impl App {
             // The panel's rows, in order, and then back out to the transcript.
             KeyCode::Char('o') if ctrl => self.cycle_child(),
             KeyCode::Esc if self.inside.is_some() => self.leave_child(),
-            KeyCode::Esc if self.working => self.interrupt(),
+            KeyCode::Esc if self.busy() => self.interrupt(),
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
             KeyCode::Char('y') if ctrl => self.copy(),
@@ -1022,7 +1022,7 @@ impl App {
 
     pub fn tick(&mut self) {
         self.branch.refresh();
-        if self.working {
+        if self.busy() {
             self.spinner = self.spinner.wrapping_add(1);
         }
         // A selection drag still held past the edge of the transcript, which the
@@ -1520,6 +1520,12 @@ impl App {
     fn interrupt(&mut self) {
         self.pending = None;
         self.session.interrupt();
+    }
+
+    /// Whether there is anything to stop: a turn, or a child still running after the
+    /// turn that started it has ended.
+    fn busy(&self) -> bool {
+        self.working || self.session.child_running()
     }
 
     fn scroll_by(&mut self, delta: isize) {

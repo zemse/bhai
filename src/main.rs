@@ -826,6 +826,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
                 println!("\n[cache break] {}: {}", found.field, found.detail)
             }
             AgentEvent::Judging(Some(call)) => println!("[judging] {call}"),
+            AgentEvent::Resumed(what) => println!("\n[resumed] {what}"),
             AgentEvent::Titled(name) => println!("[title] {name}"),
             // A probe prints what the model says, and the prompt behind it is a tui
             // readout: the size is already in the usage it prints when the call ends.
@@ -903,6 +904,7 @@ async fn cache_check(setup: Setup) -> Result<bool> {
             tx: mpsc::unbounded_channel().0,
             cancel: Arc::clone(&cancel),
             children: agent::Children::default(),
+            results: mpsc::unbounded_channel().0,
             slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
         });
     }

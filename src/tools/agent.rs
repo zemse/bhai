@@ -9,13 +9,14 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
 
 use super::{BoxFuture, Tool, string_arg, truncate};
-use crate::agent::{self, AgentEvent, Child, Children, Delegation, Model};
+use crate::agent::{self, AgentEvent, Child, ChildResult, Children, Delegation, Model, Results};
 use crate::identity::{self, Identity};
 use crate::permissions::Policy;
 
 pub const NAME: &str = "agent";
 
-/// Children of one parent running at once.
+/// Children of one parent running at once. A call past that is still accepted; the
+/// child waits for a slot rather than the parent waiting for the call.
 pub const MAX_RUNNING: usize = 3;
 
 /// Lowercased fragments that make a line look like a turn marker or control tag.
@@ -47,6 +48,8 @@ pub struct Agent {
     pub tx: mpsc::UnboundedSender<AgentEvent>,
     pub cancel: Arc<AtomicBool>,
     pub children: Children,
+    /// Where a finished child posts its report, for the parent to read between steps.
+    pub results: Results,
     pub slots: Arc<Semaphore>,
     /// This session's transcript directory.
     pub transcripts: PathBuf,
@@ -61,8 +64,12 @@ impl Tool for Agent {
         json!({
             "type": "function",
             "name": NAME,
-            "description": "Run a task in a child agent with a fresh context and return its \
-        final message. The child cannot see this conversation, so give it everything it needs.",
+            "description": "Start a task in a child agent with a fresh context. The call \
+        returns as soon as the child is running, so several can be started in a row and run \
+        at once; do not wait for one before starting the next, and do not poll. The child's \
+        report arrives on its own, as a message, whether the turn is still going or has long \
+        ended. Get on with other work, or say what you have started and stop. The child cannot \
+        see this conversation, so give it everything it needs.",
             "strict": false,
             "parameters": {
                 "type": "object",
@@ -101,52 +108,87 @@ impl Tool for Agent {
                 Ok(parsed) => parsed,
                 Err(e) => return (e, false),
             };
-            let Ok(_slot) = self.slots.acquire().await else {
-                return ("No child agent slot is available.".to_string(), false);
-            };
             let id = uuid::Uuid::new_v4().simple().to_string()[..6].to_string();
-            let transcript = self.transcripts.join(format!("child-{id}.jsonl"));
-            let model = self.model.child(&identity);
-            let (_mailbox, steer) = agent::Mailbox::open(&self.delegation.mailboxes, &id);
-            let finished = agent::run_child(Child {
-                id: &id,
-                description,
-                task,
-                prompt: (self.delegation.prompt)(&identity),
-                model: model.as_ref(),
-                policy: &self.policy,
-                tx: &self.tx,
-                cancel: &self.cancel,
-                transcript: Some(&transcript),
-                children: &self.children,
-                steer: Some(steer),
-            })
-            .await;
+            let waiting = MAX_RUNNING.saturating_sub(self.slots.available_permits());
+            self.spawn(&id, &identity, description, task);
             let name = &identity.name;
-            match finished.result {
-                Ok(text) => (
-                    format!(
-                        "child {id} ({name}) finished in {} steps, {}/{} tokens\n{}",
-                        finished.steps,
-                        finished.usage.input,
-                        finished.usage.output,
-                        truncate(&sanitize(&text))
-                    ),
-                    true,
+            let queued = match waiting >= MAX_RUNNING {
+                true => format!(
+                    ", behind the {MAX_RUNNING} already running: it starts when one of them ends"
                 ),
-                Err(e) => (
-                    format!(
-                        "child {id} ({name}) failed after {} steps, {}/{} tokens: {e:#}",
-                        finished.steps, finished.usage.input, finished.usage.output,
-                    ),
-                    false,
+                false => String::new(),
+            };
+            (
+                format!(
+                    "child {id} ({name}) started{queued}. Its report will reach you as a \
+message when it finishes; nothing else is needed to collect it."
                 ),
-            }
+                true,
+            )
         })
     }
 }
 
 impl Agent {
+    /// Run the child detached, so the turn that asked for it carries on. It holds a
+    /// slot for as long as it runs and posts its report when it ends; the parent reads
+    /// that between steps, or in a turn of its own once the session is idle.
+    fn spawn(&self, id: &str, identity: &Identity, description: &str, task: &str) {
+        let (id, description, task) = (id.to_string(), description.to_string(), task.to_string());
+        let identity = identity.clone();
+        let transcript = self.transcripts.join(format!("child-{id}.jsonl"));
+        let model = self.model.child(&identity);
+        let prompt = (self.delegation.prompt)(&identity);
+        let (mailboxes, policy) = (
+            Arc::clone(&self.delegation.mailboxes),
+            Arc::clone(&self.policy),
+        );
+        let (tx, cancel) = (self.tx.clone(), Arc::clone(&self.cancel));
+        let (children, slots) = (Arc::clone(&self.children), Arc::clone(&self.slots));
+        let results = self.results.clone();
+        tokio::spawn(async move {
+            // Past `MAX_RUNNING` the child waits here rather than the parent waiting
+            // for the call, so the model is never blocked on a slot.
+            let Ok(_slot) = slots.acquire().await else {
+                return;
+            };
+            let (_mailbox, steer) = agent::Mailbox::open(&mailboxes, &id);
+            let finished = agent::run_child(Child {
+                id: &id,
+                description: &description,
+                task: &task,
+                prompt,
+                model: model.as_ref(),
+                policy: &policy,
+                tx: &tx,
+                cancel: &cancel,
+                transcript: Some(&transcript),
+                children: &children,
+                steer: Some(steer),
+            })
+            .await;
+            let name = &identity.name;
+            let text = match finished.result {
+                Ok(text) => format!(
+                    "child {id} ({name}) finished in {} steps, {}/{} tokens\n{}",
+                    finished.steps,
+                    finished.usage.input,
+                    finished.usage.output,
+                    truncate(&sanitize(&text))
+                ),
+                Err(e) => format!(
+                    "child {id} ({name}) failed after {} steps, {}/{} tokens: {e:#}",
+                    finished.steps, finished.usage.input, finished.usage.output,
+                ),
+            };
+            let _ = results.send(ChildResult {
+                identity: identity.name.clone(),
+                description,
+                text,
+            });
+        });
+    }
+
     /// The identity, description and prompt of a call.
     fn parse<'a>(&self, args: &'a Value) -> Result<(Identity, &'a str, &'a str), String> {
         let required = |key: &str| {
@@ -209,8 +251,31 @@ mod tests {
     use crate::agent::fake::{self, Fake, call, say};
     use crate::prompt::SystemPrompt;
 
-    fn tool(fake: &Fake, cancel: bool) -> (Agent, mpsc::UnboundedReceiver<AgentEvent>) {
+    /// The tool, the events it emits, and the reports its children post.
+    struct Harness {
+        agent: Agent,
+        _events: mpsc::UnboundedReceiver<AgentEvent>,
+        results: mpsc::UnboundedReceiver<ChildResult>,
+    }
+
+    impl Harness {
+        /// Start a child and wait for the report it posts when it ends, which is what
+        /// the parent reads; the call itself only hands back the id.
+        async fn report(&mut self, args: Value) -> String {
+            let (started, ok) = self.agent.execute(&args).await;
+            assert!(ok, "{started}");
+            assert!(started.contains("started."), "{started}");
+            self.results.recv().await.expect("a report").text
+        }
+
+        fn cleanup(&self) {
+            let _ = std::fs::remove_dir_all(&self.agent.transcripts);
+        }
+    }
+
+    fn tool(fake: &Fake, cancel: bool) -> Harness {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (tx_results, results) = mpsc::unbounded_channel();
         let router = Identity {
             name: identity::ROUTER.to_string(),
             ..Identity::default()
@@ -230,15 +295,21 @@ mod tests {
             tx,
             cancel: Arc::new(AtomicBool::new(cancel)),
             children: Children::default(),
+            results: tx_results,
             slots: Arc::new(Semaphore::new(MAX_RUNNING)),
             transcripts: super::super::temp_dir(),
         };
-        (agent, rx)
+        Harness {
+            agent,
+            _events: rx,
+            results,
+        }
     }
 
     #[test]
     fn the_identity_defaults_to_general_and_excludes_the_router() {
-        let (agent, _rx) = tool(&Fake::default(), false);
+        let harness = tool(&Fake::default(), false);
+        let agent = &harness.agent;
         let args = json!({"description": "look around", "prompt": "list files"});
         assert_eq!(agent.describe(&args).unwrap(), "agent general: look around");
         let err = agent
@@ -252,10 +323,9 @@ mod tests {
     #[tokio::test]
     async fn long_output_is_capped_under_the_header() {
         let fake = Fake::new(vec![vec![say(&"x".repeat(50_000))]]);
-        let (agent, _rx) = tool(&fake, false);
+        let mut harness = tool(&fake, false);
         let args = json!({"description": "write a lot", "prompt": "go"});
-        let (out, ok) = agent.execute(&args).await;
-        assert!(ok);
+        let out = harness.report(args).await;
         let (header, body) = out.split_once('\n').unwrap();
         assert!(header.starts_with("child "), "{header}");
         assert!(
@@ -263,37 +333,35 @@ mod tests {
             "{header}"
         );
         assert!(body.contains("bytes trimmed") && body.len() < 25_000);
-        let _ = std::fs::remove_dir_all(&agent.transcripts);
+        harness.cleanup();
     }
 
     #[tokio::test]
     async fn an_answer_with_no_text_in_it_is_not_an_answer() {
         let fake = Fake::new(vec![vec![say("")]]);
-        let (agent, _rx) = tool(&fake, false);
+        let mut harness = tool(&fake, false);
         let args = json!({"description": "say nothing", "prompt": "go"});
-        let (out, ok) = agent.execute(&args).await;
-        assert!(!ok);
+        let out = harness.report(args).await;
         assert!(
             out.ends_with(
                 "(general) failed after 1 steps, 10/2 tokens: ended without a final message"
             ),
             "{out}"
         );
-        let _ = std::fs::remove_dir_all(&agent.transcripts);
+        harness.cleanup();
     }
 
     #[tokio::test]
     async fn an_interrupt_fails_the_child() {
         let fake = Fake::new(vec![vec![call("read", json!({"path": "/etc/hosts"}))]]);
-        let (agent, _rx) = tool(&fake, true);
+        let mut harness = tool(&fake, true);
         let args = json!({"description": "read hosts", "prompt": "go"});
-        let (out, ok) = agent.execute(&args).await;
-        assert!(!ok);
+        let out = harness.report(args).await;
         assert!(
             out.ends_with("(general) failed after 1 steps, 10/2 tokens: interrupted by the user"),
             "{out}"
         );
-        let _ = std::fs::remove_dir_all(&agent.transcripts);
+        harness.cleanup();
     }
 
     #[tokio::test]
@@ -302,15 +370,14 @@ mod tests {
             vec![call("read", json!({"path": "/etc/hosts"}))],
             fake::step(fake::FAIL),
         ]);
-        let (agent, _rx) = tool(&fake, false);
+        let mut harness = tool(&fake, false);
         let args = json!({"description": "read hosts", "prompt": "go"});
-        let (out, ok) = agent.execute(&args).await;
-        assert!(!ok);
+        let out = harness.report(args).await;
         assert!(
             out.ends_with("(general) failed after 2 steps, 10/2 tokens: scripted failure"),
             "{out}"
         );
-        let _ = std::fs::remove_dir_all(&agent.transcripts);
+        harness.cleanup();
     }
 
     #[tokio::test]
@@ -345,7 +412,8 @@ mod tests {
             )],
             vec![say("done")],
         ]);
-        let (mut agent, _rx) = tool(&fake, false);
+        let mut harness = tool(&fake, false);
+        let agent = &mut harness.agent;
         agent.policy = Arc::new(Policy::new(
             Mode::Bypass,
             Rules::default(),
@@ -362,17 +430,17 @@ mod tests {
                 .with_mcp(Some(Arc::new(hub.narrowed(identity))))
             })
         };
-        let (out, ok) = agent
-            .execute(&json!({"description": "echo", "prompt": "go"}))
+        let out = harness
+            .report(json!({"description": "echo", "prompt": "go"}))
             .await;
-        assert!(ok, "{out}");
+        assert!(out.contains("finished"), "{out}");
         let offered = fake.offered.lock().unwrap().clone();
         assert!(offered[0].contains(&"mcp_call".to_string()), "{offered:?}");
         let bodies = fake.bodies.lock().unwrap().clone();
         let input = bodies.last().unwrap().1["input"].to_string();
         assert!(input.contains("echo: hi"), "{input}");
         hub.shutdown().await;
-        let _ = std::fs::remove_dir_all(&agent.transcripts);
+        harness.cleanup();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -381,11 +449,10 @@ mod tests {
         let mut script = vec![vec![call("read", json!({"path": "/etc/hosts"}))]; CHILD_STEPS - 1];
         script.push(vec![say("what I found")]);
         let fake = Fake::new(script);
-        let (agent, _rx) = tool(&fake, false);
-        let (out, ok) = agent
-            .execute(&json!({"description": "look around", "prompt": "go"}))
+        let mut harness = tool(&fake, false);
+        let out = harness
+            .report(json!({"description": "look around", "prompt": "go"}))
             .await;
-        assert!(ok, "{out}");
         assert!(
             out.contains(&format!("finished in {CHILD_STEPS} steps")),
             "{out}"
@@ -398,7 +465,7 @@ mod tests {
             last.contains(&format!("budget of {CHILD_STEPS} steps")),
             "{last}"
         );
-        let _ = std::fs::remove_dir_all(&agent.transcripts);
+        harness.cleanup();
     }
 
     #[tokio::test]
@@ -407,11 +474,10 @@ mod tests {
             vec![call("read", json!({"path": "/etc/hosts"}))];
             CHILD_STEPS + 1
         ]);
-        let (agent, _rx) = tool(&fake, false);
-        let (out, ok) = agent
-            .execute(&json!({"description": "look around", "prompt": "go"}))
+        let mut harness = tool(&fake, false);
+        let out = harness
+            .report(json!({"description": "look around", "prompt": "go"}))
             .await;
-        assert!(!ok, "{out}");
         assert!(
             out.contains(&format!("failed after {CHILD_STEPS} steps")),
             "{out}"
@@ -422,7 +488,51 @@ mod tests {
             )),
             "{out}"
         );
-        let _ = std::fs::remove_dir_all(&agent.transcripts);
+        harness.cleanup();
+    }
+
+    #[tokio::test]
+    async fn every_child_asked_for_runs_at_once_and_none_of_them_holds_the_call() {
+        // Each child hangs until the turn is cancelled, so all three are alive together
+        // or the permits never run out.
+        let fake = Fake::new(Vec::new()).with_children(vec![fake::step(fake::HANG); 4]);
+        let mut harness = tool(&fake, false);
+        let args = |n: usize| json!({"description": format!("look {n}"), "prompt": "go"});
+        for n in 0..MAX_RUNNING {
+            let (out, ok) = harness.agent.execute(&args(n)).await;
+            assert!(ok, "{out}");
+            assert!(out.contains("started."), "{out}");
+        }
+        let slots = Arc::clone(&harness.agent.slots);
+        // The call returns before the child is even scheduled, so the permits are taken
+        // a moment later.
+        for _ in 0..1000 {
+            if slots.available_permits() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "all {MAX_RUNNING} are running"
+        );
+        assert!(harness.results.try_recv().is_err(), "none has finished");
+
+        // One more than there are slots is still accepted; it waits, the caller does not.
+        let (out, ok) = harness.agent.execute(&args(MAX_RUNNING)).await;
+        assert!(ok, "{out}");
+        assert!(out.contains("behind the 3 already running"), "{out}");
+
+        harness
+            .agent
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..=MAX_RUNNING {
+            let report = harness.results.recv().await.expect("a report").text;
+            assert!(report.contains("interrupted by the user"), "{report}");
+        }
+        harness.cleanup();
     }
 
     #[test]

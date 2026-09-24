@@ -357,6 +357,15 @@ impl Judge {
         state.spent = 0;
     }
 
+    /// A turn the agent started on its own, on a child's report. The task is still the
+    /// user's, so only the budget starts again: following up a report the agent asked
+    /// for is the same piece of work, not a new one.
+    pub fn resumed(&self, what: &str) {
+        let mut state = self.lock();
+        state.append(format!("a child agent finished: {}", clip(what, CLIP)));
+        state.spent = 0;
+    }
+
     /// Record a finished call, so the judge sees what the agent has been doing.
     pub fn note(&self, label: &str) {
         let mut state = self.lock();

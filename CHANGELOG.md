@@ -4,6 +4,22 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-09-24
+
+- Child agents run detached, so the session is never held by one. The `agent` call hands
+  back the child's id and returns; asking for three starts three, and they run together
+  under the same `MAX_RUNNING` limit, with a fourth waiting for a slot instead of the
+  caller waiting for the call. The report comes back on its own: between steps if the
+  turn is still going, so nothing costs an extra model call, and otherwise as a turn of
+  its own, which the session is told about so what the user types queues behind it as it
+  would behind any other. An interrupted session is the exception and stays stopped: the
+  report joins the history and the transcript, and the next message reads it. The judge
+  gets its budget back on such a turn but keeps the user's task, since following up a
+  report the agent asked for is the same piece of work. A report is carried in a user
+  message marked as one, so a session read back from disk shows it as the tool result it
+  is rather than as something the user said. The panel keeps a child that outlived its
+  turn, and Esc still stops it.
+
 ## 2026-09-23
 
 - `/export-debug` writes the whole session to one markdown file in the working directory
