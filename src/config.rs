@@ -51,7 +51,8 @@ pub struct Config {
     pub limits: Limits,
     /// `model`, `effort` and `ollama_url`: which backend the session talks to.
     pub choice: crate::client::Choice,
-    /// `statusline`: the status bar's template, or `None` for the built-in bar.
+    /// `statusline`: the status bar's template, or `None` for the built-in bar. Not
+    /// checked here: a bar that does not parse is no reason to refuse to start.
     pub statusline: Option<String>,
 }
 
@@ -263,11 +264,6 @@ impl Config {
                 "code_theme {theme:?} is not one of: {}",
                 crate::syntax::themes().join(", ")
             )));
-        }
-        if let Some(template) = &layer.statusline
-            && let Err(e) = crate::statusline::Template::parse(template)
-        {
-            return Err(bad(format!("statusline: {e}")));
         }
         let parse = |rules: &[String]| {
             rules
@@ -514,16 +510,16 @@ mod tests {
     }
 
     #[test]
-    fn statusline_is_the_global_files_and_must_parse() {
+    fn statusline_is_the_global_files_alone() {
         let dir = temp_dir();
         let (home, cwd) = (dir.join("home"), dir.join("cwd"));
         write(&cwd.join(".bhai/config.toml"), "statusline = \"$model\"\n");
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert_eq!(config.statusline, None);
 
-        write(&global_path(&home), "statusline = \"$nope\"\n");
-        let e = Config::load(Some(&home), &cwd).unwrap_err();
-        assert!(format!("{e:#}").contains("no variable `$nope`"), "{e:#}");
+        write(&global_path(&home), "statusline = \"$branch\"\n");
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert_eq!(config.statusline.as_deref(), Some("$branch"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

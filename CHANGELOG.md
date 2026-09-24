@@ -35,7 +35,9 @@ carries the shape of what is there.
   ctx, tokens, cache, rate limits and resets, queued, time and more. `/statusline` lists
   them with their values now, `/statusline set <template>` and `/statusline reset` change
   it, and `/statusline <what you want>` has the judge's model write one, checked to parse
-  before it is saved. A warning colour survives whatever the template styles.
+  before it is saved. A warning colour survives whatever the template styles. A row too
+  narrow for it drops `( ... )` groups from the right, and a template that does not parse
+  is reported at start with the built-in bar drawn instead.
 
 - A finished shell command says how it ended on the row under it: `✓ succeeded`,
   `✗ failed, exit 128`, `✗ timed out after 120s`, or who stopped it (`✗ rejected by

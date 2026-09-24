@@ -303,7 +303,7 @@ const ALWAYS: u8 = 0;
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     // The user's own template, when they wrote one, clipped at the edge like any row.
     if let Some(template) = &app.statusline {
-        let spans = template.render(&crate::statusline::values(app));
+        let spans = template.render(&crate::statusline::values(app), area.width as usize);
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }

@@ -258,6 +258,11 @@ async fn main() -> Result<()> {
     };
     let mut notices = prompt.notices();
     notices.extend(warnings);
+    if let Some(Err(e)) = statusline.as_deref().map(statusline::Template::parse) {
+        notices.push(format!(
+            "statusline in the global config does not parse, so the built-in bar is shown: {e}"
+        ));
+    }
     if args.trust {
         notices.push(policy.trust()?);
     }
@@ -487,7 +492,7 @@ struct Setup {
     title: bool,
     /// The model the config asks for, before the identity and the flags have their say.
     choice: client::Choice,
-    /// `statusline`: the status bar's template, already checked to parse.
+    /// `statusline`: the status bar's template, which may not parse.
     statusline: Option<String>,
 }
 
@@ -1166,7 +1171,7 @@ async fn run(
     app.ollama_url = ollama_url;
     app.session_id = session_id;
     app.limits = limits;
-    // Checked when the config was read, so this only fails if the check did not run.
+    // One that does not parse was already reported with the notices.
     app.statusline = statusline.and_then(|t| statusline::Template::parse(&t).ok());
     app.config_path = std::env::var_os("HOME").map(|home| config::global_path(home.as_ref()));
     app.designer = Some(designer);

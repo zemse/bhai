@@ -104,18 +104,46 @@ impl Template {
         })
     }
 
-    pub fn render(&self, values: &HashMap<&str, Value>) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        let base = Style::new().fg(Color::DarkGray);
-        render(&self.nodes, base, values, &mut spans);
-        spans
+    /// The bar in at most `width` columns. What does not fit goes a `( ... )` group at a
+    /// time from the right, so a row that is short of room loses whole parts rather than
+    /// ending halfway through one; past that the edge cuts it.
+    pub fn render(&self, values: &HashMap<&str, Value>, width: usize) -> Vec<Span<'static>> {
+        let mut hidden = vec![false; groups(&self.nodes)];
+        let mut next = hidden.len();
+        loop {
+            let mut spans = Vec::new();
+            let mut at = 0;
+            let base = Style::new().fg(Color::DarkGray);
+            render(&self.nodes, base, values, &hidden, &mut at, &mut spans);
+            let wide = spans.iter().map(Span::width).sum::<usize>() > width;
+            if !wide || next == 0 {
+                return spans;
+            }
+            next -= 1;
+            hidden[next] = true;
+        }
     }
 }
 
+/// How many `( ... )` groups there are, nested ones included.
+fn groups(nodes: &[Node]) -> usize {
+    nodes
+        .iter()
+        .map(|node| match node {
+            Node::Text(_) | Node::Var(_) => 0,
+            Node::Styled(inner, _) => groups(inner),
+            Node::Optional(inner) => 1 + groups(inner),
+        })
+        .sum()
+}
+
+/// `hidden` is indexed by each group's place in the template, which `at` counts.
 fn render(
     nodes: &[Node],
     style: Style,
     values: &HashMap<&str, Value>,
+    hidden: &[bool],
+    at: &mut usize,
     out: &mut Vec<Span<'static>>,
 ) {
     for node in nodes {
@@ -127,10 +155,14 @@ fn render(
                     out.push(Span::styled(value.text.clone(), style));
                 }
             }
-            Node::Styled(inner, own) => render(inner, style.patch(*own), values, out),
+            Node::Styled(inner, own) => render(inner, style.patch(*own), values, hidden, at, out),
             Node::Optional(inner) => {
-                if !all_empty(inner, values) {
-                    render(inner, style, values, out);
+                let this = *at;
+                *at += 1;
+                if hidden[this] || all_empty(inner, values) {
+                    *at += groups(inner);
+                } else {
+                    render(inner, style, values, hidden, at, out);
                 }
             }
         }
@@ -681,15 +713,35 @@ mod tests {
     fn variables_and_text_render_in_order() {
         let template = Template::parse("$model on $branch").unwrap();
         let values = with(&[("model", "gpt-5"), ("branch", "main")]);
-        assert_eq!(text(&template.render(&values)), "gpt-5 on main");
-        assert_eq!(template.render(&values)[1].style.fg, Some(Color::DarkGray));
+        assert_eq!(text(&template.render(&values, 200)), "gpt-5 on main");
+        assert_eq!(
+            template.render(&values, 200)[1].style.fg,
+            Some(Color::DarkGray)
+        );
     }
 
     #[test]
     fn a_group_drops_out_when_its_variables_are_empty() {
         let template = Template::parse("$model( on $branch)( · ctx $ctx) · end").unwrap();
         let values = with(&[("model", "m"), ("branch", ""), ("ctx", "4%")]);
-        assert_eq!(text(&template.render(&values)), "m · ctx 4% · end");
+        assert_eq!(text(&template.render(&values, 200)), "m · ctx 4% · end");
+    }
+
+    #[test]
+    fn a_narrow_row_drops_groups_from_the_right() {
+        let template = Template::parse("$model( on $branch)( · ctx $ctx)( · $time)").unwrap();
+        let values = with(&[
+            ("model", "m"),
+            ("branch", "main"),
+            ("ctx", "4%"),
+            ("time", "14:05"),
+        ]);
+        let row = |width| text(&template.render(&values, width));
+        assert_eq!(row(40), "m on main · ctx 4% · 14:05");
+        assert_eq!(row(20), "m on main · ctx 4%");
+        assert_eq!(row(10), "m on main");
+        // Past the last group the edge cuts what is left.
+        assert_eq!(row(3), "m");
     }
 
     #[test]
@@ -703,7 +755,7 @@ mod tests {
                 alert: Some(Style::new().fg(Color::Red)),
             },
         );
-        let spans = template.render(&values);
+        let spans = template.render(&values, 200);
         assert_eq!(text(&spans), "ctx 95%");
         assert_eq!(spans[0].style.fg, Some(Color::Cyan));
         assert_eq!(spans[0].style.bg, Some(Color::Rgb(0x10, 0x20, 0x30)));
@@ -715,7 +767,7 @@ mod tests {
     fn escapes_and_braced_names() {
         let template = Template::parse(r"\$5 \[${model}\] \(x\)").unwrap();
         let values = with(&[("model", "m")]);
-        assert_eq!(text(&template.render(&values)), "$5 [m] (x)");
+        assert_eq!(text(&template.render(&values, 200)), "$5 [m] (x)");
     }
 
     #[test]
