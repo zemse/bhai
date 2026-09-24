@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A workflow is told where to cache its steps. `Run` carries a `cache_root`, set from the
+  `Delegation` the session was built with, instead of taking `delegation.sessions.parent()`
+  and relying on that being `<project>/.bhai/sessions`. A caller with no root to give says
+  so once and every step runs.
+
 - A command is judged knowing where each file it writes lands. A bash call to the judge
   now carries `location: writes <path> inside|outside the project root; ...`, for every
   redirect target and every file a `tee`, `touch`, `mkdir`, `rm`, `rmdir`, `mv`,

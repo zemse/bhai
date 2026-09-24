@@ -33,7 +33,7 @@ const DEFAULT_BUDGET: u64 = 200_000;
 const HOME_DIR: &str = ".config/bhai/workflows";
 /// Workflow files under the project root; they replace a home one of the same name.
 const PROJECT_DIR: &str = ".bhai/workflows";
-/// Cached step results, under the same `.bhai` the session transcripts are in.
+/// Cached step results, under the `.bhai` the session transcripts are in.
 const CACHE_DIR: &str = "cache/workflows";
 
 /// What a step does when it fails.
@@ -413,6 +413,8 @@ pub struct Run<'a> {
     pub judge: Option<&'a Judge>,
     /// Where the step transcripts are written.
     pub transcripts: PathBuf,
+    /// `<project>/.bhai`, which a caching workflow's step results go under.
+    pub cache_root: PathBuf,
 }
 
 /// Run every step in dependency order, up to `max_parallel` at a time, until the steps
@@ -704,17 +706,17 @@ struct Cache {
 
 impl Cache {
     /// `None` when the workflow does not ask for a cache, or when the directory will
-    /// not open. `delegation.sessions` is `<project>/.bhai/sessions`, so the cache
-    /// goes under the same `.bhai` as the transcripts.
+    /// not open. An empty `cache_root` is a caller that has none to give, and would
+    /// otherwise scatter the cache through whatever the working directory happens to be.
     fn open(run: &Run<'_>) -> Option<Self> {
         if !run.workflow.cache {
             return None;
         }
-        let dir = run
-            .delegation
-            .sessions
-            .parent()
-            .map(|root| root.join(CACHE_DIR).join(slug(&run.workflow.name)));
+        let dir = (!run.cache_root.as_os_str().is_empty()).then(|| {
+            run.cache_root
+                .join(CACHE_DIR)
+                .join(slug(&run.workflow.name))
+        });
         match dir.filter(|dir| std::fs::create_dir_all(dir).is_ok()) {
             Some(dir) => Some(Self { dir }),
             None => {
@@ -796,17 +798,14 @@ mod tests {
     }
 
     fn delegation() -> Delegation {
-        delegation_in(PathBuf::new())
-    }
-
-    fn delegation_in(sessions: PathBuf) -> Delegation {
         Delegation {
             identities: vec![Identity::default()],
             prompt: Arc::new(|identity: &Identity| SystemPrompt {
                 identity: identity.clone(),
                 ..SystemPrompt::default()
             }),
-            sessions,
+            sessions: PathBuf::new(),
+            cache_root: PathBuf::new(),
             mailboxes: Default::default(),
         }
     }
@@ -823,6 +822,7 @@ mod tests {
                 AgentEvent::ToolStart { summary, .. } => seen.push(format!("start: {summary}")),
                 AgentEvent::ToolOutput(s) => seen.push(format!("output: {s}")),
                 AgentEvent::Info(s) => seen.push(format!("info: {s}")),
+                AgentEvent::Error(s) => seen.push(format!("error: {s}")),
                 _ => {}
             }
         }
@@ -847,7 +847,7 @@ mod tests {
         let report = run(Run {
             workflow,
             input,
-            delegation: &delegation_in(root.join("sessions")),
+            delegation: &delegation(),
             model: fake,
             policy: &Policy::default(),
             tx: &tx,
@@ -855,6 +855,7 @@ mod tests {
             children: &Children::default(),
             judge: None,
             transcripts: root.join("transcripts"),
+            cache_root: root.to_path_buf(),
         })
         .await;
         drop(tx);
@@ -1012,6 +1013,43 @@ needs: [a]\n    prompt: review {{steps.a}}\n",
     }
 
     #[tokio::test]
+    async fn without_a_cache_root_every_step_runs_and_the_run_says_so() {
+        let workflow = workflow("cache: true\nsteps:\n  - id: a\n    prompt: one\n");
+        let cwd = std::env::current_dir().unwrap();
+        let root = tools::temp_dir();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let seen = tokio::spawn(accept(rx));
+        let fake = Fake::new(vec![vec![say("ran")]]);
+        let report = run(Run {
+            workflow: &workflow,
+            input: "",
+            delegation: &delegation(),
+            model: &fake,
+            policy: &Policy::default(),
+            tx: &tx,
+            cancel: &Arc::new(AtomicBool::new(false)),
+            children: &Children::default(),
+            judge: None,
+            transcripts: root.join("transcripts"),
+            cache_root: PathBuf::new(),
+        })
+        .await;
+        drop(tx);
+        assert_eq!(report.steps[0].status, Status::Ok);
+        assert!(!report.steps[0].cached);
+        assert_eq!(fake.bodies.lock().unwrap().len(), 1);
+        let seen = seen.await.unwrap();
+        assert!(
+            seen.iter()
+                .any(|line| line.contains("no directory to cache steps in")),
+            "{seen:?}"
+        );
+        // Nothing was written beside the working directory either.
+        assert!(!cwd.join(CACHE_DIR).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn a_changed_step_re_runs_every_step_after_it() {
         // `b`'s own prompt never changes, so only the rule keeps it from hitting.
         let workflow = workflow(
@@ -1089,6 +1127,7 @@ needs: [a]\n    prompt: review it\n",
             children: &Children::default(),
             judge: None,
             transcripts: PathBuf::new(),
+            cache_root: PathBuf::new(),
         })
         .await;
         drop(tx);

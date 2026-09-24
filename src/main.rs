@@ -453,9 +453,11 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let identity = identity::find(&identities, name)?;
     let hub = mcp::start(&config, &roots, &identity).await;
     let mut prompt = identity::build(&config, &roots, &identity, &identities).with_mcp(hub.clone());
+    let bhai = roots.cwd.join(".bhai");
     let delegation = Delegation {
         identities,
-        sessions: roots.cwd.join(".bhai").join("sessions"),
+        sessions: bhai.join("sessions"),
+        cache_root: bhai,
         // Replaced with the session's own once there is a session to type into.
         mailboxes: agent::Mailboxes::default(),
         // Children reuse the session's MCP connections, narrowed to their identity.

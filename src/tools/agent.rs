@@ -317,6 +317,7 @@ mod tests {
                     ..SystemPrompt::default()
                 }),
                 sessions: PathBuf::new(),
+                cache_root: PathBuf::new(),
                 mailboxes: Default::default(),
             },
             model: Arc::new(fake.clone()),
