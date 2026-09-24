@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-25
 
+- An effort the API does not take is refused before it is sent: `/effort`, `/model` and
+  `POST /model` accept `none`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`, and the
+  picker drops the catalog's `ultra`, which the API answers with a 400. A GPT-6 update the
+  backend still refuses, such as `none` on `gpt-6-astra`, is taken back out of the history
+  and the session file, and the session returns to the effort it was on; left in, it went
+  out with every request after it and failed each one.
+
 - A child agent can be put on another model. The `agent` tool takes `model` and `effort`,
   so an identity's model is its default rather than its ceiling and `general` no longer
   needs a near-duplicate identity per model. A new `models` tool lists what the backends

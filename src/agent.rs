@@ -74,6 +74,9 @@ pub enum AgentEvent {
     },
     /// History was dropped: the conversation starts again from nothing.
     Cleared,
+    /// The model runs at this effort again, after the backend refused an update to
+    /// another one.
+    Effort(String),
     /// Token counts for the model call that just finished.
     Usage(Usage),
     /// Token counts for a model call a child agent just finished.
@@ -735,9 +738,11 @@ pub(crate) async fn run_with(
             Next::Retry | Next::Compact => (None, None),
         };
         // Just before what opens the turn, which is where the API takes an update.
+        let mut update_at = None;
         if (landed.is_some() || message.is_some())
             && let Some(update) = effort_change(model.as_ref(), &history)
         {
+            update_at = Some(history.len());
             history.push(update);
         }
         if let Some(result) = landed {
@@ -856,6 +861,38 @@ pub(crate) async fn run_with(
             }
         };
         if let Err(e) = result.result {
+            // A refused request that carried a new update may be refusing the update, and
+            // one left in the history would go out with every request after it.
+            if let Some(at) = update_at
+                && crate::client::bad_request(&e)
+            {
+                let before = compact::estimate(&history, tokenizer);
+                let refused = history.remove(at);
+                let name = model.name().to_string();
+                let back = crate::client::announced_effort(&history)
+                    .or(model.effort_updates().map(|(request, _)| request))
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(switched) = model.switch(&name, &back) {
+                    model = switched;
+                    registry = build(&model);
+                }
+                // Earlier calls index the history the removal shifted, and the guard holds
+                // the refused request, which the next one no longer extends.
+                (calls, monitor) = (Vec::new(), CacheMonitor::default());
+                model.reset("an effort update was refused");
+                if let Sink::Session(writer) = &mut sink {
+                    let after = compact::estimate(&history, tokenizer);
+                    if let Err(e) = writer.compact("effort refused", before, after, &history) {
+                        let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+                    }
+                }
+                let _ = tx.send(AgentEvent::Info(format!(
+                    "the backend refused effort {}, so the session is back on {back}",
+                    refused["reasoning"]["effort"].as_str().unwrap_or_default()
+                )));
+                let _ = tx.send(AgentEvent::Effort(back));
+            }
             let _ = tx.send(AgentEvent::TurnFailed(format!("{e:#}")));
         }
         // Between turns the history holds every call's output, so it can be rewritten.
@@ -1490,7 +1527,9 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 // The terminal is titled by the session, not by a child of one turn of it.
                 | AgentEvent::Titled(_)
                 | AgentEvent::Compacted { .. }
-                | AgentEvent::Cleared => continue,
+                | AgentEvent::Cleared
+                // A child's effort is its own request's, never an update.
+                | AgentEvent::Effort(_) => continue,
                 // An approval is modal, so it is answered where every other one is,
                 // with the tag saying which child is asking.
                 AgentEvent::Approval {
@@ -1925,6 +1964,8 @@ pub mod fake {
     pub const FAIL: &str = "fake.fail";
     /// A script step that streams a little, then waits for an interrupt.
     pub const HANG: &str = "fake.hang";
+    /// A script step the backend refuses as a bad request.
+    pub const REFUSE: &str = "fake.refuse";
 
     /// Answers each call with the next scripted output and remembers the tool names
     /// every call was offered. Each call's request body is built and checked as the
@@ -2107,6 +2148,10 @@ pub mod fake {
                 let next = next.ok_or_else(|| anyhow!("the script ran out"))?;
                 match next.first().and_then(|item| item["type"].as_str()) {
                     Some(FAIL) => bail!("scripted failure"),
+                    Some(REFUSE) => {
+                        let refused = "400 Bad Request: Invalid value".to_string();
+                        return Err(crate::client::BadRequest(refused).into());
+                    }
                     Some(HANG) => {
                         on_delta(Delta::Text("partial".to_string()));
                         while !cancel.load(Ordering::Relaxed) {
@@ -4320,6 +4365,39 @@ mod tests {
         // Every request extends the one before it, so nothing broke or reset the cache.
         assert_eq!(*fake.breaks.lock().unwrap(), []);
         assert!(fake.resets.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_update_leaves_the_history_and_the_effort_as_they_were() {
+        use fake::{REFUSE, say};
+
+        let refuse = vec![json!({ "type": REFUSE })];
+        let (fake, tx_user, tx_control, mut rx, cancel) =
+            gpt6(vec![vec![say("one")], refuse, vec![say("three")]]);
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        tx_control.send(effort("minimal")).await.unwrap();
+        let events = drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Effort(back) if back == "medium")),
+            "{events:?}"
+        );
+        drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        let refused = bodies[1].1["input"].as_array().unwrap();
+        assert!(refused.contains(&crate::client::effort_update("minimal")));
+        // The call after it goes out without the update, and so does every one after.
+        let sent = bodies[2].1["input"].as_array().unwrap();
+        assert!(
+            !sent
+                .iter()
+                .any(|item| item["type"] == "configuration_update"),
+            "{sent:?}"
+        );
+        assert_eq!(sent.last().unwrap()["content"][0]["text"], "third");
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
     }
 
     #[tokio::test]

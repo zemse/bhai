@@ -201,6 +201,10 @@ pub fn codex_models(body: &Value) -> Vec<Model> {
                 .iter()
                 .filter_map(|level| {
                     let name = level.get("effort").and_then(Value::as_str)?;
+                    // The catalog offers levels the API refuses, such as `ultra`.
+                    if !crate::client::EFFORTS.contains(&name) {
+                        return None;
+                    }
                     let detail = level.get("description").and_then(Value::as_str);
                     Some(effort(name, detail.unwrap_or_default()))
                 })
@@ -587,7 +591,9 @@ mod tests {
                 "slug": "gpt-6-astra",
                 "display_name": "GPT-6-Astra",
                 "default_reasoning_level": "low",
-                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "max"}],
+                "supported_reasoning_levels": [
+                    {"effort": "low"}, {"effort": "max"}, {"effort": "ultra"},
+                ],
                 "visibility": "list",
                 "priority": 1,
             },
@@ -608,6 +614,8 @@ mod tests {
         let efforts: Vec<_> = gpt55.efforts.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(efforts, ["low", "medium", "high"]);
         assert_eq!(gpt55.efforts[0].detail, "Fast");
+        let astra: Vec<_> = models[0].efforts.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(astra, ["low", "max"], "the API refuses ultra");
     }
 
     #[test]

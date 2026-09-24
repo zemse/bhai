@@ -34,6 +34,27 @@ pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 const MAX_ATTEMPTS: usize = 3;
 
+/// The `reasoning.effort` values the Responses API takes. The models catalog also lists
+/// `ultra` for some models, which the API refuses.
+pub const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// A request the backend refused as malformed: sent again, it fails the same way.
+#[derive(Debug)]
+pub struct BadRequest(pub String);
+
+impl std::fmt::Display for BadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BadRequest {}
+
+/// Whether `e` is the backend refusing the request itself.
+pub fn bad_request(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<BadRequest>())
+}
+
 /// Whether `model` takes an effort change as a `configuration_update` input item, which
 /// leaves the request's own `reasoning.effort`, and so the cached prefix, as it was. The
 /// GPT-6 family only: on any other model the effort is part of the rendered prefix.
@@ -525,6 +546,8 @@ impl Client {
                 ))
             } else if status.as_u16() == 429 || status.as_u16() >= 500 {
                 Error::Retryable(anyhow!("{status}: {msg}"))
+            } else if status.as_u16() == 400 {
+                Error::Fatal(BadRequest(format!("{status}: {msg}")).into())
             } else {
                 Error::Fatal(anyhow!("{status}: {msg}"))
             });

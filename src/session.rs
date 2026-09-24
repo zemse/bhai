@@ -273,6 +273,8 @@ pub enum SubmitError {
     /// An effort change would re-read the whole conversation uncached; the cache goes
     /// cold on its own after this long.
     CacheWarm(Duration),
+    /// The Codex API takes no such `reasoning.effort`.
+    UnknownEffort(String),
 }
 
 impl fmt::Display for SubmitError {
@@ -285,6 +287,11 @@ impl fmt::Display for SubmitError {
                 "this model caches per effort, so a change now re-reads the whole conversation uncached. It goes through once the cache expires in {}m{:02}s, or after /clear; a gpt-6 model changes effort without the miss",
                 left.as_secs() / 60,
                 left.as_secs() % 60
+            ),
+            SubmitError::UnknownEffort(effort) => write!(
+                f,
+                "the API takes no effort `{effort}`; it takes {}",
+                crate::client::EFFORTS.join(", ")
             ),
         }
     }
@@ -516,6 +523,11 @@ impl Session {
         let inner = self.lock();
         if inner.working {
             return Err(SubmitError::Busy);
+        }
+        if crate::client::Provider::of(&model) == crate::client::Provider::Codex
+            && !crate::client::EFFORTS.contains(&effort.as_str())
+        {
+            return Err(SubmitError::UnknownEffort(effort));
         }
         if let Some(left) = self.effort_miss(&model, &effort, inner.last_call) {
             return Err(SubmitError::CacheWarm(left));
@@ -814,6 +826,14 @@ impl Session {
             AgentEvent::Cleared => {
                 inner.last_call = None;
                 Event::Cleared
+            }
+            AgentEvent::Effort(effort) => {
+                let mut current = self.model.lock().unwrap_or_else(|e| e.into_inner());
+                current.1 = effort.clone();
+                Event::Model {
+                    model: current.0.clone(),
+                    effort,
+                }
             }
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnFailed(s) => Event::TurnFailed(s),
@@ -1639,6 +1659,33 @@ mod tests {
             session.set_model("gpt-6-sol".into(), "xhigh".into(), None),
             Ok(())
         );
+    }
+
+    #[test]
+    fn an_effort_the_api_does_not_take_is_refused_and_a_refused_update_is_undone() {
+        let (session, _control) = on("gpt-6-astra");
+        let refused = session.set_model("gpt-6-astra".into(), "ultra".into(), None);
+        assert_eq!(
+            refused,
+            Err(SubmitError::UnknownEffort("ultra".to_string()))
+        );
+        // Ollama sends no effort at all, so there is nothing to check.
+        assert_eq!(
+            session.set_model("ollama:gemma4:e4b".into(), "ultra".into(), None),
+            Ok(())
+        );
+
+        let (session, _control) = on("gpt-6-astra");
+        session
+            .set_model("gpt-6-astra".into(), "minimal".into(), None)
+            .unwrap();
+        let mut events = session.subscribe();
+        session.on_agent(AgentEvent::Effort("medium".to_string()));
+        assert_eq!(session.model().1, "medium");
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Model { effort, .. }) if effort == "medium"
+        ));
     }
 
     #[test]
