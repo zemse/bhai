@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A child agent that spends its whole step budget says so. It used to report "finished" in
+  the same words as a natural completion, so a result the agent was told to cut short read
+  as a finished one: the `agent` tool output now says `finished in 40 steps (step budget
+  spent)` and a workflow's report line says `ok, step budget spent`. A workflow no longer
+  caches such a step either, for the same reason a failed one is not cached: what it
+  answered with is what it had when it was cut off, and the cache would hand that back for
+  every later run.
+
 - A workflow is told where to cache its steps. `Run` carries a `cache_root`, set from the
   `Delegation` the session was built with, instead of taking `delegation.sessions.parent()`
   and relying on that being `<project>/.bhai/sessions`. A caller with no root to give says

@@ -780,7 +780,7 @@ pub(crate) async fn run_with(
                 }
             }
         };
-        if let (_, Err(e)) = result {
+        if let Err(e) = result.result {
             let _ = tx.send(AgentEvent::TurnFailed(format!("{e:#}")));
         }
         // Between turns the history holds every call's output, so it can be rewritten.
@@ -808,8 +808,28 @@ pub(crate) async fn run_with(
     }
 }
 
-/// Returns the number of model calls made and the failure, if there was one. `sink`
-/// gets every history item as it lands.
+/// How one turn ended: the model calls it made, whether its step budget was spent, and
+/// the failure if there was one.
+struct Turn {
+    steps: usize,
+    /// The budget message went in, so the answer is what the agent had at that point
+    /// rather than what it would have finished with.
+    truncated: bool,
+    result: anyhow::Result<()>,
+}
+
+impl Turn {
+    /// A turn that ran to an answer, however much of its budget that took.
+    fn ended(steps: usize, truncated: bool) -> Self {
+        Self {
+            steps,
+            truncated,
+            result: Ok(()),
+        }
+    }
+}
+
+/// `sink` gets every history item as it lands.
 #[allow(clippy::too_many_arguments)]
 async fn turn(
     model: &dyn Model,
@@ -830,8 +850,9 @@ async fn turn(
     mut results: Option<&mut mpsc::UnboundedReceiver<ChildResult>>,
     // Steps this turn may take, for one nobody is watching; `None` for no bound.
     limit: Option<usize>,
-) -> (usize, anyhow::Result<()>) {
+) -> Turn {
     let mut error_rounds = 0usize;
+    let mut truncated = false;
 
     let mut step = 0usize;
     loop {
@@ -840,12 +861,14 @@ async fn turn(
         // mid-tool throws away everything it found, so it is told to finish first.
         if let Some(limit) = limit {
             if step > limit {
-                return (
-                    step - 1,
-                    Err(anyhow!("kept calling tools past its {limit}-step budget")),
-                );
+                return Turn {
+                    steps: step - 1,
+                    truncated,
+                    result: Err(anyhow!("kept calling tools past its {limit}-step budget")),
+                };
             }
             if step == limit {
+                truncated = true;
                 let from = history.len();
                 history.push(json!({
                     "type": "message",
@@ -887,7 +910,7 @@ async fn turn(
                     .await
                     .is_some()
                 {
-                    return (step - 1, Ok(()));
+                    return Turn::ended(step - 1, truncated);
                 }
             } else {
                 let _ = tx.send(AgentEvent::CacheStalled(cache::MAX_MISSES));
@@ -951,8 +974,14 @@ async fn turn(
         let items = match answer {
             Ok(items) => items,
             // An interrupt is the user's decision, not an error worth reporting.
-            Err(_) if cancel.load(Ordering::Relaxed) => return (step, Ok(())),
-            Err(e) => return (step, Err(e)),
+            Err(_) if cancel.load(Ordering::Relaxed) => return Turn::ended(step, truncated),
+            Err(e) => {
+                return Turn {
+                    steps: step,
+                    truncated,
+                    result: Err(e),
+                };
+            }
         };
         if let Some(usage) = finished {
             let call = Call {
@@ -978,7 +1007,7 @@ async fn turn(
             // in and the agent keeps going rather than ending on the answer before it.
             let typed = steered(steer.as_deref_mut());
             if typed.is_empty() {
-                return (step, Ok(()));
+                return Turn::ended(step, truncated);
             }
             let from = history.len();
             history.extend(typed);
@@ -1010,7 +1039,7 @@ async fn turn(
         record(sink, &history[sent..], tx);
 
         if cancel.load(Ordering::Relaxed) {
-            return (step, Ok(()));
+            return Turn::ended(step, truncated);
         }
 
         error_rounds = if all_failed { error_rounds + 1 } else { 0 };
@@ -1018,7 +1047,7 @@ async fn turn(
             let _ = tx.send(AgentEvent::Error(
                 "stopped: the last few tool calls all failed".to_string(),
             ));
-            return (step, Ok(()));
+            return Turn::ended(step, truncated);
         }
     }
 }
@@ -1270,6 +1299,9 @@ pub struct Child<'a> {
 #[derive(Debug)]
 pub struct Finished {
     pub steps: usize,
+    /// The child spent its whole step budget, so its result is what it had when it was
+    /// told to stop rather than what it set out to produce.
+    pub truncated: bool,
     pub usage: Usage,
     /// The final assistant text, or why there is none.
     pub result: anyhow::Result<String>,
@@ -1415,7 +1447,11 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     };
     let ((result, history), (usage, failure)) = tokio::join!(work, forward);
 
-    let (steps, result) = result;
+    let Turn {
+        steps,
+        truncated,
+        result,
+    } = result;
     let result = match result {
         Ok(()) if child.cancel.load(Ordering::Relaxed) => Err(anyhow!("interrupted by the user")),
         Ok(()) => final_text(&history).ok_or_else(|| {
@@ -1429,6 +1465,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     });
     Finished {
         steps,
+        truncated,
         usage,
         result,
     }
@@ -2097,7 +2134,7 @@ mod tests {
             "role": "user",
             "content": [{ "type": "input_text", "text": "go" }],
         })];
-        let (steps, result) = turn(
+        let Turn { steps, result, .. } = turn(
             &fake,
             &registry,
             &Policy::default(),

@@ -358,6 +358,8 @@ pub struct StepReport {
     pub usage: Usage,
     /// Answered from the cache, so it cost nothing and ran no child.
     pub cached: bool,
+    /// The step spent its whole budget, so its result is partial.
+    pub truncated: bool,
 }
 
 /// What a finished run spent, step by step.
@@ -384,6 +386,7 @@ impl Report {
         for step in &self.steps {
             let status = match &step.status {
                 Status::Ok if step.cached => "ok, from cache".to_string(),
+                Status::Ok if step.truncated => "ok, step budget spent".to_string(),
                 Status::Ok => "ok".to_string(),
                 Status::Failed(e) => format!("failed: {e}"),
                 Status::Skipped(reason) => format!("did not run: {reason}"),
@@ -449,6 +452,7 @@ pub async fn run(run: Run<'_>) -> Report {
     let mut results: HashMap<String, String> = HashMap::new();
     let mut usage = vec![Usage::default(); workflow.steps.len()];
     let mut cached = vec![false; workflow.steps.len()];
+    let mut truncated = vec![false; workflow.steps.len()];
     let cache = Cache::open(&run);
     // Once a wave holds a step the cache does not have, every later wave runs cold and
     // is not asked about. A changed result changes the prompts rendered after it, so
@@ -511,12 +515,16 @@ pub async fn run(run: Run<'_>) -> Report {
             for ((index, _, key), done) in launched.iter().zip(finished) {
                 let step = &workflow.steps[*index];
                 usage[*index] = done.usage;
+                truncated[*index] = done.truncated;
                 add(&mut report.usage, done.usage);
                 match done.result {
                     Ok(text) => {
                         // Only on the way out of this arm, so a failed step is not
-                        // stored and the next run retries it.
-                        if let (Some(cache), Some(key)) = (&cache, key) {
+                        // stored and the next run retries it. A step that spent its
+                        // budget is not stored either: what it answered with is what it
+                        // had when it was cut off, and a cache would hand that back for
+                        // good.
+                        if let (Some(cache), Some(key), false) = (&cache, key, done.truncated) {
                             cache.write(key, step, &identities[*index], &text);
                         }
                         results.insert(step.id.clone(), text);
@@ -541,13 +549,17 @@ pub async fn run(run: Run<'_>) -> Report {
         .zip(status)
         .zip(usage)
         .zip(cached)
-        .map(|(((step, status), usage), cached)| StepReport {
-            id: step.id.clone(),
-            identity: step.identity.clone(),
-            status: status.unwrap_or(Status::Skipped("not reached".to_string())),
-            usage,
-            cached,
-        })
+        .zip(truncated)
+        .map(
+            |((((step, status), usage), cached), truncated)| StepReport {
+                id: step.id.clone(),
+                identity: step.identity.clone(),
+                status: status.unwrap_or(Status::Skipped("not reached".to_string())),
+                usage,
+                cached,
+                truncated,
+            },
+        )
         .collect();
     let _ = run.tx.send(AgentEvent::Info(report.text()));
     report
@@ -1070,6 +1082,37 @@ needs: [a]\n    prompt: review it\n",
         let fake = Fake::new(Vec::new());
         let (third, _) = go_in(&root, &workflow, "another repo", &fake).await;
         assert!(third.steps.iter().all(|s| s.cached), "{:?}", third.steps);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_step_that_spends_its_budget_says_so_and_is_not_cached() {
+        let workflow = workflow("cache: true\nsteps:\n  - id: a\n    prompt: one\n");
+        let root = tools::temp_dir();
+        let mut script = vec![
+            vec![fake::call(
+                "read",
+                serde_json::json!({"path": "/etc/hosts"})
+            )];
+            agent::CHILD_STEPS - 1
+        ];
+        script.push(vec![say("what I had so far")]);
+        let fake = Fake::new(script);
+        let (report, _) = go_in(&root, &workflow, "", &fake).await;
+        assert_eq!(report.steps[0].status, Status::Ok);
+        assert!(report.steps[0].truncated);
+        assert!(
+            report.text().contains("a (general) ok, step budget spent"),
+            "{}",
+            report.text()
+        );
+
+        // A partial result is not what a re-run hands back.
+        let fake = Fake::new(vec![vec![say("the whole answer")]]);
+        let (again, _) = go_in(&root, &workflow, "", &fake).await;
+        assert_eq!(again.steps[0].status, Status::Ok);
+        assert!(!again.steps[0].cached);
+        assert!(!again.steps[0].truncated);
         let _ = std::fs::remove_dir_all(root);
     }
 

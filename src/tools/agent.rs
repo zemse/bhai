@@ -194,8 +194,12 @@ impl Agent {
             let name = &identity.name;
             let text = match finished.result {
                 Ok(text) => format!(
-                    "child {id} ({name}) finished in {} steps, {}/{} tokens\n{}",
+                    "child {id} ({name}) finished in {} steps{}, {}/{} tokens\n{}",
                     finished.steps,
+                    match finished.truncated {
+                        true => " (step budget spent)",
+                        false => "",
+                    },
                     finished.usage.input,
                     finished.usage.output,
                     truncate(&sanitize(&text))
@@ -493,7 +497,9 @@ mod tests {
             .report(json!({"description": "look around", "prompt": "go"}))
             .await;
         assert!(
-            out.contains(&format!("finished in {CHILD_STEPS} steps")),
+            out.contains(&format!(
+                "finished in {CHILD_STEPS} steps (step budget spent)"
+            )),
             "{out}"
         );
         assert!(out.ends_with("what I found"), "{out}");
