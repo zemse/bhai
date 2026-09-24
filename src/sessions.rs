@@ -12,6 +12,47 @@ use sha2::{Digest, Sha256};
 
 /// Where sessions live, under the project root.
 pub const DIR: &str = ".bhai/sessions";
+
+/// Create `dir` and everything above it, reachable only by the user on unix. What bhai
+/// writes is what a session read, wrote and was told; the default umask would leave it
+/// readable by everyone with an account on the machine.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
+/// Open `path` for appending, creating it readable only by the user. A file that already
+/// exists keeps the mode it has.
+pub fn private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Write `contents` to `path`, creating it readable only by the user.
+pub fn private_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents.as_bytes())
+}
 /// Characters of the first user message `bhai sessions` shows.
 const FIRST_CHARS: usize = 60;
 
@@ -166,12 +207,9 @@ impl Writer {
     fn open(&mut self) -> Result<&std::fs::File> {
         if self.file.is_none() {
             if let Some(dir) = self.path.parent() {
-                std::fs::create_dir_all(dir)?;
+                private_dir(dir)?;
             }
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
+            let mut file = private_append(&self.path)
                 .with_context(|| format!("could not open {}", self.path.display()))?;
             hold(&file, &self.header.session)?;
             let mut header = serde_json::to_value(&self.header)?;
@@ -525,6 +563,22 @@ mod tests {
         let mut writer = Writer::resume(&dir, &loaded).unwrap();
         writer.append(&items()[0]).unwrap();
         assert_eq!(load(&path).unwrap().items.len(), 6);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A transcript holds what the session read, wrote and was told, so it is the user's
+    /// alone. The default umask would leave it readable by every account on the machine.
+    #[cfg(unix)]
+    #[test]
+    fn a_transcript_and_its_directory_are_the_users_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = temp_dir().join("nested").join(DIR);
+        let mut writer = Writer::create(&dir, header("s1"));
+        writer.append(&items()[0]).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path(&dir, "s1")), 0o600);
+        assert_eq!(mode(&dir), 0o700);
         let _ = std::fs::remove_dir_all(dir);
     }
 

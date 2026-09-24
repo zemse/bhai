@@ -370,12 +370,9 @@ impl History {
             return Ok(());
         };
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::sessions::private_dir(dir)?;
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut file = crate::sessions::private_append(path)?;
         writeln!(file, "{}", line(text)?)?;
         Ok(())
     }
@@ -419,7 +416,7 @@ fn rewrite(path: &Path, entries: &[String]) -> Result<()> {
         out.push_str(&line(entry)?);
         out.push('\n');
     }
-    std::fs::write(path, out)?;
+    crate::sessions::private_write(path, &out)?;
     Ok(())
 }
 

@@ -118,7 +118,7 @@ impl CacheGuard {
 
     fn append(&self, path: &Path, found: &CacheBreak) -> Result<()> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::sessions::private_dir(dir)?;
         }
         let line = json!({
             "timestamp": chrono::Local::now().to_rfc3339(),
@@ -126,10 +126,7 @@ impl CacheGuard {
             "field": found.field,
             "detail": found.detail,
         });
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+        let mut file = crate::sessions::private_append(path)
             .with_context(|| format!("could not open {}", path.display()))?;
         writeln!(file, "{line}")?;
         Ok(())

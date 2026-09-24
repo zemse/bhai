@@ -1265,12 +1265,9 @@ fn record(sink: &mut Sink<'_>, items: &[Value], tx: &mpsc::UnboundedSender<Agent
 
 fn append_jsonl(path: &Path, items: &[Value]) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        sessions::private_dir(dir)?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let mut file = sessions::private_append(path)
         .with_context(|| format!("could not open {}", path.display()))?;
     for item in items {
         writeln!(file, "{item}")?;

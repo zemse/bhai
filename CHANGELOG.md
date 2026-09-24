@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- What bhai writes is the user's alone. Session transcripts, child transcripts, the prompt
+  history, the workflow step cache and everything under `.bhai/debug` were created with the
+  default umask, so on a shared machine every account could read what a session read, wrote
+  and was told. On unix they are now created `0600`, and the directories holding them `0700`.
+  Files that already exist keep the mode they have.
+
 - What a file or a server can put in the system prompt is bounded. An instruction file over
   64 KiB is skipped and said instead of loaded, since the prompt is a prefix every call of
   the session pays for. MCP server and tool names in the listing lose their control

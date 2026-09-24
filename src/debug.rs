@@ -69,7 +69,7 @@ pub struct Bundle {
 pub fn export(bundle: &Bundle, dir: &Path) -> Result<PathBuf> {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let path = dir.join(format!("bhai-debug-{stamp}.md"));
-    std::fs::write(&path, bundle.markdown())
+    crate::sessions::private_write(&path, &bundle.markdown())
         .with_context(|| format!("could not write {}", path.display()))?;
     Ok(path)
 }

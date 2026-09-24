@@ -729,7 +729,7 @@ impl Cache {
                 .join(CACHE_DIR)
                 .join(slug(&run.workflow.name))
         });
-        match dir.filter(|dir| std::fs::create_dir_all(dir).is_ok()) {
+        match dir.filter(|dir| crate::sessions::private_dir(dir).is_ok()) {
             Some(dir) => Some(Self { dir }),
             None => {
                 let _ = run.tx.send(AgentEvent::Error(
@@ -755,7 +755,7 @@ impl Cache {
             output: output.to_string(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&entry) {
-            let _ = std::fs::write(self.dir.join(format!("{key}.json")), text);
+            let _ = crate::sessions::private_write(&self.dir.join(format!("{key}.json")), &text);
         }
     }
 }

@@ -661,13 +661,14 @@ pub fn debug_dir() -> PathBuf {
 
 /// Write `context-<timestamp>.json` and `.md` into `dir`; returns the JSON path.
 pub fn export(profile: &Profile, dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    crate::sessions::private_dir(dir)
+        .with_context(|| format!("could not create {}", dir.display()))?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%3f");
     let path = dir.join(format!("context-{stamp}.json"));
-    std::fs::write(&path, serde_json::to_string_pretty(profile)?)
+    crate::sessions::private_write(&path, &serde_json::to_string_pretty(profile)?)
         .with_context(|| format!("could not write {}", path.display()))?;
     let md = path.with_extension("md");
-    std::fs::write(&md, profile.markdown())
+    crate::sessions::private_write(&md, &profile.markdown())
         .with_context(|| format!("could not write {}", md.display()))?;
     Ok(path)
 }
@@ -675,7 +676,7 @@ pub fn export(profile: &Profile, dir: &Path) -> Result<PathBuf> {
 /// Append one JSONL line for a finished model call.
 pub fn log_usage(path: &Path, usage: &Usage, hit: &Hit, items: usize) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::sessions::private_dir(dir)?;
     }
     let line = json!({
         "timestamp": chrono::Local::now().to_rfc3339(),
@@ -687,10 +688,7 @@ pub fn log_usage(path: &Path, usage: &Usage, hit: &Hit, items: usize) -> Result<
         "expected_cached": hit.expected_cached,
         "hit_ratio": hit.hit_ratio,
     });
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let mut file = crate::sessions::private_append(path)
         .with_context(|| format!("could not open {}", path.display()))?;
     writeln!(file, "{line}")?;
     Ok(())
