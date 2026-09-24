@@ -10,7 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
+use chrono::Local;
 use futures_util::future::join_all;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{self, AgentEvent, Child, Children, Delegation};
@@ -29,6 +32,8 @@ const DEFAULT_BUDGET: u64 = 200_000;
 const HOME_DIR: &str = ".config/bhai/workflows";
 /// Workflow files under the project root; they replace a home one of the same name.
 const PROJECT_DIR: &str = ".bhai/workflows";
+/// Cached step results, under the same `.bhai` the session transcripts are in.
+const CACHE_DIR: &str = "cache/workflows";
 
 /// What a step does when it fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +64,9 @@ pub struct Workflow {
     pub budget_tokens: u64,
     /// Steps launched at once, never more than the child agent fan-out cap.
     pub max_parallel: usize,
+    /// Keep each step's result and hand it back when the step has not changed. Off
+    /// unless the file asks for it: a hit answers today's run with yesterday's text.
+    pub cache: bool,
     pub steps: Vec<Step>,
     /// Prose shown by `/workflows`.
     pub body: String,
@@ -131,6 +139,11 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
     };
     let budget_tokens = number("budget_tokens", DEFAULT_BUDGET)?;
     let max_parallel = number("max_parallel", 1)?.clamp(1, tools::agent::MAX_RUNNING as u64);
+    let cache = match value("cache").as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => bail!("bad `cache` `{other}`"),
+    };
 
     let mut steps = Vec::new();
     for item in frontmatter::items(&front, "steps").unwrap_or_default() {
@@ -160,6 +173,7 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
         source: source.to_string(),
         budget_tokens,
         max_parallel: max_parallel as usize,
+        cache,
         steps,
         body: body.trim_end().to_string(),
     })
@@ -295,12 +309,13 @@ pub fn report(found: &Found) -> String {
     for workflow in &found.workflows {
         let _ = writeln!(
             out,
-            "{} ({}): {} step(s), budget {} tokens, {} at a time",
+            "{} ({}): {} step(s), budget {} tokens, {} at a time{}",
             workflow.name,
             workflow.source,
             workflow.steps.len(),
             workflow.budget_tokens,
-            workflow.max_parallel
+            workflow.max_parallel,
+            caching(workflow)
         );
         // The description and the file's prose, indented under the definition.
         for line in workflow.description.lines().chain(workflow.body.lines()) {
@@ -314,6 +329,14 @@ pub fn report(found: &Found) -> String {
         let _ = writeln!(out, "{error}");
     }
     out
+}
+
+/// What the cache setting adds to a line describing a workflow.
+fn caching(workflow: &Workflow) -> &'static str {
+    match workflow.cache {
+        true => ", unchanged steps from cache",
+        false => "",
+    }
 }
 
 /// How one step ended.
@@ -332,6 +355,8 @@ pub struct StepReport {
     pub identity: String,
     pub status: Status,
     pub usage: Usage,
+    /// Answered from the cache, so it cost nothing and ran no child.
+    pub cached: bool,
 }
 
 /// What a finished run spent, step by step.
@@ -357,6 +382,7 @@ impl Report {
         );
         for step in &self.steps {
             let status = match &step.status {
+                Status::Ok if step.cached => "ok, from cache".to_string(),
                 Status::Ok => "ok".to_string(),
                 Status::Failed(e) => format!("failed: {e}"),
                 Status::Skipped(reason) => format!("did not run: {reason}"),
@@ -417,6 +443,14 @@ pub async fn run(run: Run<'_>) -> Report {
     let mut status: Vec<Option<Status>> = vec![None; workflow.steps.len()];
     let mut results: HashMap<String, String> = HashMap::new();
     let mut usage = vec![Usage::default(); workflow.steps.len()];
+    let mut cached = vec![false; workflow.steps.len()];
+    let cache = Cache::open(&run);
+    // Once a wave holds a step the cache does not have, every later wave runs cold and
+    // is not asked about. A changed result changes the prompts rendered after it, so
+    // those keys would miss anyway; not looking makes the rule the code's rather than a
+    // side effect of the keys. Steps in the same wave do not feed each other, so a miss
+    // says nothing about its siblings and they are still allowed to hit.
+    let mut cold = false;
     // Set once no more steps are launched, with the reason the rest did not run.
     let mut stopped: Option<String> = None;
 
@@ -424,6 +458,7 @@ pub async fn run(run: Run<'_>) -> Report {
         for (index, reason) in wave.blocked {
             status[index] = Some(Status::Skipped(reason));
         }
+        let mut missed = false;
         for chunk in wave.ready.chunks(workflow.max_parallel) {
             if stopped.is_none() && run.cancel.load(Ordering::Relaxed) {
                 stopped = Some("the run was interrupted".to_string());
@@ -440,23 +475,45 @@ pub async fn run(run: Run<'_>) -> Report {
                 }
                 continue;
             }
-            let launched: Vec<(usize, String)> = chunk
-                .iter()
-                .map(|&index| {
-                    let step = &workflow.steps[index];
-                    (index, render(&step.prompt, run.input, &results))
-                })
-                .collect();
-            let finished = join_all(launched.iter().map(|(index, prompt)| {
+            // The key, kept beside each launched step so the result can be stored under
+            // it. A cold run still stores what it produces; it only stops reading.
+            let mut launched: Vec<(usize, String, Option<String>)> = Vec::new();
+            for &index in chunk {
+                let step = &workflow.steps[index];
+                let prompt = render(&step.prompt, run.input, &results);
+                let Some(cache) = &cache else {
+                    launched.push((index, prompt, None));
+                    continue;
+                };
+                let key = key(step, &identities[index], &prompt);
+                match (!cold).then(|| cache.read(&key)).flatten() {
+                    Some(output) => {
+                        replay(&run, step, &identities[index], &output);
+                        results.insert(step.id.clone(), output);
+                        status[index] = Some(Status::Ok);
+                        cached[index] = true;
+                    }
+                    None => {
+                        missed = true;
+                        launched.push((index, prompt, Some(key)));
+                    }
+                }
+            }
+            let finished = join_all(launched.iter().map(|(index, prompt, _)| {
                 step(&run, &workflow.steps[*index], &identities[*index], prompt)
             }))
             .await;
-            for ((index, _), done) in launched.iter().zip(finished) {
+            for ((index, _, key), done) in launched.iter().zip(finished) {
                 let step = &workflow.steps[*index];
                 usage[*index] = done.usage;
                 add(&mut report.usage, done.usage);
                 match done.result {
                     Ok(text) => {
+                        // Only on the way out of this arm, so a failed step is not
+                        // stored and the next run retries it.
+                        if let (Some(cache), Some(key)) = (&cache, key) {
+                            cache.write(key, step, &identities[*index], &text);
+                        }
                         results.insert(step.id.clone(), text);
                         status[*index] = Some(Status::Ok);
                     }
@@ -470,6 +527,7 @@ pub async fn run(run: Run<'_>) -> Report {
                 }
             }
         }
+        cold |= missed;
     }
 
     report.steps = workflow
@@ -477,11 +535,13 @@ pub async fn run(run: Run<'_>) -> Report {
         .iter()
         .zip(status)
         .zip(usage)
-        .map(|((step, status), usage)| StepReport {
+        .zip(cached)
+        .map(|(((step, status), usage), cached)| StepReport {
             id: step.id.clone(),
             identity: step.identity.clone(),
             status: status.unwrap_or(Status::Skipped("not reached".to_string())),
             usage,
+            cached,
         })
         .collect();
     let _ = run.tx.send(AgentEvent::Info(report.text()));
@@ -512,12 +572,13 @@ fn plan(workflow: &Workflow) -> String {
         .map(|s| format!("{} ({})", s.id, s.identity))
         .collect();
     format!(
-        "workflow {}: {} step(s) [{}], budget {} tokens, {} at a time",
+        "workflow {}: {} step(s) [{}], budget {} tokens, {} at a time{}",
         workflow.name,
         workflow.steps.len(),
         steps.join(", "),
         workflow.budget_tokens,
-        workflow.max_parallel
+        workflow.max_parallel,
+        caching(workflow)
     )
 }
 
@@ -607,6 +668,104 @@ async fn step(run: &Run<'_>, step: &Step, identity: &Identity, prompt: &str) -> 
     finished
 }
 
+/// Put a cached step through the transcript the way a run one goes, so a re-run reads
+/// as the first one did.
+fn replay(run: &Run<'_>, step: &Step, identity: &Identity, output: &str) {
+    let _ = run.tx.send(AgentEvent::ToolStart {
+        tool: crate::tools::agent::NAME.to_string(),
+        summary: format!(
+            "workflow {} step {} ({}), from cache",
+            run.workflow.name, step.id, identity.name
+        ),
+    });
+    let _ = run.tx.send(AgentEvent::ToolOutput(tools::truncate(
+        &tools::agent::sanitize(output),
+    )));
+}
+
+/// One step's stored result. The key is the file name; the rest is here so the file
+/// says what it belongs to.
+#[derive(Serialize, Deserialize)]
+struct Cached {
+    step: String,
+    identity: String,
+    saved: String,
+    output: String,
+}
+
+/// A workflow's step results on disk, one file per key.
+struct Cache {
+    dir: PathBuf,
+}
+
+impl Cache {
+    /// `None` when the workflow does not ask for a cache, or when the directory will
+    /// not open. `delegation.sessions` is `<project>/.bhai/sessions`, so the cache
+    /// goes under the same `.bhai` as the transcripts.
+    fn open(run: &Run<'_>) -> Option<Self> {
+        if !run.workflow.cache {
+            return None;
+        }
+        let dir = run
+            .delegation
+            .sessions
+            .parent()
+            .map(|root| root.join(CACHE_DIR).join(slug(&run.workflow.name)));
+        match dir.filter(|dir| std::fs::create_dir_all(dir).is_ok()) {
+            Some(dir) => Some(Self { dir }),
+            None => {
+                let _ = run.tx.send(AgentEvent::Error(
+                    "workflow: no directory to cache steps in, so every step will run".to_string(),
+                ));
+                None
+            }
+        }
+    }
+
+    /// What was stored under `key`, or `None` for a miss and for a file that will not
+    /// read: an unusable cache runs the step.
+    fn read(&self, key: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.dir.join(format!("{key}.json"))).ok()?;
+        serde_json::from_str::<Cached>(&text).ok().map(|c| c.output)
+    }
+
+    fn write(&self, key: &str, step: &Step, identity: &Identity, output: &str) {
+        let entry = Cached {
+            step: step.id.clone(),
+            identity: identity.name.clone(),
+            saved: Local::now().to_rfc3339(),
+            output: output.to_string(),
+        };
+        if let Ok(text) = serde_json::to_string_pretty(&entry) {
+            let _ = std::fs::write(self.dir.join(format!("{key}.json")), text);
+        }
+    }
+}
+
+/// What a cached result is keyed on: the step's id, the prompt as it will be sent, and
+/// the whole identity definition, so an edited agent file runs the step again.
+fn key(step: &Step, identity: &Identity, prompt: &str) -> String {
+    let identity = format!("{identity:?}");
+    let mut hasher = Sha256::new();
+    for part in [step.id.as_str(), prompt, identity.as_str()] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// A workflow name as one path component.
+fn slug(name: &str) -> String {
+    name.chars()
+        .map(
+            |c| match c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                true => c,
+                false => '-',
+            },
+        )
+        .collect()
+}
+
 /// Tokens a run has spent: what was sent plus what came back.
 fn spent(usage: &Usage) -> u64 {
     usage.input + usage.output
@@ -621,6 +780,8 @@ fn add(total: &mut Usage, usage: Usage) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::agent::fake::{self, Fake, say};
     use crate::permissions::Answer;
@@ -631,13 +792,17 @@ mod tests {
     }
 
     fn delegation() -> Delegation {
+        delegation_in(PathBuf::new())
+    }
+
+    fn delegation_in(sessions: PathBuf) -> Delegation {
         Delegation {
             identities: vec![Identity::default()],
             prompt: Arc::new(|identity: &Identity| SystemPrompt {
                 identity: identity.clone(),
                 ..SystemPrompt::default()
             }),
-            sessions: PathBuf::new(),
+            sessions,
             mailboxes: Default::default(),
         }
     }
@@ -661,23 +826,34 @@ mod tests {
     }
 
     async fn go(workflow: &Workflow, input: &str, fake: &Fake) -> (Report, Vec<String>, PathBuf) {
+        let root = tools::temp_dir();
+        let (report, seen) = go_in(&root, workflow, input, fake).await;
+        (report, seen, root)
+    }
+
+    /// One run with its project directory given, so two runs share one cache.
+    async fn go_in(
+        root: &Path,
+        workflow: &Workflow,
+        input: &str,
+        fake: &Fake,
+    ) -> (Report, Vec<String>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let seen = tokio::spawn(accept(rx));
-        let transcripts = tools::temp_dir();
         let report = run(Run {
             workflow,
             input,
-            delegation: &delegation(),
+            delegation: &delegation_in(root.join("sessions")),
             model: fake,
             policy: &Policy::default(),
             tx: &tx,
             cancel: &Arc::new(AtomicBool::new(false)),
             children: &Children::default(),
-            transcripts: transcripts.clone(),
+            transcripts: root.join("transcripts"),
         })
         .await;
         drop(tx);
-        (report, seen.await.unwrap(), transcripts)
+        (report, seen.await.unwrap())
     }
 
     fn statuses(report: &Report) -> Vec<(&str, &Status)> {
@@ -799,6 +975,93 @@ needs: [a]\n    prompt: two {{steps.a}}\n",
     }
 
     #[tokio::test]
+    async fn a_second_run_of_an_unchanged_workflow_calls_no_model() {
+        let workflow = workflow(
+            "cache: true\nsteps:\n  - id: a\n    prompt: look at {{input}}\n  - id: b\n    \
+needs: [a]\n    prompt: review {{steps.a}}\n",
+        );
+        assert!(workflow.cache);
+        let root = tools::temp_dir();
+        let fake = Fake::new(vec![vec![say("a said this")], vec![say("b done")]]);
+        let (first, _) = go_in(&root, &workflow, "the repo", &fake).await;
+        assert_eq!(statuses(&first), [("a", &Status::Ok), ("b", &Status::Ok)]);
+        assert!(first.steps.iter().all(|s| !s.cached));
+
+        // An empty script, so any call the second run makes fails the step.
+        let fake = Fake::new(Vec::new());
+        let (again, seen) = go_in(&root, &workflow, "the repo", &fake).await;
+        assert_eq!(statuses(&again), [("a", &Status::Ok), ("b", &Status::Ok)]);
+        assert!(again.steps.iter().all(|s| s.cached));
+        assert_eq!(spent(&again.usage), 0);
+        assert!(fake.bodies.lock().unwrap().is_empty());
+        assert!(
+            seen.contains(&"start: workflow w step b (general), from cache".to_string()),
+            "{seen:?}"
+        );
+        assert!(
+            again.text().contains("a (general) ok, from cache"),
+            "{}",
+            again.text()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_changed_step_re_runs_every_step_after_it() {
+        // `b`'s own prompt never changes, so only the rule keeps it from hitting.
+        let workflow = workflow(
+            "cache: true\nsteps:\n  - id: a\n    prompt: look at {{input}}\n  - id: b\n    \
+needs: [a]\n    prompt: review it\n",
+        );
+        let root = tools::temp_dir();
+        let fake = Fake::new(vec![vec![say("first a")], vec![say("first b")]]);
+        go_in(&root, &workflow, "one repo", &fake).await;
+
+        let fake = Fake::new(vec![vec![say("second a")], vec![say("second b")]]);
+        let (again, _) = go_in(&root, &workflow, "another repo", &fake).await;
+        assert!(again.steps.iter().all(|s| !s.cached), "{:?}", again.steps);
+        let bodies = fake.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+
+        // The changed input is now the cached one, so running it again hits both steps.
+        let fake = Fake::new(Vec::new());
+        let (third, _) = go_in(&root, &workflow, "another repo", &fake).await;
+        assert!(third.steps.iter().all(|s| s.cached), "{:?}", third.steps);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_failed_step_is_not_cached() {
+        let workflow = workflow("cache: true\nsteps:\n  - id: a\n    prompt: one\n");
+        let root = tools::temp_dir();
+        let fake = Fake::new(vec![fake::step(fake::FAIL)]);
+        let (first, _) = go_in(&root, &workflow, "", &fake).await;
+        assert!(matches!(first.steps[0].status, Status::Failed(_)));
+
+        let fake = Fake::new(vec![vec![say("worked this time")]]);
+        let (again, _) = go_in(&root, &workflow, "", &fake).await;
+        assert_eq!(again.steps[0].status, Status::Ok);
+        assert!(!again.steps[0].cached);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn without_the_frontmatter_key_nothing_is_cached() {
+        let workflow = workflow("steps:\n  - id: a\n    prompt: one\n");
+        assert!(!workflow.cache);
+        let root = tools::temp_dir();
+        for _ in 0..2 {
+            let fake = Fake::new(vec![vec![say("ran")]]);
+            let (report, _) = go_in(&root, &workflow, "", &fake).await;
+            assert_eq!(report.steps[0].status, Status::Ok);
+            assert!(!report.steps[0].cached);
+            assert_eq!(fake.bodies.lock().unwrap().len(), 1);
+        }
+        assert!(!root.join(CACHE_DIR).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn a_refused_confirmation_runs_nothing() {
         let workflow = workflow("steps:\n  - id: a\n    prompt: one\n");
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -861,6 +1124,16 @@ needs: [a]\n    prompt: two\n---\n",
 
         let missing = parse("---\nname: w\n---\n", "./test").unwrap_err();
         assert!(format!("{missing:#}").contains("no `steps`"), "{missing:#}");
+
+        let cache = parse(
+            "---\nname: w\ncache: sometimes\nsteps:\n  - id: a\n    prompt: one\n---\n",
+            "./test",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{cache:#}").contains("bad `cache` `sometimes`"),
+            "{cache:#}"
+        );
     }
 
     #[test]
@@ -873,6 +1146,7 @@ needs: [a]\n    prompt: two\n---\n",
         .unwrap();
         assert_eq!(workflow.budget_tokens, DEFAULT_BUDGET);
         assert_eq!(workflow.max_parallel, tools::agent::MAX_RUNNING);
+        assert!(!workflow.cache);
         assert_eq!(workflow.steps[0].identity, "router");
         assert_eq!(workflow.steps[0].prompt, "read {{input}}\nthen stop");
         assert_eq!(workflow.steps[0].on_fail, OnFail::Stop);

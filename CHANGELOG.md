@@ -6,6 +6,19 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A workflow can keep its step results between runs, so re-running one skips the steps
+  that have not changed. `cache: true` in the definition's frontmatter turns it on and
+  nothing else does: a hit answers today's run with an older answer, so the file the
+  author wrote is where that choice belongs, and both the confirmation prompt and
+  `/workflows` say which workflows have it. A result is keyed on the step's id, the
+  prompt as it will be sent once `{{input}}` and `{{steps.<id>}}` are filled in, and the
+  whole identity the step runs as, so an edited agent file runs the step again; the files
+  sit in `.bhai/cache/workflows/<name>`, beside the session transcripts and gitignored.
+  The first step whose key has changed runs, and so does every wave after it, which is
+  not asked about the cache at all. A step that failed is never stored, so the next run
+  retries it. A hit spends no tokens and launches no child, and says so in the transcript
+  and in the run's report.
+
 - Child agents run detached, so the session is never held by one. The `agent` call hands
   back the child's id and returns; asking for three starts three, and they run together
   under the same `MAX_RUNNING` limit, with a fourth waiting for a slot instead of the
