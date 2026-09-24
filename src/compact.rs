@@ -17,8 +17,10 @@ pub const OLLAMA_WINDOW: u64 = 32_768;
 pub const DEFAULT_WINDOW: u64 = 128_000;
 /// The default fraction of the window a call may read before history is compacted.
 pub const COMPACT_AT: f64 = 0.8;
-/// Compaction aims for this fraction of the window.
+/// Compaction aims for this fraction of the window, or for this fraction of a lower
+/// trigger: a target equal to the trigger would leave the next turn over it again.
 const TARGET: f64 = 0.6;
+const TARGET_OF_TRIGGER: f64 = 0.75;
 /// The most recent tool results are never evicted.
 const KEEP_RESULTS: usize = 6;
 /// How the summary starts in the compacted history.
@@ -57,9 +59,11 @@ impl Limits {
         input as f64 > self.compact_at * self.window(model) as f64
     }
 
-    /// The size compaction aims for, in tokens, never above `compact_at`.
+    /// The size compaction aims for, in tokens, always below `compact_at`.
     pub fn target(&self, model: &str) -> u64 {
-        (TARGET.min(self.compact_at) * self.window(model) as f64) as u64
+        let fraction = TARGET.min(self.compact_at * TARGET_OF_TRIGGER);
+        // Rounded, so a trigger that is exact in decimal does not lose a token to binary.
+        (fraction * self.window(model) as f64).round() as u64
     }
 }
 
@@ -195,12 +199,22 @@ mod tests {
             compact_at: 0.7,
         };
         assert!(set.over("other", 701));
-        assert_eq!(set.target("other"), 600);
+        assert_eq!(set.target("other"), 525);
+        // A trigger at or under the flat target: aiming for it would compact into a
+        // history that is over the trigger again, so the target follows the trigger down.
         let low = Limits {
             compact_at: 0.5,
             ..set
         };
-        assert_eq!(low.target("other"), 500);
+        assert_eq!(low.target("other"), 375);
+        for compact_at in [0.1, 0.3, 0.5, 0.6, 0.8, 0.95, 1.0] {
+            let limits = Limits { compact_at, ..set };
+            let window = limits.window("other") as f64;
+            assert!(
+                (limits.target("other") as f64) < compact_at * window,
+                "target at compact_at {compact_at}"
+            );
+        }
     }
 
     #[test]

@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A lowered `compact_at` no longer compacts into a history that is already over it. The
+  target was `min(0.6, compact_at)` of the window, so `compact_at = 0.5` summarised down to
+  exactly the trigger and the next turn triggered again. It is now three quarters of the
+  trigger, capped at 0.6, which leaves the default (`compact_at = 0.8`) aiming at the same
+  0.6 it always did.
+
 - What bhai writes is the user's alone. Session transcripts, child transcripts, the prompt
   history, the workflow step cache and everything under `.bhai/debug` were created with the
   default umask, so on a shared machine every account could read what a session read, wrote
