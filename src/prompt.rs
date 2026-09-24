@@ -80,8 +80,7 @@ impl SystemPrompt {
 identities. A child starts with none of this conversation and is thrown away with its \
 context after, so it earns its cost only when it would read far more than it reports \
 back: what you have already read, or could read in a few calls, is cheaper to do here. \
-It is held to what the permission rules allow outright, so it may be refused a call you \
-would have been given. Pick the identity whose tools and skills fit the task; one with \
+It is judged on its own task with a budget of its own, so it can run what you could. Pick the identity whose tools and skills fit the task; one with \
 no model of its own runs on yours, at your effort. Do not delegate edits that depend on \
 each other.\n\nA child runs detached: the call hands back its id and returns at once, and \
 the report arrives later as a message. Start everything you want running in one go rather \
@@ -245,9 +244,9 @@ until the 120-second timeout kills it.
 - Read before you write. Look at a file before editing it, and verify after editing.
 - Do not commit to git unless the user asks for it.
 
-Answer in plain text for a terminal: short, specific, no markdown headers or bullet-point \
-padding. Say what you did and what you found. When a task is done, stop calling tools and \
-report the result."
+Answer short and specific. Markdown is rendered here, so use a heading, list, table or code \
+block where the answer needs one and prose where it does not. Say what you did and what you \
+found. When a task is done, stop calling tools and report the result."
     )
 }
 

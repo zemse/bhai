@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- The system prompt stops saying two things that are not true. It forbade markdown headers
+  and bullets while the transcript has rendered headings, tables, lists, code and mermaid
+  since the hackmd port, and the model ignored the rule in every transcript that was looked
+  at; it now says to use the structure an answer needs and prose where it does not. The
+  delegation section still said a child "is held to what the permission rules allow
+  outright", which stopped being true when a child got a judge of its own.
+
 - An answer the backend cut off at the model's output limit says so. Ollama's
   `done_reason: length` was read as a finished turn, so a truncated answer looked complete;
   the transcript now carries `cut off at the model's output limit; the answer is what it
