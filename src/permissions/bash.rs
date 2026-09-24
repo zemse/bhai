@@ -547,6 +547,32 @@ fn awk_reads_only(args: &[String]) -> bool {
     })
 }
 
+/// The files a command changes through its arguments, as written: every operand of the
+/// programs that create, delete or rewrite what they name, and the destination of those
+/// that copy or link into it. Redirects are in `Command::writes`. A program not listed
+/// here changes nothing this can name, which says nothing about whether it writes.
+pub fn written_args(words: &[String]) -> Vec<&str> {
+    let Some((name, args)) = words.split_first() else {
+        return Vec::new();
+    };
+    let mut operands = Vec::new();
+    let mut flags = true;
+    for arg in args {
+        match arg.as_str() {
+            "--" if flags => flags = false,
+            a if flags && a.starts_with('-') && a != "-" => {}
+            a => operands.push(a),
+        }
+    }
+    match basename(name) {
+        "tee" | "touch" | "mkdir" | "rm" | "rmdir" | "mv" | "truncate" => operands,
+        "cp" | "ln" | "install" | "rsync" => operands.last().copied().into_iter().collect(),
+        // The first operand is the mode or owner, the rest are what it is set on.
+        "chmod" | "chown" => operands.into_iter().skip(1).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The directory a `cd` moves to, for the only shape this can follow: one operand, no
 /// flags, and no `~` for the shell to expand. `cd`, `cd -` and `cd a b` are not that.
 pub fn cd_target(words: &[String]) -> Option<&str> {

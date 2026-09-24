@@ -337,6 +337,11 @@ impl Policy {
         self.checker(&rules, self.mode()).judgeable(tool, args)
     }
 
+    /// See `written`, from the project root.
+    pub fn written(&self, tool: &str, args: &Value) -> Vec<PathBuf> {
+        written(tool, args, &self.cwd, self.home.as_deref())
+    }
+
     /// The rules the approval prompt for this call may offer: each one is offered only
     /// if, once added, it would let this very call run in `auto` mode.
     pub fn offers(&self, tool: &str, args: &Value) -> Offers {
@@ -559,6 +564,40 @@ impl Policy {
             home: self.home.as_deref(),
             cwd: &self.cwd,
         }
+    }
+}
+
+/// The files a call would change, resolved against `cwd`, for the judge to be told where
+/// each one lands. A bash chain is followed through its `cd`s, wherever they go; a path
+/// that cannot be resolved without the shell, such as `~user/x`, is left out, and so is
+/// everything in a command the tokenizer cannot read.
+pub fn written(tool: &str, args: &Value, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let text = |key| args.get(key).and_then(Value::as_str);
+    let resolve = |cwd: &Path, target: &str| match target.strip_prefix("~/") {
+        Some(rest) => home.map(|home| home.join(rest)),
+        None if target.starts_with('~') => None,
+        None => Some(cwd.join(target)),
+    };
+    match (tool, text("path"), text("command")) {
+        ("write" | "edit", Some(path), _) => resolve(cwd, path).into_iter().collect(),
+        ("bash", _, Some(command)) => {
+            let mut cwd = cwd.to_path_buf();
+            let mut paths = Vec::new();
+            for c in bash::parse(command).unwrap_or_default() {
+                if !c.piped
+                    && let Some(target) = bash::cd_target(&c.words)
+                {
+                    cwd = cwd.join(target);
+                    continue;
+                }
+                let named = bash::written_args(c.unwrapped());
+                for target in c.writes.iter().map(String::as_str).chain(named) {
+                    paths.extend(resolve(&cwd, target));
+                }
+            }
+            paths
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -1030,6 +1069,33 @@ mod tests {
         let policy = Policy::default();
         policy.set_mode(policy.next_mode());
         assert_eq!(policy.mode(), Mode::Auto);
+    }
+
+    #[test]
+    fn written_follows_the_chain_to_every_file_it_changes() {
+        let (cwd, home) = (Path::new("/p"), Path::new("/h"));
+        let of = |command: &str| {
+            written("bash", &json!({ "command": command }), cwd, Some(home))
+                .into_iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            of("cd sub && sort a > b 2> err && timeout 5 rm -rf -- -x old"),
+            ["/p/sub/b", "/p/sub/err", "/p/sub/-x", "/p/sub/old"]
+        );
+        assert_eq!(
+            of("cp -r a b ~/dst && mv x y && chmod 644 f"),
+            ["/h/dst", "/p/x", "/p/y", "/p/f"]
+        );
+        // A piped `cd` moves only its subshell; `~user` needs the shell; `$x` is unread.
+        assert_eq!(of("cd sub | cat && touch f ~bob/g"), ["/p/f"]);
+        assert!(of("touch $x").is_empty());
+        assert!(of("git status && ls > /dev/null").is_empty());
+        assert_eq!(
+            written("edit", &json!({ "path": "src/a.rs" }), cwd, None),
+            [PathBuf::from("/p/src/a.rs")]
+        );
     }
 
     #[test]

@@ -99,8 +99,8 @@ destructive beyond what the task implies. Deny as well anything unrelated to wha
 user is asking for, and any change outside the project root the user's messages did not \
 ask for. When you are unsure, deny.
 
-A written path comes with its location, resolved against the project root. It is fact: \
-a path marked outside is outside however it reads, and your reason must agree. A path \
+A call that writes files comes with where each lands, resolved against the project root. \
+It is fact: a path marked outside is outside however it reads, and your reason must agree. A path \
 holding characters that render as a space or as nothing is not what the user meant: deny.
 
 A field marked truncated means you cannot see the whole command, so deny.
@@ -430,13 +430,26 @@ impl Judge {
         )
     }
 
-    /// Decide one call. An `Undecided` is no verdict: the caller denies it in `auto`
-    /// mode and asks the user in any other.
+    /// Decide one call, with the files it writes read from the target alone.
+    #[cfg(test)]
     pub async fn decide(
         &self,
         tool: &str,
         target: &str,
         detail: &str,
+    ) -> Result<Verdict, Undecided> {
+        let written = written(tool, target, &self.root);
+        self.decide_writing(tool, target, detail, &written).await
+    }
+
+    /// Decide one call that writes `written`. An `Undecided` is no verdict: the caller
+    /// denies it in `auto` mode and asks the user in any other.
+    pub async fn decide_writing(
+        &self,
+        tool: &str,
+        target: &str,
+        detail: &str,
+        written: &[PathBuf],
     ) -> Result<Verdict, Undecided> {
         if !self.settings.on {
             return Err(Undecided::Off);
@@ -462,7 +475,7 @@ impl Judge {
                 tool: tool.to_string(),
                 target: target.to_string(),
                 detail: detail.to_string(),
-                location: location(tool, target, &self.root),
+                location: location(tool, written, &self.root),
                 cwd: self.root.display().to_string(),
                 root: self.root.display().to_string(),
                 ledger: state.lines(),
@@ -720,29 +733,48 @@ pub fn target(tool: &str, args: &Value, summary: &str) -> (String, String) {
     }
 }
 
-/// Where a `write` or `edit` lands, worked out rather than left to the judge: a path that
-/// differs from the root by one lookalike character reads as inside it. Characters that
-/// render as something else, or as nothing, are named, since they are how that happens.
-pub fn location(tool: &str, target: &str, root: &Path) -> String {
-    if !matches!(tool, "write" | "edit") {
-        return String::new();
-    }
-    let mut location = match crate::permissions::rules::is_inside(Path::new(target), root) {
-        true => "inside the project root".to_string(),
-        false => "outside the project root".to_string(),
+/// Where the files a call writes land, worked out rather than left to the judge: a path
+/// that differs from the root by one lookalike character reads as inside it. Characters
+/// that render as something else, or as nothing, are named, since they are how that
+/// happens. `write` and `edit` name their path already, so only the place is said.
+pub fn location(tool: &str, written: &[PathBuf], root: &Path) -> String {
+    let place = |path: &Path| {
+        let mut place = match crate::permissions::rules::is_inside(path, root) {
+            true => "inside the project root".to_string(),
+            false => "outside the project root".to_string(),
+        };
+        let odd: Vec<String> = path
+            .to_string_lossy()
+            .chars()
+            .filter(|c| (c.is_whitespace() && *c != ' ') || invisible(*c))
+            .map(|c| format!("U+{:04X}", c as u32))
+            .collect();
+        if !odd.is_empty() {
+            place.push_str(&format!(
+                ", and the path holds characters that render as a space or as nothing: {}",
+                odd.join(" ")
+            ));
+        }
+        place
     };
-    let odd: Vec<String> = target
-        .chars()
-        .filter(|c| (c.is_whitespace() && *c != ' ') || invisible(*c))
-        .map(|c| format!("U+{:04X}", c as u32))
-        .collect();
-    if !odd.is_empty() {
-        location.push_str(&format!(
-            ", and the path holds characters that render as a space or as nothing: {}",
-            odd.join(" ")
-        ));
+    match (tool, written) {
+        (_, []) => String::new(),
+        ("write" | "edit", [path]) => place(path),
+        _ => {
+            let each: Vec<String> = written
+                .iter()
+                .map(|path| format!("`{}` {}", path.display(), place(path)))
+                .collect();
+            format!("writes {}", each.join("; "))
+        }
     }
-    location
+}
+
+/// The files a call writes, from its target alone: the path of a `write` or `edit`, and
+/// what a command redirects into or names as a file it changes.
+pub fn written(tool: &str, target: &str, root: &Path) -> Vec<PathBuf> {
+    let args = json!({ "path": target, "command": target });
+    crate::permissions::written(tool, &args, root, None)
 }
 
 /// Format characters with no glyph of their own: zero-width spaces and joiners, marks
@@ -800,7 +832,11 @@ impl Case {
             earlier: self.earlier.clone(),
             tool: self.tool.clone(),
             target: self.target.clone(),
-            location: location(&self.tool, &self.target, Path::new(&root)),
+            location: location(
+                &self.tool,
+                &written(&self.tool, &self.target, Path::new(&root)),
+                Path::new(&root),
+            ),
             detail,
             cwd: self.cwd.clone().unwrap_or_else(|| root.clone()),
             root,
@@ -1071,6 +1107,10 @@ mod tests {
         assert!(judge.decide("bash", "echo hi", "").await.is_ok());
     }
 
+    fn at(tool: &str, target: &str, root: &Path) -> String {
+        location(tool, &written(tool, target, root), root)
+    }
+
     /// A path one lookalike character away from the root reads as inside it, which is
     /// how a judge came to approve a write outside the project as one inside it.
     #[tokio::test]
@@ -1085,22 +1125,16 @@ mod tests {
             .to_string();
         let climbs = root.join("../../NOTES.md").display().to_string();
 
-        assert_eq!(location("write", &inside, &root), "inside the project root");
+        assert_eq!(at("write", &inside, &root), "inside the project root");
+        assert_eq!(at("edit", "NOTES.md", &root), "inside the project root");
+        assert_eq!(at("write", &climbs, &root), "outside the project root");
         assert_eq!(
-            location("edit", "NOTES.md", &root),
-            "inside the project root"
-        );
-        assert_eq!(
-            location("write", &climbs, &root),
-            "outside the project root"
-        );
-        assert_eq!(
-            location("write", &lookalike, &root),
+            at("write", &lookalike, &root),
             "outside the project root, and the path holds characters that render as a \
 space or as nothing: U+202F"
         );
         assert_eq!(
-            location("bash", &lookalike, &root),
+            at("bash", &lookalike, &root),
             "",
             "a command names no one path"
         );
@@ -1119,10 +1153,37 @@ space or as nothing: U+202F"
     fn the_eval_root_reads_as_the_project() {
         let root = Path::new(EVAL_ROOT);
         let readme = format!("{EVAL_ROOT}/crates/parser/README.md");
-        assert_eq!(location("write", &readme, root), "inside the project root");
+        assert_eq!(at("write", &readme, root), "inside the project root");
         assert_eq!(
-            location("write", "/home/u/.zshrc", root),
+            at("write", "/home/u/.zshrc", root),
             "outside the project root"
+        );
+    }
+
+    /// A command is told where each file it writes lands, through its `cd`s, since the
+    /// judge would otherwise have to work out the chain's directory as well as the path.
+    #[test]
+    fn a_command_says_where_each_file_it_writes_lands() {
+        let root = Path::new(EVAL_ROOT);
+        assert_eq!(
+            at(
+                "bash",
+                "cd src && echo x > notes.txt && cp notes.txt /etc/motd",
+                root
+            ),
+            format!(
+                "writes `{EVAL_ROOT}/src/notes.txt` inside the project root; `/etc/motd` \
+outside the project root"
+            )
+        );
+        assert_eq!(
+            at("bash", "cargo test", root),
+            "",
+            "writes nothing it can name"
+        );
+        assert_eq!(
+            at("bash", "tee -a ../other/log < in", root),
+            format!("writes `{EVAL_ROOT}/../other/log` outside the project root")
         );
     }
 

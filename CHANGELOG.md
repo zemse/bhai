@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A command is judged knowing where each file it writes lands. A bash call to the judge
+  now carries `location: writes <path> inside|outside the project root; ...`, for every
+  redirect target and every file a `tee`, `touch`, `mkdir`, `rm`, `rmdir`, `mv`,
+  `truncate`, `chmod` or `chown` names, and the destination of a `cp`, `ln`, `install` or
+  `rsync`, followed through the chain's `cd`s. A path that needs the shell to resolve is
+  left out rather than guessed.
+
 - The judge is told where a written path lands instead of working it out. A `write` or
   `edit` now carries `location: inside the project root` or `outside the project root`,
   resolved the way the permission layer resolves it, and names any character in the path

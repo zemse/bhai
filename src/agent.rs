@@ -290,6 +290,8 @@ pub struct Delegation {
     pub prompt: Arc<dyn Fn(&Identity) -> SystemPrompt + Send + Sync>,
     /// Child transcripts go to `<sessions>/<session id>/child-<id>.jsonl`.
     pub sessions: PathBuf,
+    /// `<project>/.bhai`, which a caching workflow keeps its step results under.
+    pub cache_root: PathBuf,
     /// Shared with the session, so what is typed into a pane reaches that child.
     pub mailboxes: Mailboxes,
 }
@@ -469,6 +471,10 @@ pub(crate) async fn run_with(
         .as_ref()
         .map(|d| d.sessions.join(&session_id))
         .unwrap_or_default();
+    let cache_root = delegation
+        .as_ref()
+        .map(|d| d.cache_root.clone())
+        .unwrap_or_default();
     // Built again when `/model` switches, so a child starts on the model its parent is
     // on. What tools there are does not depend on the model, so the schemas hold.
     let build = |model: &Arc<dyn Model>| {
@@ -568,6 +574,7 @@ pub(crate) async fn run_with(
                                     children: &children,
                                     judge: judge.as_deref(),
                                     transcripts: transcripts.clone(),
+                                    cache_root: cache_root.clone(),
                                 })
                                 .await;
                             }
@@ -1666,7 +1673,9 @@ async fn judged(
     policy
         .judgeable(name, args)
         .map_err(Undecided::Unjudgeable)?;
-    judge.decide(name, target, detail).await
+    judge
+        .decide_writing(name, target, detail, &policy.written(name, args))
+        .await
 }
 
 /// Prompt the user for a call. `None` means approved; otherwise the result to return.
@@ -2143,6 +2152,7 @@ mod tests {
                 ..SystemPrompt::default()
             }),
             sessions: dir.clone(),
+            cache_root: dir.clone(),
             mailboxes: Default::default(),
         };
         let cancel = Arc::new(Cancel::default());
@@ -2360,6 +2370,7 @@ mod tests {
                 ..crate::prompt::system_prompt(&[], Vec::new())
             }),
             sessions: dir.clone(),
+            cache_root: dir.clone(),
             mailboxes: Default::default(),
         };
         let rules = Rules {
@@ -3209,6 +3220,7 @@ mod tests {
                 ..crate::prompt::system_prompt(&[], Vec::new())
             }),
             sessions: dir.clone(),
+            cache_root: dir.clone(),
             mailboxes: Default::default(),
         };
         let policy = Arc::new(Policy::new(Mode::Ask, Rules::default(), None, dir.clone()));
