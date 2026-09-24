@@ -5,7 +5,7 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -163,9 +163,9 @@ pub struct App {
     pub pinned: HashSet<usize>,
     /// Tool output entries shown in full rather than collapsed.
     pub expanded: HashSet<usize>,
-    /// Entries with rows folded away right now, filled in by the renderer. A click on
-    /// one of these opens or closes it; a click anywhere else pins the badge.
-    pub folds: HashSet<usize>,
+    /// Entries with rows folded away right now, filled in by the renderer, each to the
+    /// entry a click on it opens or closes. A click anywhere else pins the badge.
+    pub folds: HashMap<usize, usize>,
     pub all_badges: bool,
     /// Clickable approval choices and the key each stands for, filled in by the renderer.
     pub buttons: Vec<(Rect, KeyCode)>,
@@ -276,7 +276,7 @@ impl App {
             mouse_row: None,
             pinned: HashSet::new(),
             expanded: HashSet::new(),
-            folds: HashSet::new(),
+            folds: HashMap::new(),
             all_badges: false,
             buttons: Vec::new(),
             input_area: None,
@@ -678,10 +678,9 @@ impl App {
             self.retry();
             return true;
         }
-        let set = if self.folds.contains(&entry) {
-            &mut self.expanded
-        } else {
-            &mut self.pinned
+        let (set, entry) = match self.folds.get(&entry) {
+            Some(&fold) => (&mut self.expanded, fold),
+            None => (&mut self.pinned, entry),
         };
         if !set.remove(&entry) {
             set.insert(entry);

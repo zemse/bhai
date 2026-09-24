@@ -6,6 +6,10 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A shell command's output stays out of sight until the command is clicked: the command
+  row ends in `[+N lines]`, a click on it shows the output in full, and a click on the
+  command or the output closes it again. A command still running shows its latest lines.
+
 - `sed -i` and `dd of=` count as writes for the judge's location line: the files a `sed`
   edits in place, in GNU's `-i.bak` form or BSD's `-i ''`, and the file a `dd` writes
   other than `/dev/null`.

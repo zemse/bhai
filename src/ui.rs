@@ -6,7 +6,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -504,17 +504,34 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let entries = app.entries();
     let mut spans = Vec::with_capacity(entries.list.len());
     let mut joins: Vec<Join> = Vec::new();
-    let mut folds = HashSet::new();
+    let mut folds = HashMap::new();
     for (index, entry) in entries.list.iter().enumerate() {
         let start = lines.len();
         // Only the last entry can be run again: anything after it has moved the history
         // on, and a turn of its own is already running.
         let retryable = index + 1 == entries.list.len() && !app.working;
-        let rows = entry_lines(entry, width, app.expanded.contains(&index), retryable);
+        // A shell command's output opens and closes with the command above it.
+        let owner = match index
+            .checked_sub(1)
+            .map(|above| (above, &entries.list[above]))
+        {
+            Some((above, command)) if shell_output(command, entry).is_some() => above,
+            _ => index,
+        };
+        let expanded = app.expanded.contains(&owner);
+        if owner != index && !expanded {
+            folds.insert(index, owner);
+            continue;
+        }
+        let output = entries
+            .list
+            .get(index + 1)
+            .and_then(|next| shell_output(entry, next));
+        let rows = entry_lines(entry, width, expanded, retryable, output);
         lines.extend(rows.lines);
         joins.extend(rows.joins);
-        if rows.folded {
-            folds.insert(index);
+        if rows.folded || owner != index {
+            folds.insert(index, owner);
         }
         // The blank separator line belongs to no entry.
         spans.push((start..lines.len() - 1, index));
@@ -740,6 +757,18 @@ fn collapsed_rows(entry: &Entry) -> Option<usize> {
     }
 }
 
+/// The output `entry` is when it is what the shell command `command` printed.
+fn shell_output<'a>(command: &Entry, entry: &'a Entry) -> Option<&'a str> {
+    match (command, entry) {
+        (Entry::Command { tool, .. }, Entry::Output(output))
+            if tool == crate::tools::bash::NAME =>
+        {
+            Some(output)
+        }
+        _ => None,
+    }
+}
+
 /// What an entry draws: its rows, how each one joins the row above it, and whether it
 /// has rows a click folds away.
 struct Rows {
@@ -750,7 +779,14 @@ struct Rows {
 
 /// An entry's rows plus a blank separator, and whether it has rows a click folds away.
 /// Thinking and long tool output show only a little of themselves unless `expanded`.
-fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> Rows {
+/// `output` is what a shell command printed, which stays out of sight until then.
+fn entry_lines(
+    entry: &Entry,
+    width: usize,
+    expanded: bool,
+    retryable: bool,
+    output: Option<&str>,
+) -> Rows {
     if let Entry::Assistant(text) = entry {
         let lead = MESSAGE_MARK.chars().count();
         let indent = " ".repeat(lead);
@@ -806,6 +842,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> 
     let text = &crate::wrap::readable(text);
     let mut wrapped_lines = joined(text, width.saturating_sub(lead).max(4));
     let hidden = collapsed_rows(entry).map_or(0, |rows| wrapped_lines.len().saturating_sub(rows));
+    let printed = output.map_or(0, |output| output.lines().count());
     if hidden > 0 && !expanded {
         match entry {
             // A running command shows its latest lines; everything else its first.
@@ -826,6 +863,10 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> 
     // A ground of its own is only a block if it runs the width of the transcript, so the
     // rows under one are filled out rather than ending where the text does.
     let ground = matches!(entry, Entry::User(_));
+    // A shell command whose output is out of sight says so at the end of its last row,
+    // counting its own folded rows in with what it printed.
+    let tucked = output.is_some() && !expanded;
+    let last = wrapped_lines.len().saturating_sub(1);
     for (i, (wrapped, join)) in wrapped_lines.into_iter().enumerate() {
         let lead = if i == 0 {
             prefix.to_string()
@@ -837,7 +878,16 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> 
             let pad = width.saturating_sub(crate::wrap::width(&row));
             row.push_str(&" ".repeat(pad));
         }
-        lines.push(Line::from(Span::styled(row, style)));
+        if tucked && i == last {
+            let note = format!(" [+{} lines]", hidden + printed);
+            let room = width.saturating_sub(note.chars().count()).max(1);
+            lines.push(Line::from(vec![
+                Span::styled(clip(&row, room), style),
+                Span::styled(note, Style::new().fg(Color::DarkGray)),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(row, style)));
+        }
         // The entry starts under the one before it, whatever the wrap made of the rest.
         joins.push(match i {
             0 => Join::Newline,
@@ -845,7 +895,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> 
         });
     }
     // A running command says how far it has got instead, on the row below.
-    if hidden > 0 && !inline && !matches!(entry, Entry::Running { .. }) {
+    if hidden > 0 && !inline && !tucked && !matches!(entry, Entry::Running { .. }) {
         lines.push(Line::from(Span::styled(
             match expanded {
                 true => format!("{indent}[collapse]"),
@@ -877,7 +927,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> 
     Rows {
         lines,
         joins,
-        folded: hidden > 0,
+        folded: hidden > 0 || output.is_some(),
     }
 }
 
@@ -1926,8 +1976,46 @@ mod tests {
             .apply(&Event::ToolOutput("exit code: 0\n1".to_string()));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
-        assert!(text.contains("$ seq 5\n\nexit code: 0\n1\n"), "{text}");
+        assert!(text.contains("$ seq 5 [+2 lines]\n\n"), "{text}");
+        assert!(!text.contains("exit code"), "{text}");
         assert!(!text.contains("running"), "{text}");
+    }
+
+    #[test]
+    fn a_shell_command_opens_and_closes_its_output() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Command {
+            tool: "bash".to_string(),
+            summary: "seq 5".to_string(),
+        });
+        app.entries()
+            .push(Entry::Output("exit code: 0\n1\n2\n3\n4\n5".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("$ seq 5 [+6 lines]\n"), "{text}");
+        assert!(!text.contains("exit code"), "{text}");
+
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
+        assert!(click(&mut app, 2, rows.start));
+        assert!(app.pinned.is_empty(), "a click on the command does not pin");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("$ seq 5\n\nexit code: 0\n1\n2\n3\n4\n5\n[collapse]\n"),
+            "{text}"
+        );
+
+        // A click on the output closes it again, under its command.
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 2).cloned().unwrap();
+        assert!(click(&mut app, 2, rows.start));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("$ seq 5 [+6 lines]\n"), "{text}");
+        assert!(
+            app.rows.iter().all(|(_, e)| *e != 2),
+            "the output has no rows"
+        );
     }
 
     #[test]
