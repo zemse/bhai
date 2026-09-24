@@ -151,7 +151,7 @@ pub struct Item {
     pub tokens: u64,
     /// Bytes/4.
     pub estimated: u64,
-    /// Percent of all context bytes.
+    /// Percent of all context tokens.
     pub share: f64,
 }
 
@@ -352,7 +352,13 @@ pub fn build(
 
     let calibration = calls.last().map(|last| {
         let sent = fixed + last.sent.min(history.len());
-        let estimated_tokens: u64 = items[..sent].iter().map(|i| i.estimated).sum();
+        // Encrypted reasoning is sent and not read, so counting its bytes here would
+        // make the estimate look high and scale every estimated row down to match.
+        let estimated_tokens: u64 = items[..sent]
+            .iter()
+            .filter(|i| !unread(i))
+            .map(|i| i.estimated)
+            .sum();
         Calibration {
             input_tokens: last.usage.input,
             estimated_tokens,
@@ -387,9 +393,12 @@ pub fn build(
 
     let total_bytes: usize = items.iter().map(|i| i.bytes).sum();
     let estimated_tokens = items.iter().map(|i| i.estimated).sum();
-    let total_tokens = items.iter().map(|i| i.tokens).sum();
+    let total_tokens: u64 = items.iter().map(|i| i.tokens).sum();
+    // Of the tokens, not of the bytes. Encrypted reasoning is a third of the bytes and
+    // none of what a call reads, so a share by bytes points at the one row that costs
+    // nothing to resend and away from the tool output that costs the most.
     for item in &mut items {
-        item.share = percent(item.bytes, total_bytes);
+        item.share = percent(item.tokens, total_tokens);
     }
 
     let mut categories: Vec<Category> = Vec::new();
@@ -412,7 +421,7 @@ pub fn build(
         }
     }
     for c in &mut categories {
-        c.share = percent(c.bytes, total_bytes);
+        c.share = percent(c.tokens, total_tokens);
     }
 
     // Stable sorts, so equal sizes keep their context order.
@@ -712,7 +721,13 @@ fn json_string(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
-fn percent(part: usize, total: usize) -> f64 {
+/// An item the model is sent and does not read: encrypted reasoning, which the backend
+/// replays to itself and never charges as input.
+fn unread(item: &Item) -> bool {
+    item.category == "reasoning"
+}
+
+fn percent(part: u64, total: u64) -> f64 {
     part as f64 * 100.0 / total.max(1) as f64
 }
 
@@ -874,14 +889,19 @@ mod tests {
         };
         let profile = build(&plain("be brief"), &[], &history, &[call], &ByteEstimate);
         let c = profile.calibration.as_ref().unwrap();
-        let unsent = profile
-            .items
-            .iter()
-            .find(|i| i.label == "#4 assistant message")
-            .unwrap();
+        let by_label = |label: &str| {
+            profile
+                .items
+                .iter()
+                .find(|i| i.label == label)
+                .unwrap()
+                .estimated
+        };
+        // What the last call sent, less what the model does not read: the assistant
+        // message came after it, and the encrypted reasoning is replayed uncharged.
         assert_eq!(
             c.estimated_tokens,
-            profile.estimated_tokens - unsent.estimated
+            profile.estimated_tokens - by_label("#4 assistant message") - by_label("#1 reasoning")
         );
         assert!((c.factor - 1000.0 / c.estimated_tokens as f64).abs() < 1e-9);
         let top = &profile.items[0];

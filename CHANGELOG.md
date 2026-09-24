@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- `/context` shares are shares of the tokens, not of the bytes, and the calibration
+  factor divides by what the model actually reads. Encrypted reasoning is a third of a
+  session's bytes and none of its input, so the old table put `reasoning` at 34% and
+  `function_call_output` at 48% where the real split is 10% and 69%, and the factor came
+  out 0.74 where it should have been 1.12, scaling every estimated row down by a quarter.
+
 - Every permission decision is appended to `.bhai/debug/permissions.jsonl`, the allows
   included: timestamp, mode, whether the project is trusted, tool, summary, outcome
   (`ran` or `blocked`), who decided (`rules`, `rule`, `judge`, `auto`, `you`) and the
