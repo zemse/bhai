@@ -55,7 +55,13 @@ pub enum AgentEvent {
     /// Output of the running call so far, for the UI only.
     ToolProgress(String),
     ToolOutput(String),
-    ToolRejected(String),
+    /// A call that did not run: who stopped it, and why when they said.
+    ToolRejected {
+        tool: String,
+        summary: String,
+        by: Rejecter,
+        reason: String,
+    },
     /// A notice for the transcript, such as a call the policy allowed.
     Info(String),
     /// The auto-approval judge is deciding this call, or `None` once it has.
@@ -122,6 +128,30 @@ pub enum AgentEvent {
     Resumed(String),
     /// The agent is done with this turn and is waiting for input.
     TurnEnd,
+}
+
+/// Who stopped a call before it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rejecter {
+    User,
+    /// A deny rule in the permission settings.
+    Rule,
+    /// The judge ruled against it.
+    Judge,
+    /// `auto` mode, which denies what the judge could not rule on rather than asking.
+    Auto,
+}
+
+impl Rejecter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Rejecter::User => "rejected by you",
+            Rejecter::Rule => "blocked by a rule",
+            Rejecter::Judge => "rejected by judge",
+            Rejecter::Auto => "rejected by auto mode",
+        }
+    }
 }
 
 /// What the loop does next, once something has woken it: a turn on a new message, a
@@ -1447,7 +1477,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::ToolStart { .. }
                 | AgentEvent::ToolProgress(_)
                 | AgentEvent::ToolOutput(_)
-                | AgentEvent::ToolRejected(_)
+                | AgentEvent::ToolRejected { .. }
                 | AgentEvent::Info(_)) => inside(said),
                 other @ (AgentEvent::ChildUsage(_)
                 | AgentEvent::CacheHit(_)
@@ -1577,7 +1607,12 @@ async fn execute(
             }
         }
         Decision::Deny(reason) => {
-            let _ = tx.send(AgentEvent::ToolRejected(format!("{summary} ({reason})")));
+            let _ = tx.send(AgentEvent::ToolRejected {
+                tool: name.to_string(),
+                summary: summary.clone(),
+                by: Rejecter::Rule,
+                reason: reason.to_string(),
+            });
             return (
                 format!(
                     "Blocked by the user's permission settings ({reason}); it did not run. Do \
@@ -1624,9 +1659,12 @@ not retry it. Try a different approach, or ask the user."
                     )));
                 }
                 Ok(Verdict::Deny { reason }) => {
-                    let _ = tx.send(AgentEvent::ToolRejected(format!(
-                        "auto-denied: {summary} ({reason})"
-                    )));
+                    let _ = tx.send(AgentEvent::ToolRejected {
+                        tool: name.to_string(),
+                        summary: summary.clone(),
+                        by: Rejecter::Judge,
+                        reason: reason.clone(),
+                    });
                     return (
                         format!(
                             "denied by auto policy: {reason}. It did not run. Do not retry it \
@@ -1655,9 +1693,12 @@ as-is. Try a different approach, or ask the user."
                         ),
                         Undecided::Off => ("no judge is running in this session".to_string(), ""),
                     };
-                    let _ = tx.send(AgentEvent::ToolRejected(format!(
-                        "auto-denied: {summary} ({why})"
-                    )));
+                    let _ = tx.send(AgentEvent::ToolRejected {
+                        tool: name.to_string(),
+                        summary: summary.clone(),
+                        by: Rejecter::Auto,
+                        reason: why.clone(),
+                    });
                     // The rule that would let this very call through, so telling the
                     // user to ask for it is a command they can run rather than a mode
                     // they have to go and find.
@@ -1764,7 +1805,12 @@ async fn ask(
         }
         return None;
     }
-    let _ = tx.send(AgentEvent::ToolRejected(summary.to_string()));
+    let _ = tx.send(AgentEvent::ToolRejected {
+        tool: name.to_string(),
+        summary: summary.to_string(),
+        by: Rejecter::User,
+        reason: String::new(),
+    });
     Some((
         "The user rejected this call; it did not run. Do not retry it as-is. Ask what they \
 want instead, or try a different approach."
@@ -2548,12 +2594,17 @@ mod tests {
         assert!(
             !events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::ToolRejected(_))),
+                .any(|e| matches!(e, AgentEvent::ToolRejected { .. })),
             "the parent's transcript holds none of the child's calls"
         );
         let rejected = events.iter().find_map(|e| match e {
             AgentEvent::Child { id, event } => match &**event {
-                AgentEvent::ToolRejected(s) => Some((id.clone(), s.clone())),
+                AgentEvent::ToolRejected {
+                    summary,
+                    by: Rejecter::Rule,
+                    reason,
+                    ..
+                } => Some((id.clone(), format!("{summary} ({reason})"))),
                 _ => None,
             },
             _ => None,
@@ -2904,11 +2955,13 @@ mod tests {
             "{}",
             run.outputs[0]
         );
-        assert!(
-            run.events.iter().any(
-                |e| matches!(e, AgentEvent::ToolRejected(m) if m.starts_with("auto-denied: "))
-            )
-        );
+        assert!(run.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolRejected {
+                by: Rejecter::Judge,
+                ..
+            }
+        )));
     }
 
     /// `auto` mode never prompts, so a judge that answers with an error, nothing at all
@@ -3369,7 +3422,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::ToolRejected(_)))
+                .any(|e| matches!(e, AgentEvent::ToolRejected { .. }))
         );
         let events = turn(&mut rx, "take long", &[]).await;
         assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
@@ -3428,7 +3481,7 @@ mod tests {
         // No judge runs here, and `auto` never prompts, so the call is denied outright.
         let events = turn(&mut rx, "look it up", &[]).await;
         assert!(events.iter().any(
-            |e| matches!(e, AgentEvent::ToolRejected(m) if m.contains("no judge is running"))
+            |e| matches!(e, AgentEvent::ToolRejected { by: Rejecter::Auto, reason, .. } if reason.contains("no judge is running"))
         ));
 
         policy.set_mode(policy.next_mode());

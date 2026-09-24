@@ -23,6 +23,54 @@ const DRAIN: Duration = Duration::from_millis(100);
 /// Bytes kept from each end of each stream. Two streams at twice this is what
 /// `format_output` may pass on, which is [`super::MAX_OUTPUT`].
 const KEEP: usize = super::MAX_OUTPUT / 4;
+/// How each result starts, which is how [`outcome`] reads it back.
+const EXIT: &str = "exit code: ";
+const KILLED: &str = "killed by signal";
+const TIMED_OUT: &str = "Command timed out";
+const UNSTARTED: &str = "Could not start the command";
+
+/// How a command ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Succeeded,
+    Failed(i32),
+    Killed,
+    TimedOut,
+    Unstarted,
+}
+
+impl Outcome {
+    pub fn ok(self) -> bool {
+        self == Outcome::Succeeded
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Outcome::Succeeded => "succeeded".to_string(),
+            Outcome::Failed(code) => format!("failed, exit {code}"),
+            Outcome::Killed => "killed by a signal".to_string(),
+            Outcome::TimedOut => format!("timed out after {}s", TIMEOUT.as_secs()),
+            Outcome::Unstarted => "could not start".to_string(),
+        }
+    }
+}
+
+/// How the command behind a result the model was given ended, or `None` when the
+/// result is not one this tool wrote.
+pub fn outcome(output: &str) -> Option<Outcome> {
+    let first = output.lines().next().unwrap_or_default();
+    if let Some(code) = first.strip_prefix(EXIT) {
+        return match code {
+            "0" => Some(Outcome::Succeeded),
+            KILLED => Some(Outcome::Killed),
+            code => code.parse().ok().map(Outcome::Failed),
+        };
+    }
+    if first.starts_with(TIMED_OUT) {
+        return Some(Outcome::TimedOut);
+    }
+    first.starts_with(UNSTARTED).then_some(Outcome::Unstarted)
+}
 
 pub struct Bash;
 
@@ -109,18 +157,18 @@ async fn run(command: &str, live: Live<'_>) -> String {
         .kill_on_drop(true)
         .spawn();
     let mut child = match child {
-        Err(e) => return format!("Could not start the command: {e}"),
+        Err(e) => return format!("{UNSTARTED}: {e}"),
         Ok(child) => child,
     };
     let (stdout, stderr, status) = match collect(&mut child, live).await {
-        Err(e) => return format!("Could not start the command: {e}"),
+        Err(e) => return format!("{UNSTARTED}: {e}"),
         Ok(collected) => collected,
     };
     match status {
         Some(status) => format_output(&stdout, &stderr, status),
         // What it printed before the clock ran out is still what it was doing.
         None => format!(
-            "Command timed out after {}s and was killed. Run something shorter, or send it to \
+            "{TIMED_OUT} after {}s and was killed. Run something shorter, or send it to \
 the background with its output redirected to a file and poll that.\n{}",
             TIMEOUT.as_secs(),
             truncate(&body(&stdout, &stderr))
@@ -281,8 +329,8 @@ fn body(stdout: &Kept, stderr: &Kept) -> String {
 fn format_output(stdout: &Kept, stderr: &Kept, status: ExitStatus) -> String {
     let code = status
         .code()
-        .map_or_else(|| "killed by signal".to_string(), |c| c.to_string());
-    format!("exit code: {code}\n{}", truncate(&body(stdout, stderr)))
+        .map_or_else(|| KILLED.to_string(), |c| c.to_string());
+    format!("{EXIT}{code}\n{}", truncate(&body(stdout, stderr)))
 }
 
 #[cfg(test)]
@@ -292,6 +340,28 @@ mod tests {
     use std::time::Instant;
 
     static NOT_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+    #[test]
+    fn the_result_says_how_the_command_ended() {
+        assert_eq!(outcome("exit code: 0\nok"), Some(Outcome::Succeeded));
+        assert_eq!(outcome("exit code: 128\n"), Some(Outcome::Failed(128)));
+        assert_eq!(
+            outcome("exit code: killed by signal\n"),
+            Some(Outcome::Killed)
+        );
+        assert_eq!(
+            outcome("Command timed out after 120s and was killed."),
+            Some(Outcome::TimedOut)
+        );
+        assert_eq!(
+            outcome("Could not start the command: no such file"),
+            Some(Outcome::Unstarted)
+        );
+        assert_eq!(
+            outcome("The user rejected this call; it did not run."),
+            None
+        );
+    }
 
     fn quiet() -> Live<'static> {
         Live {

@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A finished shell command says how it ended on the row under it: `✓ succeeded`,
+  `✗ failed, exit 128`, `✗ timed out after 120s`, or who stopped it (`✗ rejected by
+  judge`, `by you`, `by auto mode`, `blocked by a rule`), with the `[+N lines]` its click
+  opens. A rejected call of any tool is now drawn as its command with the rejection and its
+  reason under it, and `tool_rejected` events carry `tool`, `summary`, `by` and `reason`.
+
 - A shell command's output stays out of sight until the command is clicked: the command
   row ends in `[+N lines]`, a click on it shows the output in full, and a click on the
   command or the output closes it again. A command still running shows its latest lines.

@@ -515,7 +515,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
             .checked_sub(1)
             .map(|above| (above, &entries.list[above]))
         {
-            Some((above, command)) if shell_output(command, entry).is_some() => above,
+            Some((above, command)) if shell_result(command, entry).is_some() => above,
             _ => index,
         };
         let expanded = app.expanded.contains(&owner);
@@ -523,11 +523,11 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
             folds.insert(index, owner);
             continue;
         }
-        let output = entries
+        let result = entries
             .list
             .get(index + 1)
-            .and_then(|next| shell_output(entry, next));
-        let rows = entry_lines(entry, width, expanded, retryable, output);
+            .and_then(|next| shell_result(entry, next));
+        let rows = entry_lines(entry, width, expanded, retryable, result);
         lines.extend(rows.lines);
         joins.extend(rows.joins);
         if rows.folded || owner != index {
@@ -757,14 +757,30 @@ fn collapsed_rows(entry: &Entry) -> Option<usize> {
     }
 }
 
-/// The output `entry` is when it is what the shell command `command` printed.
-fn shell_output<'a>(command: &Entry, entry: &'a Entry) -> Option<&'a str> {
+/// `entry` when it is how the shell command `command` ended: what it printed, or why
+/// it never ran.
+fn shell_result<'a>(command: &Entry, entry: &'a Entry) -> Option<&'a Entry> {
     match (command, entry) {
-        (Entry::Command { tool, .. }, Entry::Output(output))
+        (Entry::Command { tool, .. }, Entry::Output(_) | Entry::Rejected { .. })
             if tool == crate::tools::bash::NAME =>
         {
-            Some(output)
+            Some(entry)
         }
+        _ => None,
+    }
+}
+
+/// How a shell command ended, as the row drawn under it, or `None` for a result the
+/// shell did not write, such as one read back from an older session.
+fn shell_status(result: &Entry) -> Option<(String, Color)> {
+    match result {
+        Entry::Output(output) => {
+            crate::tools::bash::outcome(output).map(|outcome| match outcome.ok() {
+                true => (format!("✓ {}", outcome.label()), Color::Green),
+                false => (format!("✗ {}", outcome.label()), Color::Red),
+            })
+        }
+        Entry::Rejected { by, .. } => Some((format!("✗ {}", by.label()), Color::Red)),
         _ => None,
     }
 }
@@ -779,13 +795,13 @@ struct Rows {
 
 /// An entry's rows plus a blank separator, and whether it has rows a click folds away.
 /// Thinking and long tool output show only a little of themselves unless `expanded`.
-/// `output` is what a shell command printed, which stays out of sight until then.
+/// `result` is how a shell command ended, which stays out of sight until then.
 fn entry_lines(
     entry: &Entry,
     width: usize,
     expanded: bool,
     retryable: bool,
-    output: Option<&str>,
+    result: Option<&Entry>,
 ) -> Rows {
     if let Entry::Assistant(text) = entry {
         let lead = MESSAGE_MARK.chars().count();
@@ -819,6 +835,7 @@ fn entry_lines(
             folded: false,
         };
     }
+    let rejected: String;
     let (prefix, text, style): (&str, &str, Style) = match entry {
         Entry::User(t) => ("› ", t, Style::new().bg(USER_BG)),
         Entry::Assistant(t) => ("", t, Style::new()),
@@ -829,7 +846,13 @@ fn entry_lines(
         }
         Entry::Output(t) => ("", t, Style::new().fg(Color::Gray)),
         Entry::Running { tail, .. } => ("", tail.trim_end(), Style::new().fg(Color::Gray)),
-        Entry::Rejected(t) => ("✗ ", t, Style::new().fg(Color::Red)),
+        Entry::Rejected { by, reason } => {
+            rejected = match reason.is_empty() {
+                true => by.label().to_string(),
+                false => format!("{}: {reason}", by.label()),
+            };
+            ("✗ ", rejected.as_str(), Style::new().fg(Color::Red))
+        }
         Entry::Error(t) | Entry::Failed(t) => ("! ", t, Style::new().fg(Color::Red).bold()),
         Entry::Info(t) => ("", t, Style::new().fg(Color::DarkGray)),
         Entry::Summary(t) => ("≡ ", t, Style::new().fg(Color::DarkGray)),
@@ -842,7 +865,7 @@ fn entry_lines(
     let text = &crate::wrap::readable(text);
     let mut wrapped_lines = joined(text, width.saturating_sub(lead).max(4));
     let hidden = collapsed_rows(entry).map_or(0, |rows| wrapped_lines.len().saturating_sub(rows));
-    let printed = output.map_or(0, |output| output.lines().count());
+    let printed = result.map_or(0, |result| result.text().lines().count());
     if hidden > 0 && !expanded {
         match entry {
             // A running command shows its latest lines; everything else its first.
@@ -863,10 +886,7 @@ fn entry_lines(
     // A ground of its own is only a block if it runs the width of the transcript, so the
     // rows under one are filled out rather than ending where the text does.
     let ground = matches!(entry, Entry::User(_));
-    // A shell command whose output is out of sight says so at the end of its last row,
-    // counting its own folded rows in with what it printed.
-    let tucked = output.is_some() && !expanded;
-    let last = wrapped_lines.len().saturating_sub(1);
+    let tucked = result.is_some() && !expanded;
     for (i, (wrapped, join)) in wrapped_lines.into_iter().enumerate() {
         let lead = if i == 0 {
             prefix.to_string()
@@ -878,21 +898,34 @@ fn entry_lines(
             let pad = width.saturating_sub(crate::wrap::width(&row));
             row.push_str(&" ".repeat(pad));
         }
-        if tucked && i == last {
-            let note = format!(" [+{} lines]", hidden + printed);
-            let room = width.saturating_sub(note.chars().count()).max(1);
-            lines.push(Line::from(vec![
-                Span::styled(clip(&row, room), style),
-                Span::styled(note, Style::new().fg(Color::DarkGray)),
-            ]));
-        } else {
-            lines.push(Line::from(Span::styled(row, style)));
-        }
+        lines.push(Line::from(Span::styled(row, style)));
         // The entry starts under the one before it, whatever the wrap made of the rest.
         joins.push(match i {
             0 => Join::Newline,
             _ => join,
         });
+    }
+    // A finished shell command says how it ended on the row below, and what that row
+    // hides, counting the command's own folded rows in with what it printed.
+    if let Some(result) = result {
+        let hides = hidden + printed;
+        let note = (tucked && hides > 0).then(|| format!("[+{hides} lines]"));
+        let mut spans = Vec::new();
+        if let Some((label, colour)) = shell_status(result) {
+            spans.push(Span::styled(label, Style::new().fg(colour)));
+        }
+        if let Some(note) = note {
+            let gap = if spans.is_empty() { "" } else { " " };
+            spans.push(Span::styled(
+                format!("{gap}{note}"),
+                Style::new().fg(Color::DarkGray),
+            ));
+        }
+        if !spans.is_empty() {
+            spans.insert(0, Span::raw(indent.clone()));
+            lines.push(Line::from(spans));
+            joins.push(Join::Newline);
+        }
     }
     // A running command says how far it has got instead, on the row below.
     if hidden > 0 && !inline && !tucked && !matches!(entry, Entry::Running { .. }) {
@@ -927,7 +960,7 @@ fn entry_lines(
     Rows {
         lines,
         joins,
-        folded: hidden > 0 || output.is_some(),
+        folded: hidden > 0 || printed > 0,
     }
 }
 
@@ -1292,6 +1325,7 @@ fn render_trust(frame: &mut Frame, area: Rect, gate: &TrustGate) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::Rejecter;
     use crate::cache::CacheBreak;
     use crate::permissions::Offers;
     use crate::session::{Approval, Event};
@@ -1976,7 +2010,10 @@ mod tests {
             .apply(&Event::ToolOutput("exit code: 0\n1".to_string()));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
-        assert!(text.contains("$ seq 5 [+2 lines]\n\n"), "{text}");
+        assert!(
+            text.contains("$ seq 5\n  ✓ succeeded [+2 lines]\n\n"),
+            "{text}"
+        );
         assert!(!text.contains("exit code"), "{text}");
         assert!(!text.contains("running"), "{text}");
     }
@@ -1993,7 +2030,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
-        assert!(text.contains("$ seq 5 [+6 lines]\n"), "{text}");
+        assert!(
+            text.contains("$ seq 5\n  ✓ succeeded [+6 lines]\n"),
+            "{text}"
+        );
         assert!(!text.contains("exit code"), "{text}");
 
         let (rows, _) = app.rows.iter().find(|(_, e)| *e == 1).cloned().unwrap();
@@ -2002,7 +2042,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
         assert!(
-            text.contains("$ seq 5\n\nexit code: 0\n1\n2\n3\n4\n5\n[collapse]\n"),
+            text.contains("$ seq 5\n  ✓ succeeded\n\nexit code: 0\n1\n2\n3\n4\n5\n[collapse]\n"),
             "{text}"
         );
 
@@ -2011,10 +2051,84 @@ mod tests {
         assert!(click(&mut app, 2, rows.start));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
-        assert!(text.contains("$ seq 5 [+6 lines]\n"), "{text}");
+        assert!(
+            text.contains("$ seq 5\n  ✓ succeeded [+6 lines]\n"),
+            "{text}"
+        );
         assert!(
             app.rows.iter().all(|(_, e)| *e != 2),
             "the output has no rows"
+        );
+    }
+
+    #[test]
+    fn a_shell_command_says_how_it_ended() {
+        let mut app = App::detached();
+        let run = |app: &mut App, summary: &str, output: &str| {
+            app.entries().apply(&Event::ToolStart {
+                tool: "bash".to_string(),
+                summary: summary.to_string(),
+            });
+            app.entries().apply(&Event::ToolOutput(output.to_string()));
+        };
+        run(&mut app, "false", "exit code: 1\n");
+        run(
+            &mut app,
+            "sleep 999",
+            "Command timed out after 120s and was killed.\n",
+        );
+        app.entries().apply(&Event::ToolRejected {
+            tool: "bash".to_string(),
+            summary: "rm -rf /".to_string(),
+            by: Rejecter::Judge,
+            reason: "unrelated to the stated task".to_string(),
+        });
+        app.entries().apply(&Event::ToolRejected {
+            tool: "bash".to_string(),
+            summary: "ls".to_string(),
+            by: Rejecter::User,
+            reason: String::new(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("$ false\n  ✗ failed, exit 1 [+1 lines]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("$ sleep 999\n  ✗ timed out after 120s [+1 lines]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("$ rm -rf /\n  ✗ rejected by judge [+1 lines]\n"),
+            "{text}"
+        );
+        assert!(!text.contains("unrelated"), "{text}");
+        // Nothing was said of it, so there is nothing to open.
+        assert!(text.contains("$ ls\n  ✗ rejected by you\n"), "{text}");
+
+        // A click on the rejected command opens the judge's reason under it.
+        let command = app
+            .entries()
+            .list
+            .iter()
+            .position(|e| e.text() == "rm -rf /")
+            .unwrap();
+        let (rows, _) = app
+            .rows
+            .iter()
+            .find(|(_, e)| *e == command)
+            .cloned()
+            .unwrap();
+        assert!(click(&mut app, 2, rows.start));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains(
+                "  ✗ rejected by judge\n\n✗ rejected by judge: unrelated to the stated task\n"
+            ),
+            "{text}"
         );
     }
 

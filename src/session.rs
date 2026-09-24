@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::agent::{AgentEvent, Cancel, Control, Mailboxes};
+use crate::agent::{AgentEvent, Cancel, Control, Mailboxes, Rejecter};
 use crate::cache::{CacheBreak, Hit};
 use crate::client::Usage;
 use crate::entries::{Entries, Entry};
@@ -64,7 +64,13 @@ pub enum Event {
     /// Output of the running call so far; never part of history.
     ToolProgress(String),
     ToolOutput(String),
-    ToolRejected(String),
+    /// A call that did not run: who stopped it, and why when they said.
+    ToolRejected {
+        tool: String,
+        summary: String,
+        by: Rejecter,
+        reason: String,
+    },
     Usage(Usage),
     /// Usage of a child agent's model call.
     ChildUsage(Usage),
@@ -688,7 +694,17 @@ impl Session {
             AgentEvent::ToolStart { tool, summary } => Event::ToolStart { tool, summary },
             AgentEvent::ToolProgress(s) => Event::ToolProgress(s),
             AgentEvent::ToolOutput(s) => Event::ToolOutput(s),
-            AgentEvent::ToolRejected(s) => Event::ToolRejected(s),
+            AgentEvent::ToolRejected {
+                tool,
+                summary,
+                by,
+                reason,
+            } => Event::ToolRejected {
+                tool,
+                summary,
+                by,
+                reason,
+            },
             AgentEvent::Usage(usage) => {
                 add(&mut inner.total, usage);
                 inner.last_usage = Some(usage);
@@ -926,7 +942,17 @@ fn said(event: AgentEvent) -> Option<Event> {
         AgentEvent::ToolStart { tool, summary } => Event::ToolStart { tool, summary },
         AgentEvent::ToolProgress(s) => Event::ToolProgress(s),
         AgentEvent::ToolOutput(s) => Event::ToolOutput(s),
-        AgentEvent::ToolRejected(s) => Event::ToolRejected(s),
+        AgentEvent::ToolRejected {
+            tool,
+            summary,
+            by,
+            reason,
+        } => Event::ToolRejected {
+            tool,
+            summary,
+            by,
+            reason,
+        },
         AgentEvent::Info(s) => Event::Info(s),
         AgentEvent::Error(s) => Event::Error(s),
         _ => return None,

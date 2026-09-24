@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde_json::Value;
 
+use crate::agent::Rejecter;
 use crate::client::Usage;
 use crate::profile::{self, CallTokens, EntryTokens, Tokens};
 use crate::session::Event;
@@ -31,7 +32,12 @@ pub enum Entry {
         lines: usize,
     },
     Output(String),
-    Rejected(String),
+    /// A call that did not run, under the command it would have been. `reason` is empty
+    /// when the user gave none.
+    Rejected {
+        by: Rejecter,
+        reason: String,
+    },
     Error(String),
     /// A turn that failed rather than answering. Unlike an `Error`, the history still
     /// stands behind it, so the transcript offers to run the turn again.
@@ -100,8 +106,20 @@ impl Entries {
                     None => self.push(entry),
                 }
             }
-            Event::ToolRejected(command) => {
-                self.push(Entry::Rejected(format!("rejected: {command}")))
+            Event::ToolRejected {
+                tool,
+                summary,
+                by,
+                reason,
+            } => {
+                self.push(Entry::Command {
+                    tool: tool.clone(),
+                    summary: summary.clone(),
+                });
+                self.push(Entry::Rejected {
+                    by: *by,
+                    reason: reason.clone(),
+                });
             }
             Event::ChildUsage(usage) => {
                 let child = self.attribution.child.get_or_insert_default();
@@ -279,7 +297,7 @@ impl Entries {
                 let command = fresh
                     .clone()
                     .find(|&i| matches!(self.list[i], Entry::Command { .. }));
-                let result = last(|e| matches!(e, Entry::Output(_) | Entry::Rejected(_)));
+                let result = last(|e| matches!(e, Entry::Output(_) | Entry::Rejected { .. }));
                 if let Some(entry) = command.or(result) {
                     let tokens = self.tokens.entry(entry).or_default();
                     tokens.output = Some(output);
@@ -365,7 +383,7 @@ impl Entry {
             | Entry::Command { summary: t, .. }
             | Entry::Running { tail: t, .. }
             | Entry::Output(t)
-            | Entry::Rejected(t)
+            | Entry::Rejected { reason: t, .. }
             | Entry::Error(t)
             | Entry::Failed(t)
             | Entry::Info(t)
@@ -381,7 +399,7 @@ impl Entry {
             Entry::Command { .. } => "command",
             Entry::Running { .. } => "running",
             Entry::Output(_) => "output",
-            Entry::Rejected(_) => "rejected",
+            Entry::Rejected { .. } => "rejected",
             Entry::Error(_) => "error",
             Entry::Failed(_) => "failed",
             Entry::Info(_) => "info",
@@ -547,11 +565,18 @@ mod tests {
             calls: vec![3],
             ..CallTokens::default()
         }));
-        app.apply(&Event::ToolRejected("ls".to_string()));
+        app.apply(&Event::ToolRejected {
+            tool: "bash".to_string(),
+            summary: "ls".to_string(),
+            by: Rejecter::User,
+            reason: String::new(),
+        });
         app.apply(&Event::Item(2));
-        let rejected = app.tokens[&2];
-        assert_eq!(rejected.output, Some(3));
-        assert_eq!(rejected.call, Some(usage(10, 0, 3, 0)));
+        // A rejected call is drawn as its command too, and the call is put on that.
+        let command = app.tokens[&2];
+        assert_eq!(command.output, Some(3));
+        assert_eq!(command.call, Some(usage(10, 0, 3, 0)));
+        assert!(matches!(app.list[3], Entry::Rejected { .. }));
     }
 
     #[test]

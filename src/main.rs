@@ -841,7 +841,15 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             }
             AgentEvent::ToolStart { summary, .. } => println!("\n$ {summary}"),
             AgentEvent::ToolOutput(output) => println!("{output}"),
-            AgentEvent::ToolRejected(command) => println!("[rejected] {command}"),
+            AgentEvent::ToolRejected {
+                summary,
+                by,
+                reason,
+                ..
+            } => match reason.is_empty() {
+                true => println!("[{}] {summary}", by.label()),
+                false => println!("[{}] {summary} ({reason})", by.label()),
+            },
             AgentEvent::Info(message) => println!("[info] {message}"),
             AgentEvent::Compacted { notice, summary } => {
                 println!("[info] {notice}");
