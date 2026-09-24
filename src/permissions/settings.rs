@@ -127,7 +127,20 @@ pub fn claude(home: Option<&Path>, cwd: &Path) -> (Rules, Vec<String>) {
                             (false, false) => rule,
                         });
                     }
-                    Some(Err(e)) => notices.push(format!("skipped in {}: {e}", path.display())),
+                    // A rule the user wrote to stop something must not stop nothing
+                    // because its shape is one the tokenizer refuses. Deny and ask only:
+                    // an allow rule that over-matches approves what was never approved.
+                    Some(Err(e)) => match Rule::raw(text).filter(|_| key != "allow") {
+                        Some(rule) => {
+                            let rule = rule.with_source(path.display().to_string());
+                            into.push(match (user, repo) {
+                                (true, _) => rule.by_user(),
+                                (false, true) => rule.repo_supplied(),
+                                (false, false) => rule,
+                            });
+                        }
+                        None => notices.push(format!("skipped in {}: {e}", path.display())),
+                    },
                     None => {}
                 }
             }
@@ -294,15 +307,25 @@ mod tests {
         assert_eq!(users, [true, true, true, false]);
         let repo: Vec<bool> = rules.allow.iter().map(|r| r.repo).collect();
         assert_eq!(repo, [false, false, false, true]);
-        assert_eq!(texts(&rules.deny), ["Read(*.pem)", "bash(rm:*)", "Edit(*)"]);
+        // `Bash(npm run test?)` is a shape `Rule::parse` refuses. A deny rule is kept as
+        // the text it names rather than dropped, so it still stops what it was written for.
+        assert_eq!(
+            texts(&rules.deny),
+            [
+                "Read(*.pem)",
+                "Bash(npm run test?)",
+                "bash(rm:*)",
+                "Edit(*)"
+            ]
+        );
+        assert!(rules.deny[1].is_raw() && !rules.deny[2].is_raw());
         assert_eq!(texts(&rules.ask), ["Write(docs/**)"]);
         assert_eq!(
             rules.ask[0].source,
             cwd.join(".claude/settings.json").display().to_string()
         );
-        assert_eq!(notices.len(), 2, "{notices:?}");
-        assert!(notices[0].contains("npm run"));
-        assert!(notices[1].contains("ignored the allow rules"));
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("ignored the allow rules"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

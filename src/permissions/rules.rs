@@ -32,6 +32,10 @@ enum Pattern {
     /// Words joined by spaces, where each `*` matches any text.
     Glob(String),
     Path(String),
+    /// The text of a bash pattern nothing here can parse, matched anywhere in the command.
+    /// Only ever a deny or an ask rule: over-matching there asks too often, which is the
+    /// safe side, while over-matching an allow rule approves what the user did not.
+    Raw(String),
 }
 
 /// Where relative and `~/` patterns resolve.
@@ -72,6 +76,42 @@ impl Rule {
             tool,
             pattern,
         })
+    }
+
+    /// A deny or ask rule for `bash` whose pattern `parse` refused, kept as the text it
+    /// names: a rule the user wrote to stop something should not stop nothing because the
+    /// tokenizer could not read the shape they wrote it in. `None` for anything else,
+    /// which has no text to fall back on.
+    pub fn raw(text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        let (name, rest) = trimmed.split_once('(')?;
+        let content = rest.strip_suffix(')')?.trim();
+        if !name.trim().eq_ignore_ascii_case("bash") || content.is_empty() || content == "*" {
+            return None;
+        }
+        Some(Self {
+            text: trimmed.to_string(),
+            source: String::new(),
+            user: false,
+            repo: false,
+            tool: "bash".to_string(),
+            pattern: Pattern::Raw(content.to_ascii_lowercase()),
+        })
+    }
+
+    /// Whether this is a rule matched against the command text rather than its words.
+    pub fn is_raw(&self) -> bool {
+        matches!(self.pattern, Pattern::Raw(_))
+    }
+
+    /// Whether a raw rule's text appears in `command`. False for every other pattern:
+    /// they are matched on words.
+    pub fn matches_text(&self, command: &str) -> bool {
+        let Pattern::Raw(want) = &self.pattern else {
+            return false;
+        };
+        wildcard(want, &command.to_ascii_lowercase(), false)
+            || command.to_ascii_lowercase().contains(want.as_str())
     }
 
     pub fn with_source(self, source: impl Into<String>) -> Self {
@@ -143,7 +183,7 @@ impl Rule {
                         .strip_suffix(" *")
                         .is_some_and(|bare| wildcard(bare, &text, false))
             }
-            Pattern::Path(_) => false,
+            Pattern::Path(_) | Pattern::Raw(_) => false,
         }
     }
 
@@ -166,7 +206,7 @@ impl Rule {
                 let path = fold_all(components(path));
                 glob(&pattern, &path)
             }
-            Pattern::Command { .. } | Pattern::Glob(_) => false,
+            Pattern::Command { .. } | Pattern::Glob(_) | Pattern::Raw(_) => false,
         }
     }
 }

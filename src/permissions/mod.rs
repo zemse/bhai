@@ -539,7 +539,11 @@ impl Policy {
                 } else {
                     String::new()
                 };
-                out.push_str(&format!("\n  {}  ({source}{inactive})", rule.text));
+                let how = match rule.is_raw() {
+                    true => ", matched as text",
+                    false => "",
+                };
+                out.push_str(&format!("\n  {}  ({source}{inactive}{how})", rule.text));
             }
         }
         out
@@ -686,6 +690,12 @@ impl Checker<'_> {
                 .find(|r| r.applies_to("bash") && r.is_any())
                 .cloned()
         };
+        // A rule kept as text is matched on the command as written, whatever the tokenizer
+        // makes of it, so it decides the same way either side of the parse.
+        if let Some(rule) = self.find_text(&self.rules.deny, command) {
+            return denied(&rule);
+        }
+        let asked_as_text = self.find_text(&self.rules.ask, command).is_some();
         let Some(commands) = bash::parse(command) else {
             // Unparseable, so it is never allowed. A rule for every command decides it,
             // and so does a worded one over the raw text: the words the user denied are
@@ -701,9 +711,10 @@ impl Checker<'_> {
                 return denied(&rule);
             }
         }
-        if commands
-            .iter()
-            .any(|c| self.find_loose(&self.rules.ask, c).is_some() || bash::mentions_protected(c))
+        if asked_as_text
+            || commands.iter().any(|c| {
+                self.find_loose(&self.rules.ask, c).is_some() || bash::mentions_protected(c)
+            })
         {
             return Decision::Ask;
         }
@@ -781,6 +792,14 @@ impl Checker<'_> {
     /// A worded rule over the raw text of a command the tokenizer refused. Every suffix
     /// is tried, since nothing here knows where the program starts; matching too much is
     /// safe where the answer can only be deny or ask.
+    /// The first rule kept as text that appears in `command`.
+    fn find_text(&self, rules: &[Rule], command: &str) -> Option<Rule> {
+        rules
+            .iter()
+            .find(|r| r.applies_to("bash") && r.matches_text(command))
+            .cloned()
+    }
+
     fn find_raw(&self, rules: &[Rule], command: &str) -> Option<Rule> {
         let words = bash::raw_words(command);
         rules
@@ -809,6 +828,9 @@ impl Checker<'_> {
         match tool {
             "bash" => {
                 let command = text("command").unwrap_or_default();
+                if let Some(rule) = self.find_text(&self.rules.ask, command) {
+                    return Err(Reserved::Asked(rule.text));
+                }
                 match bash::parse(command) {
                     Some(commands) => commands.iter().try_for_each(|c| {
                         if let Some(word) = bash::protected_mention(c) {
@@ -1845,6 +1867,52 @@ mod tests {
         );
         assert_eq!(bash(&p, "cd wordcount && cargo test"), Decision::Ask);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A rule whose shape `Rule::parse` refuses used to be dropped with a notice, so a
+    /// deny rule stopped nothing. Kept as text, it stops what it names, wherever it is.
+    #[test]
+    fn a_rule_kept_as_text_denies_and_asks_on_the_command_as_written() {
+        let deny = Rule::raw("Bash(rm -rf /)").unwrap();
+        assert!(deny.is_raw());
+        let p = Policy::new(
+            Mode::Auto,
+            Rules {
+                deny: vec![deny],
+                ask: vec![Rule::raw("Bash(npm run test?)").unwrap()],
+                ..Rules::default()
+            },
+            None,
+            std::env::temp_dir(),
+        );
+        for command in [
+            "rm -rf /",
+            "RM -RF /",
+            "echo one && rm -rf / && echo two",
+            // A shape the tokenizer refuses outright is still matched on its text.
+            "for d in a b; do rm -rf / $d; done",
+        ] {
+            assert_eq!(
+                bash(&p, command),
+                Decision::Deny("deny rule Bash(rm -rf /)".to_string()),
+                "{command}"
+            );
+        }
+        assert_ne!(bash(&p, "rm -rf /tmp/x"), Decision::Ask, "not this one");
+        // An ask rule kept as text is the user saying they want to see it, so the judge
+        // is not offered it either.
+        assert_eq!(bash(&p, "npm run test?"), Decision::Ask);
+        assert!(matches!(
+            p.judgeable("bash", &json!({"command": "npm run test?"})),
+            Err(Reserved::Asked(_))
+        ));
+        // Only deny and ask: an allow rule that over-matched would approve what was not.
+        assert!(Rule::raw("Read(*.pem)").is_none());
+        assert!(Rule::raw("Bash").is_none());
+        assert!(
+            p.describe()
+                .contains("Bash(rm -rf /)  (built in, matched as text)")
+        );
     }
 
     /// `Bash(cd:*)` is common in a Claude Code settings file. It lets the move happen; it

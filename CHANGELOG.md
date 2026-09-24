@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A deny or ask rule whose shape bhai cannot parse now fails closed. `Bash(npm run test?)`
+  and anything else with a `?`, a chain or a substitution in it was dropped with a startup
+  notice, so a rule written to stop something stopped nothing. Such a rule is kept as the
+  text it names, matched case-insensitively anywhere in the command, on either side of the
+  tokenizer; `/permissions` marks it `matched as text`. Allow rules are still dropped, since
+  one that over-matches approves what the user did not.
+
 - `bhai sessions prune [n]` deletes all but the `n` newest sessions, 20 by default, with
   their child transcripts; a session another bhai has open is left where it is. Nothing
   prunes on its own, since the transcripts are the debug record. The exit hint also stopped
