@@ -802,6 +802,7 @@ fn entry_lines(entry: &Entry, width: usize, expanded: bool, retryable: bool) -> 
     let indent = " ".repeat(lead);
     let mut lines: Vec<Line> = Vec::new();
     let mut joins: Vec<Join> = Vec::new();
+    let text = &crate::wrap::readable(text);
     let mut wrapped_lines = joined(text, width.saturating_sub(lead).max(4));
     let hidden = collapsed_rows(entry).map_or(0, |rows| wrapped_lines.len().saturating_sub(rows));
     if hidden > 0 && !expanded {
@@ -1417,6 +1418,30 @@ mod tests {
         assert_eq!(rows[start], "\u{23fa} a message long enough");
         // What the wrap made of the rest lines up under the message, not under the mark.
         assert_eq!(rows[start + 1], "  that it wraps around");
+    }
+
+    /// A tool's output and a model's answer are text nobody here wrote. What the terminal
+    /// would act on never reaches a row, and what it would show as nothing is shown.
+    #[test]
+    fn a_hidden_payload_in_output_is_shown_and_an_escape_is_not_drawn() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Output(
+            "\u{1b}[31mred\u{1b}[0m \u{e0041}\u{e0042}".to_string(),
+        ));
+        app.entries()
+            .push(Entry::Assistant("done \u{e0041} \u{1b}[2J".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
+        assert!(!shown.contains('\u{e0041}'), "{shown:?}");
+        assert!(shown.contains("··"), "{shown:?}");
+        // The rows the selection and a copy read are the same string.
+        assert!(
+            app.lines.iter().all(|l| !l.contains('\u{1b}')),
+            "{:?}",
+            app.lines
+        );
     }
 
     #[test]

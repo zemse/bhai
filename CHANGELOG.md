@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A transcript draws what a terminal would act on or hide as what it is. Control bytes from
+  a command's output went to the screen, into the rows a selection is measured in, and onto
+  the system clipboard; tag and bidi characters, which render as nothing, carried text
+  nobody could see. Both are now taken out before the wrap: control characters are dropped
+  (`\n` and `\t` stay), and a character that renders as nothing is shown as `·`. Emoji
+  joiners and variation selectors are left alone.
+
 - The debug server asks who is calling. `--serve` bound a port that answered any local
   process, and those endpoints run commands, answer approvals and switch the permission
   mode, so any program on the machine could drive a session. Each run now mints a token,

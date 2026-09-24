@@ -2,6 +2,39 @@
 //! wrap made, so every row carries the break it came after and a copy puts back the rows
 //! the wrap broke rather than the lines the text really has.
 
+/// What a character that renders as nothing is shown as.
+const MARK: char = '·';
+
+/// Text as it can be drawn: a terminal acts on a control character rather than showing
+/// it, and shows nothing at all for a tag or bidi character. Neither is written by anyone
+/// here, since a transcript carries what a model said and what a command printed, and the
+/// copy, the rows on screen and the selection all read this one string.
+pub fn readable(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(|c| dropped(c) || marked(c)) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.chars()
+            .filter(|c| !dropped(*c))
+            .map(|c| if marked(c) { MARK } else { c })
+            .collect(),
+    )
+}
+
+/// A control character the terminal would act on. `\n` is the line structure and `\t` is
+/// width, so both stay.
+fn dropped(c: char) -> bool {
+    c.is_control() && c != '\n' && c != '\t'
+}
+
+/// A character that carries text while rendering as nothing: the tag block, which is where
+/// text is hidden in a page or a tool result today, and the bidi overrides, which reorder
+/// what is read without changing what is there. Emoji joiners and variation selectors are
+/// left alone: they render as the character they compose.
+fn marked(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{e0000}'..='\u{e007f}')
+}
+
 /// How a row joins the one above it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Join {
@@ -128,6 +161,25 @@ mod tests {
     #[test]
     fn wrap_handles_multibyte_text() {
         assert_eq!(wrap("héllo wörld", 5), vec!["héllo", "wörld"]);
+    }
+
+    #[test]
+    fn what_a_terminal_would_act_on_or_hide_does_not_reach_a_row() {
+        // Colour from a command's output: the terminal would act on it, the copy would
+        // carry it, and the wrap would count it as width it does not have.
+        // The escape byte and the bell go; what they bracketed is text like any other.
+        assert_eq!(readable("\u{1b}[31mred\u{1b}[0m\u{7}"), "[31mred[0m");
+        assert_eq!(readable("a\rb"), "ab");
+        // Structure stays.
+        assert_eq!(readable("one\ntwo\tthree"), "one\ntwo\tthree");
+        // Text that renders as nothing is shown rather than dropped, so a payload hidden
+        // in a tool result is visible in the transcript.
+        assert_eq!(readable("hi\u{e0041}\u{e0042}"), "hi··");
+        assert_eq!(readable("a\u{202e}b"), "a·b");
+        // An emoji is composed of joiners and selectors that render as what they compose.
+        let family = "👨\u{200d}👩\u{200d}👧";
+        assert_eq!(readable(family), family);
+        assert_eq!(readable("plain"), "plain");
     }
 
     #[test]

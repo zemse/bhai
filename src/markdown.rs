@@ -20,6 +20,7 @@ const CODE_INDENT: &str = "  ";
 /// Renders `text` into lines no wider than `width` chars, each with how it joins the one
 /// above so a copy of a selection can undo the wrapping done here.
 pub fn render(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Join>) {
+    let text = &crate::wrap::readable(text);
     let mut renderer = Renderer {
         width: width.max(1),
         ..Renderer::default()
