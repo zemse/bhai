@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A child agent in `auto` mode is judged instead of denied. Children ran with no judge,
+  which was harmless while a call with no verdict fell back to asking, and blocked every
+  call past the rules once `auto` stopped asking. Each child now gets a judge forked from
+  the session's when it starts: the user's task, what the session had done and the brief
+  it was given, then its own calls on a budget of its own. What it spends counts toward
+  the session's judge total, and its lines in the judge log carry its id.
+
 - An interrupt now stops a detached child for good. The turn and its children used to
   share one flag, which the next prompt cleared, so a child that had not reached its next
   check between the two carried on as though nothing had happened. Each child takes a flag

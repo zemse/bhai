@@ -12,6 +12,7 @@ use crate::agent::{
     self, AgentEvent, Cancel, Child, ChildResult, Children, Delegation, Model, Results,
 };
 use crate::identity::{self, Identity};
+use crate::judge::Judge;
 use crate::permissions::Policy;
 
 pub const NAME: &str = "agent";
@@ -51,6 +52,8 @@ pub struct Agent {
     /// interrupt stops a child for good rather than until the next prompt clears it.
     pub cancel: Arc<Cancel>,
     pub children: Children,
+    /// The session's judge, which each child's own starts from.
+    pub judge: Option<Arc<Judge>>,
     /// Where a finished child posts its report, for the parent to read between steps.
     pub results: Results,
     pub slots: Arc<Semaphore>,
@@ -151,6 +154,8 @@ impl Agent {
         let (tx, cancel) = (self.tx.clone(), self.cancel.child());
         let (children, slots) = (Arc::clone(&self.children), Arc::clone(&self.slots));
         let results = self.results.clone();
+        // Forked now, so the child starts from what the session had done when it asked.
+        let judge = self.judge.as_ref().map(|judge| judge.child(&id, &task));
         tokio::spawn(async move {
             // Past `MAX_RUNNING` the child waits here rather than the parent waiting
             // for the call, so the model is never blocked on a slot.
@@ -183,6 +188,7 @@ impl Agent {
                 transcript: Some(&transcript),
                 children: &children,
                 steer: Some(steer),
+                judge,
             })
             .await;
             let name = &identity.name;
@@ -324,6 +330,7 @@ mod tests {
                 stop
             },
             children: Children::default(),
+            judge: None,
             results: tx_results,
             slots: Arc::new(Semaphore::new(MAX_RUNNING)),
             transcripts: super::super::temp_dir(),

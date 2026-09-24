@@ -484,6 +484,7 @@ pub(crate) async fn run_with(
                 tx: tx.clone(),
                 cancel: Arc::clone(&stop),
                 children: Arc::clone(&children),
+                judge: judge.clone(),
                 results: tx_results.clone(),
                 slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
             });
@@ -565,6 +566,7 @@ pub(crate) async fn run_with(
                                     tx: &tx,
                                     cancel: &cancel,
                                     children: &children,
+                                    judge: judge.as_deref(),
                                     transcripts: transcripts.clone(),
                                 })
                                 .await;
@@ -1253,6 +1255,8 @@ pub struct Child<'a> {
     pub children: &'a Children,
     /// Messages typed into this child's pane while it runs.
     pub steer: Option<mpsc::UnboundedReceiver<String>>,
+    /// Decides the calls `auto` mode would prompt for, from `Judge::child`.
+    pub judge: Option<Judge>,
 }
 
 /// How a child agent ended.
@@ -1303,8 +1307,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             child.model,
             &registry,
             child.policy,
-            // A child works on its own task, not the user's, so it never reaches the judge.
-            None,
+            child.judge.as_ref(),
             &tools,
             &child.prompt.text,
             &mut history,
@@ -1353,7 +1356,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::Resumed(_)
                 | AgentEvent::Call(_)
                 | AgentEvent::Item(_)
-                // A child's calls never reach the judge, so this cannot arrive.
+                // The status bar says what the session is waiting on, and a child's
+                // verdict lands in its pane either way.
                 | AgentEvent::Judging(_)
                 // The terminal is titled by the session, not by a child of one turn of it.
                 | AgentEvent::Titled(_)
@@ -2243,6 +2247,7 @@ mod tests {
             transcript: None,
             children: &Children::default(),
             steer: Some(steer),
+            judge: None,
         })
         .await;
 
@@ -2253,6 +2258,74 @@ mod tests {
         let bodies = fake.bodies.lock().unwrap().clone();
         let input = bodies.last().unwrap().1["input"].to_string();
         assert!(input.contains("look again"), "{input}");
+    }
+
+    /// `auto` mode never prompts, so a child with no judge could only run what the rules
+    /// already allow. Its judge starts from the session's and follows its own work.
+    #[tokio::test]
+    async fn a_child_in_auto_mode_is_judged_from_the_sessions_summary() {
+        use crate::judge::Verdict;
+        use crate::judge::fake::Answers;
+        use crate::permissions::{Relax, Rules, Trust};
+        use fake::{Fake, call, say};
+
+        let dir = tools::temp_dir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let policy = Policy::new(Mode::Auto, Rules::default(), None, repo.clone())
+            .with_relax(Relax {
+                writes: false,
+                commands: false,
+            })
+            .with_trust(Trust::new(&dir.join("config"), &repo));
+        policy.trust().unwrap();
+        let (parent, backend) = crate::judge::fake::judge(
+            Answers::Verdict(Verdict::Approve {
+                reason: "a step toward the task".to_string(),
+            }),
+            &repo,
+        );
+        parent.note("read src/parser.rs");
+
+        let target = repo.join("notes.txt");
+        let fake = Fake::new(vec![
+            vec![call(
+                "write",
+                json!({"path": target, "content": "splits on commas"}),
+            )],
+            vec![say("written")],
+        ]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let finished = run_child(Child {
+            id: "c1",
+            description: "write notes",
+            task: "note what the parser does",
+            prompt: crate::prompt::system_prompt(&[], Vec::new()),
+            model: &fake,
+            policy: &policy,
+            tx: &tx,
+            cancel: &Arc::new(AtomicBool::new(false)),
+            transcript: None,
+            children: &Children::default(),
+            steer: None,
+            judge: Some(parent.child("c1", "note what the parser does")),
+        })
+        .await;
+
+        assert_eq!(finished.result.unwrap(), "written");
+        assert!(target.exists(), "the judged write ran");
+        let request = backend.calls.lock().unwrap()[0].clone();
+        assert_eq!(request.task, "add a unit test for the parser");
+        let ledger = request.ledger.join("\n");
+        for line in [
+            "the user said: add a unit test for the parser",
+            "ran: read src/parser.rs",
+            "started child agent c1 on: note what the parser does",
+        ] {
+            assert!(ledger.contains(line), "{line} missing from {ledger}");
+        }
+        assert!(parent.total().input > 0, "the child's verdict is counted");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

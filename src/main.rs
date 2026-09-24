@@ -903,6 +903,7 @@ async fn cache_check(setup: Setup) -> Result<bool> {
             tx: mpsc::unbounded_channel().0,
             cancel: Arc::clone(&cancel),
             children: agent::Children::default(),
+            judge: None,
             results: mpsc::unbounded_channel().0,
             slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
         });

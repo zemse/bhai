@@ -21,6 +21,7 @@ use crate::client::Usage;
 use crate::frontmatter;
 use crate::identity::{self, Identity};
 use crate::instructions::{self, Roots};
+use crate::judge::Judge;
 use crate::permissions::{Offers, Policy};
 use crate::tools;
 
@@ -408,6 +409,8 @@ pub struct Run<'a> {
     pub tx: &'a mpsc::UnboundedSender<AgentEvent>,
     pub cancel: &'a Arc<AtomicBool>,
     pub children: &'a Children,
+    /// The session's judge, which each step's own starts from.
+    pub judge: Option<&'a Judge>,
     /// Where the step transcripts are written.
     pub transcripts: PathBuf,
 }
@@ -658,6 +661,7 @@ async fn step(run: &Run<'_>, step: &Step, identity: &Identity, prompt: &str) -> 
         transcript: Some(&run.transcripts.join(format!("child-{id}.jsonl"))),
         children: run.children,
         steer: Some(steer),
+        judge: run.judge.map(|judge| judge.child(&id, prompt)),
     })
     .await;
     let output = match &finished.result {
@@ -849,6 +853,7 @@ mod tests {
             tx: &tx,
             cancel: &Arc::new(AtomicBool::new(false)),
             children: &Children::default(),
+            judge: None,
             transcripts: root.join("transcripts"),
         })
         .await;
@@ -1082,6 +1087,7 @@ needs: [a]\n    prompt: review it\n",
             tx: &tx,
             cancel: &Arc::new(AtomicBool::new(false)),
             children: &Children::default(),
+            judge: None,
             transcripts: PathBuf::new(),
         })
         .await;

@@ -269,10 +269,14 @@ pub struct Judge {
     settings: Settings,
     /// Where every verdict is appended, if anywhere.
     log: Option<PathBuf>,
+    /// The child agent this judge rules for, which its log lines are tagged with.
+    agent: Option<String>,
+    /// What every judge of the session has cost, a child's included.
+    total: Arc<Mutex<Usage>>,
     state: Mutex<State>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     /// The latest user message, which is the task being judged against.
     task: String,
@@ -294,7 +298,6 @@ struct State {
     /// that cannot produce the object is not going to start, so the rest of the session
     /// puts each call once rather than ten times.
     shapeless: bool,
-    total: Usage,
 }
 
 impl State {
@@ -329,7 +332,34 @@ impl Judge {
             root,
             settings,
             log: None,
+            agent: None,
+            total: Arc::default(),
             state: Mutex::default(),
+        }
+    }
+
+    /// The judge for child agent `id`, on `task`. It starts from everything this one
+    /// knows, so the child is judged against the user's task and what the session did
+    /// to get here, and from then on its ledger follows the child alone, on a budget
+    /// of its own. The brief goes in the ledger rather than replacing the task: the
+    /// parent model wrote it, and the user's words are what a verdict answers to.
+    pub fn child(&self, id: &str, task: &str) -> Self {
+        let mut state = State {
+            spent: 0,
+            ..self.lock().clone()
+        };
+        state.append(format!(
+            "started child agent {id} on: {}",
+            clip(&task.replace('\n', " "), TASK_CLIP)
+        ));
+        Self {
+            backend: Arc::clone(&self.backend),
+            root: self.root.clone(),
+            settings: self.settings.clone(),
+            log: self.log.clone(),
+            agent: Some(id.to_string()),
+            total: Arc::clone(&self.total),
+            state: Mutex::new(state),
         }
     }
 
@@ -374,7 +404,7 @@ impl Judge {
 
     /// What the judge has cost so far; never part of the conversation's totals.
     pub fn total(&self) -> Usage {
-        self.lock().total
+        *self.total.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// What `/permissions` prints about the judge.
@@ -471,18 +501,18 @@ impl Judge {
             }
         }
         let Some(verdict) = verdict else {
-            let mut state = self.lock();
             // The attempts cost tokens even though they decided nothing.
-            add(&mut state.total, spent);
+            self.spend(spent);
+            let mut state = self.lock();
             // Every try spent on an answer that never took shape: stop paying for the
             // retries for the rest of the session.
             state.shapeless |= misshapen == TRIES;
             return Err(Undecided::Unanswered);
         };
         let usage = spent;
+        self.spend(usage);
         {
             let mut state = self.lock();
-            add(&mut state.total, usage);
             state.cache.insert(key, verdict.clone());
             state.append(format!(
                 "judged {target}: {} ({})",
@@ -491,6 +521,13 @@ impl Judge {
             ));
         }
         Ok(verdict)
+    }
+
+    fn spend(&self, usage: Usage) {
+        add(
+            &mut self.total.lock().unwrap_or_else(|e| e.into_inner()),
+            usage,
+        );
     }
 
     /// Append one JSONL line; a failed write must never fail the call.
@@ -507,6 +544,7 @@ impl Judge {
         };
         let line = json!({
             "timestamp": chrono::Local::now().to_rfc3339(),
+            "agent": self.agent,
             "summary": request.text(),
             "verdict": verdict.map(Verdict::name),
             "reason": verdict.map(Verdict::reason),
@@ -989,6 +1027,38 @@ mod tests {
         );
         assert!(backend.calls.lock().unwrap().is_empty(), "never called");
         assert!(judge.decide("bash", "echo hi", "").await.is_ok());
+    }
+
+    /// A child's judge starts where the session's is, then keeps a ledger and a budget
+    /// of its own, so neither one's work crowds the other's.
+    #[tokio::test]
+    async fn a_childs_judge_starts_from_the_sessions_and_goes_its_own_way() {
+        let (parent, backend) = judge(Answers::Verdict(approve("fine")), Path::new("/p"));
+        parent.note("ran the tests");
+        let child = parent.child("c1", "fix the failing test");
+        child.note("read the test");
+        assert!(child.decide("bash", "cargo test", "").await.is_ok());
+        assert_eq!(parent.lock().spent, 0, "the session's budget is untouched");
+        assert!(
+            !parent
+                .lock()
+                .ledger
+                .iter()
+                .any(|l| l.contains("read the test"))
+        );
+        assert_eq!(parent.total(), child.total(), "one total for the session");
+
+        let request = backend.calls.lock().unwrap()[0].clone();
+        assert_eq!(request.task, "add a unit test for the parser");
+        assert_eq!(
+            request.ledger,
+            [
+                "the user said: add a unit test for the parser",
+                "ran: ran the tests",
+                "started child agent c1 on: fix the failing test",
+                "ran: read the test",
+            ]
+        );
     }
 
     #[tokio::test]
