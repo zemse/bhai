@@ -155,6 +155,9 @@ pub async fn attempt(
     let mut text = String::new();
     let mut calls: Vec<Value> = Vec::new();
     let mut done = false;
+    // Held until the attempt succeeds, so a retry after the final event does not count
+    // one call's usage twice.
+    let mut counted = None;
 
     loop {
         let chunk = match client::watched(stream.next(), cancel, "stream idle for too long").await?
@@ -195,7 +198,7 @@ pub async fn attempt(
             }
             if event.get("done").and_then(Value::as_bool) == Some(true) {
                 done = true;
-                on_delta(Delta::Usage(usage(&event)));
+                counted = Some(usage(&event));
             }
         }
         // The rest of the batch is drained above, so nothing sharing the final event's
@@ -207,6 +210,9 @@ pub async fn attempt(
 
     if !done {
         return Err(Error::Retryable(anyhow!("stream ended before done")));
+    }
+    if let Some(usage) = counted {
+        on_delta(Delta::Usage(usage));
     }
     Ok(items(text, calls))
 }
@@ -388,6 +394,35 @@ mod tests {
         };
         assert_eq!(text, "héllo 🙂!");
         assert_eq!(items[0]["content"][0]["text"], "héllo 🙂!");
+    }
+
+    /// Usage belongs to a call that came back with an answer. An error sharing the final
+    /// event's chunk sends the whole call again, and an attempt already counted would put
+    /// one call's tokens in twice.
+    #[tokio::test]
+    async fn a_failure_after_the_final_event_counts_nothing() {
+        let body = concat!(
+            "{\"message\":{\"content\":\"hi\"},\"done\":true,\"prompt_eval_count\":9,\
+             \"eval_count\":3}\n",
+            "{\"error\":\"the model was unloaded\"}\n",
+        );
+        let url = serve_chunks(vec![body.as_bytes().to_vec()]).await;
+
+        let mut counted = Vec::new();
+        let mut on_delta = |delta: Delta| {
+            if let Delta::Usage(usage) = delta {
+                counted.push(usage);
+            }
+        };
+        let http = reqwest::Client::new();
+        let request = json!({});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let read = attempt(&http, &url, &request, &mut on_delta, &cancel);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .expect("the reply waited for a socket that never closed");
+        assert!(result.is_err(), "the error after `done` ends the attempt");
+        assert!(counted.is_empty(), "{counted:?}");
     }
 
     #[tokio::test]

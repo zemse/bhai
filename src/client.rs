@@ -478,6 +478,10 @@ impl Client {
         // turn is assembled from the per-item `done` events instead.
         let mut items: Vec<Value> = Vec::new();
         let mut completed = false;
+        // Held until the attempt succeeds: an error after the terminal event retries the
+        // whole call, and usage reported for an attempt that was sent again is counted
+        // twice.
+        let mut usage: Option<Usage> = None;
 
         loop {
             let chunk = match watched(stream.next(), cancel, "stream idle for too long").await? {
@@ -531,7 +535,7 @@ impl Client {
                         {
                             items = output.clone();
                         }
-                        on_delta(Delta::Usage(Usage::from_completed(&event)));
+                        usage = Some(Usage::from_completed(&event));
                     }
                     "codex.rate_limits" => {
                         let now = chrono::Utc::now().timestamp();
@@ -564,6 +568,9 @@ impl Client {
         }
 
         if completed {
+            if let Some(usage) = usage {
+                on_delta(Delta::Usage(usage));
+            }
             Ok(items)
         } else {
             Err(Error::Retryable(anyhow!(

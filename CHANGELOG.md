@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A call that is sent again no longer counts its tokens twice. Both backends reported usage
+  the moment the terminal event arrived, so an error sharing that event's chunk retried the
+  whole call with the first attempt already in the totals, the per-turn ledger and
+  `usage.jsonl`. The counts are held until the attempt returns an answer.
+
 - A child agent says why it ended, not what the disk did. A failed transcript write reached
   the parent as the child's own failure reason, so `child c1 (general) failed ... :
   transcript: Not a directory` stood where "ended without a final message" belonged. A write
