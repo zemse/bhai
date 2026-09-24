@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A judge case that writes to `~/...` is judged with the location line a session gives
+  it. `--judge-eval` resolved a case's paths with no home, so a leading `~/` named no
+  file, the case carried no `location:` at all, and the eval could not reproduce the one
+  kind of call the location fact exists for. Cases take a `home`, defaulting to `/home/u`.
+
 - `/effort <level>` changes the reasoning effort alone, and so does `POST /model` on the
   debug server with only `effort` given. An effort switch keeps the model's encrypted
   thinking and the context ledger, where `/model` dropped both. The Codex backend keys

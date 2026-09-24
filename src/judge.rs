@@ -438,7 +438,7 @@ impl Judge {
         target: &str,
         detail: &str,
     ) -> Result<Verdict, Undecided> {
-        let written = written(tool, target, &self.root);
+        let written = written(tool, target, &self.root, None);
         self.decide_writing(tool, target, detail, &written).await
     }
 
@@ -771,10 +771,12 @@ pub fn location(tool: &str, written: &[PathBuf], root: &Path) -> String {
 }
 
 /// The files a call writes, from its target alone: the path of a `write` or `edit`, and
-/// what a command redirects into or names as a file it changes.
-pub fn written(tool: &str, target: &str, root: &Path) -> Vec<PathBuf> {
+/// what a command redirects into or names as a file it changes. `home` resolves a leading
+/// `~/`, which the approval path always can: without it a case writing to `~/.zshrc` is
+/// put to the judge with no location at all, which is not what a session does.
+pub fn written(tool: &str, target: &str, root: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let args = json!({ "path": target, "command": target });
-    crate::permissions::written(tool, &args, root, None)
+    crate::permissions::written(tool, &args, root, home)
 }
 
 /// Format characters with no glyph of their own: zero-width spaces and joiners, marks
@@ -785,6 +787,8 @@ fn invisible(c: char) -> bool {
 
 /// The project path a case falls back to when it names no cwd or root.
 pub const EVAL_ROOT: &str = "/home/u/workspace/bhai";
+/// The home a case's `~/` resolves against when it names none.
+pub const EVAL_HOME: &str = "/home/u";
 
 /// One `--judge-eval` case: one line of the cases file.
 #[derive(Debug, Clone, Deserialize)]
@@ -804,6 +808,10 @@ pub struct Case {
     pub cwd: Option<String>,
     #[serde(default)]
     pub root: Option<String>,
+    /// The home directory a leading `~/` resolves against. The parent of [`EVAL_ROOT`]
+    /// when the case names none.
+    #[serde(default)]
+    pub home: Option<String>,
     #[serde(default)]
     pub recent: Vec<String>,
     /// What the judge should answer: `approve` or `deny`.
@@ -816,6 +824,7 @@ impl Case {
     /// tokenizer cannot read is marked in the eval exactly as it is in a session.
     pub fn request(&self) -> JudgeRequest {
         let root = self.root.clone().unwrap_or_else(|| EVAL_ROOT.to_string());
+        let home = self.home.clone().unwrap_or_else(|| EVAL_HOME.to_string());
         let detail = match self.detail.is_empty() {
             true => {
                 target(
@@ -834,7 +843,12 @@ impl Case {
             target: self.target.clone(),
             location: location(
                 &self.tool,
-                &written(&self.tool, &self.target, Path::new(&root)),
+                &written(
+                    &self.tool,
+                    &self.target,
+                    Path::new(&root),
+                    Some(Path::new(&home)),
+                ),
                 Path::new(&root),
             ),
             detail,
@@ -1108,7 +1122,7 @@ mod tests {
     }
 
     fn at(tool: &str, target: &str, root: &Path) -> String {
-        location(tool, &written(tool, target, root), root)
+        location(tool, &written(tool, target, root, None), root)
     }
 
     /// A path one lookalike character away from the root reads as inside it, which is
