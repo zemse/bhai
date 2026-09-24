@@ -463,12 +463,58 @@ fn follow_links(path: &Path) -> PathBuf {
     }
 }
 
+/// Names that hold credentials wherever they sit. Reading one puts it in the transcript,
+/// which is the exfiltration, so these are protected against a read as much as a write.
+const SECRET_NAMES: [&str; 11] = [
+    ".netrc",
+    ".pgpass",
+    ".htpasswd",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    "secring.gpg",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+];
+/// Extensions of a private key or a keystore, on the same terms.
+const SECRET_EXTENSIONS: [&str; 5] = ["pem", "p12", "pfx", "jks", "keystore"];
+/// Names that hold credentials only in their own directory. The directory itself is not
+/// on the list: a task about `~/.aws` or `~/.gnupg` has config to write that is not a key.
+const SECRET_PAIRS: [[&str; 2]; 8] = [
+    [".aws", "credentials"],
+    [".kube", "config"],
+    [".docker", "config.json"],
+    [".azure", "credentials"],
+    [".gnupg", "private-keys-v1.d"],
+    [".cargo", "credentials.toml"],
+    [".config", "gh"],
+    [".config", "gcloud"],
+];
+
+/// One lowercased path component, or one part of a shell word, that names credentials.
+pub fn is_secret_name(part: &str) -> bool {
+    SECRET_NAMES.contains(&part)
+        || part
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| SECRET_EXTENSIONS.contains(&ext))
+}
+
+/// Two adjacent components that name credentials only together.
+pub fn is_secret_pair(pair: &[&str]) -> bool {
+    SECRET_PAIRS.iter().any(|p| pair == p)
+}
+
 /// Files the agent may never change without asking, whatever the mode or rules say.
 pub fn is_protected(path: &Path, home: Option<&Path>) -> bool {
     let parts: Vec<String> = components(path).iter().map(|p| p.to_lowercase()).collect();
     let name = parts.last().map(String::as_str).unwrap_or_default();
     let parent = parts.len().checked_sub(2).map(|i| parts[i].as_str());
-    if parts.iter().any(|p| p == ".git")
+    if parts.iter().any(|p| p == ".git" || is_secret_name(p))
+        || parts
+            .windows(2)
+            .any(|w| is_secret_pair(&[w[0].as_str(), w[1].as_str()]))
         || name.starts_with(".env")
         || parts.ends_with(&[".bhai".to_string(), "config.toml".to_string()])
         || parts.ends_with(&[".bhai".to_string(), "settings.local.json".to_string()])

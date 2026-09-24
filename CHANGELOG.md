@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A credential file is protected against a read, not only against a write. The read tool
+  answers a protected path the way `cat` always has, so the cheaper of the two is no
+  longer the way around it, and what counts as one now covers `.netrc`, `.pgpass`,
+  `.htpasswd`, `.git-credentials`, `.npmrc`, `.pypirc`, `secring.gpg`, the ssh key names,
+  `*.pem`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, and the credential file of `.aws`,
+  `.kube`, `.docker`, `.azure`, `.cargo`, `.config/gh` and `.config/gcloud`. A bare `env`
+  is no longer read-only: it prints every secret the process holds.
+
 - The status bar can be a template: `statusline` in `~/.config/bhai/config.toml`, in a
   subset of starship's format (`$var`, `[text](bold cyan)`, `( ... )` dropped when its
   variables are empty, `\` escapes) over 26 variables: model, effort, mode, branch, dir,

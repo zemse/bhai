@@ -671,11 +671,15 @@ impl Checker<'_> {
         if find(&self.rules.ask, true).is_some() {
             return Decision::Ask;
         }
-        if !needs_approval {
-            return Decision::Allow(String::new());
-        }
+        // Before the approval check, not after it: a read needs no approval, but reading
+        // a protected path puts it in the transcript, which is the thing being protected
+        // against. `cat` on the same file has always asked; this is the read tool
+        // answering the same way.
         if rules::is_protected(path, base.home) {
             return Decision::Ask;
+        }
+        if !needs_approval {
+            return Decision::Allow(String::new());
         }
         let allowed = find(&self.allow(), false)
             .map(|r| rule_reason(&r))
@@ -1421,8 +1425,12 @@ mod tests {
             ),
             (&ask_mode, "edit", "/home/u/repo/src/main.rs", Decision::Ask),
             (&ask_mode, "edit", "/home/u/repo/.git/HEAD", Decision::Ask),
-            // Reads skip approval: only deny and ask rules touch them.
-            (&ask_mode, "read", "/home/u/repo/.env", allowed("")),
+            // Reads skip approval, but not on a protected path: the read is what puts
+            // the file in the transcript.
+            (&ask_mode, "read", "/home/u/repo/.env", Decision::Ask),
+            (&bypass, "read", "/home/u/.ssh/id_rsa", Decision::Ask),
+            (&auto, "read", "/home/u/.aws/credentials", Decision::Ask),
+            (&ask_mode, "read", "/home/u/repo/src/main.rs", allowed("")),
             (
                 &ask_mode,
                 "read",
@@ -1437,6 +1445,68 @@ mod tests {
                 "{tool} {path} in {}",
                 policy.mode()
             );
+        }
+    }
+
+    /// The backend is not trusted with the transcript it is served. A model that asks
+    /// for a credential file must not get one without the user seeing the call, whatever
+    /// the mode, and whichever tool it reaches for: the read tool and `cat` answer the
+    /// same, or the cheaper one is the whole defence.
+    #[test]
+    fn a_hostile_backend_cannot_read_credentials() {
+        let trusted = |mode| {
+            let policy = policy(mode, &[], &[], &[]);
+            let trust = Trust::new(Path::new("/home/u/.config/bhai"), Path::new("/home/u/repo"));
+            policy.set_trusted(&trust.snapshot());
+            policy
+        };
+        let commands = [
+            "cat /home/u/.ssh/id_rsa",
+            "cat /home/u/keys/id_ed25519",
+            "cat /home/u/.aws/credentials",
+            "cat /home/u/.netrc",
+            "cat /home/u/.git-credentials",
+            "cat /home/u/.npmrc",
+            "cat /home/u/.pypirc",
+            "cat /home/u/.kube/config",
+            "cat /home/u/.docker/config.json",
+            "cat /home/u/.cargo/credentials.toml",
+            "head -c 64 /home/u/certs/server.pem",
+            "find /home/u -name '*.pem' -type f",
+        ];
+        let paths = [
+            "/home/u/.ssh/id_rsa",
+            "/home/u/repo/.env",
+            "/home/u/.codex/auth.json",
+            "/home/u/.aws/credentials",
+            "/home/u/.netrc",
+            "/home/u/certs/server.pem",
+        ];
+        for mode in Mode::ALL {
+            let policy = trusted(mode);
+            for command in commands {
+                assert!(
+                    !matches!(bash(&policy, command), Decision::Allow(_)),
+                    "{command} in {mode}"
+                );
+            }
+            // An environment dump names no file, so only the modes that weigh a call
+            // at all can stop it; `bypass` allows it the way it allows anything else.
+            if mode != Mode::Bypass {
+                assert_eq!(bash(&policy, "env"), Decision::Ask, "env in {mode}");
+            }
+            for path in paths {
+                assert_eq!(
+                    file(&policy, "read", path),
+                    Decision::Ask,
+                    "{path} in {mode}"
+                );
+                // `auto` never prompts, so the judge must not be offered it either.
+                assert!(
+                    policy.judgeable("read", &json!({ "path": path })).is_err(),
+                    "{path} in {mode}"
+                );
+            }
         }
     }
 

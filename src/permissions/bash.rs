@@ -1,6 +1,8 @@
 //! A small shell tokenizer for permission checks. It understands just enough bash to
 //! split a command into simple commands and words, and refuses everything else.
 
+use super::rules;
+
 /// One simple command: its words after quote removal.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Command {
@@ -412,8 +414,8 @@ pub fn is_read_only(words: &[String]) -> bool {
         "tree" => !has(&|a| is_short_flag(a, 'o')),
         // `-s` sets the clock.
         "date" => !has(&|a| is_short_flag(a, 's') || a.starts_with("--set")),
-        // An argument sets the hostname, and `env cmd` runs cmd.
-        "env" | "hostname" => args.is_empty(),
+        // An argument sets the hostname.
+        "hostname" => args.is_empty(),
         // Only the `-v` forms reach here; they print where a name resolves, like `which`.
         "command" => is_lookup(args.first().map(String::as_str)),
         // `-o` writes the sorted output to a file, `--compress-program` runs a program.
@@ -797,15 +799,16 @@ fn protected_word(word: &str) -> bool {
         return false;
     }
     let parts: Vec<&str> = lower.split(['/', '=', ':', ',']).collect();
-    parts
-        .iter()
-        .any(|p| matches!(*p, ".git" | ".ssh" | ".codex" | ".claude") || p.starts_with(".env"))
-        || parts.windows(2).any(|w| {
-            matches!(
-                w,
-                [".config", "bhai"] | [".bhai", "config.toml"] | [".bhai", "settings.local.json"]
-            )
-        })
+    parts.iter().any(|p| {
+        matches!(*p, ".git" | ".ssh" | ".codex" | ".claude")
+            || p.starts_with(".env")
+            || rules::is_secret_name(p)
+    }) || parts.windows(2).any(|w| {
+        matches!(
+            w,
+            [".config", "bhai"] | [".bhai", "config.toml"] | [".bhai", "settings.local.json"]
+        ) || rules::is_secret_pair(w)
+    })
 }
 
 #[cfg(test)]
@@ -1190,7 +1193,6 @@ mod tests {
             "tree -L 2",
             "file x",
             "date -u",
-            "env",
             "uname -a",
             "df -h",
             "ps aux",
@@ -1231,6 +1233,8 @@ mod tests {
             "file -C -m x",
             "/bin/ls",
             "date -s 12:00",
+            // Every secret the process holds, printed into the transcript.
+            "env",
             "env cargo test",
             "hostname other",
             "sort -o out x",
