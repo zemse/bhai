@@ -947,6 +947,9 @@ async fn turn(
                     AgentEvent::Cache(found)
                 }
                 Delta::RateLimits(limits) => AgentEvent::RateLimits(limits),
+                Delta::Truncated => AgentEvent::Info(
+                    "cut off at the model's output limit; the answer is what it had".to_string(),
+                ),
             });
         };
 

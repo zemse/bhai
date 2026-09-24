@@ -198,6 +198,11 @@ pub async fn attempt(
             }
             if event.get("done").and_then(Value::as_bool) == Some(true) {
                 done = true;
+                // `stop` and a missing reason are a finished answer; `length` means the
+                // model was cut off at `num_predict` or the context window.
+                if event.get("done_reason").and_then(Value::as_str) == Some("length") {
+                    on_delta(Delta::Truncated);
+                }
                 counted = Some(usage(&event));
             }
         }
@@ -394,6 +399,41 @@ mod tests {
         };
         assert_eq!(text, "héllo 🙂!");
         assert_eq!(items[0]["content"][0]["text"], "héllo 🙂!");
+    }
+
+    /// A reply the model was cut off in is still the answer, and the transcript says so.
+    #[tokio::test]
+    async fn a_length_capped_reply_is_kept_and_reported() {
+        /// One reply whose final event carries `done` plus whatever `done` names, as the
+        /// items it produced and whether it reported being cut off.
+        async fn reported(done: &str) -> (Vec<Value>, bool) {
+            let body = format!(
+                "{{\"message\":{{\"content\":\"as far as I got\"}},\"done\":true{done}}}\n"
+            );
+            let url = serve_chunks(vec![body.into_bytes()]).await;
+            let mut cut = false;
+            let mut on_delta = |delta: Delta| {
+                if matches!(delta, Delta::Truncated) {
+                    cut = true;
+                }
+            };
+            let http = reqwest::Client::new();
+            let request = json!({});
+            let cancel = Arc::new(AtomicBool::new(false));
+            let read = attempt(&http, &url, &request, &mut on_delta, &cancel);
+            let items = match tokio::time::timeout(std::time::Duration::from_secs(5), read).await {
+                Ok(Ok(items)) => items,
+                Ok(Err(_)) => panic!("a capped reply is an answer, not an error"),
+                Err(_) => panic!("the reply waited for a socket that never closed"),
+            };
+            (items, cut)
+        }
+
+        let (items, cut) = reported(",\"done_reason\":\"length\"").await;
+        assert!(cut, "a length-capped reply says so");
+        assert_eq!(items[0]["content"][0]["text"], "as far as I got");
+        assert!(!reported(",\"done_reason\":\"stop\"").await.1);
+        assert!(!reported("").await.1);
     }
 
     /// Usage belongs to a call that came back with an answer. An error sharing the final

@@ -79,6 +79,9 @@ pub enum Delta {
     Cache(Option<CacheBreak>),
     /// Rate-limit headroom from the response headers or a stream event.
     RateLimits(RateLimits),
+    /// The backend stopped the model at its output cap: what streamed is the whole
+    /// answer, and there is no more of it to ask for.
+    Truncated,
 }
 
 /// Token counts for one model call, as `response.completed` reports them.
@@ -527,6 +530,10 @@ impl Client {
                     // it produced is the answer rather than something to send again.
                     "response.completed" | "response.incomplete" => {
                         completed = true;
+                        if event.get("type").and_then(Value::as_str) == Some("response.incomplete")
+                        {
+                            on_delta(Delta::Truncated);
+                        }
                         // Some deployments do populate it; prefer their copy when present.
                         if let Some(output) = event
                             .pointer("/response/output")

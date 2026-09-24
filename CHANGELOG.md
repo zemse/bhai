@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- An answer the backend cut off at the model's output limit says so. Ollama's
+  `done_reason: length` was read as a finished turn, so a truncated answer looked complete;
+  the transcript now carries `cut off at the model's output limit; the answer is what it
+  had`, and the Codex `response.incomplete` event says the same. What streamed is still kept
+  as the answer, since it is what the user already read.
+
 - A call that is sent again no longer counts its tokens twice. Both backends reported usage
   the moment the terminal event arrived, so an error sharing that event's chunk retried the
   whole call with the first attempt already in the totals, the per-turn ledger and
