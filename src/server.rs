@@ -55,6 +55,10 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/retry", post(retry))
         .route("/mode", post(mode))
         .route("/context", get(context))
+        .route("/permissions", get(permissions))
+        .route("/allow", post(allow))
+        .route("/trust", post(trust))
+        .route("/untrust", post(untrust))
         .route("/children", get(children))
         .route("/steer", post(steer))
         .layer(middleware::from_fn(move |request, next| {
@@ -116,6 +120,12 @@ struct Prompt {
 #[derive(Deserialize)]
 struct ModeBody {
     mode: Mode,
+}
+
+#[derive(Deserialize)]
+struct AllowBody {
+    /// A permission rule as `/allow` takes it, such as `Bash(cargo test:*)`.
+    rule: String,
 }
 
 #[derive(Deserialize)]
@@ -271,6 +281,36 @@ async fn mode(State(session): State<Arc<Session>>, Json(body): Json<ModeBody>) -
     // for. The reply says which it is rather than pretending.
     let mode = session.set_mode(body.mode);
     Json(json!({ "ok": true, "mode": mode })).into_response()
+}
+
+/// The rules in force, as `/permissions` shows them.
+async fn permissions(State(session): State<Arc<Session>>) -> Response {
+    Json(json!({ "permissions": session.permissions() })).into_response()
+}
+
+/// `/allow`, for a session nobody is sitting in front of: a headless run is exactly where
+/// a prompt cannot be answered, so it is also where a rule has to be settable.
+async fn allow(State(session): State<Arc<Session>>, Json(body): Json<AllowBody>) -> Response {
+    match session.allow(body.rule.trim()) {
+        Ok(text) => Json(json!({ "ok": true, "allowed": text })).into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+    }
+}
+
+async fn trust(State(session): State<Arc<Session>>) -> Response {
+    match session.trust() {
+        Ok(text) => Json(json!({ "ok": true, "trusted": text, "mode": session.state().mode }))
+            .into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+    }
+}
+
+async fn untrust(State(session): State<Arc<Session>>) -> Response {
+    match session.untrust() {
+        Ok(text) => Json(json!({ "ok": true, "untrusted": text, "mode": session.state().mode }))
+            .into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+    }
 }
 
 async fn context(State(session): State<Arc<Session>>) -> Response {
@@ -655,6 +695,40 @@ mod tests {
         assert_eq!(
             get_json(&http, format!("{base}/state")).await["model"],
             "test-model"
+        );
+    }
+
+    /// A headless run is exactly where nobody can answer a prompt, so it is where a rule
+    /// has to be settable without one.
+    #[tokio::test]
+    async fn a_rule_can_be_added_over_http() {
+        let (base, _) = start().await;
+        let http = reqwest::Client::new();
+        assert!(
+            !get_json(&http, format!("{base}/permissions")).await["permissions"]
+                .as_str()
+                .unwrap()
+                .contains("Bash(cargo test:*)")
+        );
+        assert_eq!(
+            post(
+                &http,
+                format!("{base}/allow"),
+                json!({"rule": "Bash(cargo test:*)"})
+            )
+            .await,
+            StatusCode::OK
+        );
+        let shown = get_json(&http, format!("{base}/permissions")).await["permissions"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(shown.contains("Bash(cargo test:*)"), "{shown}");
+        // A rule that does not parse is the caller's mistake, not a silent no-op.
+        assert!(
+            post(&http, format!("{base}/allow"), json!({"rule": "Bash(rm"}))
+                .await
+                .is_client_error()
         );
     }
 

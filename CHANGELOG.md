@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- The debug server can set a permission rule: `POST /allow {"rule": "Bash(cargo test:*)"}`,
+  `POST /trust`, `POST /untrust`, and `GET /permissions` for what is in force. `/allow` and
+  `/trust` were TUI commands only, and a headless run is exactly where no prompt can be
+  answered.
+
 - Text with wide characters in it wraps and selects where it is drawn. Rows were measured
   in characters, so a line of CJK or emoji was wrapped at half the columns it takes and ran
   past the edge of the view, and a click mapped its column straight to a character index, so
