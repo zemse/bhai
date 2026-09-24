@@ -12,18 +12,20 @@ pub mod agent;
 pub mod bash;
 pub mod edit;
 pub mod mcp;
+pub mod models;
 pub mod read;
 pub mod skill;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 6] = [
+pub const NAMES: [&str; 7] = [
     bash::NAME,
     read::NAME,
     write::NAME,
     edit::NAME,
     skill::NAME,
     agent::NAME,
+    models::NAME,
 ];
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
@@ -92,6 +94,12 @@ impl Registry {
     /// The `agent` tool, for a parent session only.
     pub fn with_agent(mut self, agent: agent::Agent) -> Self {
         self.tools.push(Box::new(agent));
+        self
+    }
+
+    /// The `models` tool, which only a session that can delegate has a use for.
+    pub fn with_models(mut self, models: models::Models) -> Self {
+        self.tools.push(Box::new(models));
         self
     }
 

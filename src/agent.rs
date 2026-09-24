@@ -215,6 +215,11 @@ pub trait Model: Send + Sync {
     /// The model's name, which picks its tokenizer.
     fn name(&self) -> &str;
 
+    /// Where the Ollama server is, for listing what it serves.
+    fn ollama_url(&self) -> &str {
+        crate::ollama::DEFAULT_URL
+    }
+
     /// The request's effort and the one the model runs at, for a model that takes an
     /// effort change as a `configuration_update`; `None` for any other.
     fn effort_updates(&self) -> Option<(&str, &str)> {
@@ -255,6 +260,10 @@ impl Model for Client {
 
     fn child(&self, identity: &Identity) -> Arc<dyn Model> {
         Arc::new(self.for_child(identity))
+    }
+
+    fn ollama_url(&self) -> &str {
+        Client::ollama_url(self)
     }
 
     fn switch(&self, model: &str, effort: &str) -> Option<Arc<dyn Model>> {
@@ -534,6 +543,9 @@ pub(crate) async fn run_with(
                 judge: judge.clone(),
                 results: tx_results.clone(),
                 slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
+            });
+            registry = registry.with_models(tools::models::Models {
+                current: Arc::clone(model),
             });
         }
         registry

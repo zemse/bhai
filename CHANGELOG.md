@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-25
 
+- A child agent can be put on another model. The `agent` tool takes `model` and `effort`,
+  so an identity's model is its default rather than its ceiling and `general` no longer
+  needs a near-duplicate identity per model. A new `models` tool lists what the backends
+  will serve, with each model's efforts and window, which is the same list `/model`
+  offers; the delegation section says to read it rather than guess an id. Children on one
+  identity but different models get their own prompt cache keys.
+
 - An effort change on a GPT-6 model (`gpt-6`, `gpt-6-*`, `gpt-6.*`) keeps the prompt
   cache. The request's `reasoning.effort` stays what the conversation opened on, and the
   change goes into the history as a `configuration_update` item just before the next

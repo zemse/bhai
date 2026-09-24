@@ -997,6 +997,9 @@ async fn cache_check(setup: Setup) -> Result<bool> {
             results: mpsc::unbounded_channel().0,
             slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
         });
+        registry = registry.with_models(tools::models::Models {
+            current: Arc::new(client.clone()),
+        });
     }
     let tools = registry.schemas();
     let mut input = cache_check_prefix(&system, &tools);

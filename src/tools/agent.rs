@@ -84,6 +84,17 @@ impl Tool for Agent {
                         "type": "string",
                         "description": "The identity to run the child as, from the listed ones. Default `general`."
                     },
+                    "model": {
+                        "type": "string",
+                        "description": "Run the child on this model instead of the one the \
+        identity or this session would use, as an id the `models` tool lists. Give one when the task \
+        wants a model this session is not on; omit it otherwise."
+                    },
+                    "effort": {
+                        "type": "string",
+                        "description": "The reasoning effort for the child, from the ones the \
+        `models` tool lists against its model. Omit to keep the model's own default."
+                    },
                     "description": {
                         "type": "string",
                         "description": "What the child does, in 3 to 6 words."
@@ -243,7 +254,21 @@ impl Agent {
             .filter(|i| i.name != identity::ROUTER)
             .cloned()
             .collect();
-        let identity = identity::find(&choices, name).map_err(|e| format!("{e:#}."))?;
+        let mut identity = identity::find(&choices, name).map_err(|e| format!("{e:#}."))?;
+        // An identity's own model is its default, not a ceiling: one call can put it on
+        // another without a second identity that differs only by the model.
+        let given = |key: &str| {
+            string_arg(args, key)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        if let Some(model) = given("model") {
+            identity.model = Some(model);
+        }
+        if let Some(effort) = given("effort") {
+            identity.effort = Some(effort);
+        }
         Ok((identity, description, prompt))
     }
 }
@@ -359,6 +384,44 @@ mod tests {
         assert!(err.contains("unknown identity `router`"), "{err}");
         assert!(agent.describe(&json!({"description": "d"})).is_err());
         assert!(!agent.needs_approval());
+    }
+
+    /// An identity's model is a default. Without a per-call override the only way to put
+    /// `general` on another model is a second identity that differs by nothing else.
+    #[test]
+    fn a_call_can_put_an_identity_on_another_model() {
+        let harness = tool(&Fake::default(), false);
+        let agent = &harness.agent;
+        let of = |args: &Value| {
+            let (identity, _, _) = agent.parse(args).unwrap();
+            (identity.name, identity.model, identity.effort)
+        };
+        assert_eq!(
+            of(&json!({"description": "d", "prompt": "p"})),
+            ("general".to_string(), None, None)
+        );
+        assert_eq!(
+            of(&json!({
+                "description": "d",
+                "prompt": "p",
+                "model": "ollama:gemma4:e4b",
+                "effort": "low"
+            })),
+            (
+                "general".to_string(),
+                Some("ollama:gemma4:e4b".to_string()),
+                Some("low".to_string())
+            )
+        );
+        // Blank is not a choice, so it does not override the identity's own.
+        assert_eq!(
+            of(&json!({"description": "d", "prompt": "p", "model": "  "})),
+            ("general".to_string(), None, None)
+        );
+        let schema = agent.schema();
+        let properties = &schema["parameters"]["properties"];
+        assert!(properties.get("model").is_some(), "{properties}");
+        assert!(properties.get("effort").is_some(), "{properties}");
     }
 
     #[tokio::test]

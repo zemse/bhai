@@ -81,8 +81,12 @@ identities. A child starts with none of this conversation and is thrown away wit
 context after, so it earns its cost only when it would read far more than it reports \
 back: what you have already read, or could read in a few calls, is cheaper to do here. \
 It is judged on its own task with a budget of its own, so it can run what you could. Pick the identity whose tools and skills fit the task; one with \
-no model of its own runs on yours, at your effort. Do not delegate edits that depend on \
-each other.\n\nA child runs detached: the call hands back its id and returns at once, and \
+no model of its own runs on yours, at your effort. An identity's model is its default and \
+not a ceiling: pass `model` to put this one child on another, and `effort` with it, which \
+is how a task that wants a model this session is not on gets one. The ids are the ones the \
+`models` tool lists, so read that list rather than guessing a name; a model you have heard \
+of elsewhere is not necessarily one either backend here will serve. Do not delegate edits \
+that depend on each other.\n\nA child runs detached: the call hands back its id and returns at once, and \
 the report arrives later as a message. Start everything you want running in one go rather \
 than one at a time, then either carry on with work that does not depend on them or say \
 what you have started and stop. The user has the session back either way, and a report \

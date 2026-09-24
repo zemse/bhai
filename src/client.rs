@@ -322,7 +322,12 @@ impl Client {
             .clone()
             .with_overrides(None, Some(effort))
             .with_overrides(identity.model.clone(), identity.effort.clone());
-        child.cache_key = format!("{}-{}", self.session_id, identity.name);
+        // One identity can now run on more than one model, so the key has to separate
+        // them: two children sharing a key would each cold-start the other's prefix.
+        child.cache_key = match child.model() == self.model() {
+            true => format!("{}-{}", self.session_id, identity.name),
+            false => format!("{}-{}-{}", self.session_id, identity.name, child.model()),
+        };
         let strict = self
             .guard
             .lock()
