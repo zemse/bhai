@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- `command -v` inside a loop is no longer denied outright. The blunt word split that decides
+  whether a command the parser cannot read may go to the judge treated every `command` as a
+  program that runs its arguments, so `for f in rg fd; do command -v $f; done` was refused in
+  `auto` while the same probe without the loop went through. It now reads the word after a
+  `command`, the way the parsed path already does.
+
 - An allow rule for `cd` no longer carries the project with it. `Bash(cd:*)`, which a Claude
   Code settings file commonly has, matched `cd ~`, `cd -` and a bare `cd` as an ordinary
   allowed command while the cwd tracking, which reads only `cd <one relative or absolute

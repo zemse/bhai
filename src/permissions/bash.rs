@@ -120,14 +120,14 @@ fn runs_arguments(words: &[String]) -> bool {
     let Some(name) = words.first().map(|w| basename(w)) else {
         return false;
     };
-    REFUSED.contains(&name) && !(name == "command" && is_lookup(&words[1..]))
+    REFUSED.contains(&name) && !(name == "command" && is_lookup(words.get(1).map(String::as_str)))
 }
 
 /// `command -v`, `-V` and `-p` in any combination, as long as one of `v` or `V` is in
 /// there: those print where a name resolves to rather than running it. Anything else,
 /// including a bare `command foo`, runs its arguments.
-fn is_lookup(args: &[String]) -> bool {
-    args.first().is_some_and(|flag| {
+fn is_lookup(flag: Option<&str>) -> bool {
+    flag.is_some_and(|flag| {
         let Some(letters) = flag.strip_prefix('-').filter(|f| !f.starts_with('-')) else {
             return false;
         };
@@ -415,7 +415,7 @@ pub fn is_read_only(words: &[String]) -> bool {
         // An argument sets the hostname, and `env cmd` runs cmd.
         "env" | "hostname" => args.is_empty(),
         // Only the `-v` forms reach here; they print where a name resolves, like `which`.
-        "command" => is_lookup(args),
+        "command" => is_lookup(args.first().map(String::as_str)),
         // `-o` writes the sorted output to a file, `--compress-program` runs a program.
         "sort" => !has(&|a| {
             is_short_flag(a, 'o')
@@ -692,9 +692,15 @@ fn blunt_split(input: &str) -> impl Iterator<Item = &str> {
 }
 
 fn names_reserved(input: &str) -> Option<Reserved> {
-    blunt_split(input).find_map(|word| {
+    let words: Vec<&str> = blunt_split(input).collect();
+    words.iter().enumerate().find_map(|(i, word)| {
+        let word = *word;
         let name = basename(word);
-        if REFUSED.contains(&name) || SHELLS.contains(&name) {
+        // The one refused word with a form that runs nothing: `command -v foo` prints
+        // where a name resolves. Without this a probe inside a loop, which is all this
+        // split can see, is refused while the same probe on its own is not.
+        let lookup = name == "command" && is_lookup(words.get(i + 1).copied());
+        if !lookup && (REFUSED.contains(&name) || SHELLS.contains(&name)) {
             return Some(Reserved::Program(name.to_string()));
         }
         let globs_a_dot_name = word.contains(['*', '?', '[']) && word.split('/').any(dot_name);
@@ -744,6 +750,8 @@ mod tests {
             "for f in src/*.rs; do wc -l $f; done",
             "curl -H \"x-api-key: $KEY\" https://api.example.test/v1",
             "echo \"$(date)\" >> notes.md",
+            // `command -v` runs nothing, whatever the loop around it hides from the split.
+            "for f in rg fd; do command -v $f; done",
         ] {
             assert!(parse(tame).is_none(), "{tame}");
             assert!(reserved(tame).is_none(), "{tame}");
@@ -760,6 +768,9 @@ mod tests {
             "ls $('s'udo rm -rf /)",
             "echo $(\\sudo id)",
             "echo $(su\\do id)",
+            // Without `-v` it runs its argument, and `-v` does not cover what follows it.
+            "for f in rg fd; do command $f; done",
+            "command -v $(sudo id)",
         ] {
             assert!(reserved(word).is_some(), "{word}");
         }

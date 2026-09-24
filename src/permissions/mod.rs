@@ -1691,6 +1691,10 @@ mod tests {
         // A probe of what is installed, which `command` in the refused list used to take
         // the whole chain down with.
         assert!(command("command -v gpg || true").is_ok(), "a lookup");
+        assert!(
+            command("for f in rg fd; do command -v $f; done").is_ok(),
+            "a lookup the loop hides from the blunt split"
+        );
 
         // An ask rule is the user saying they want to see it, so the judge does not get
         // to wave it through in the one mode where nothing else would stop it.
