@@ -550,11 +550,24 @@ fn awk_reads_only(args: &[String]) -> bool {
 /// The files a command changes through its arguments, as written: every operand of the
 /// programs that create, delete or rewrite what they name, and the destination of those
 /// that copy or link into it. Redirects are in `Command::writes`. A program not listed
-/// here changes nothing this can name, which says nothing about whether it writes.
+/// here changes nothing this can name, which says nothing about whether it writes. `sed`
+/// counts once `-i` edits in place, and `dd` for its `of=`.
 pub fn written_args(words: &[String]) -> Vec<&str> {
     let Some((name, args)) = words.split_first() else {
         return Vec::new();
     };
+    match basename(name) {
+        "sed" => return sed_in_place(args),
+        // `of=/dev/null` writes nothing, as with a redirect.
+        "dd" => {
+            return args
+                .iter()
+                .filter_map(|arg| arg.strip_prefix("of="))
+                .filter(|file| *file != "/dev/null")
+                .collect();
+        }
+        _ => {}
+    }
     let mut operands = Vec::new();
     let mut flags = true;
     for arg in args {
@@ -570,6 +583,65 @@ pub fn written_args(words: &[String]) -> Vec<&str> {
         // The first operand is the mode or owner, the rest are what it is set on.
         "chmod" | "chown" => operands.into_iter().skip(1).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// The files a `sed` rewrites: its operands, once `-i` says it edits them in place. The
+/// script is the first operand unless `-e` or `-f` gave one. GNU takes the backup suffix
+/// joined to the flag (`-i.bak`, so `-ie` is the suffix `e`), BSD as the next word
+/// (`-i ''`, `-i .bak`); a bare `-i` followed by an empty word or one starting with `.`
+/// is read the BSD way, which is the only way either sed would accept that word.
+fn sed_in_place(args: &[String]) -> Vec<&str> {
+    let (mut in_place, mut script, mut flags) = (false, false, true);
+    let mut operands = Vec::new();
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        let arg = arg.as_str();
+        if !flags || arg == "-" || !arg.starts_with('-') {
+            match script {
+                true => operands.push(arg),
+                false => script = true,
+            }
+            continue;
+        }
+        if arg == "--" {
+            flags = false;
+        } else if arg == "--in-place" || arg.starts_with("--in-place=") {
+            in_place = true;
+        } else if arg == "--expression" || arg == "--file" {
+            args.next();
+            script = true;
+        } else if arg.starts_with("--expression=") || arg.starts_with("--file=") {
+            script = true;
+        } else if !arg.starts_with("--") {
+            let cluster = &arg[1..];
+            for (at, flag) in cluster.char_indices() {
+                let rest = &cluster[at + 1..];
+                match flag {
+                    'i' => {
+                        in_place = true;
+                        let bsd = |next: &&String| next.is_empty() || next.starts_with('.');
+                        if cluster == "i" && args.peek().is_some_and(bsd) {
+                            args.next();
+                        }
+                        break;
+                    }
+                    // Each takes an argument, the rest of the cluster or the next word.
+                    'e' | 'f' | 'l' => {
+                        if rest.is_empty() {
+                            args.next();
+                        }
+                        script |= flag != 'l';
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    match in_place {
+        true => operands,
+        false => Vec::new(),
     }
 }
 
@@ -739,6 +811,37 @@ fn protected_word(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `sed` writes its files only in place, and which word is the script and which a
+    /// backup suffix differs between GNU and BSD.
+    #[test]
+    fn a_sed_writes_the_files_it_edits_in_place() {
+        let written = |command: &str| {
+            let commands = parse(command).unwrap();
+            written_args(commands[0].unwrapped())
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        for (command, files) in [
+            (
+                "sed -i 's/a/b/' src/a.rs src/b.rs",
+                &["src/a.rs", "src/b.rs"][..],
+            ),
+            ("sed -i '' 's/a/b/' src/a.rs", &["src/a.rs"]),
+            ("sed -i .bak -e 's/a/b/' src/a.rs", &["src/a.rs"]),
+            ("sed -i.bak -E 's/a+/b/' src/a.rs", &["src/a.rs"]),
+            ("sed -Ei -e s/a/b/ -e s/c/d/ f", &["f"]),
+            ("sed -ie 's/a/b/' f", &["f"]),
+            ("sed -ni -f edit.sed f", &["f"]),
+            ("sed --in-place=.orig --expression=s/a/b/ -- -f", &["-f"]),
+            ("sed -n 's/a/b/p' src/a.rs", &[]),
+            ("sed 's/a/b/' src/a.rs > out", &[]),
+            ("dd if=a of=b.img", &["b.img"]),
+        ] {
+            assert_eq!(written(command), files, "{command}");
+        }
+    }
 
     /// What can be read off a command this parser refuses: the programs that run their
     /// arguments as something else, and the paths only the user may approve.

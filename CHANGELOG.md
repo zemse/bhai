@@ -6,6 +6,10 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- `sed -i` and `dd of=` count as writes for the judge's location line: the files a `sed`
+  edits in place, in GNU's `-i.bak` form or BSD's `-i ''`, and the file a `dd` writes
+  other than `/dev/null`.
+
 - The debug server can set a permission rule: `POST /allow {"rule": "Bash(cargo test:*)"}`,
   `POST /trust`, `POST /untrust`, and `GET /permissions` for what is in force. `/allow` and
   `/trust` were TUI commands only, and a headless run is exactly where no prompt can be

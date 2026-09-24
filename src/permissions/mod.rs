@@ -1138,6 +1138,10 @@ mod tests {
         assert!(of("touch $x").is_empty());
         assert!(of("git status && ls > /dev/null").is_empty());
         assert_eq!(
+            of("dd if=/dev/zero of=disk.img bs=1m && dd if=a of=/dev/null"),
+            ["/p/disk.img"]
+        );
+        assert_eq!(
             written("edit", &json!({ "path": "src/a.rs" }), cwd, None),
             [PathBuf::from("/p/src/a.rs")]
         );
