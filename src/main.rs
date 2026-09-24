@@ -73,6 +73,9 @@ enum Event {
     Mouse(MouseEvent),
     Paste(String),
     Session(session::Event),
+    /// The forwarder fell behind and the channel dropped events, so what the stream sets
+    /// is read from the session instead.
+    Resync,
     Tick,
 }
 
@@ -1116,7 +1119,12 @@ async fn run(
         loop {
             let event = match events.recv().await {
                 Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if forward_tx.send(Event::Resync).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             };
             if forward_tx.send(Event::Session(event)).is_err() {
@@ -1206,6 +1214,10 @@ fn apply(app: &mut App, event: Event, root: &std::path::Path) -> bool {
                 title::set(&title::compose(root, Some(name)));
             }
             app.on_event(event);
+            true
+        }
+        Event::Resync => {
+            app.resync();
             true
         }
         Event::Tick => {

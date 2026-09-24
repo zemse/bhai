@@ -1023,6 +1023,23 @@ impl App {
         }
     }
 
+    /// Reload from the session what the event stream would have set. A consumer that
+    /// falls behind has events dropped, not delayed, so the parts of the view that are a
+    /// running total of events would stay wrong until the next turn: whether a turn is
+    /// running, what is waiting for an answer, the mode, the model, the queue. The token
+    /// counts are not among them; they are summed from the stream, and adding the
+    /// session's totals here would count what did arrive twice.
+    pub fn resync(&mut self) {
+        let state = self.session.state();
+        self.working = state.working;
+        self.queued = state.queued;
+        self.pending = state.pending;
+        self.mode = state.mode;
+        self.model = state.model;
+        self.effort = state.effort;
+        self.identity = state.identity;
+    }
+
     pub fn tick(&mut self) {
         self.branch.refresh();
         if self.busy() {
@@ -2204,6 +2221,36 @@ mod tests {
         app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.input.value(), "x");
         assert_eq!(app.input.selection(), None);
+    }
+
+    /// A consumer that falls behind has events dropped, not delayed. Everything the
+    /// stream sets would stay wrong until the next turn said otherwise.
+    #[test]
+    fn a_resync_reads_the_running_state_back_from_the_session() {
+        let (tx_user, _rx_user) = tokio::sync::mpsc::channel(1);
+        let (tx_control, _rx_control) = tokio::sync::mpsc::channel(1);
+        let session = Session::new(
+            "m".to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            Arc::default(),
+            Arc::default(),
+            None,
+        );
+        let mut app = App::new(Arc::clone(&session));
+        // What the dropped events would have set: a turn started and the mode cycled.
+        session.submit("go".to_string()).unwrap();
+        session.set_mode(Mode::Bypass);
+        assert!(!app.working && app.mode == Mode::Ask);
+
+        app.resync();
+        assert!(app.working);
+        assert_eq!(app.mode, Mode::Bypass);
+        assert_eq!(app.model, "m");
+        // Token counts are summed from the stream, so a resync must not add them again.
+        assert_eq!((app.tokens_in, app.tokens_out), (0, 0));
     }
 
     fn transcript(lines: &[&str]) -> App {

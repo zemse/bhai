@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A TUI that falls behind the event stream catches up instead of staying wrong. Events are
+  dropped, not delayed, when the channel overflows, so the spinner, the pending approval,
+  the queue and the mode chip could all sit at whatever the last event they saw said. A
+  dropped batch now triggers a resync from the session; the token counts are left alone,
+  since they are summed from the stream.
+
 - A `.mcp.json` server that changed since it was approved is not started. The approval in
   `~/.claude.json` is a list of names, so a repo could keep the name and change the command
   to anything; bhai now records what each approved server was defined as, under
