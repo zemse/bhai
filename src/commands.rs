@@ -95,6 +95,13 @@ pub const COMMANDS: &[Command] = &[
         args: "",
         help: "pick the model this session talks to",
     },
+    // No args hint, though it takes a request: on its own it shows the template and
+    // the variables, which is where a first look starts.
+    Command {
+        name: "statusline",
+        args: "",
+        help: "the status bar, /statusline <what you want> to change it",
+    },
     Command {
         name: "mcp",
         args: "",

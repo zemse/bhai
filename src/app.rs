@@ -31,6 +31,7 @@ use crate::profile::{self, Transcript};
 use crate::session::{Approval, ChildRow, Event, Prompt, Session};
 use crate::skills::Skill;
 use crate::speed::Speed;
+use crate::statusline;
 use crate::workflow::{self, Found};
 use crate::wrap::Join;
 
@@ -54,6 +55,9 @@ this session and every later one.
   /allow mcp__chrome-devtools     every tool of one MCP server
 A deny rule still refuses, and a protected path still asks. /permissions lists what is \
 set.";
+
+/// Where `/statusline <request>` puts the template it was given, or why it has none.
+type Designed = Arc<Mutex<Option<Result<String, String>>>>;
 
 /// A selection over the transcript's wrapped lines, as (line, column) cells. Anchoring
 /// to the wrapped buffer rather than the screen keeps it put while the view scrolls.
@@ -260,6 +264,14 @@ pub struct App {
     pub ollama_url: String,
     /// The session's id, which names its file on disk; empty until main fills it in.
     pub session_id: String,
+    /// The status bar's template, or `None` for the built-in bar.
+    pub statusline: Option<statusline::Template>,
+    /// The global config file, which `/statusline` saves the template to.
+    pub config_path: Option<PathBuf>,
+    /// The model call behind `/statusline <request>`.
+    pub designer: Option<Arc<dyn statusline::Design>>,
+    /// Its answer, once the task it runs on has one.
+    designing: Option<Designed>,
     pub quit: bool,
     session: Arc<Session>,
 }
@@ -329,6 +341,10 @@ impl App {
             picker: None,
             ollama_url: crate::ollama::DEFAULT_URL.to_string(),
             session_id: String::new(),
+            statusline: None,
+            config_path: None,
+            designer: None,
+            designing: None,
             quit: false,
             session,
         }
@@ -1057,6 +1073,18 @@ impl App {
         if let Some(picker) = &mut self.picker {
             picker.poll();
         }
+        let designed = self
+            .designing
+            .as_ref()
+            .and_then(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).take());
+        if let Some(designed) = designed {
+            self.designing = None;
+            self.follow = true;
+            match designed.and_then(|t| statusline::Template::parse(&t)) {
+                Ok(template) => self.set_statusline(Some(template)),
+                Err(e) => self.note(Entry::Error(format!("no status line: {e}"))),
+            }
+        }
     }
 
     fn submit(&mut self) {
@@ -1172,6 +1200,13 @@ impl App {
             self.model_command(rest.trim());
             return;
         }
+        if let Some(rest) = message.strip_prefix("/statusline")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            self.statusline_command(rest.trim());
+            return;
+        }
         if message.starts_with("/mcp") {
             self.follow = true;
             self.note(Entry::Info(crate::mcp::report(self.mcp.as_deref())));
@@ -1228,6 +1263,77 @@ impl App {
         if let Err(e) = self.session.submit(prompt) {
             self.note(Entry::Error(e.to_string()));
         }
+    }
+
+    /// `/statusline` on its own shows the template and the variables; `set <template>`
+    /// and `reset` change it; anything else is a request the model writes one for.
+    fn statusline_command(&mut self, rest: &str) {
+        if rest.is_empty() {
+            let report = statusline::report(self, self.config_path.as_deref());
+            self.note(Entry::Info(report));
+            return;
+        }
+        if rest == "reset" {
+            self.set_statusline(None);
+            return;
+        }
+        if let Some(template) = rest.strip_prefix("set ") {
+            match statusline::Template::parse(template.trim()) {
+                Ok(template) => self.set_statusline(Some(template)),
+                Err(e) => self.note(Entry::Error(format!("no status line: {e}"))),
+            }
+            return;
+        }
+        if self.designing.is_some() {
+            self.note(Entry::Error(
+                "a status line is already being written".to_string(),
+            ));
+            return;
+        }
+        let Some(designer) = self.designer.clone() else {
+            self.note(Entry::Error(
+                "no model to write a status line with here; /statusline set <template> sets one"
+                    .to_string(),
+            ));
+            return;
+        };
+        let current = match &self.statusline {
+            Some(template) => template.source.clone(),
+            None => "none yet; the built-in bar shows bhai, the model and effort, the branch, \
+ctx, the token totals, the cache rate, cache alerts, the rate limits and the hint"
+                .to_string(),
+        };
+        let request = format!("Current template: {current}\n\nWhat the user wants: {rest}");
+        let slot = Arc::new(Mutex::new(None));
+        self.designing = Some(Arc::clone(&slot));
+        tokio::spawn(async move {
+            let designed = designer.design(&request).await;
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(designed);
+        });
+        self.note(Entry::Info("writing the status line…".to_string()));
+    }
+
+    /// Put `template` on the bar and in the global config, or go back to the built-in
+    /// bar for `None`. Nothing changes unless it is saved.
+    fn set_statusline(&mut self, template: Option<statusline::Template>) {
+        if let Some(path) = &self.config_path
+            && let Err(e) =
+                crate::config::save_statusline(path, template.as_ref().map(|t| t.source.as_str()))
+        {
+            self.note(Entry::Error(format!(
+                "could not save the status line: {e:#}"
+            )));
+            return;
+        }
+        let saved = match &self.config_path {
+            Some(path) => format!(", saved in {}", path.display()),
+            None => String::new(),
+        };
+        self.note(Entry::Info(match &template {
+            Some(template) => format!("status line: {}{saved}", template.source),
+            None => format!("status line: the built-in one{saved}"),
+        }));
+        self.statusline = template;
     }
 
     /// `/model` on its own opens the picker, which asks each backend what it will serve
@@ -2004,6 +2110,62 @@ mod tests {
         app.input.set("/allow not a rule".to_string());
         app.submit();
         assert!(last(&mut app).contains("expected a tool name"));
+    }
+
+    #[tokio::test]
+    async fn statusline_is_set_by_hand_or_by_the_model_and_saved() {
+        let (mut app, _user, _control) = connected();
+        let last = |app: &mut App| match app.entries().list.last() {
+            Some(Entry::Info(text) | Entry::Error(text)) => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        let dir = std::env::temp_dir().join(format!("bhai-statusline-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.toml");
+        app.config_path = Some(path.clone());
+
+        app.input.set("/statusline".to_string());
+        app.submit();
+        assert!(last(&mut app).contains("$ctx"), "the variables are listed");
+
+        app.input.set("/statusline set $nope".to_string());
+        app.submit();
+        assert!(last(&mut app).contains("no variable `$nope`"));
+        assert!(app.statusline.is_none() && !path.exists());
+
+        app.input
+            .set("/statusline set [$model](bold) on $branch".to_string());
+        app.submit();
+        assert!(last(&mut app).starts_with("status line: [$model](bold) on $branch"));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(saved, "statusline = \"[$model](bold) on $branch\"\n");
+
+        // A request goes to the model, with the template it is to change.
+        let designer = crate::statusline::fake::Designer::new(Ok("$model · $time"));
+        app.designer = Some(designer.clone());
+        app.input.set("/statusline add the clock".to_string());
+        app.submit();
+        assert_eq!(last(&mut app), "writing the status line…");
+        while app
+            .designing
+            .as_ref()
+            .is_some_and(|slot| slot.lock().unwrap().is_none())
+        {
+            tokio::task::yield_now().await;
+        }
+        app.tick();
+        assert_eq!(app.statusline.as_ref().unwrap().source, "$model · $time");
+        let asked = designer.asked.lock().unwrap().clone();
+        assert!(asked[0].contains("[$model](bold) on $branch"), "{asked:?}");
+        assert!(
+            asked[0].ends_with("What the user wants: add the clock"),
+            "{asked:?}"
+        );
+
+        app.input.set("/statusline reset".to_string());
+        app.submit();
+        assert!(app.statusline.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The export is meant to be handed to someone instead of a screenshot, so what it

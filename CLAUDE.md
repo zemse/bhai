@@ -13,7 +13,7 @@ items are the internal format everywhere, so both backends carry the same histor
   `compact.rs`, `limits.rs`, `workflow.rs`
 - **tui**: `app.rs` (state and keys), `ui.rs` (rendering), `input.rs`, `entries.rs`,
   `markdown.rs`, `wrap.rs`, `diff.rs`, `commands.rs`, `models.rs` (the `/model` picker),
-  `branch.rs` (the branch on the status bar)
+  `branch.rs` (the branch on the status bar), `statusline.rs` (the user's template for it)
 - **session**: `session.rs` (the hub every consumer reads), `sessions.rs` (on disk),
   `server.rs` (the debug server)
 - **context**: `prompt.rs`, `instructions.rs`, `identity.rs`, `skills.rs`, `config.rs`,

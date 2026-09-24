@@ -7,6 +7,7 @@
 //! global file's call too: `load_global_claude`, `load_global_agents` and the skills
 //! `sources` list are ignored in a project file, since a clone that switched them would be
 //! dropping the user's standing instructions or widening what it can put in the prompt.
+//! `statusline` is read from the global file only, and `/statusline` writes it there.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -50,6 +51,8 @@ pub struct Config {
     pub limits: Limits,
     /// `model`, `effort` and `ollama_url`: which backend the session talks to.
     pub choice: crate::client::Choice,
+    /// `statusline`: the status bar's template, or `None` for the built-in bar.
+    pub statusline: Option<String>,
 }
 
 impl Default for Config {
@@ -72,6 +75,7 @@ impl Default for Config {
             import_claude_permissions: true,
             limits: Limits::default(),
             choice: crate::client::Choice::default(),
+            statusline: None,
         }
     }
 }
@@ -150,6 +154,7 @@ struct Layer {
     ollama_url: Option<String>,
     context_window: Option<u64>,
     compact_at: Option<f64>,
+    statusline: Option<String>,
     #[serde(default)]
     permissions: RulesLayer,
 }
@@ -204,7 +209,7 @@ impl Config {
     pub fn load(home: Option<&Path>, cwd: &Path) -> Result<Self> {
         let mut config = Self::default();
         if let Some(home) = home {
-            config.apply_file(&home.join(".config/bhai/config.toml"), true)?;
+            config.apply_file(&global_path(home), true)?;
         }
         config.apply_file(&cwd.join(".bhai/config.toml"), false)?;
         Ok(config)
@@ -259,6 +264,11 @@ impl Config {
                 crate::syntax::themes().join(", ")
             )));
         }
+        if let Some(template) = &layer.statusline
+            && let Err(e) = crate::statusline::Template::parse(template)
+        {
+            return Err(bad(format!("statusline: {e}")));
+        }
         let parse = |rules: &[String]| {
             rules
                 .iter()
@@ -301,6 +311,9 @@ impl Config {
         }
         // Where inference runs is the user's call, never a cloned repo's.
         if trusted {
+            if layer.statusline.is_some() {
+                self.statusline = layer.statusline.clone();
+            }
             for (field, value) in [
                 (&mut self.choice.model, &layer.model),
                 (&mut self.choice.effort, &layer.effort),
@@ -388,6 +401,71 @@ impl Config {
     }
 }
 
+/// The global config file under `home`.
+pub fn global_path(home: &Path) -> std::path::PathBuf {
+    home.join(".config/bhai/config.toml")
+}
+
+/// Set the root-level `statusline` key of the file at `path`, or remove it for `None`,
+/// leaving every other line as it was. The file is only replaced once the new text
+/// reads back with the template in it.
+pub fn save_statusline(path: &Path, template: Option<&str>) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    // Keys under a `[table]` belong to it, so the root ends at the first header.
+    let root = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+    let at = lines[..root].iter().position(|line| {
+        line.trim_start()
+            .strip_prefix("statusline")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    });
+    if let Some(at) = at {
+        let value = lines[at]
+            .split_once('=')
+            .map_or("", |(_, v)| v)
+            .trim_start();
+        if value.starts_with("\"\"\"") || value.starts_with("'''") {
+            anyhow::bail!(
+                "{} sets statusline over several lines; edit it there by hand",
+                path.display()
+            );
+        }
+    }
+    let line = template.map(|t| format!("statusline = {}", toml::Value::String(t.to_string())));
+    match (at, line) {
+        (Some(at), Some(line)) => lines[at] = line,
+        (Some(at), None) => {
+            lines.remove(at);
+        }
+        (None, Some(line)) => lines.insert(root, line),
+        (None, None) => return Ok(()),
+    }
+    let mut new = lines.join("\n");
+    if !new.is_empty() {
+        new.push('\n');
+    }
+    let layer: Layer = toml::from_str(&new)
+        .with_context(|| format!("the new {} does not read back", path.display()))?;
+    anyhow::ensure!(
+        layer.statusline.as_deref() == template,
+        "the new {} does not read back with the template",
+        path.display()
+    );
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let temp = path.with_extension("toml.tmp");
+    std::fs::write(&temp, new).with_context(|| format!("writing {}", temp.display()))?;
+    std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +480,51 @@ mod tests {
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn statusline_is_saved_without_touching_the_rest() {
+        let dir = temp_dir();
+        let home = dir.join("home");
+        let path = global_path(&home);
+        let original = "# mine\nmodel = \"gpt-5\"\n\n[permissions]\nallow = [\"Bash(ls:*)\"]\n";
+        write(&path, original);
+
+        save_statusline(&path, Some(r#"$model "quoted" \$"#)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# mine\nmodel = \"gpt-5\"\n\nstatusline = "),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("[permissions]\nallow = [\"Bash(ls:*)\"]\n"),
+            "{text}"
+        );
+        let config = Config::load(Some(&home), &dir.join("cwd")).unwrap();
+        assert_eq!(config.statusline.as_deref(), Some(r#"$model "quoted" \$"#));
+
+        // A second save replaces the line rather than adding one.
+        save_statusline(&path, Some("$branch")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("statusline").count(), 1, "{text}");
+
+        save_statusline(&path, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn statusline_is_the_global_files_and_must_parse() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(&cwd.join(".bhai/config.toml"), "statusline = \"$model\"\n");
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert_eq!(config.statusline, None);
+
+        write(&global_path(&home), "statusline = \"$nope\"\n");
+        let e = Config::load(Some(&home), &cwd).unwrap_err();
+        assert!(format!("{e:#}").contains("no variable `$nope`"), "{e:#}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- The status bar can be a template: `statusline` in `~/.config/bhai/config.toml`, in a
+  subset of starship's format (`$var`, `[text](bold cyan)`, `( ... )` dropped when its
+  variables are empty, `\` escapes) over 26 variables: model, effort, mode, branch, dir,
+  ctx, tokens, cache, rate limits and resets, queued, time and more. `/statusline` lists
+  them with their values now, `/statusline set <template>` and `/statusline reset` change
+  it, and `/statusline <what you want>` has the judge's model write one, checked to parse
+  before it is saved. A warning colour survives whatever the template styles.
+
 - A finished shell command says how it ended on the row under it: `✓ succeeded`,
   `✗ failed, exit 128`, `✗ timed out after 120s`, or who stopped it (`✗ rejected by
   judge`, `by you`, `by auto mode`, `blocked by a rule`), with the `[+N lines]` its click

@@ -34,6 +34,7 @@ mod session;
 mod sessions;
 mod skills;
 mod speed;
+mod statusline;
 mod syntax;
 mod title;
 mod tokens;
@@ -187,6 +188,7 @@ async fn main() -> Result<()> {
         judge,
         title: titled,
         choice,
+        statusline,
     } = load(args.flags, &name).await?;
     let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
@@ -310,6 +312,11 @@ allow it.",
     let history = saved.history.clone();
     let session_id = saved.writer.header.session.clone();
     let ollama_url = client.ollama_url().to_string();
+    // `/statusline <request>` is one small call, on the judge's model like the title's.
+    let designer: Arc<dyn statusline::Design> = Arc::new(statusline::ModelDesigner::new(
+        client.clone(),
+        judge.model.clone(),
+    ));
     let (session, events) = start(
         client,
         prompt,
@@ -397,6 +404,8 @@ allow it.",
         ollama_url,
         session_id.clone(),
         limits,
+        statusline,
+        designer,
     )
     .await;
     release_modes(mouse, paste, keyboard);
@@ -478,6 +487,8 @@ struct Setup {
     title: bool,
     /// The model the config asks for, before the identity and the flags have their say.
     choice: client::Choice,
+    /// `statusline`: the status bar's template, already checked to parse.
+    statusline: Option<String>,
 }
 
 /// Config and instruction files for the working directory, as the system prompt for
@@ -515,6 +526,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let judge = config.judge.clone();
     let titled = config.title;
     let choice = config.choice.clone();
+    let statusline = config.statusline.clone();
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
     Ok(Setup {
@@ -525,6 +537,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
         judge,
         title: titled,
         choice,
+        statusline,
     })
 }
 
@@ -1098,6 +1111,8 @@ async fn run(
     ollama_url: String,
     session_id: String,
     limits: Limits,
+    statusline: Option<String>,
+    designer: Arc<dyn statusline::Design>,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -1151,6 +1166,10 @@ async fn run(
     app.ollama_url = ollama_url;
     app.session_id = session_id;
     app.limits = limits;
+    // Checked when the config was read, so this only fails if the check did not run.
+    app.statusline = statusline.and_then(|t| statusline::Template::parse(&t).ok());
+    app.config_path = std::env::var_os("HOME").map(|home| config::global_path(home.as_ref()));
+    app.designer = Some(designer);
     {
         let mut entries = app.entries();
         entries.restore(history);

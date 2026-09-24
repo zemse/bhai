@@ -301,6 +301,12 @@ const ALWAYS: u8 = 0;
 /// left of the rate-limit windows. It sits under the prompt so the transcript has the
 /// whole screen above it to scroll through.
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+    // The user's own template, when they wrote one, clipped at the edge like any row.
+    if let Some(template) = &app.statusline {
+        let spans = template.render(&crate::statusline::values(app));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let dim = Style::new().fg(Color::DarkGray);
     let mut bar = vec![
         (
@@ -486,7 +492,7 @@ fn clip(text: &str, max: usize) -> String {
     }
 }
 
-fn compact(n: u64) -> String {
+pub fn compact(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
     } else if n < 1_000_000 {
@@ -2633,6 +2639,35 @@ mod tests {
         assert!(bar.contains("ctx 82% "), "{bar}");
         // Past the point compaction waits for, so it is not drawn as an idle number.
         assert_eq!(status_cell(&terminal, "ctx ").fg, Color::Yellow);
+    }
+
+    #[test]
+    fn a_statusline_template_replaces_the_built_in_bar() {
+        let mut app = App::detached();
+        app.branch = crate::branch::Branch::named("main");
+        app.statusline = Some(
+            crate::statusline::Template::parse(
+                "[ $model ](fg:black bg:green)( on $branch)( · ctx $ctx)",
+            )
+            .unwrap(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let bar = status(&terminal);
+        // No call has read the context yet, so its group is not drawn at all.
+        assert_eq!(bar.trim_end(), " m  on main", "{bar}");
+        assert_eq!(status_cell(&terminal, " m ").bg, Color::Green);
+        assert_eq!(status_cell(&terminal, "on main").fg, Color::DarkGray);
+
+        app.last_usage = Some(Usage {
+            input: 250_000,
+            ..Usage::default()
+        });
+        app.limits.window = Some(262_144);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let bar = status(&terminal);
+        assert!(bar.contains("on main · ctx 95%"), "{bar}");
+        assert_eq!(status_cell(&terminal, "95%").fg, Color::Red);
     }
 
     #[test]
