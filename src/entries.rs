@@ -403,7 +403,9 @@ impl Entry {
 /// that marks it as one.
 fn reported(text: &str) -> Option<String> {
     let rest = text.strip_prefix(crate::agent::CHILD_RESULT)?;
-    Some(rest.trim_start().to_string())
+    // What follows the marker on that first line is for the model, not the transcript.
+    let body = rest.split_once("\n\n").map_or(rest, |(_, body)| body);
+    Some(body.trim_start().to_string())
 }
 
 /// The summary inside a folded user message, without the line that marks it as one.

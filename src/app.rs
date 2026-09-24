@@ -1011,6 +1011,9 @@ impl App {
                 self.model = model;
                 self.effort = effort;
             }
+            // A child's report opened a turn nobody typed. Deliberately not `follow`:
+            // a landing report must not yank a scrolled-up reader to the bottom.
+            Event::Resumed(_) => self.working = true,
             Event::Judging(what) => self.judging = what.clone(),
             Event::TurnEnd => {
                 self.working = false;
@@ -2434,6 +2437,25 @@ mod tests {
         assert!(
             matches!(app.entries().list.last(), Some(Entry::Info(t)) if t.starts_with("mouse: on"))
         );
+    }
+
+    /// A wake is a turn nobody typed. Without this the spinner and the child panel stay
+    /// off for its whole duration and a trailing failure still offers `[click to retry]`.
+    #[test]
+    fn a_landing_report_puts_the_tui_back_to_work_without_moving_the_view() {
+        let mut app = App::detached();
+        app.scroll = 7;
+        app.follow = false;
+        app.on_event(Event::Resumed("clean up".to_string()));
+        assert!(app.working);
+        assert!(
+            !app.follow,
+            "a report must not yank a scrolled-up reader down"
+        );
+        assert_eq!(app.scroll, 7);
+
+        app.on_event(Event::TurnEnd);
+        assert!(!app.working);
     }
 
     #[test]

@@ -943,6 +943,26 @@ fn render_children(frame: &mut Frame, area: Rect, app: &mut App, children: &[Chi
 const CLOSE: &str = " ✕ close ";
 
 /// One subagent row: how it is doing, its id, who it runs as and what it was sent for.
+/// A running child says something every few seconds, so silence past this is worth
+/// showing: it is the only thing that separates a long build from a wedged retry loop.
+const QUIET: u64 = 20;
+
+/// How long a running child has been quiet, once that is long enough to mean anything.
+fn quiet(child: &ChildRow) -> String {
+    if child.state != ChildState::Running {
+        return String::new();
+    }
+    let secs = child.idle().as_secs();
+    if secs < QUIET {
+        return String::new();
+    }
+    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+        (0, 0, s) => format!(" · quiet {s}s"),
+        (0, m, _) => format!(" · quiet {m}m"),
+        (h, m, _) => format!(" · quiet {h}h{m}m"),
+    }
+}
+
 fn child_row(child: &ChildRow, width: usize, spinner: usize, open: bool) -> Line<'static> {
     let (mark, colour) = match child.state {
         ChildState::Running => (SPINNER[spinner % SPINNER.len()], Color::Yellow),
@@ -950,12 +970,15 @@ fn child_row(child: &ChildRow, width: usize, spinner: usize, open: bool) -> Line
         ChildState::Failed => ("✗", Color::Red),
     };
     let head = format!(" {mark} {} ", child.id);
+    let quiet = quiet(child);
     let mut tail = format!("{} · {}", child.identity, child.description);
     // The open row is the way back out, which nothing said until it said so: the close
     // reads as a button and the whole row is what a click lands on.
     let close = if open { CLOSE } else { "" };
-    let room = width.saturating_sub(head.chars().count() + close.chars().count());
-    tail = clip(&tail, room);
+    let room =
+        width.saturating_sub(head.chars().count() + close.chars().count() + quiet.chars().count());
+    tail = clip(&tail, room) + &quiet;
+    let room = room + quiet.chars().count();
     let pad = room.saturating_sub(tail.chars().count());
     if open {
         // The open pane's row is the transcript's title, so it reads as selected.

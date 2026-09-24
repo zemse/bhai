@@ -3,13 +3,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
 
 use super::{BoxFuture, Tool, string_arg, truncate};
-use crate::agent::{self, AgentEvent, Child, ChildResult, Children, Delegation, Model, Results};
+use crate::agent::{
+    self, AgentEvent, Cancel, Child, ChildResult, Children, Delegation, Model, Results,
+};
 use crate::identity::{self, Identity};
 use crate::permissions::Policy;
 
@@ -46,7 +47,9 @@ pub struct Agent {
     pub model: Arc<dyn Model>,
     pub policy: Arc<Policy>,
     pub tx: mpsc::UnboundedSender<AgentEvent>,
-    pub cancel: Arc<AtomicBool>,
+    /// The turn's stop signal. Each child takes a flag of its own from it, so an
+    /// interrupt stops a child for good rather than until the next prompt clears it.
+    pub cancel: Arc<Cancel>,
     pub children: Children,
     /// Where a finished child posts its report, for the parent to read between steps.
     pub results: Results,
@@ -143,7 +146,9 @@ impl Agent {
             Arc::clone(&self.delegation.mailboxes),
             Arc::clone(&self.policy),
         );
-        let (tx, cancel) = (self.tx.clone(), Arc::clone(&self.cancel));
+        // Taken here, not inside the task: a child queued behind the running ones must
+        // still be stopped by an interrupt that lands before it gets a slot.
+        let (tx, cancel) = (self.tx.clone(), self.cancel.child());
         let (children, slots) = (Arc::clone(&self.children), Arc::clone(&self.slots));
         let results = self.results.clone();
         tokio::spawn(async move {
@@ -152,6 +157,19 @@ impl Agent {
             let Ok(_slot) = slots.acquire().await else {
                 return;
             };
+            // Interrupted while it waited for a slot. It never ran, so there is no
+            // transcript to report; say so rather than leaving the parent to wonder.
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = results.send(ChildResult {
+                    identity: identity.name.clone(),
+                    description,
+                    text: format!(
+                        "child {id} ({}) was stopped before it started.",
+                        identity.name
+                    ),
+                });
+                return;
+            }
             let (_mailbox, steer) = agent::Mailbox::open(&mailboxes, &id);
             let finished = agent::run_child(Child {
                 id: &id,
@@ -176,9 +194,14 @@ impl Agent {
                     finished.usage.output,
                     truncate(&sanitize(&text))
                 ),
+                // The chain can quote what the child produced (a tool's own error text,
+                // a model error echoing content), so it goes through `sanitize` too.
                 Err(e) => format!(
-                    "child {id} ({name}) failed after {} steps, {}/{} tokens: {e:#}",
-                    finished.steps, finished.usage.input, finished.usage.output,
+                    "child {id} ({name}) failed after {} steps, {}/{} tokens: {}",
+                    finished.steps,
+                    finished.usage.input,
+                    finished.usage.output,
+                    truncate(&sanitize(&format!("{e:#}")))
                 ),
             };
             let _ = results.send(ChildResult {
@@ -293,7 +316,13 @@ mod tests {
             model: Arc::new(fake.clone()),
             policy: Arc::new(Policy::default()),
             tx,
-            cancel: Arc::new(AtomicBool::new(cancel)),
+            cancel: {
+                let stop = Arc::new(Cancel::default());
+                if cancel {
+                    stop.stop();
+                }
+                stop
+            },
             children: Children::default(),
             results: tx_results,
             slots: Arc::new(Semaphore::new(MAX_RUNNING)),
@@ -351,14 +380,16 @@ mod tests {
         harness.cleanup();
     }
 
+    /// Already stopped when the call came, so it never gets a slot. It costs no model
+    /// call, and the parent is told rather than left waiting for a report.
     #[tokio::test]
-    async fn an_interrupt_fails_the_child() {
+    async fn a_child_stopped_before_its_slot_never_runs() {
         let fake = Fake::new(vec![vec![call("read", json!({"path": "/etc/hosts"}))]]);
         let mut harness = tool(&fake, true);
         let args = json!({"description": "read hosts", "prompt": "go"});
         let out = harness.report(args).await;
         assert!(
-            out.ends_with("(general) failed after 1 steps, 10/2 tokens: interrupted by the user"),
+            out.ends_with("(general) was stopped before it started."),
             "{out}"
         );
         harness.cleanup();
@@ -524,14 +555,24 @@ mod tests {
         assert!(ok, "{out}");
         assert!(out.contains("behind the 3 already running"), "{out}");
 
-        harness
-            .agent
-            .cancel
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // The running ones are interrupted where they stand; the one still waiting for a
+        // slot never starts. Which report arrives first is up to the runtime.
+        harness.agent.cancel.stop();
+        let mut reports = Vec::new();
         for _ in 0..=MAX_RUNNING {
-            let report = harness.results.recv().await.expect("a report").text;
-            assert!(report.contains("interrupted by the user"), "{report}");
+            reports.push(harness.results.recv().await.expect("a report").text);
         }
+        let (queued, running): (Vec<_>, Vec<_>) = reports
+            .iter()
+            .partition(|r| r.contains("was stopped before it started"));
+        assert_eq!(queued.len(), 1, "{reports:?}");
+        assert_eq!(running.len(), MAX_RUNNING, "{reports:?}");
+        assert!(
+            running
+                .iter()
+                .all(|r| r.contains("interrupted by the user")),
+            "{running:?}"
+        );
         harness.cleanup();
     }
 

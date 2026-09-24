@@ -248,7 +248,6 @@ fn error(status: StatusCode, message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use futures_util::StreamExt;
@@ -303,7 +302,7 @@ mod tests {
             "router".to_string(),
             tx_user,
             tx_control,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::agent::Cancel::default()),
             Arc::new(Policy::default()),
             None,
         );
@@ -476,7 +475,7 @@ mod tests {
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, rx_control) = mpsc::channel(1);
         let (tx_agent, rx_agent) = mpsc::unbounded_channel();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(crate::agent::Cancel::default());
         let policy = Arc::new(Policy::default());
         let session = Session::new(
             "fake".to_string(),

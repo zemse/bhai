@@ -3,13 +3,13 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::agent::{AgentEvent, Control, Mailboxes};
+use crate::agent::{AgentEvent, Cancel, Control, Mailboxes};
 use crate::cache::{CacheBreak, Hit};
 use crate::client::Usage;
 use crate::entries::{Entries, Entry};
@@ -146,6 +146,24 @@ pub struct ChildRow {
     pub identity: String,
     pub description: String,
     pub state: ChildState,
+    /// Events heard from this child. A coarse sign of progress, since a child that is
+    /// working says something every few seconds and one that is wedged says nothing.
+    pub steps: u32,
+    /// When the last of them arrived. Reported as seconds, which is the form a reader
+    /// wants: from outside, a child in a retry loop and one on a long build look the
+    /// same until you can see how long it has been quiet.
+    #[serde(rename = "idle_secs", serialize_with = "idle_secs")]
+    pub last: Instant,
+}
+
+impl ChildRow {
+    pub fn idle(&self) -> Duration {
+        self.last.elapsed()
+    }
+}
+
+fn idle_secs<S: serde::Serializer>(last: &Instant, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u64(last.elapsed().as_secs())
 }
 
 /// A child agent's own transcript, which the panel opens and a message can be typed
@@ -281,7 +299,7 @@ pub struct Session {
     mailboxes: Mailboxes,
     tx_user: mpsc::Sender<String>,
     tx_control: mpsc::Sender<Control>,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<Cancel>,
     policy: Arc<Policy>,
     /// The auto-approval judge, when one runs; it owns its own usage and budget.
     judge: Option<Arc<Judge>>,
@@ -295,7 +313,7 @@ impl Session {
         identity: String,
         tx_user: mpsc::Sender<String>,
         tx_control: mpsc::Sender<Control>,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<Cancel>,
         policy: Arc<Policy>,
         judge: Option<Arc<Judge>>,
     ) -> Arc<Self> {
@@ -360,7 +378,7 @@ impl Session {
         }
         // Cleared here, not when the agent picks the message up, so an interrupt that
         // lands in between still stops the turn.
-        self.cancel.store(false, Ordering::Relaxed);
+        self.cancel.clear();
         self.tx_user
             .try_send(prompt.text)
             .map_err(|_| SubmitError::Closed)?;
@@ -389,7 +407,7 @@ impl Session {
         let Some(prompt) = inner.queue.pop_front() else {
             return;
         };
-        self.cancel.store(false, Ordering::Relaxed);
+        self.cancel.clear();
         if let Err(e) = self.tx_user.try_send(prompt.text.clone()) {
             inner
                 .queue
@@ -442,7 +460,7 @@ impl Session {
             return false;
         }
         // Cancel first so the agent does not move on to the next call once rejected.
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel.stop();
         // Every parked call, not just the one on screen: parallel steps park their own.
         while self.answer(Answer::Reject, None).is_some() {}
         self.publish(Event::Interrupted);
@@ -558,7 +576,7 @@ impl Session {
         if inner.working {
             return Err(SubmitError::Busy);
         }
-        self.cancel.store(false, Ordering::Relaxed);
+        self.cancel.clear();
         let notice = match &asked {
             Some(asked) => format!("compacting history, keeping {asked}"),
             None => "compacting history".to_string(),
@@ -578,7 +596,7 @@ impl Session {
         if inner.working {
             return Err(SubmitError::Busy);
         }
-        self.cancel.store(false, Ordering::Relaxed);
+        self.cancel.clear();
         self.tx_control
             .try_send(Control::Retry)
             .map_err(|_| SubmitError::Closed)?;
@@ -607,7 +625,7 @@ impl Session {
         if inner.working {
             return Err(SubmitError::Busy);
         }
-        self.cancel.store(false, Ordering::Relaxed);
+        self.cancel.clear();
         self.tx_control
             .try_send(Control::Workflow { workflow, input })
             .map_err(|_| SubmitError::Closed)?;
@@ -770,6 +788,8 @@ impl Session {
                         identity: identity.clone(),
                         description: description.clone(),
                         state: ChildState::Running,
+                        steps: 0,
+                        last: Instant::now(),
                     },
                     entries,
                 });
@@ -783,7 +803,9 @@ impl Session {
                 }
             }
             Event::Child { id, event } => {
-                if let Some(pane) = children.iter().find(|p| p.row.id == *id) {
+                if let Some(pane) = children.iter_mut().find(|p| p.row.id == *id) {
+                    pane.row.steps += 1;
+                    pane.row.last = Instant::now();
                     let entries = Arc::clone(&pane.entries);
                     drop(children);
                     entries
@@ -893,7 +915,7 @@ mod tests {
     fn session() -> (Arc<Session>, mpsc::Receiver<String>) {
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, _) = mpsc::channel(1);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let policy = Arc::new(Policy::default());
         (
             Session::new(
@@ -1171,7 +1193,7 @@ mod tests {
         assert_eq!(rx_user.try_recv().unwrap(), "b");
         assert!(session.state().working);
         // The interrupt cleared the cancel flag on the way out, so the new turn runs.
-        assert!(!session.cancel.load(Ordering::Relaxed));
+        assert!(!session.cancel.stopped());
         session.on_agent(AgentEvent::TurnEnd);
         assert_eq!(rx_user.try_recv().unwrap(), "c");
         session.on_agent(AgentEvent::TurnEnd);
@@ -1265,11 +1287,11 @@ mod tests {
     #[test]
     fn an_interrupt_before_the_agent_starts_survives() {
         let (session, _rx) = session();
-        session.cancel.store(true, Ordering::Relaxed);
+        session.cancel.stop();
         session.submit("hi".to_string()).unwrap();
-        assert!(!session.cancel.load(Ordering::Relaxed));
+        assert!(!session.cancel.stopped());
         assert!(session.interrupt());
-        assert!(session.cancel.load(Ordering::Relaxed));
+        assert!(session.cancel.stopped());
     }
 
     /// Parallel workflow steps each park a call. The second must not displace the first
@@ -1327,7 +1349,7 @@ mod tests {
         session.submit("a".to_string()).unwrap();
         let mut wait = approval(&session);
         assert!(session.interrupt());
-        assert!(session.cancel.load(Ordering::Relaxed));
+        assert!(session.cancel.stopped());
         assert_eq!(wait.try_recv(), Ok(Answer::Reject));
     }
 

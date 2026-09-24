@@ -44,7 +44,6 @@ mod wrap;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -637,7 +636,7 @@ fn start(
     let (tx_user, rx_user) = mpsc::channel::<String>(16);
     let (tx_control, rx_control) = mpsc::channel::<Control>(16);
     let (tx_agent, rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(agent::Cancel::default());
     let policy = Arc::new(policy);
     // Built whatever the mode is, since `shift+tab` cycles into `auto` mid-session; the
     // policy is what decides that a call may reach it at all.
@@ -752,7 +751,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
     let (tx_user, rx_user) = mpsc::channel::<String>(1);
     let (_tx_control, rx_control) = mpsc::channel::<Control>(1);
     let (tx_agent, mut rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(agent::Cancel::default());
     let client = client::Client::new(&setup.choice)?
         .with_overrides(
             system.identity.model.clone(),
@@ -892,7 +891,7 @@ async fn cache_check(setup: Setup) -> Result<bool> {
         );
         return Ok(true);
     }
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(agent::Cancel::default());
     // The same tool list a session offers, the agent tool included; it is never run.
     let mut registry = tools::Registry::for_prompt(&system);
     if system.identity.allows_tool(tools::agent::NAME) {
@@ -928,7 +927,7 @@ async fn cache_check(setup: Setup) -> Result<bool> {
             _ => {}
         };
         let items = client
-            .respond(&system.text, &tools, &input, &mut on_delta, &cancel)
+            .respond(&system.text, &tools, &input, &mut on_delta, &cancel.flag())
             .await?;
         let usage = usage.ok_or_else(|| anyhow::anyhow!("call {call} reported no usage"))?;
         let hit = monitor.observe(&usage, std::time::Instant::now());

@@ -313,6 +313,12 @@ pub type Children = Arc<Mutex<Vec<ChildUsage>>>;
 /// typed.
 pub const CHILD_RESULT: &str = "A child agent you started has finished.";
 
+/// Added when the report opens a turn of its own. By then the user already has an answer,
+/// so the report is an addendum: without this the model re-answers from the top and every
+/// late child costs a full correction round.
+const CHILD_RESULT_LATE: &str = " You have already answered the user, so say what this \
+adds or changes and leave the rest of your answer standing.";
+
 /// A detached child agent that has finished, on its way into the parent's history.
 #[derive(Debug)]
 pub struct ChildResult {
@@ -326,6 +332,62 @@ pub struct ChildResult {
 /// Where a detached child posts its report when it ends. The parent holds the other
 /// end for the life of the session, so a child that outlives its turn is still read.
 pub type Results = mpsc::UnboundedSender<ChildResult>;
+
+/// The stop signal for a turn and for the children it started.
+///
+/// A detached child outlives the turn that started it, so it cannot read the turn's own
+/// flag: the next `Session::submit` clears that flag to let the new turn run, and a child
+/// still reading it would see the interrupt undone and carry on. `child` hands out a flag
+/// of its own instead, which `stop` latches and `clear` never touches.
+#[derive(Default)]
+pub struct Cancel {
+    turn: Arc<AtomicBool>,
+    children: Mutex<Vec<Arc<AtomicBool>>>,
+}
+
+impl Cancel {
+    /// The turn's own flag, which the loop and the tools read.
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.turn)
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.turn.load(Ordering::Relaxed)
+    }
+
+    /// Stop the turn and every child still running under it.
+    pub fn stop(&self) {
+        self.turn.store(true, Ordering::Relaxed);
+        for child in self.lock().iter() {
+            child.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Let the next turn run. A child already stopped stays stopped.
+    pub fn clear(&self) {
+        self.turn.store(false, Ordering::Relaxed);
+    }
+
+    /// A flag for a child about to start: already set if the turn is, and latched by any
+    /// later `stop`. The one the finished children left behind are dropped here, since a
+    /// flag only the list still holds belongs to a task that has ended.
+    pub fn child(&self) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(self.stopped()));
+        let mut children = self.lock();
+        children.retain(|c| Arc::strong_count(c) > 1);
+        children.push(Arc::clone(&flag));
+        flag
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Arc<AtomicBool>>> {
+        self.children.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.lock().len()
+    }
+}
 
 /// A session written to disk as it runs, with the history it resumes from.
 pub struct Saved {
@@ -361,7 +423,7 @@ pub async fn run(
     rx_user: mpsc::Receiver<String>,
     rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<Cancel>,
     usage_log: Option<PathBuf>,
     delegation: Option<Delegation>,
     saved: Option<Saved>,
@@ -388,12 +450,16 @@ pub(crate) async fn run_with(
     mut rx_user: mpsc::Receiver<String>,
     mut rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<Cancel>,
     usage_log: Option<PathBuf>,
     delegation: Option<Delegation>,
     saved: Option<Saved>,
     mut limits: Limits,
 ) {
+    // The loop reads the turn's flag; the `agent` tool needs the whole signal, so it can
+    // hand each detached child a flag that an interrupt latches.
+    let stop = cancel;
+    let cancel = stop.flag();
     let children = Children::default();
     // Children run detached, so a report can arrive mid-turn or long after the turn
     // that started the child has ended. The receiver lives as long as the session.
@@ -416,7 +482,7 @@ pub(crate) async fn run_with(
                 model: Arc::clone(model),
                 policy: Arc::clone(&policy),
                 tx: tx.clone(),
-                cancel: Arc::clone(&cancel),
+                cancel: Arc::clone(&stop),
                 children: Arc::clone(&children),
                 results: tx_results.clone(),
                 slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
@@ -599,8 +665,8 @@ pub(crate) async fn run_with(
             if resume {
                 let _ = tx.send(AgentEvent::Resumed(result.description.clone()));
             }
-            let mut what = vec![land(result, &mut history, &tx)];
-            what.extend(delivered(Some(&mut rx_results), &mut history, &tx));
+            let mut what = vec![land(result, resume, &mut history, &tx)];
+            what.extend(delivered(Some(&mut rx_results), resume, &mut history, &tx));
             if !resume {
                 let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
                 record(&mut sink, &history[from..], &tx);
@@ -798,7 +864,7 @@ async fn turn(
         // call, so this step reads it. Only between steps, never at the end of the turn,
         // which is what frees the session while the rest of the children run.
         let from = history.len();
-        if !delivered(results.as_deref_mut(), history, tx).is_empty() {
+        if !delivered(results.as_deref_mut(), false, history, tx).is_empty() {
             record(sink, &history[from..], tx);
         }
         if monitor.tripped() {
@@ -950,8 +1016,14 @@ async fn turn(
 
 /// Put a finished child's report into the history, where it reads as the tool result
 /// it is: the call that started the child only ever handed back its id.
+///
+/// Appends, and only appends. The cache matches on a prefix, so merging two reports into
+/// one item, or landing them in any order but the one they arrived in, rewrites history
+/// the parent has already sent and re-bills everything after it. `CacheGuard` fails the
+/// tests if that happens; the bill is where it would show up otherwise.
 fn land(
     result: ChildResult,
+    late: bool,
     history: &mut Vec<Value>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
 ) -> String {
@@ -966,7 +1038,10 @@ fn land(
         "role": "user",
         "content": [{
             "type": "input_text",
-            "text": format!("{CHILD_RESULT}\n\n{}", result.text),
+            "text": match late {
+                true => format!("{CHILD_RESULT}{CHILD_RESULT_LATE}\n\n{}", result.text),
+                false => format!("{CHILD_RESULT}\n\n{}", result.text),
+            },
         }],
     }));
     let _ = tx.send(AgentEvent::Item(history.len() - 1));
@@ -977,6 +1052,7 @@ fn land(
 /// returns what each of them was doing.
 fn delivered(
     results: Option<&mut mpsc::UnboundedReceiver<ChildResult>>,
+    late: bool,
     history: &mut Vec<Value>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
 ) -> Vec<String> {
@@ -985,7 +1061,7 @@ fn delivered(
     };
     let mut landed = Vec::new();
     while let Ok(result) = results.try_recv() {
-        landed.push(land(result, history, tx));
+        landed.push(land(result, late, history, tx));
     }
     landed
 }
@@ -1911,6 +1987,39 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
+
+    /// The bug this type exists for: `Session::submit` clears the turn's flag for the
+    /// next turn, and a detached child reading that same flag would carry on.
+    #[test]
+    fn an_interrupt_latches_on_a_child_that_outlives_the_turn() {
+        let stop = Cancel::default();
+        let child = stop.child();
+        stop.stop();
+        assert!(stop.stopped());
+        assert!(child.load(Ordering::Relaxed));
+
+        stop.clear();
+        assert!(!stop.stopped(), "the next turn may run");
+        assert!(child.load(Ordering::Relaxed), "the child unlatched");
+    }
+
+    #[test]
+    fn a_child_started_under_a_stopped_turn_starts_stopped() {
+        let stop = Cancel::default();
+        stop.stop();
+        assert!(
+            stop.child().load(Ordering::Relaxed),
+            "a child queued behind a slot must not start after an interrupt"
+        );
+    }
+
+    #[test]
+    fn a_finished_child_is_dropped_from_the_list() {
+        let stop = Cancel::default();
+        drop(stop.child());
+        let _running = stop.child();
+        assert_eq!(stop.tracked(), 1, "the finished child was kept");
+    }
     use super::*;
     use crate::permissions::Mode;
 
@@ -1919,7 +2028,7 @@ mod tests {
         let (_tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, rx_control) = mpsc::channel(1);
         let (tx, _rx) = mpsc::unbounded_channel();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         tokio::spawn(run(
             Client::new(&crate::client::Choice::default()).unwrap(),
             crate::prompt::system_prompt(&[], Vec::new()),
@@ -2001,6 +2110,10 @@ mod tests {
         let last = bodies.last().unwrap().1["input"].to_string();
         assert!(last.contains(CHILD_RESULT), "{last}");
         assert!(last.contains("what I found"), "{last}");
+        assert!(
+            !last.contains(CHILD_RESULT_LATE),
+            "a report read mid-turn is not late: the answer is still being written\n{last}"
+        );
     }
 
     #[tokio::test]
@@ -2028,7 +2141,7 @@ mod tests {
             sessions: dir.clone(),
             mailboxes: Default::default(),
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
         let (_tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2071,7 +2184,7 @@ mod tests {
             }
         }
         // As `Session::interrupt` does. The child gives up and reports its failure.
-        cancel.store(true, Ordering::Relaxed);
+        cancel.stop();
         while let Some(event) = rx.recv().await {
             let ended = matches!(event, AgentEvent::ChildEnded { .. });
             events.push(event);
@@ -2195,7 +2308,7 @@ mod tests {
             rx_user,
             rx_control,
             tx,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(Cancel::default()),
             None,
             Some(delegation),
             None,
@@ -2232,6 +2345,12 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::Resumed(what) if what == "clean up")),
             "{events:?}"
+        );
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let woke = bodies.last().unwrap().1["input"].to_string();
+        assert!(
+            woke.contains(CHILD_RESULT_LATE),
+            "a report that opens its own turn adds to the answer, it does not redo it\n{woke}"
         );
         assert!(
             events
@@ -2357,14 +2476,14 @@ mod tests {
     async fn drive(
         tx_user: &mpsc::Sender<String>,
         rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
-        cancel: &AtomicBool,
+        cancel: &Cancel,
         message: &str,
         answers: &[Answer],
     ) -> Vec<AgentEvent> {
         // As `Session::submit` does.
-        cancel.store(false, Ordering::Relaxed);
+        cancel.clear();
         tx_user.send(message.to_string()).await.unwrap();
-        collect(rx, cancel, message, answers).await
+        collect(rx, &cancel.flag(), message, answers).await
     }
 
     /// Everything the loop says until the next turn ends, for a turn nobody started:
@@ -2384,12 +2503,12 @@ mod tests {
     async fn drive_retry(
         tx_control: &mpsc::Sender<Control>,
         rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
-        cancel: &AtomicBool,
+        cancel: &Cancel,
         answers: &[Answer],
     ) -> Vec<AgentEvent> {
-        cancel.store(false, Ordering::Relaxed);
+        cancel.clear();
         tx_control.send(Control::Retry).await.unwrap();
-        collect(rx, cancel, "retry", answers).await
+        collect(rx, &cancel.flag(), "retry", answers).await
     }
 
     /// Everything the loop says until the turn ends, answering approvals as they come.
@@ -2474,7 +2593,7 @@ mod tests {
         ]);
         let (judge, backend) = crate::judge::fake::judge_with(answers, &repo, settings);
         let judge = Arc::new(judge);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
         let (_tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2641,7 +2760,7 @@ mod tests {
 
         let fake = Fake::new(vec![vec![say("one")], vec![say("two")]]);
         let namer = crate::title::fake::Namer::new(Some("fix the judge cache"));
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
         let (_tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2749,9 +2868,9 @@ mod tests {
             .with_trust(Trust::new(&dir.join("config"), &repo));
         policy.trust().unwrap();
 
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (judge, backend) =
-            crate::judge::fake::judge(Answers::Interrupted(Arc::clone(&cancel)), &repo);
+            crate::judge::fake::judge(Answers::Interrupted(cancel.flag()), &repo);
         let target = repo.join("notes.txt");
         let (tx, _rx) = mpsc::unbounded_channel();
         let (output, ok) = execute(
@@ -2760,7 +2879,7 @@ mod tests {
             Some(&judge),
             &fake::call("write", json!({"path": target, "content": "x"})),
             &tx,
-            &cancel,
+            &cancel.flag(),
         )
         .await;
         assert!(!ok);
@@ -2801,12 +2920,12 @@ mod tests {
         );
         judge.start_turn("add a unit test for the parser");
 
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let interrupting = tokio::spawn({
             let cancel = Arc::clone(&cancel);
             async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                cancel.store(true, Ordering::Relaxed);
+                cancel.stop();
             }
         });
         let target = repo.join("notes.txt");
@@ -2818,7 +2937,7 @@ mod tests {
             Some(&judge),
             &fake::call("write", json!({"path": target, "content": "x"})),
             &tx,
-            &cancel,
+            &cancel.flag(),
         )
         .await;
         interrupting.await.unwrap();
@@ -2841,7 +2960,7 @@ mod tests {
     async fn an_interrupt_while_the_user_decides_stops_the_call() {
         let dir = tools::temp_dir();
         let target = dir.join("notes.txt");
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let answering = tokio::spawn({
@@ -2849,7 +2968,7 @@ mod tests {
             async move {
                 while let Some(event) = rx.recv().await {
                     if let AgentEvent::Approval { reply, .. } = event {
-                        cancel.store(true, Ordering::Relaxed);
+                        cancel.stop();
                         let _ = reply.send(Answer::Accept(None));
                         return;
                     }
@@ -2862,7 +2981,7 @@ mod tests {
             None,
             &fake::call("write", json!({"path": target, "content": "x"})),
             &tx,
-            &cancel,
+            &cancel.flag(),
         )
         .await;
         answering.await.unwrap();
@@ -2884,7 +3003,7 @@ mod tests {
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, rx_control) = mpsc::channel(1);
         let (tx, rx_agent) = mpsc::unbounded_channel();
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let policy = Arc::new(Policy::default());
         let session = Session::new(
             "fake".to_string(),
@@ -3020,7 +3139,7 @@ mod tests {
             mailboxes: Default::default(),
         };
         let policy = Arc::new(Policy::new(Mode::Ask, Rules::default(), None, dir.clone()));
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let saved = Saved {
             writer: Writer::create(&dir, Header::new("sess", "general", "fake", "medium", &dir)),
             history: Vec::new(),
@@ -3249,7 +3368,7 @@ mod tests {
             let (tx_user, rx_user) = mpsc::channel(1);
             let (tx_control, rx_control) = mpsc::channel(1);
             let (tx, mut rx) = mpsc::unbounded_channel();
-            let cancel = Arc::new(AtomicBool::new(false));
+            let cancel = Arc::new(Cancel::default());
             let running = tokio::spawn(run_with(
                 Arc::new(fake.clone()),
                 "sess".to_string(),
@@ -3330,7 +3449,7 @@ mod tests {
             writer: Writer::create(&dir, Header::new("sess", "general", "fake", "medium", &dir)),
             history: Vec::new(),
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3480,7 +3599,7 @@ mod tests {
             vec![say("short")],
             vec![say("three")],
         ]);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3552,7 +3671,7 @@ mod tests {
         use fake::{Fake, say};
 
         let fake = Fake::new(vec![vec![say("one")], vec![say("two")]]);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3607,7 +3726,7 @@ mod tests {
 
         let think = json!({"type": "reasoning", "encrypted_content": "opaque"});
         let fake = Fake::new(vec![vec![think.clone(), say("one")], vec![say("two")]]);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3673,7 +3792,7 @@ mod tests {
     async fn stall(fake: fake::Fake, answers: &[Answer]) -> Vec<AgentEvent> {
         let dir = tools::temp_dir();
         let policy = Policy::new(Mode::Bypass, Default::default(), None, dir.clone());
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
         let (_tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3760,7 +3879,7 @@ mod tests {
             writer: Writer::create(&dir, Header::new("sess", "general", "fake", "medium", &dir)),
             history: Vec::new(),
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
         let (_tx_control, rx_control) = mpsc::channel(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3789,7 +3908,7 @@ mod tests {
             match event {
                 AgentEvent::ToolProgress(chunk) => {
                     assert!(output.is_none(), "progress after the result");
-                    cancel.store(true, Ordering::Relaxed);
+                    cancel.stop();
                     progress.push(chunk);
                 }
                 AgentEvent::ToolOutput(out) => output = Some(out),

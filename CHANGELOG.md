@@ -6,6 +6,26 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- An interrupt now stops a detached child for good. The turn and its children used to
+  share one flag, which the next prompt cleared, so a child that had not reached its next
+  check between the two carried on as though nothing had happened. Each child takes a flag
+  of its own from the turn's, which an interrupt latches and no later prompt clears. A
+  child still waiting for a slot when the interrupt lands never starts at all, and says so
+  rather than leaving the parent to wait for a report that is not coming.
+
+- A report that opens a turn of its own says it is one. The user already has an answer by
+  then, so the message the model reads asks for what the report adds or changes and leaves
+  the rest standing, which is the difference between one follow-up and a correction round
+  per late child. A report read between the steps of a running turn is unchanged: the
+  answer is still being written.
+
+- The child panel says how long a running child has been quiet, and the TUI knows a wake
+  is a turn. A child heard from every few seconds and one wedged in a retry loop looked
+  the same from outside; the row now carries the silence once it is long enough to mean
+  something. The spinner and the panel stayed off for the whole of a turn a child's report
+  opened, since only a typed message marked the TUI as working; the report does now too,
+  without moving a reader who has scrolled up.
+
 - A workflow can keep its step results between runs, so re-running one skips the steps
   that have not changed. `cache: true` in the definition's frontmatter turns it on and
   nothing else does: a hit answers today's run with an older answer, so the file the
