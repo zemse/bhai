@@ -283,14 +283,15 @@ pub fn build(
         config.load_global_agents &= sources.contains(&Source::GlobalAgents);
         config.load_project_instructions &= sources.contains(&Source::Project);
     }
-    let skills = if config.skills && identity.allows_tool(tools::skill::NAME) {
-        skills::discover(roots, &config.skill_sources)
-            .into_iter()
-            .filter(|s| identity.allows_skill(&s.name))
-            .collect()
-    } else {
-        Vec::new()
+    let found = match config.skills && identity.allows_tool(tools::skill::NAME) {
+        true => skills::discover(roots, &config.skill_sources),
+        false => skills::Discovered::default(),
     };
+    let skills: Vec<_> = found
+        .skills
+        .into_iter()
+        .filter(|s| identity.allows_skill(&s.name))
+        .collect();
     let loaded = instructions::load(&config, roots);
     let mut files = loaded.files;
     if !identity.prompt.is_empty() {
@@ -306,6 +307,7 @@ pub fn build(
         prompt = prompt.with_agents(identities);
     }
     prompt.skipped = loaded.skipped;
+    prompt.skipped.extend(found.shadowed);
     prompt.identity = identity.clone();
     prompt
 }

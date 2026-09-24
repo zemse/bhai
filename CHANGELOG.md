@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A skill name reaches the prompt as one short line, and a shadowed skill is named at
+  startup. A `name:` written as a YAML block put its own lines in the listing, so a skill
+  file could write whatever it liked where the listing's shape is; the name is now collapsed
+  to one line and cut at 64 bytes, leaving every ordinary name byte-identical. A project
+  skill that replaces a global one of the same name is reported the way a skipped import is,
+  since the precedence is deliberate but the file that lost is still on disk.
+
 - A project `.bhai/config.toml` can no longer turn off the user's global instruction files or
   widen where skills are read from. `load_global_claude`, `load_global_agents` and the skills
   `sources` list are the global file's call, like `permission_mode`, `allow` and the model
