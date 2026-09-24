@@ -304,8 +304,13 @@ allow it.",
         for notice in &notices {
             eprintln!("bhai: {notice}");
         }
-        eprintln!("bhai: debug server on http://{}", listener.local_addr()?);
-        let result = server::serve(listener, session).await;
+        let token = server::mint();
+        eprintln!(
+            "bhai: debug server on http://{} ({}: {token})",
+            listener.local_addr()?,
+            server::TOKEN_HEADER
+        );
+        let result = server::serve(listener, session, token).await;
         shutdown(hub).await;
         return result;
     }
@@ -1100,9 +1105,12 @@ async fn run(
     }
     if let Some(listener) = listener {
         let addr = listener.local_addr()?;
-        app.entries()
-            .push(app::Entry::Info(format!("debug server on http://{addr}")));
-        tokio::spawn(server::serve(listener, session));
+        let token = server::mint();
+        app.entries().push(app::Entry::Info(format!(
+            "debug server on http://{addr} ({}: {token})",
+            server::TOKEN_HEADER
+        )));
+        tokio::spawn(server::serve(listener, session, token));
     }
     // The tab says where the session is running until the model says what it is doing.
     let root = std::env::current_dir().unwrap_or_default();

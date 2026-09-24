@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- The debug server asks who is calling. `--serve` bound a port that answered any local
+  process, and those endpoints run commands, answer approvals and switch the permission
+  mode, so any program on the machine could drive a session. Each run now mints a token,
+  prints it beside the address, and requires it in an `x-bhai-token` header. That also
+  closes `/events` as a cross-origin subresource: a page cannot set the header.
+
 - A lowered `compact_at` no longer compacts into a history that is already over it. The
   target was `min(0.6, compact_at)` of the window, so `compact_at = 0.5` summarised down to
   exactly the trigger and the next turn triggered again. It is now three quarters of the

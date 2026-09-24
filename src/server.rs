@@ -21,17 +21,30 @@ use crate::session::{self, Session, Submitted};
 
 /// Port `--serve` listens on when none is given.
 pub const DEFAULT_PORT: u16 = 7878;
+/// The header every request carries the run's token in.
+pub const TOKEN_HEADER: &str = "x-bhai-token";
+
+/// A token for one run, printed where the server's address is. The server can run
+/// commands as the user, and a port on localhost is open to every process on the machine,
+/// so knowing the port is not enough.
+pub fn mint() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
 
 /// Bind to 127.0.0.1 only; the server can run commands, so it never faces the network.
 pub async fn bind(port: u16) -> anyhow::Result<TcpListener> {
     Ok(TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?)
 }
 
-pub async fn serve(listener: TcpListener, session: Arc<Session>) -> anyhow::Result<()> {
-    Ok(axum::serve(listener, router(session)).await?)
+pub async fn serve(
+    listener: TcpListener,
+    session: Arc<Session>,
+    token: String,
+) -> anyhow::Result<()> {
+    Ok(axum::serve(listener, router(session, token)).await?)
 }
 
-fn router(session: Arc<Session>) -> Router {
+fn router(session: Arc<Session>, token: String) -> Router {
     Router::new()
         .route("/state", get(state))
         .route("/events", get(events))
@@ -44,13 +57,18 @@ fn router(session: Arc<Session>) -> Router {
         .route("/context", get(context))
         .route("/children", get(children))
         .route("/steer", post(steer))
-        .layer(middleware::from_fn(local_only))
+        .layer(middleware::from_fn(move |request, next| {
+            let token = token.clone();
+            async move { local_only(&token, request, next).await }
+        }))
         .with_state(session)
 }
 
 /// Refuse browsers: any web page could otherwise POST `/approve` to localhost, and a
-/// rebound DNS name could drive the whole session.
-async fn local_only(request: Request, next: Next) -> Response {
+/// rebound DNS name could drive the whole session. The token is what makes the rest of
+/// the machine's processes, which can reach the port as easily as the user can, say where
+/// they got it: it is printed once, where the address is.
+async fn local_only(token: &str, request: Request, next: Next) -> Response {
     let headers = request.headers();
     let host = headers
         .get(header::HOST)
@@ -63,7 +81,31 @@ async fn local_only(request: Request, next: Next) -> Response {
             "only local, non-browser clients are allowed",
         );
     }
+    let given = headers
+        .get(TOKEN_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    if !constant_eq(given, token) {
+        return error(
+            StatusCode::FORBIDDEN,
+            &format!(
+                "this session's {TOKEN_HEADER} is required; it is printed where the server's address is"
+            ),
+        );
+    }
     next.run(request).await
+}
+
+/// Compare without stopping at the first wrong byte.
+fn constant_eq(given: &str, token: &str) -> bool {
+    if given.len() != token.len() {
+        return false;
+    }
+    given
+        .bytes()
+        .zip(token.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 #[derive(Deserialize)]
@@ -291,6 +333,9 @@ mod tests {
 
     /// Start a server on an ephemeral port in front of a fake agent that says hi, asks
     /// to run one command, and reports the decision on the returned channel.
+    /// The token the test server is started with.
+    const TOKEN: &str = "test-token";
+
     async fn start() -> (String, oneshot::Receiver<Answer>) {
         let (tx_user, mut rx_user) = mpsc::channel::<String>(1);
         let (tx_control, mut rx_control) = mpsc::channel::<Control>(1);
@@ -355,16 +400,30 @@ mod tests {
         });
         let listener = bind(0).await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(serve(listener, session));
+        tokio::spawn(serve(listener, session, TOKEN.to_string()));
         (base, rx_decision)
     }
 
     async fn get_json(http: &reqwest::Client, url: String) -> Value {
-        http.get(url).send().await.unwrap().json().await.unwrap()
+        http.get(url)
+            .header(TOKEN_HEADER, TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
 
     async fn post(http: &reqwest::Client, url: String, body: Value) -> StatusCode {
-        let status = http.post(url).json(&body).send().await.unwrap().status();
+        let status = http
+            .post(url)
+            .header(TOKEN_HEADER, TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status();
         StatusCode::from_u16(status.as_u16()).unwrap()
     }
 
@@ -393,10 +452,20 @@ mod tests {
         assert_eq!(state["working"], false);
         assert!(state["pending"].is_null());
 
-        let events = http.get(format!("{base}/events")).send().await.unwrap();
+        let events = http
+            .get(format!("{base}/events"))
+            .header(TOKEN_HEADER, TOKEN)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(events.status().as_u16(), 200);
 
-        let empty = http.post(format!("{base}/approve")).send().await.unwrap();
+        let empty = http
+            .post(format!("{base}/approve"))
+            .header(TOKEN_HEADER, TOKEN)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(empty.status(), StatusCode::CONFLICT);
         assert_eq!(
             post(&http, format!("{base}/prompt"), json!({"text": "go"})).await,
@@ -506,7 +575,7 @@ mod tests {
         ));
         let listener = bind(0).await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(serve(listener, session));
+        tokio::spawn(serve(listener, session, TOKEN.to_string()));
         let http = reqwest::Client::new();
 
         for text in ["first", "second"] {
@@ -547,6 +616,7 @@ mod tests {
         let from_page = http
             .post(format!("{base}/approve"))
             .header("origin", "https://example.com")
+            .header(TOKEN_HEADER, TOKEN)
             .send()
             .await
             .unwrap();
@@ -554,10 +624,38 @@ mod tests {
         let rebound = http
             .get(format!("{base}/state"))
             .header("host", "evil.example:7878")
+            .header(TOKEN_HEADER, TOKEN)
             .send()
             .await
             .unwrap();
         assert_eq!(rebound.status().as_u16(), 403);
+    }
+
+    /// Anything on the machine can reach the port, so the port is not the credential.
+    #[tokio::test]
+    async fn a_request_without_the_token_is_refused() {
+        let (base, _) = start().await;
+        let http = reqwest::Client::new();
+        for request in [
+            http.get(format!("{base}/state")),
+            http.get(format!("{base}/events")),
+            http.post(format!("{base}/interrupt")),
+            http.get(format!("{base}/state")).header(TOKEN_HEADER, ""),
+            http.get(format!("{base}/state"))
+                .header(TOKEN_HEADER, "test-toke"),
+            http.get(format!("{base}/state"))
+                .header(TOKEN_HEADER, "test-token-"),
+            http.get(format!("{base}/state"))
+                .header(TOKEN_HEADER, "TEST-TOKEN"),
+        ] {
+            let refused = request.send().await.unwrap();
+            assert_eq!(refused.status().as_u16(), 403);
+        }
+        // The one that was told.
+        assert_eq!(
+            get_json(&http, format!("{base}/state")).await["model"],
+            "test-model"
+        );
     }
 
     #[tokio::test]
