@@ -1644,7 +1644,16 @@ async fn execute(
     // The policy answers first; only `Ask` reaches the prompt.
     match policy.check(name, &args, tool.needs_approval()) {
         Decision::Allow(reason) => {
-            audit("ran", "rules", &reason);
+            // A tool that needs no approval is allowed before any rule is consulted, so
+            // there is no reason to carry; the log says which it was rather than nothing.
+            audit(
+                "ran",
+                "rules",
+                match reason.is_empty() {
+                    true => "the tool needs no approval",
+                    false => &reason,
+                },
+            );
             if tool.needs_approval() {
                 let _ = tx.send(AgentEvent::Info(format!(
                     "auto-allowed: {summary} ({reason})"
