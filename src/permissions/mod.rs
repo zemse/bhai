@@ -9,7 +9,7 @@ use std::sync::{RwLock, RwLockReadGuard};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 pub mod bash;
 pub mod rules;
@@ -221,6 +221,8 @@ pub struct Policy {
     trusted: AtomicBool,
     /// What `auto` mode relaxes once the project is trusted.
     relax: Relax,
+    /// Where every decision is appended, if anywhere.
+    log: Option<PathBuf>,
 }
 
 impl Policy {
@@ -235,6 +237,7 @@ impl Policy {
             trust: None,
             trusted: AtomicBool::new(false),
             relax: Relax::default(),
+            log: None,
         }
     }
 
@@ -247,6 +250,44 @@ impl Policy {
 
     pub fn with_relax(self, relax: Relax) -> Self {
         Self { relax, ..self }
+    }
+
+    pub fn with_log(self, log: PathBuf) -> Self {
+        Self {
+            log: Some(log),
+            ..self
+        }
+    }
+
+    /// Append what became of one call. A call the rules allow outright is as much a
+    /// decision as one they refuse: without the allows the log says what was stopped and
+    /// nothing about what ran, and in `bypass`, where nothing is stopped, it would say
+    /// nothing at all.
+    pub fn audit(&self, tool: &str, summary: &str, outcome: &str, by: &str, reason: &str) {
+        let Some(path) = &self.log else {
+            return;
+        };
+        let line = json!({
+            "timestamp": chrono::Local::now().to_rfc3339(),
+            "mode": self.mode().to_string(),
+            "trusted": self.trusted(),
+            "tool": tool,
+            "summary": summary,
+            "outcome": outcome,
+            "by": by,
+            "reason": (!reason.is_empty()).then_some(reason),
+        });
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{line}");
+        }
     }
 
     pub fn with_trust(self, trust: Trust) -> Self {

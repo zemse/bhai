@@ -1605,9 +1605,12 @@ async fn execute(
         Err(e) => return (format!("Invalid tool call: {e}"), false),
     };
 
+    let audit = |outcome, by, reason: &str| policy.audit(name, &summary, outcome, by, reason);
+
     // The policy answers first; only `Ask` reaches the prompt.
     match policy.check(name, &args, tool.needs_approval()) {
         Decision::Allow(reason) => {
+            audit("ran", "rules", &reason);
             if tool.needs_approval() {
                 let _ = tx.send(AgentEvent::Info(format!(
                     "auto-allowed: {summary} ({reason})"
@@ -1615,6 +1618,7 @@ async fn execute(
             }
         }
         Decision::Deny(reason) => {
+            audit("blocked", "rule", &reason);
             let _ = tx.send(AgentEvent::ToolRejected {
                 tool: name.to_string(),
                 summary: summary.clone(),
@@ -1662,11 +1666,13 @@ not retry it. Try a different approach, or ask the user."
                             false,
                         );
                     }
+                    audit("ran", "judge", &reason);
                     let _ = tx.send(AgentEvent::Info(format!(
                         "auto-approved: {summary} ({reason})"
                     )));
                 }
                 Ok(Verdict::Deny { reason }) => {
+                    audit("blocked", "judge", &reason);
                     let _ = tx.send(AgentEvent::ToolRejected {
                         tool: name.to_string(),
                         summary: summary.clone(),
@@ -1701,6 +1707,7 @@ as-is. Try a different approach, or ask the user."
                         ),
                         Undecided::Off => ("no judge is running in this session".to_string(), ""),
                     };
+                    audit("blocked", "auto", &why);
                     let _ = tx.send(AgentEvent::ToolRejected {
                         tool: name.to_string(),
                         summary: summary.clone(),
@@ -1726,8 +1733,10 @@ as-is. Try a different approach, or ask the user."
                 Err(_) => {
                     let offers = policy.offers(name, &args);
                     if let Some(result) = ask(name, &summary, &offers, policy, tx).await {
+                        audit("blocked", "you", "");
                         return result;
                     }
+                    audit("ran", "you", "");
                     // An interrupt that landed while the prompt was up cannot reject it
                     // once the approval has left the channel, so it is honoured here.
                     if cancel.load(Ordering::Relaxed) {
@@ -3097,6 +3106,55 @@ mod tests {
             "{}",
             run.outputs[0]
         );
+    }
+
+    /// Every call leaves a line, the ones nothing stopped included. In `bypass` nothing
+    /// is stopped, so a log of refusals alone would be an empty file for the mode that
+    /// most needs one.
+    #[tokio::test]
+    async fn every_decision_is_logged_including_the_allows() {
+        use crate::permissions::{Rule, Rules};
+
+        let dir = tools::temp_dir();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let log = dir.join("debug").join("permissions.jsonl");
+        let rules = Rules {
+            deny: vec![Rule::parse("Bash(rm:*)").unwrap()],
+            ..Rules::default()
+        };
+        let policy = Policy::new(Mode::Bypass, rules, None, repo.clone()).with_log(log.clone());
+
+        let cancel = Arc::new(Cancel::default());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = Registry::new(Vec::new());
+        let calls = [
+            fake::call(
+                "write",
+                json!({ "path": repo.join("notes.txt"), "content": "x" }),
+            ),
+            fake::call("bash", json!({ "command": "rm -rf x" })),
+        ];
+        for call in &calls {
+            let _ = execute(&registry, &policy, None, call, &tx, &cancel.flag()).await;
+        }
+
+        let lines: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["outcome"], "ran");
+        assert_eq!(lines[0]["by"], "rules");
+        assert_eq!(lines[0]["mode"], "bypass");
+        assert_eq!(lines[0]["reason"], "bypass mode");
+        assert_eq!(lines[0]["tool"], "write");
+        assert_eq!(lines[1]["outcome"], "blocked");
+        assert_eq!(lines[1]["by"], "rule");
+        assert_eq!(lines[1]["reason"], "deny rule Bash(rm:*)");
+        // The write ran, so the log is not claiming something that did not happen.
+        assert!(repo.join("notes.txt").exists());
     }
 
     /// An interrupt while the judge is deciding still stops the call: a verdict that

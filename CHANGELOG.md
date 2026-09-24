@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- Every permission decision is appended to `.bhai/debug/permissions.jsonl`, the allows
+  included: timestamp, mode, whether the project is trusted, tool, summary, outcome
+  (`ran` or `blocked`), who decided (`rules`, `rule`, `judge`, `auto`, `you`) and the
+  reason. The judge log only ever held the calls that reached the judge, which is none of
+  them in `ask` and `bypass`, so a session's own record said what was stopped and nothing
+  about what ran.
+
 - `bypass` stops asking. A protected path and a command the tokenizer could not take
   apart are guards bhai supplies itself, and `bypass` is the user saying they do not want
   to be second-guessed, so it runs them. Their own `deny` and `ask` rules are not guards

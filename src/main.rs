@@ -570,7 +570,8 @@ fn permissions(config: Config, home: Option<PathBuf>, cwd: PathBuf) -> (Policy, 
     };
     let mut policy = Policy::new(config.permission_mode, rules, home, cwd)
         .with_store(store)
-        .with_relax(relax);
+        .with_relax(relax)
+        .with_log(profile::debug_dir().join("permissions.jsonl"));
     if let Some(trust) = trust {
         policy = policy.with_trust(trust);
     }
