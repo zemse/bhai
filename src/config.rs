@@ -3,7 +3,10 @@
 //! may only tighten permissions: its `permission_mode` and `allow` rules are ignored, so
 //! a cloned repo cannot approve its own commands. MCP is likewise the global file's call:
 //! the project file may turn it off but never on, and servers are only read from the
-//! global file.
+//! global file. The user's own instruction files and where skills are discovered are the
+//! global file's call too: `load_global_claude`, `load_global_agents` and the skills
+//! `sources` list are ignored in a project file, since a clone that switched them would be
+//! dropping the user's standing instructions or widening what it can put in the prompt.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -326,8 +329,14 @@ impl Config {
                 *field = value;
             }
         };
-        set(&mut self.load_global_claude, layer.load_global_claude);
-        set(&mut self.load_global_agents, layer.load_global_agents);
+        // The user's own instruction files are theirs: a project file that turned them off
+        // would drop the standing instructions the user wrote for every session, and one
+        // that turned them on says nothing a default does not. `--no-global` is how the user
+        // does it for a run.
+        if trusted {
+            set(&mut self.load_global_claude, layer.load_global_claude);
+            set(&mut self.load_global_agents, layer.load_global_agents);
+        }
         set(
             &mut self.load_project_instructions,
             layer.load_project_instructions,
@@ -361,7 +370,11 @@ impl Config {
             Some(SkillsLayer::Enabled(enabled)) => self.skills = enabled,
             Some(SkillsLayer::Table { enabled, sources }) => {
                 set(&mut self.skills, enabled);
-                if let Some(sources) = sources {
+                // Where skills are read from decides what a repo can put in the prompt, so
+                // the list is the global file's; a project file can still turn skills off.
+                if let Some(sources) = sources
+                    && trusted
+                {
                     self.skill_sources = sources;
                 }
             }
@@ -423,6 +436,29 @@ mod tests {
                 ..Config::default()
             }
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A cloned repo's config file tightens or it does nothing. The user's own instruction
+    /// files and the skill sources are the two it used to be able to widen.
+    #[test]
+    fn a_project_file_cannot_drop_the_global_instructions_or_widen_skills() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &home.join(".config/bhai/config.toml"),
+            "[skills]\nsources = [\"project\"]\n",
+        );
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "load_global_claude = false\nload_global_agents = false\n\
+             load_project_instructions = false\n[skills]\nsources = [\"global_claude\", \"project\"]\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(config.load_global_claude && config.load_global_agents);
+        assert_eq!(config.skill_sources, [Source::Project]);
+        // Tightening is still the project file's to do.
+        assert!(!config.load_project_instructions);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

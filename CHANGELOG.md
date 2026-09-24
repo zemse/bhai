@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A project `.bhai/config.toml` can no longer turn off the user's global instruction files or
+  widen where skills are read from. `load_global_claude`, `load_global_agents` and the skills
+  `sources` list are the global file's call, like `permission_mode`, `allow` and the model
+  already are; a clone that set them was dropping the standing instructions the user wrote
+  for every session, or adding a source it could then write skills into. Turning skills or
+  the project's own instructions off is still the project file's to do.
+
 - `command -v` inside a loop is no longer denied outright. The blunt word split that decides
   whether a command the parser cannot read may go to the judge treated every `command` as a
   program that runs its arguments, so `for f in rg fd; do command -v $f; done` was refused in
