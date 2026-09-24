@@ -3,14 +3,26 @@
 //! replaces an earlier one of the same name. A repo's `.mcp.json` servers only start
 //! once approved in `~/.claude.json`, as Claude Code asks for. `${VAR}` in HTTP header
 //! values is expanded from the environment.
+//!
+//! The approval in `~/.claude.json` is by name only, so a repo that keeps the name and
+//! changes the command starts under an approval given to a different program. bhai keeps a
+//! fingerprint of each approved `.mcp.json` server beside its own config and skips one that
+//! has changed since; `bhai mcp approve <name>` accepts it as it is now.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::{Headers, McpServer};
 use crate::instructions::{self, Roots};
+
+/// Where the fingerprints of approved `.mcp.json` servers are kept, under bhai's own
+/// config directory: the approval itself is Claude Code's, but what was approved is bhai's
+/// to remember.
+const APPROVALS: &str = ".config/bhai/mcp-approvals.json";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Server {
@@ -28,7 +40,8 @@ pub struct Server {
     pub skip: Option<String>,
 }
 
-/// Every configured server, merged by name in source order.
+/// Every configured server, merged by name in source order. A `.mcp.json` server whose
+/// definition has changed since it was approved is skipped rather than started.
 pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
     let mut found: Vec<Server> = Vec::new();
 
@@ -53,14 +66,44 @@ pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
         }
     }
     if let Some(mcp_json) = read(&project_root.join(".mcp.json")) {
+        let store = approvals_path(roots);
+        let mut recorded = store.as_deref().map(read_approvals).unwrap_or_default();
+        let key = project_root.display().to_string();
+        let mut added = false;
         for mut server in parse(&mcp_json, ".mcp.json") {
             if server.skip.is_none() {
                 server.skip = unapproved(project, &server.name);
+            }
+            // Approved by name, and nothing else against it: the definition it was approved
+            // as is what it has to keep. First sight is the baseline, which is all the
+            // approval ever had.
+            if server.skip.is_none() {
+                let now = fingerprint(&server);
+                let entry = recorded.entry(key.clone()).or_default();
+                match entry.get(&server.name) {
+                    Some(approved) if *approved != now => {
+                        server.skip = Some(format!(
+                            "changed since it was approved; `bhai mcp approve {}` accepts it as it is now",
+                            server.name
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        entry.insert(server.name.clone(), now);
+                        added = true;
+                    }
+                }
             }
             // An unapproved repo entry must not shadow the user's own server.
             if server.skip.is_none() || !found.iter().any(|s| s.name == server.name) {
                 add(&mut found, server);
             }
+        }
+        if added
+            && let Some(store) = &store
+            && let Err(e) = write_approvals(store, &recorded)
+        {
+            eprintln!("bhai: {e:#}");
         }
     }
     for (name, server) in bhai {
@@ -85,6 +128,81 @@ pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
         );
     }
     found
+}
+
+/// The store of what each approved `.mcp.json` server looked like, by project root.
+type Approvals = BTreeMap<String, BTreeMap<String, String>>;
+
+fn approvals_path(roots: &Roots) -> Option<PathBuf> {
+    roots.home.as_ref().map(|home| home.join(APPROVALS))
+}
+
+/// The store, or an empty one when there is none or it will not read: a store that cannot
+/// be read records every server afresh rather than refusing them all.
+fn read_approvals(path: &Path) -> Approvals {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_approvals(path: &Path, approvals: &Approvals) -> Result<()> {
+    let mut text = serde_json::to_string_pretty(approvals)?;
+    text.push('\n');
+    crate::permissions::settings::write_atomic(path, text.as_bytes())
+        .with_context(|| format!("could not record MCP approvals in {}", path.display()))
+}
+
+/// What a server is approved as: the program it runs and where it connects. Header values
+/// are left out, since they hold `${VAR}` expansions and tokens that rotate; what decides
+/// which code runs is the command, its arguments, the environment and the url.
+fn fingerprint(server: &Server) -> String {
+    let mut hasher = Sha256::new();
+    let mut part = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    part(server.command.as_bytes());
+    for arg in &server.args {
+        part(arg.as_bytes());
+    }
+    for (key, value) in &server.env {
+        part(key.as_bytes());
+        part(value.as_bytes());
+    }
+    part(server.url.as_deref().unwrap_or_default().as_bytes());
+    for key in server.headers.0.keys() {
+        part(key.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Record `name` as it is defined now, so the next run starts it. Returns what was
+/// recorded, for the line that says what was accepted.
+pub fn approve(roots: &Roots, bhai: &BTreeMap<String, McpServer>, name: &str) -> Result<Server> {
+    let project_root = instructions::project_root(&roots.cwd);
+    let store = approvals_path(roots).context("no home directory to record the approval in")?;
+    let server = load(roots, bhai)
+        .into_iter()
+        .find(|s| s.name == name)
+        .with_context(|| format!("no MCP server `{name}` is configured"))?;
+    if server.source != ".mcp.json" {
+        anyhow::bail!(
+            "`{name}` comes from {}, which is your own file, so there is nothing to approve",
+            server.source
+        );
+    }
+    let mut approvals = read_approvals(&store);
+    approvals
+        .entry(project_root.display().to_string())
+        .or_default()
+        .insert(name.to_string(), fingerprint(&server));
+    write_approvals(&store, &approvals)?;
+    Ok(server)
 }
 
 /// A name with `__` would make `mcp__server__tool` ambiguous, so it never starts.
@@ -357,6 +475,33 @@ mod tests {
         let servers = load(&roots, &BTreeMap::new());
         let b = servers.iter().find(|s| s.name == "b").unwrap();
         assert_eq!(b.command, "b-project");
+
+        // The approval is by name, so what `ok` was approved as is recorded on first sight
+        // and a repo that changes the command behind the name has to be approved again.
+        let store = roots.home.as_ref().unwrap().join(APPROVALS);
+        let key = roots.cwd.display().to_string();
+        assert!(read_approvals(&store)[&key].contains_key("ok"));
+        write(
+            &roots.cwd.join(".mcp.json"),
+            json!({"mcpServers": {"ok": {"command": "ok", "args": ["--now-with-this"]}}}),
+        );
+        let changed = load(&roots, &BTreeMap::new());
+        let ok = changed.iter().find(|s| s.name == "ok").unwrap();
+        assert!(
+            ok.skip
+                .as_ref()
+                .unwrap()
+                .starts_with("changed since it was approved"),
+            "{:?}",
+            ok.skip
+        );
+        let approved = approve(&roots, &BTreeMap::new(), "ok").unwrap();
+        assert_eq!(approved.args, ["--now-with-this"]);
+        let after = load(&roots, &BTreeMap::new());
+        assert_eq!(after.iter().find(|s| s.name == "ok").unwrap().skip, None);
+        // A server from the user's own files is not the repo's to change.
+        assert!(approve(&roots, &BTreeMap::new(), "web").is_err());
+        assert!(approve(&roots, &BTreeMap::new(), "nothing").is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

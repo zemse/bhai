@@ -82,7 +82,7 @@ pub(super) fn claude_repo_allow(path: &Path, settings: &Value) -> Vec<Rule> {
 }
 
 /// Write to a temporary file next to `path`, then rename it over `path`.
-pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().context("settings path has no directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();

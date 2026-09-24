@@ -100,6 +100,28 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `bhai mcp approve <name>` records a `.mcp.json` server as it is defined now, which
+    // is how a server that changed since its approval is accepted again.
+    if args.first().is_some_and(|a| a == "mcp") {
+        let name = match (args.get(1).map(String::as_str), args.get(2)) {
+            (Some("approve"), Some(name)) => name,
+            _ => bail!("usage: bhai mcp approve <server>"),
+        };
+        let cwd = std::env::current_dir()?;
+        let roots = instructions::Roots::from_env(cwd.clone());
+        let config = Config::load(roots.home.as_deref(), &roots.cwd)?;
+        let server = mcp::servers::approve(&roots, &config.mcp_servers, name)?;
+        let what = match &server.url {
+            Some(url) => url.clone(),
+            None => format!("{} {}", server.command, server.args.join(" "))
+                .trim()
+                .to_string(),
+        };
+        println!("approved {name} as `{what}` from {}", server.source);
+        println!("it starts with the next bhai in this project");
+        return Ok(());
+    }
+
     // `bhai --probe [prompt]` does one non-interactive model call, for checking that
     // auth and the wire format still work without entering the TUI.
     if args.first().is_some_and(|a| a == "--probe") {
@@ -135,7 +157,7 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [sessions [prune [n]]] [--probe [prompt]] [--cache-check] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [sessions [prune [n]]] [mcp approve <server>] [--probe [prompt]] [--cache-check] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }

@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A `.mcp.json` server that changed since it was approved is not started. The approval in
+  `~/.claude.json` is a list of names, so a repo could keep the name and change the command
+  to anything; bhai now records what each approved server was defined as, under
+  `~/.config/bhai/mcp-approvals.json`, and skips one whose command, arguments, environment
+  or url has changed since, saying so in `/mcp`. `bhai mcp approve <server>` accepts it as it
+  is now. Header values are not part of it, since a rotating token is not a change of
+  program.
+
 - A panic in the agent loop ends the turn it was running. The task was spawned with its
   handle dropped, so a panic in the loop or in a tool left the session marked working, with
   a spinner that never stopped and no error to say why. The loop is now watched, and a panic
