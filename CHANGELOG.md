@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- The judge is told where a written path lands instead of working it out. A `write` or
+  `edit` now carries `location: inside the project root` or `outside the project root`,
+  resolved the way the permission layer resolves it, and names any character in the path
+  that renders as a space or as nothing. The prompt says to take it as fact. Outside is
+  still allowed when the user asked for it; a reason that calls an outside path inside is
+  not. `is_inside` resolves a root that does not exist yet the same way as the path.
+
 - `/export-debug` writes every child agent of the session: its row, the brief it was
   given, everything its pane showed and where its full history is on disk. It used to list
   only the children still on the panel, which a new message clears of finished ones, and

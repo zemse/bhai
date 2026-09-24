@@ -405,7 +405,9 @@ fn wildcard(pattern: &str, text: &str, question: bool) -> bool {
 /// not exist yet resolves through its nearest existing parent, so a new file under a
 /// symlink that leaves the project is seen for what it is.
 pub fn is_inside(path: &Path, root: &Path) -> bool {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // Resolved the same way as the path, so a root that does not exist yet still meets
+    // it on equal terms.
+    let root = follow_links(root);
     let path = follow_links(&root.join(path));
     components(&path).starts_with(&components(&root))
 }
