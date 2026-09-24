@@ -54,6 +54,7 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/interrupt", post(interrupt))
         .route("/retry", post(retry))
         .route("/mode", post(mode))
+        .route("/model", post(model))
         .route("/context", get(context))
         .route("/permissions", get(permissions))
         .route("/allow", post(allow))
@@ -120,6 +121,13 @@ struct Prompt {
 #[derive(Deserialize)]
 struct ModeBody {
     mode: Mode,
+}
+
+/// A switch: either field left out stays as it is, so `{"effort": "low"}` keeps the model.
+#[derive(Deserialize)]
+struct ModelBody {
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -281,6 +289,16 @@ async fn mode(State(session): State<Arc<Session>>, Json(body): Json<ModeBody>) -
     // for. The reply says which it is rather than pretending.
     let mode = session.set_mode(body.mode);
     Json(json!({ "ok": true, "mode": mode })).into_response()
+}
+
+/// `/model`, and `/effort` with the model left out.
+async fn model(State(session): State<Arc<Session>>, Json(body): Json<ModelBody>) -> Response {
+    let (model, effort) = session.model();
+    let (model, effort) = (body.model.unwrap_or(model), body.effort.unwrap_or(effort));
+    match session.set_model(model.clone(), effort.clone(), None) {
+        Ok(()) => Json(json!({ "ok": true, "model": model, "effort": effort })).into_response(),
+        Err(e) => error(StatusCode::CONFLICT, &e.to_string()),
+    }
 }
 
 /// The rules in force, as `/permissions` shows them.
@@ -752,6 +770,21 @@ mod tests {
             post(&http, format!("{base}/mode"), json!({"mode": "yolo"}))
                 .await
                 .is_client_error()
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_is_set_over_http_keeping_the_model() {
+        let (base, _) = start().await;
+        let http = reqwest::Client::new();
+        assert_eq!(
+            post(&http, format!("{base}/model"), json!({"effort": "xhigh"})).await,
+            StatusCode::OK
+        );
+        let state = get_json(&http, format!("{base}/state")).await;
+        assert_eq!(
+            (&state["model"], &state["effort"]),
+            (&json!("test-model"), &json!("xhigh"))
         );
     }
 

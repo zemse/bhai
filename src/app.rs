@@ -1200,6 +1200,13 @@ impl App {
             self.model_command(rest.trim());
             return;
         }
+        if let Some(rest) = message.strip_prefix("/effort")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            self.effort_command(rest.trim());
+            return;
+        }
         if let Some(rest) = message.strip_prefix("/statusline")
             && (rest.is_empty() || rest.starts_with(' '))
         {
@@ -1356,9 +1363,31 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         self.switch_model(name.to_string(), effort, None);
     }
 
+    /// `/effort <level>`: the same model at another reasoning effort, keeping its
+    /// thinking. On its own it says what the session runs at.
+    fn effort_command(&mut self, rest: &str) {
+        if crate::client::Provider::of(&self.model) == crate::client::Provider::Ollama {
+            self.note(Entry::Info(model_notice(&self.model, &self.effort)));
+            return;
+        }
+        if rest.is_empty() {
+            self.note(Entry::Info(format!(
+                "effort: {}. Usage: /effort <low|medium|high|xhigh>",
+                self.effort
+            )));
+            return;
+        }
+        self.switch_model(self.model.clone(), rest.to_string(), None);
+    }
+
     /// Put the session on `model`, and say so.
     fn switch_model(&mut self, model: String, effort: String, window: Option<u64>) {
-        let notice = model_notice(&model, &effort);
+        let notice = match model == self.model {
+            true => format!(
+                "effort: {effort}. The model and its thinking stay; the backend caches per effort, so the next call starts the prompt cache again."
+            ),
+            false => model_notice(&model, &effort),
+        };
         match self.session.set_model(model, effort, window) {
             Ok(()) => self.note(Entry::Info(notice)),
             Err(e) => self.note(Entry::Error(format!("cannot switch models: {e}"))),
@@ -2238,6 +2267,18 @@ mod tests {
         assert_eq!(
             (state.model.as_str(), state.effort.as_str()),
             ("gpt-5.5", "xhigh")
+        );
+    }
+
+    #[test]
+    fn effort_keeps_the_model() {
+        let (mut app, _user, _control) = connected();
+        app.input.set("/effort xhigh".to_string());
+        app.submit();
+        let state = app.session.state();
+        assert_eq!(
+            (state.model.as_str(), state.effort.as_str()),
+            (app.model.as_str(), "xhigh")
         );
     }
 

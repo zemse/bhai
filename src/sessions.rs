@@ -325,10 +325,14 @@ pub fn load(path: &Path) -> Result<Loaded> {
             let (Some(switched), Some(to)) = (text("model"), text("effort")) else {
                 bail!("{}: model record {id} names no model", path.display());
             };
-            (model, effort) = (switched, to);
             // As the live switch does: encrypted reasoning belongs to the model that
-            // produced it and cannot be replayed to another one.
-            items.retain(|(item, _)| item.get("type").and_then(Value::as_str) != Some("reasoning"));
+            // produced it and cannot be replayed to another one. An effort alone keeps it.
+            if switched != model {
+                items.retain(|(item, _)| {
+                    item.get("type").and_then(Value::as_str) != Some("reasoning")
+                });
+            }
+            (model, effort) = (switched, to);
         } else {
             let Some(item) = record.get("item") else {
                 bail!("{}: record {id} has no item", path.display());
@@ -746,6 +750,25 @@ mod tests {
             .count();
         assert_eq!(reasoning, 1, "only what the model now in use produced");
         assert_eq!(loaded.items.len(), 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_effort_switch_keeps_the_reasoning() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+
+        let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
+        writer.model("gpt-5", "low", "abc").unwrap();
+        writer.append(&items()[1]).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.effort, "low");
+        let reasoning = loaded
+            .items
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .count();
+        assert_eq!(reasoning, 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

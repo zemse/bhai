@@ -223,6 +223,11 @@ impl CacheMonitor {
         hit
     }
 
+    /// The next call reads a cold cache on purpose, so it is not judged.
+    pub fn forget(&mut self) {
+        self.previous = None;
+    }
+
     /// Whether enough judged calls missed in a row to warn about.
     pub fn tripped(&self) -> bool {
         self.misses >= MAX_MISSES
@@ -474,6 +479,17 @@ mod tests {
         let (_, t) = call(&mut monitor, t, usage(1000, 0), false);
         let (small, _) = call(&mut monitor, t, usage(1100, 0), false);
         assert_eq!(small, Hit::default());
+    }
+
+    #[test]
+    fn a_forgotten_call_is_not_judged() {
+        let mut monitor = CacheMonitor::default();
+        let (_, t) = call(&mut monitor, Instant::now(), usage(2000, 0), false);
+        monitor.forget();
+        let (cold, t) = call(&mut monitor, t, usage(2100, 0), false);
+        assert_eq!(cold, Hit::default());
+        let (hit, _) = call(&mut monitor, t, usage(2200, 2048), false);
+        assert_eq!(hit.hit_ratio, Some(1.0));
     }
 
     /// Every judged call of `usages` in order, counting the warnings it raises.

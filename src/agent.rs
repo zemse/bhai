@@ -619,20 +619,28 @@ pub(crate) async fn run_with(
                     }
                     // Between turns, so the switch never lands mid-call. What the old
                     // model thought is dropped: encrypted reasoning belongs to the model
-                    // that produced it and cannot be replayed to another one.
+                    // that produced it and cannot be replayed to another one. An effort
+                    // alone keeps the model and its history, but the backend caches per
+                    // effort, so the next call is cold all the same.
                     Control::Model { model: name, effort, window } => {
+                        let same = name == model.name();
                         match model.switch(&name, &effort) {
                             Some(switched) => {
                                 model = switched;
                                 registry = build(&model);
-                                tokenizer = tokens::for_model(model.name());
-                                limits.window = configured_window.or(window);
-                                history.retain(|item| {
-                                    item.get("type").and_then(Value::as_str) != Some("reasoning")
-                                });
-                                // Earlier calls index the old history, and the new model
-                                // reads a cache of its own that is cold.
-                                (calls, monitor) = (Vec::new(), CacheMonitor::default());
+                                if !same {
+                                    tokenizer = tokens::for_model(model.name());
+                                    limits.window = configured_window.or(window);
+                                    history.retain(|item| {
+                                        item.get("type").and_then(Value::as_str)
+                                            != Some("reasoning")
+                                    });
+                                    // Earlier calls index the old history, and the new
+                                    // model reads a cache of its own that is cold.
+                                    (calls, monitor) = (Vec::new(), CacheMonitor::default());
+                                } else {
+                                    monitor.forget();
+                                }
                                 // Recorded, so a resume comes back on this model rather
                                 // than the one the session opened on.
                                 if let Some(writer) = &mut writer {
@@ -2058,7 +2066,10 @@ pub mod fake {
                 effort: effort.to_string(),
                 ..self.clone()
             };
-            switched.reset("the model changed");
+            switched.reset(match model == self.model {
+                true => "the effort changed",
+                false => "the model changed",
+            });
             Some(Arc::new(switched))
         }
 
@@ -4013,6 +4024,67 @@ mod tests {
             "encrypted reasoning cannot be replayed to another model: {sent:?}"
         );
         assert_eq!(sent.last().unwrap()["content"][0]["text"], "second");
+    }
+
+    #[tokio::test]
+    async fn an_effort_switch_keeps_the_history_and_its_ledger() {
+        use fake::{Fake, say};
+
+        let think = json!({"type": "reasoning", "encrypted_content": "opaque"});
+        let fake = Fake::new(vec![vec![think.clone(), say("one")], vec![say("two")]]);
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        tx_control
+            .send(Control::Model {
+                model: "fake".to_string(),
+                effort: "low".to_string(),
+                window: None,
+            })
+            .await
+            .unwrap();
+        let (reply, wait) = oneshot::channel();
+        tx_control.send(Control::Context(reply)).await.unwrap();
+        assert!(wait.await.unwrap().calibration.is_some());
+
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        assert_eq!(bodies[1].1["reasoning"]["effort"], "low");
+        // The second request extends the first: only the `reasoning` field differs.
+        let (first, sent) = (
+            bodies[0].1["input"].as_array().unwrap(),
+            bodies[1].1["input"].as_array().unwrap(),
+        );
+        assert_eq!(sent[..first.len()], first[..]);
+        assert!(sent.contains(&think));
+        let reasons: Vec<_> = fake
+            .resets
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, reason)| reason.clone())
+            .collect();
+        assert_eq!(reasons, ["the effort changed"]);
     }
 
     /// A session that misses the cache on every judged call, one call per script step,

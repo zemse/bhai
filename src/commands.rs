@@ -95,6 +95,11 @@ pub const COMMANDS: &[Command] = &[
         args: "",
         help: "pick the model this session talks to",
     },
+    Command {
+        name: "effort",
+        args: " <level>",
+        help: "the reasoning effort, keeping the model",
+    },
     // No args hint, though it takes a request: on its own it shows the template and
     // the variables, which is where a first look starts.
     Command {

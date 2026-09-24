@@ -211,12 +211,17 @@ impl Client {
 
     /// The same session on another model, for `/model`. The guard is shared with the
     /// client this came from, and a different model reads a different cached prefix, so
-    /// the switch forgets the last request rather than reporting it as a break.
+    /// the switch forgets the last request rather than reporting it as a break. An
+    /// effort alone changes only the `reasoning` field, so it is forgotten the same way.
     pub fn switch(&self, model: &str, effort: &str) -> Self {
+        let reason = match model == self.model {
+            true => "the effort changed",
+            false => "the model changed",
+        };
         let switched = self
             .clone()
             .with_overrides(Some(model.to_string()), Some(effort.to_string()));
-        switched.reset_cache("the model changed");
+        switched.reset_cache(reason);
         switched
     }
 

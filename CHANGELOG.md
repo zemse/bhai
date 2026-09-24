@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- `/effort <level>` changes the reasoning effort alone, and so does `POST /model` on the
+  debug server with only `effort` given. An effort switch keeps the model's encrypted
+  thinking and the context ledger, where `/model` dropped both. The Codex backend keys
+  its prompt cache on the effort, so the call after a switch still starts cold; the
+  cache monitor leaves that call unjudged.
+
 - A protected path is a credential, not a directory the user works in. `~/.claude` and
   `~/.codex` hold the agent's own instructions, skills and prompts beside their
   credentials, so only `auth.json`, `.credentials.json` and `settings*.json` in them are
