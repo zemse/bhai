@@ -555,7 +555,7 @@ pub(crate) async fn run_with(
                         if let Some(writer) = &mut writer
                             && let Err(e) = writer.compact("clear", before, 0, &history)
                         {
-                            let _ = tx.send(AgentEvent::Error(format!("transcript: {e:#}")));
+                            let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
                         }
                         let _ = tx.send(AgentEvent::Cleared);
                         continue;
@@ -610,7 +610,7 @@ pub(crate) async fn run_with(
                                         sessions::prefix(model.name(), &prompt.text, &tools);
                                     if let Err(e) = writer.model(model.name(), &effort, &prefix) {
                                         let _ = tx
-                                            .send(AgentEvent::Error(format!("transcript: {e:#}")));
+                                            .send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
                                     }
                                 }
                             }
@@ -1234,7 +1234,7 @@ impl Compaction<'_> {
         {
             let _ = self
                 .tx
-                .send(AgentEvent::Error(format!("transcript: {e:#}")));
+                .send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
         }
         let _ = self.tx.send(AgentEvent::Compacted {
             notice: format!("compacted history ({what}): ~{before} -> ~{after} tokens"),
@@ -1244,6 +1244,11 @@ impl Compaction<'_> {
 }
 
 /// Write `items` to the sink.
+/// What a failed transcript write is reported as. A child's pane shows it like any other
+/// error, but it is the harness's failure rather than the agent's, so it never becomes the
+/// reason a child had no answer.
+pub const TRANSCRIPT_ERROR: &str = "transcript: ";
+
 fn record(sink: &mut Sink<'_>, items: &[Value], tx: &mpsc::UnboundedSender<AgentEvent>) {
     let result = match sink {
         Sink::Discard => Ok(()),
@@ -1251,7 +1256,7 @@ fn record(sink: &mut Sink<'_>, items: &[Value], tx: &mpsc::UnboundedSender<Agent
         Sink::Session(writer) => items.iter().try_for_each(|item| writer.append(item)),
     };
     if let Err(e) = result {
-        let _ = tx.send(AgentEvent::Error(format!("transcript: {e:#}")));
+        let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
     }
 }
 
@@ -1415,11 +1420,24 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     offers,
                     reply,
                 },
+                // Shown in the child's pane, but never the reason it ended: the child
+                // answered or did not for reasons of its own, whatever the disk did.
+                AgentEvent::Error(s) if s.starts_with(TRANSCRIPT_ERROR) => {
+                    inside(AgentEvent::Error(s))
+                }
                 // An error is what the parent reports when the child ends without an
-                // answer, so it is kept here as well as shown in the child's pane. Only
-                // the session's own turn can be run again, so a child's failure is shown
-                // as the error it is.
-                AgentEvent::Error(s) | AgentEvent::TurnFailed(s) => {
+                // answer, so it is kept here as well as shown in the child's pane. The
+                // first one is kept: it is what the ones after it follow from. Only the
+                // session's own turn can be run again, so a child's failure is shown as
+                // the error it is.
+                AgentEvent::Error(s) => {
+                    if failure.is_none() {
+                        failure = Some(s.clone());
+                    }
+                    inside(AgentEvent::Error(s))
+                }
+                // Whenever it lands, this is the one that ended the turn.
+                AgentEvent::TurnFailed(s) => {
                     failure = Some(s.clone());
                     inside(AgentEvent::Error(s))
                 }
@@ -2305,6 +2323,52 @@ mod tests {
         let bodies = fake.bodies.lock().unwrap().clone();
         let input = bodies.last().unwrap().1["input"].to_string();
         assert!(input.contains("look again"), "{input}");
+    }
+
+    /// A child that cannot write its transcript still says why it ended. The disk is the
+    /// harness's problem; the child's result is about the child.
+    #[tokio::test]
+    async fn a_transcript_that_will_not_write_is_not_the_reason_a_child_ended() {
+        use fake::{Fake, say};
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // An answer with no text in it, so the turn ends cleanly with nothing to report.
+        let fake = Fake::new(vec![vec![say("")]]);
+        let policy = Policy::default();
+        // `/dev/null` is a file, so creating a directory under it fails on every write.
+        let transcript = Path::new("/dev/null/bhai/child-c1.jsonl");
+        let finished = run_child(Child {
+            id: "c1",
+            description: "look around",
+            task: "go",
+            prompt: crate::prompt::system_prompt(&[], Vec::new()),
+            model: &fake,
+            policy: &policy,
+            tx: &tx,
+            cancel: &Arc::new(AtomicBool::new(false)),
+            transcript: Some(transcript),
+            children: &Children::default(),
+            steer: None,
+            judge: None,
+        })
+        .await;
+
+        let reason = format!("{:#}", finished.result.unwrap_err());
+        assert_eq!(reason, "ended without a final message");
+        // The write failure is still shown in the child's pane.
+        drop(tx);
+        let mut errors = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Child { event, .. } = event
+                && let AgentEvent::Error(e) = &*event
+            {
+                errors.push(e.clone());
+            }
+        }
+        assert!(
+            errors.iter().any(|e| e.starts_with(TRANSCRIPT_ERROR)),
+            "{errors:?}"
+        );
     }
 
     /// `auto` mode never prompts, so a child with no judge could only run what the rules

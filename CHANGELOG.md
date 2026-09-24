@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A child agent says why it ended, not what the disk did. A failed transcript write reached
+  the parent as the child's own failure reason, so `child c1 (general) failed ... :
+  transcript: Not a directory` stood where "ended without a final message" belonged. A write
+  failure is still shown in the child's pane and is no longer eligible as the reason; of the
+  errors that are, the first is kept rather than the last, and a turn-ending failure
+  replaces it whenever it lands.
+
 - A child agent that spends its whole step budget says so. It used to report "finished" in
   the same words as a natural completion, so a result the agent was told to cut short read
   as a finished one: the `agent` tool output now says `finished in 40 steps (step budget
