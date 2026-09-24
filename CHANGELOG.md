@@ -6,6 +6,10 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A transcript past 65535 rows scrolls to its end instead of wrapping back to its top. The
+  view is now drawn from the rows below the scroll rather than through the widget's own
+  `u16` offset, which also stops it walking every row it is not drawing.
+
 - A transcript draws what a terminal would act on or hide as what it is. Control bytes from
   a command's output went to the screen, into the rows a selection is measured in, and onto
   the system clipboard; tag and bidi characters, which render as nothing, carried text

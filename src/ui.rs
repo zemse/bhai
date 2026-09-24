@@ -546,10 +546,11 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).scroll((app.scroll as u16, 0)),
-        text_area,
-    );
+    // Scrolled by dropping the rows above the view rather than by the widget's own
+    // offset, which is a u16: a transcript longer than 65535 rows would wrap back to the
+    // top of itself. It also stops the widget walking every row it is not drawing.
+    lines.drain(..app.scroll.min(lines.len()));
+    frame.render_widget(Paragraph::new(lines), text_area);
     render_badges(frame, text_area, app);
 
     app.scrollbar = (max_scroll > 0).then_some(bar_area);
@@ -1418,6 +1419,27 @@ mod tests {
         assert_eq!(rows[start], "\u{23fa} a message long enough");
         // What the wrap made of the rest lines up under the message, not under the mark.
         assert_eq!(rows[start + 1], "  that it wraps around");
+    }
+
+    /// The widget's own scroll offset is a `u16`, so a transcript past 65535 rows used to
+    /// wrap back to the top of itself. A long session reaches that.
+    #[test]
+    fn a_transcript_longer_than_a_u16_still_shows_its_end() {
+        let mut app = App::detached();
+        {
+            let mut entries = app.entries();
+            for i in 0..u16::MAX as usize + 40 {
+                entries.push(Entry::Info(format!("line {i}")));
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.scroll > u16::MAX as usize, "{}", app.scroll);
+        let shown = screen(&terminal);
+        assert!(
+            shown.contains(&format!("line {}", u16::MAX as usize + 39)),
+            "{shown:?}"
+        );
     }
 
     /// A tool's output and a model's answer are text nobody here wrote. What the terminal
