@@ -20,7 +20,7 @@ use crate::entries::Entry;
 use crate::limits::RateLimits;
 use crate::permissions::Mode;
 use crate::profile::Profile;
-use crate::session::State;
+use crate::session::{ChildLog, State};
 
 /// Characters of one transcript entry the file carries before the rest is counted off.
 /// Well past any command or answer; it is there so a session that catted a binary does
@@ -55,8 +55,10 @@ pub struct Bundle {
     pub workflows: String,
     /// The judge's log, as its JSONL lines.
     pub judged: Vec<Value>,
-    /// The child agents of the running turn, if any are still around.
-    pub children: Vec<crate::session::ChildRow>,
+    /// Every child agent of the session, oldest first, with what its pane showed.
+    pub children: Vec<ChildLog>,
+    /// Where the children's full histories are, one `child-<id>.jsonl` each.
+    pub sidechains: Option<PathBuf>,
     /// The transcript in order.
     pub entries: Vec<Entry>,
     /// `/context`, when the profile could be built.
@@ -92,10 +94,11 @@ impl Bundle {
             .filter(|line| line.starts_with("  "))
             .count();
         format!(
-            "session debug written to {}\n{} transcript entries, {} judge decisions, \
-{rules} permission rules, context {}",
+            "session debug written to {}\n{} transcript entries, {} child agents, {} judge \
+decisions, {rules} permission rules, context {}",
             path.display(),
             self.entries.len(),
+            self.children.len(),
             self.judged.len(),
             match self.profile.is_some() {
                 true => "profiled",
@@ -118,6 +121,7 @@ impl Bundle {
             None => section(&mut out, "context", PROFILE_MISSING),
         }
         self.transcript(&mut out);
+        self.children(&mut out);
         // One pass at the end, so it reaches the transcript and the judge summaries too.
         match &self.home {
             Some(home) => out.replace(&home.display().to_string(), "~"),
@@ -216,10 +220,11 @@ summaries below hold whatever this session saw, so read them before sending this
             let _ = writeln!(out, "- rate limits: {}", windows(rate));
         }
         for child in &self.children {
+            let row = &child.row;
             let _ = writeln!(
                 out,
                 "- child {} ({}, {:?}): {}",
-                child.id, child.identity, child.state, child.description
+                row.id, row.identity, row.state, row.description
             );
         }
     }
@@ -251,9 +256,13 @@ was sent.\n",
                 "" => format!("no verdict ({})", field("error")),
                 name => format!("{name}: {}", field("reason")),
             };
+            let from = match field("agent").as_str() {
+                "" => String::new(),
+                id => format!(" (child {id})"),
+            };
             let _ = writeln!(
                 out,
-                "### {} — {verdict}\n\n{}ms, {} in / {} out\n\n```\n{}\n```\n",
+                "### {}{from} — {verdict}\n\n{}ms, {} in / {} out\n\n```\n{}\n```\n",
                 field("timestamp"),
                 number("latency_ms"),
                 number("input"),
@@ -270,16 +279,38 @@ was sent.\n",
 characters is cut, with what was left off counted at the end of it.\n",
             self.entries.len()
         );
-        for (index, entry) in self.entries.iter().enumerate() {
-            let kind = match entry {
-                Entry::Command { tool, .. } => format!("command ({tool})"),
-                other => other.kind().to_string(),
-            };
+        entries(out, &self.entries, "###");
+    }
+
+    /// Each child's own transcript, which the session's leaves out: it shows the
+    /// `agent` call and the report, and nothing the child did in between.
+    fn children(&self, out: &mut String) {
+        let _ = writeln!(out, "\n## children\n");
+        if self.children.is_empty() {
+            let _ = writeln!(out, "None started in this session.\n");
+            return;
+        }
+        let _ = writeln!(
+            out,
+            "{} child agents, oldest first, each with what its pane showed. The first \
+entry is the brief it was given.\n",
+            self.children.len()
+        );
+        for child in &self.children {
+            let row = &child.row;
             let _ = writeln!(
                 out,
-                "### {index} {kind}\n\n```\n{}\n```\n",
-                clip(entry.text())
+                "### child {} ({}): {}\n\n- state: {:?}\n- events heard: {}",
+                row.id, row.identity, row.description, row.state, row.steps
             );
+            if let Some(dir) = &self.sidechains {
+                let file = dir.join(format!("child-{}.jsonl", row.id));
+                if file.exists() {
+                    let _ = writeln!(out, "- full history: {}", file.display());
+                }
+            }
+            let _ = writeln!(out);
+            entries(out, &child.entries, "####");
         }
     }
 }
@@ -300,6 +331,21 @@ fn clip(text: &str) -> String {
             text.chars().count() - ENTRY_CLIP
         ),
         None => text.to_string(),
+    }
+}
+
+/// A transcript's entries in order, each under a `level` heading.
+fn entries(out: &mut String, entries: &[Entry], level: &str) {
+    for (index, entry) in entries.iter().enumerate() {
+        let kind = match entry {
+            Entry::Command { tool, .. } => format!("command ({tool})"),
+            other => other.kind().to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "{level} {index} {kind}\n\n```\n{}\n```\n",
+            clip(entry.text())
+        );
     }
 }
 
@@ -351,6 +397,7 @@ mod tests {
             workflows: "no workflows".to_string(),
             judged: Vec::new(),
             children: Vec::new(),
+            sidechains: None,
             entries,
             profile: None,
         }
@@ -401,10 +448,54 @@ mod tests {
             "## workflows",
             "## context",
             "## transcript",
+            "## children",
         ] {
             assert!(out.contains(heading), "{heading} missing from {out}");
         }
         assert!(out.contains(PROFILE_MISSING));
         assert!(out.contains("None logged."));
+        assert!(out.contains("None started in this session."));
+    }
+
+    /// A child's work is not in the session's transcript, so the export carries each
+    /// child's own, and says which judge decisions were its.
+    #[test]
+    fn every_child_is_written_with_its_own_transcript() {
+        use crate::session::{ChildRow, ChildState};
+
+        let mut b = bundle(Vec::new());
+        b.children = vec![ChildLog {
+            row: ChildRow {
+                id: "74b01e".to_string(),
+                identity: "general".to_string(),
+                description: "build the circuits".to_string(),
+                state: ChildState::Done,
+                steps: 14,
+                last: std::time::Instant::now(),
+            },
+            entries: vec![
+                Entry::User("create the branch".to_string()),
+                Entry::Command {
+                    tool: "bash".to_string(),
+                    summary: "git status".to_string(),
+                },
+            ],
+        }];
+        b.judged = vec![serde_json::json!({
+            "timestamp": "2026-09-24T12:00:00+05:30",
+            "agent": "74b01e",
+            "verdict": "approve",
+            "reason": "reads the repo",
+            "summary": "target: git status",
+        })];
+        let out = b.markdown();
+        let children = &out[out.find("## children").unwrap()..];
+        assert!(children.contains("### child 74b01e (general): build the circuits"));
+        assert!(children.contains("create the branch"), "{children}");
+        assert!(children.contains("#### 1 command (bash)"), "{children}");
+        assert!(
+            out.contains("(child 74b01e) — approve: reads the repo"),
+            "{out}"
+        );
     }
 }

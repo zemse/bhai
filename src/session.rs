@@ -174,6 +174,13 @@ struct Pane {
     entries: Arc<Mutex<Entries>>,
 }
 
+/// One child agent as `/export-debug` writes it: its row and everything its pane showed.
+#[derive(Debug, Clone)]
+pub struct ChildLog {
+    pub row: ChildRow,
+    pub entries: Vec<Entry>,
+}
+
 /// A tool call waiting for approval.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Approval {
@@ -294,6 +301,9 @@ pub struct Session {
     entries: Mutex<Entries>,
     /// The child agents of the running turn, oldest first.
     children: Mutex<Vec<Pane>>,
+    /// Children the panel has let go of, oldest first, kept so the debug export can
+    /// still say what they did.
+    ended: Mutex<Vec<Pane>>,
     /// Where a message typed into a child's pane is posted; the agent fills it in as
     /// each child starts.
     mailboxes: Mailboxes,
@@ -324,6 +334,7 @@ impl Session {
             inner: Mutex::default(),
             entries: Mutex::default(),
             children: Mutex::default(),
+            ended: Mutex::default(),
             mailboxes: Mailboxes::default(),
             tx_user,
             tx_control,
@@ -768,7 +779,14 @@ impl Session {
             // The panel lists what is running and what this turn started, so a new turn
             // clears the finished rows and leaves the children still going.
             Event::User(_) | Event::Resumed(_) => {
-                children.retain(|pane| pane.row.state == ChildState::Running)
+                let (running, ended): (Vec<_>, Vec<_>) = std::mem::take(&mut *children)
+                    .into_iter()
+                    .partition(|pane| pane.row.state == ChildState::Running);
+                *children = running;
+                self.ended
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(ended);
             }
             Event::ChildStarted {
                 id,
@@ -853,6 +871,28 @@ impl Session {
     /// The child agents of the running turn, for the panel.
     pub fn children(&self) -> Vec<ChildRow> {
         self.panes().iter().map(|pane| pane.row.clone()).collect()
+    }
+
+    /// Every child agent of the session, the ones the panel has let go of first.
+    pub fn child_logs(&self) -> Vec<ChildLog> {
+        let log = |pane: &Pane| ChildLog {
+            row: pane.row.clone(),
+            entries: pane
+                .entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .list
+                .clone(),
+        };
+        let mut logs: Vec<ChildLog> = self
+            .ended
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(log)
+            .collect();
+        logs.extend(self.panes().iter().map(log));
+        logs
     }
 
     /// One child agent's transcript, which the pane renders and reads live.
@@ -1010,6 +1050,12 @@ mod tests {
         assert!(!session.child_running());
         session.publish(Event::User("and again".to_string()));
         assert!(session.children().is_empty());
+
+        // The panel lets them go, the debug export does not.
+        let logs = session.child_logs();
+        let ids: Vec<&str> = logs.iter().map(|log| log.row.id.as_str()).collect();
+        assert_eq!(ids, ["a1", "b2"]);
+        assert!(matches!(&logs[1].entries[0], Entry::User(t) if t == "read the docs"));
     }
 
     #[test]

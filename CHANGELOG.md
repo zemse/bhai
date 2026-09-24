@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- `/export-debug` writes every child agent of the session: its row, the brief it was
+  given, everything its pane showed and where its full history is on disk. It used to list
+  only the children still on the panel, which a new message clears of finished ones, and
+  none of what they did. The session now keeps the panes the panel lets go of, and the
+  judge decisions say which child each one was for.
+
 - A child agent in `auto` mode is judged instead of denied. Children ran with no judge,
   which was harmless while a call with no verdict fell back to asking, and blocked every
   call past the rules once `auto` stopped asking. Each child now gets a judge forked from

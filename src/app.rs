@@ -1357,7 +1357,9 @@ impl App {
             mcp: crate::mcp::report(self.mcp.as_deref()),
             workflows: workflow::report(&self.workflows),
             judged: debug::judge_log(&profile::debug_dir().join("judge.jsonl")),
-            children: self.session.children(),
+            children: self.session.child_logs(),
+            sidechains: (!self.session_id.is_empty())
+                .then(|| cwd.join(crate::sessions::DIR).join(&self.session_id)),
             // The session's own transcript, not the child pane that may be open over it.
             entries: self.session.entries().list.clone(),
             profile: None,
