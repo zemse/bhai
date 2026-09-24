@@ -709,21 +709,37 @@ impl Checker<'_> {
         }
 
         let mut reasons: Vec<String> = Vec::new();
-        // The rest of the chain runs wherever its `cd`s have left it.
-        let mut cwd = self.base.cwd.to_path_buf();
+        // The rest of the chain runs wherever its `cd`s have left it, or nowhere this can
+        // name once a `cd` it cannot follow has moved it.
+        let mut cwd: Option<PathBuf> = Some(self.base.cwd.to_path_buf());
         for c in &commands {
             // A `cd` in a pipeline moves only its own subshell, so it says nothing
             // about where the rest of the chain runs.
-            if self.mode != Mode::Ask
-                && !c.piped
-                && let Some(target) = bash::cd_target(&c.words)
-            {
-                // A `cd` out of the project decides nothing about what follows it.
-                let Some(next) = self.cd_into(&cwd, target) else {
+            if self.mode != Mode::Ask && !c.piped && c.words.first().is_some_and(|w| w == "cd") {
+                let followed = bash::cd_target(&c.words)
+                    .and_then(|target| self.cd_into(cwd.as_deref()?, target));
+                if let Some(next) = followed {
+                    cwd = Some(next);
+                    let reason = "cd inside the project".to_string();
+                    if !reasons.contains(&reason) {
+                        reasons.push(reason);
+                    }
+                    continue;
+                }
+                // `cd ~`, `cd -`, a bare `cd` and a target outside the project all leave
+                // the chain somewhere this cannot name. An allow rule for `cd` still lets
+                // the move happen, but what follows it can no longer be called the
+                // project's own work: it has to stand on a rule or on being read-only.
+                let Some(rule) = self
+                    .allow()
+                    .iter()
+                    .find(|r| r.applies_to("bash") && r.matches_words(&c.words, false))
+                    .cloned()
+                else {
                     return self.fallback(None);
                 };
-                cwd = next;
-                let reason = "cd inside the project".to_string();
+                cwd = None;
+                let reason = rule_reason(&rule);
                 if !reasons.contains(&reason) {
                     reasons.push(reason);
                 }
@@ -736,10 +752,10 @@ impl Checker<'_> {
                 .allow()
                 .iter()
                 .find(|r| r.applies_to("bash") && r.matches_words(&c.words, false))
-                .filter(|_| self.redirects_allowed(c, &cwd))
+                .filter(|_| self.redirects_allowed(c, cwd.as_deref()))
                 .map(rule_reason)
                 .or_else(|| read_only.then(|| "read-only".to_string()))
-                .or_else(|| self.project_command(c, &cwd).then(project_reason));
+                .or_else(|| self.project_command(c, cwd.as_deref()).then(project_reason));
             match reason {
                 Some(reason) => {
                     if !reasons.contains(&reason) {
@@ -864,19 +880,24 @@ impl Checker<'_> {
     }
 
     /// A build or test command the project runs on itself, from `cwd`.
-    fn project_command(&self, command: &bash::Command, cwd: &Path) -> bool {
+    fn project_command(&self, command: &bash::Command, cwd: Option<&Path>) -> bool {
+        // With nowhere to resolve a relative path against, nothing can be shown to be the
+        // project's own work.
+        let Some(cwd) = cwd else {
+            return false;
+        };
         let inside = |arg: &str| rules::is_inside(&cwd.join(arg), self.base.cwd);
         self.relaxed()
             && self.relax.commands
             && command.nested().is_empty()
             && bash::is_project_command(&command.words, &inside)
-            && self.redirects_inside(command, cwd)
+            && self.redirects_inside(command, Some(cwd))
     }
 
     /// Whether every file the command redirects into is one a write would be allowed to
     /// make: a redirect is a write, so `auto` relaxes it on the same terms. A command
     /// that writes nowhere passes.
-    fn redirects_inside(&self, command: &bash::Command, cwd: &Path) -> bool {
+    fn redirects_inside(&self, command: &bash::Command, cwd: Option<&Path>) -> bool {
         command.writes.iter().all(|target| {
             self.write_target(cwd, target)
                 .is_some_and(|path| self.project_write("write", &path))
@@ -887,7 +908,7 @@ impl Checker<'_> {
     /// allow rule names a program, not the files a redirect points its output at, so the
     /// targets are checked as writes in their own right and a deny, an ask or a
     /// protected path still stops them.
-    fn redirects_allowed(&self, command: &bash::Command, cwd: &Path) -> bool {
+    fn redirects_allowed(&self, command: &bash::Command, cwd: Option<&Path>) -> bool {
         command.writes.iter().all(|target| {
             self.write_target(cwd, target).is_some_and(|path| {
                 matches!(self.check_path("write", &path, true), Decision::Allow(_))
@@ -898,12 +919,14 @@ impl Checker<'_> {
     /// The file a redirect target names. A leading `~/` is the home directory; `Path::join`
     /// would take it for a relative component and land it inside the project. Any other
     /// `~` form is an expansion nothing here can resolve, so there is no path to check
-    /// and the redirect fails closed.
-    fn write_target(&self, cwd: &Path, target: &str) -> Option<PathBuf> {
+    /// and the redirect fails closed. So is a relative target with no directory to resolve
+    /// it against.
+    fn write_target(&self, cwd: Option<&Path>, target: &str) -> Option<PathBuf> {
         match target.strip_prefix("~/") {
             Some(rest) => Some(self.base.home?.join(rest)),
             None if target.starts_with('~') => None,
-            None => Some(cwd.join(target)),
+            None if Path::new(target).is_absolute() => Some(PathBuf::from(target)),
+            None => Some(cwd?.join(target)),
         }
     }
 
@@ -1817,6 +1840,46 @@ mod tests {
             Decision::Ask
         );
         assert_eq!(bash(&p, "cd wordcount && cargo test"), Decision::Ask);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `Bash(cd:*)` is common in a Claude Code settings file. It lets the move happen; it
+    /// does not make wherever the move landed the project.
+    #[test]
+    fn an_allow_rule_for_cd_leaves_the_directory_unknown() {
+        let dir = std::env::temp_dir().join(format!("bhai-policy-{}", uuid::Uuid::new_v4()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("wordcount")).unwrap();
+        let rules = Rules {
+            allow: rules(&["Bash(cd:*)"]),
+            ..Rules::default()
+        };
+        let p = Policy::new(Mode::Auto, rules, None, repo.clone())
+            .with_trust(Trust::new(&dir.join("config"), &repo));
+        p.trust().unwrap();
+
+        // The rule used to carry the project with it: `cd ~` was not a shape the cwd
+        // tracking could follow, so it fell through to the rule and `cargo test` ran as
+        // the project's own work in the home directory.
+        for command in [
+            "cd ~ && cargo test",
+            "cd - && cargo test",
+            "cd && cargo test",
+            "cd /etc && cargo test",
+            "cd .. && echo x > out",
+        ] {
+            assert_eq!(bash(&p, command), Decision::Ask, "{command}");
+        }
+        // What stands on its own still stands: the move is allowed and `ls` reads.
+        assert_eq!(
+            bash(&p, "cd /etc && ls -la"),
+            allowed("rule Bash(cd:*), read-only")
+        );
+        // A `cd` this can follow is still followed, rule or no rule.
+        assert_eq!(
+            bash(&p, "cd wordcount && cargo test"),
+            allowed("cd inside the project, auto, inside the project")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

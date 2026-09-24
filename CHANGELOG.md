@@ -6,6 +6,14 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- An allow rule for `cd` no longer carries the project with it. `Bash(cd:*)`, which a Claude
+  Code settings file commonly has, matched `cd ~`, `cd -` and a bare `cd` as an ordinary
+  allowed command while the cwd tracking, which reads only `cd <one relative or absolute
+  path>`, left the tracked directory at the project root: `cd ~ && cargo test` then ran in
+  the home directory as "inside the project", in `auto`, without asking. A `cd` the tracking
+  cannot follow now makes the directory unknown, so what follows it has to stand on a rule
+  or on being read-only, and never on being the project's own work.
+
 - The system prompt stops saying two things that are not true. It forbade markdown headers
   and bullets while the transcript has rendered headings, tables, lists, code and mermaid
   since the hackmd port, and the model ignored the rule in every transcript that was looked
