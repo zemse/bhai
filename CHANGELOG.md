@@ -4,6 +4,14 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-09-25
+
+- A denial in `auto` on a chained command names the rules that would cover it. One rule
+  cannot cover `a && b`, so the offer was empty for every chain, and `auto` never prompts:
+  the user was told to switch modes with nothing they could run instead. It now reads
+  `No one rule covers a chain; the user can permit its parts with `/allow Bash(printf:*)`
+  and `/allow Bash(git config:*)``, unless a link is one nothing can name.
+
 ## 2026-09-24
 
 - `/context` shares are shares of the tokens, not of the bytes, and the calibration

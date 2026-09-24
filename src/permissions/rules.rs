@@ -250,7 +250,13 @@ pub fn exact_command(command: &str) -> Option<Rule> {
 /// `Bash(ls:*)`, or `Bash(git log:*)` for multi-verb tools. Never behind a wrapper,
 /// where the prefix would be the wrapper itself.
 pub fn prefix_command(command: &str) -> Option<Rule> {
-    let command = single(command)?;
+    prefix_of(&single(command)?)
+}
+
+fn prefix_of(command: &bash::Command) -> Option<Rule> {
+    if command.words.is_empty() || bash::mentions_protected(command) {
+        return None;
+    }
     if command.unwrapped().len() < command.words.len() {
         return None;
     }
@@ -278,6 +284,27 @@ pub fn prefix_command(command: &str) -> Option<Rule> {
 }
 
 /// The one simple command in `command`, unless it may reach a protected path.
+/// A prefix rule for each link of a chain, in order and without repeats. One rule cannot
+/// cover `a && b`, so a chain offers none; naming the rules each link would need is still
+/// something the user can act on, which an empty offer is not.
+pub fn prefix_commands(command: &str) -> Vec<String> {
+    let parts = bash::parse(command).unwrap_or_default();
+    // One command already has a rule of its own, from `prefix_command`.
+    if parts.len() < 2 {
+        return Vec::new();
+    }
+    let mut rules: Vec<String> = Vec::new();
+    for part in &parts {
+        let Some(rule) = prefix_of(part) else {
+            return Vec::new();
+        };
+        if !rules.contains(&rule.text) {
+            rules.push(rule.text);
+        }
+    }
+    rules
+}
+
 fn single(command: &str) -> Option<bash::Command> {
     let mut commands = bash::parse(command)?;
     if commands.len() != 1 {
@@ -779,6 +806,30 @@ mod tests {
             cwd: Path::new(CWD),
         };
         assert!(!home.matches_path(Path::new("/home/u/x"), no_home, false));
+    }
+
+    /// A denial in `auto` is not a prompt, so an offer with nothing in it leaves the
+    /// user with no way to say yes. One rule cannot cover a chain; naming one per link
+    /// can.
+    #[test]
+    fn a_chain_offers_a_rule_for_each_of_its_parts() {
+        assert_eq!(
+            prefix_commands(
+                "printf '.bhai\n' > ~/.gitignore_global && git config --global core.excludesFile ~/.gitignore_global && cat ~/.gitignore_global"
+            ),
+            ["Bash(printf:*)", "Bash(git config:*)", "Bash(cat:*)"]
+        );
+        // Repeats collapse, so the same program twice is offered once.
+        assert_eq!(
+            prefix_commands("cargo build && cargo test"),
+            ["Bash(cargo build:*)", "Bash(cargo test:*)"]
+        );
+        assert_eq!(prefix_commands("echo a && echo b"), ["Bash(echo:*)"]);
+        // One command has a single rule of its own, so there is no chain to spell out.
+        assert!(prefix_commands("cargo test").is_empty());
+        // A link nothing can name takes the whole chain with it.
+        assert!(prefix_commands("cat ~/.ssh/id_rsa && echo done").is_empty());
+        assert!(prefix_commands("ls $(x) && echo done").is_empty());
     }
 
     #[test]

@@ -1717,11 +1717,21 @@ as-is. Try a different approach, or ask the user."
                     // The rule that would let this very call through, so telling the
                     // user to ask for it is a command they can run rather than a mode
                     // they have to go and find.
+                    let chain = || {
+                        let command = args.get("command").and_then(Value::as_str)?;
+                        let rules = crate::permissions::rules::prefix_commands(command);
+                        let each: Vec<String> =
+                            rules.iter().map(|r| format!("`/allow {r}`")).collect();
+                        (!each.is_empty()).then(|| format!(
+                            " No one rule covers a chain; the user can permit its parts with {}.",
+                            each.join(" and ")
+                        ))
+                    };
                     let offer = match policy.offers(name, &args).prefix {
                         Some(rule) => format!(
                             " To permit this and calls like it, the user can run `/allow {rule}`."
                         ),
-                        None => String::new(),
+                        None => chain().unwrap_or_default(),
                     };
                     return (
                         format!(
