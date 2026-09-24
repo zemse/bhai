@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-24
 
+- A panic in the agent loop ends the turn it was running. The task was spawned with its
+  handle dropped, so a panic in the loop or in a tool left the session marked working, with
+  a spinner that never stopped and no error to say why. The loop is now watched, and a panic
+  becomes a failed turn and a `TurnEnd`.
+
 - A deny or ask rule whose shape bhai cannot parse now fails closed. `Bash(npm run test?)`
   and anything else with a `?`, a chain or a substitution in it was dropped with a startup
   notice, so a rule written to stop something stopped nothing. Such a rule is kept as the

@@ -693,7 +693,11 @@ fn start(
         mailboxes: session.mailboxes(),
         ..delegation
     };
-    tokio::spawn(agent::run(
+    // A panic in the loop or in a tool would otherwise end the task with the session still
+    // marked working: no error, no `TurnEnd`, and a spinner that never stops. The panic
+    // itself is reported by the hook; this is what lets the session say so and come back.
+    let watch = tx_agent.clone();
+    let loop_task = tokio::spawn(agent::run(
         client,
         prompt,
         policy,
@@ -708,6 +712,7 @@ fn start(
         Some(saved),
         limits,
     ));
+    tokio::spawn(session::watch(loop_task, watch));
     tokio::spawn(session::pump(Arc::clone(&session), rx_agent));
     (session, events)
 }

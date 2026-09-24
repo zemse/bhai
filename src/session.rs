@@ -940,6 +940,23 @@ fn add(total: &mut Usage, usage: Usage) {
     total.reasoning += usage.reasoning;
 }
 
+/// Watch the agent's task and say so if it stopped on a panic. Nothing else reports it:
+/// the loop owns the sender, so a panic ends the turn with no error and no `TurnEnd`, and
+/// the session sits on a turn that will never finish. The panic itself is printed by the
+/// process hook; this is what lets the session say it is over.
+pub async fn watch(task: tokio::task::JoinHandle<()>, tx: mpsc::UnboundedSender<AgentEvent>) {
+    let Err(e) = task.await else {
+        return;
+    };
+    if !e.is_panic() {
+        return;
+    }
+    let _ = tx.send(AgentEvent::TurnFailed(
+        "the agent loop stopped on a panic; this session cannot take another message".to_string(),
+    ));
+    let _ = tx.send(AgentEvent::TurnEnd);
+}
+
 /// Feed the agent's events into the session until the agent goes away.
 pub async fn pump(session: Arc<Session>, mut rx_agent: mpsc::UnboundedReceiver<AgentEvent>) {
     while let Some(event) = rx_agent.recv().await {
@@ -970,6 +987,33 @@ mod tests {
             ),
             rx_user,
         )
+    }
+
+    /// A panic in the loop ends its task with no error and no `TurnEnd` of its own, so
+    /// without this the session stays working and the spinner never stops.
+    #[tokio::test]
+    async fn a_panicked_loop_ends_the_turn_it_left_running() {
+        let (session, _rx_user) = session();
+        let (tx_agent, rx_agent) = mpsc::unbounded_channel();
+        let pumping = tokio::spawn(pump(Arc::clone(&session), rx_agent));
+        let task = tokio::spawn({
+            let tx = tx_agent.clone();
+            async move {
+                let _ = tx.send(AgentEvent::Streaming(true));
+                panic!("a tool went wrong");
+            }
+        });
+        watch(task, tx_agent).await;
+        // `watch` held the last sender, so the pump ends once it has the events.
+        pumping.await.unwrap();
+        let state = session.state();
+        assert!(!state.working, "{state:?}");
+        let said = session
+            .entries()
+            .list
+            .iter()
+            .any(|e| matches!(e, Entry::Failed(text) if text.contains("panic")));
+        assert!(said, "{:?}", session.entries().list);
     }
 
     fn approval(session: &Session) -> oneshot::Receiver<Answer> {
