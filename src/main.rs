@@ -1041,6 +1041,12 @@ async fn cache_check(setup: Setup, wait: Option<Duration>) -> Result<bool> {
         });
     }
     let tools = registry.schemas();
+    // The cache matches on the prefix whatever the key, so without a prefix of its own a
+    // waited call could find one that a concurrent check, or a session, kept warm.
+    let instructions = match wait {
+        Some(_) => format!("cache-check {}\n{}", uuid::Uuid::new_v4(), system.text),
+        None => system.text.clone(),
+    };
     let mut input = cache_check_prefix(&system, &tools);
     let mut monitor = cache::CacheMonitor::default();
     let mut rows = Vec::new();
@@ -1066,7 +1072,7 @@ async fn cache_check(setup: Setup, wait: Option<Duration>) -> Result<bool> {
             _ => {}
         };
         let items = client
-            .respond(&system.text, &tools, &input, &mut on_delta, &cancel.flag())
+            .respond(&instructions, &tools, &input, &mut on_delta, &cancel.flag())
             .await?;
         let usage = usage.ok_or_else(|| anyhow::anyhow!("call {call} reported no usage"))?;
         let mut hit = monitor.observe(&usage, std::time::Instant::now());
