@@ -375,6 +375,15 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ));
     }
+    if let Some(left) = app.cache_left() {
+        bar.push((
+            ALWAYS,
+            Span::styled(
+                format!("cache expires in {} ", clock(left)),
+                Style::new().fg(Color::Yellow),
+            ),
+        ));
+    }
     if let Some(tokens) = app.cold_tokens() {
         bar.push((
             ALWAYS,
@@ -509,6 +518,12 @@ fn clip(text: &str, max: usize) -> String {
         true => flat.chars().take(max.saturating_sub(1)).collect::<String>() + "…",
         false => flat,
     }
+}
+
+/// A countdown as `4:07`, rounded up so it never shows `0:00` while time is left.
+pub fn clock(left: Duration) -> String {
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 pub fn compact(n: u64) -> String {
@@ -1367,6 +1382,13 @@ mod tests {
             output,
             reasoning,
         }
+    }
+
+    #[test]
+    fn a_countdown_rounds_up_to_the_second() {
+        assert_eq!(clock(Duration::from_secs(247)), "4:07");
+        assert_eq!(clock(Duration::from_millis(300)), "0:01");
+        assert_eq!(clock(Duration::from_secs(300)), "5:00");
     }
 
     #[test]

@@ -41,6 +41,10 @@ pub const VARIABLES: &[(&str, &str)] = &[
         "a cache break, a stall or a miss, while there is one",
     ),
     (
+        "cache_timer",
+        "`cache expires in 4:07`, over the cache's last five minutes",
+    ),
+    (
         "cache_expired",
         "`cache expired: /clear to save ~86k tokens`, once the cache has likely lapsed",
     ),
@@ -485,6 +489,16 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
         (None, false, None) => Value::default(),
     };
     set("cache_alert", cache_alert);
+    set(
+        "cache_timer",
+        match app.cache_left() {
+            Some(left) => Value {
+                text: format!("cache expires in {}", crate::ui::clock(left)),
+                alert: Some(Style::new().fg(Color::Yellow)),
+            },
+            None => Value::default(),
+        },
+    );
     set(
         "cache_expired",
         match app.cold_tokens() {

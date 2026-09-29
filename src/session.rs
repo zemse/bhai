@@ -306,8 +306,11 @@ struct Inner {
     calls: u64,
     children: Usage,
     last_usage: Option<Usage>,
-    /// When the conversation's last call finished, while its cached prefix may be warm.
+    /// When the conversation's last call was sent, which is when the backend last wrote
+    /// or reused its cached prefix, while that may be warm.
     last_call: Option<Instant>,
+    /// When the call in flight was sent.
+    sending: Option<Instant>,
     last_cache_break: Option<CacheBreak>,
     rate_limits: Option<RateLimits>,
     next_id: u64,
@@ -557,6 +560,17 @@ impl Session {
         }
     }
 
+    /// How long the cached prefix has left while idle, once that is under `CACHE_WARNING`.
+    pub fn cache_left(&self) -> Option<Duration> {
+        let inner = self.lock();
+        if inner.working || inner.last_usage.is_none_or(|usage| usage.input == 0) {
+            return None;
+        }
+        crate::cache::CACHE_TTL
+            .checked_sub(inner.last_call?.elapsed())
+            .filter(|left| !left.is_zero() && *left <= crate::cache::CACHE_WARNING)
+    }
+
     /// How long the cached prefix may stay warm, when putting the current model on
     /// `effort` would re-read it all: a Codex model outside the GPT-6 family renders the
     /// effort ahead of the conversation. `None` when the change costs nothing.
@@ -769,7 +783,7 @@ impl Session {
             AgentEvent::Usage(usage) => {
                 add(&mut inner.total, usage);
                 inner.last_usage = Some(usage);
-                inner.last_call = Some(Instant::now());
+                inner.last_call = Some(inner.sending.take().unwrap_or_else(Instant::now));
                 Event::Usage(usage)
             }
             AgentEvent::ChildUsage(usage) => {
@@ -815,7 +829,12 @@ impl Session {
                 Event::RateLimits(limits)
             }
             AgentEvent::Sending(tokens) => Event::Sending(tokens),
-            AgentEvent::Streaming(on) => Event::Streaming(on),
+            AgentEvent::Streaming(on) => {
+                if on {
+                    inner.sending = Some(Instant::now());
+                }
+                Event::Streaming(on)
+            }
             AgentEvent::Info(s) => Event::Info(s),
             AgentEvent::Judging(what) => Event::Judging(what),
             AgentEvent::Titled(name) => Event::Titled(name),
@@ -1704,5 +1723,30 @@ mod tests {
         );
         session.on_agent(AgentEvent::Cleared);
         assert_eq!(session.cold_tokens(), None);
+    }
+
+    #[test]
+    fn the_cache_counts_down_its_last_minutes() {
+        let (session, _control) = on("gpt-5.6-sol");
+        called(&session, 86_000);
+        assert_eq!(session.cache_left(), None, "not close yet");
+        let ttl = crate::cache::CACHE_TTL;
+        let warning = crate::cache::CACHE_WARNING;
+        session.lock().last_call = Some(Instant::now() - (ttl - warning / 2));
+        let left = session.cache_left().expect("counting down");
+        assert!(left <= warning / 2 && left > warning / 4, "{left:?}");
+        session.lock().last_call = Some(Instant::now() - ttl);
+        assert_eq!(session.cache_left(), None, "expired instead");
+        assert_eq!(session.cold_tokens(), Some(86_000));
+    }
+
+    #[test]
+    fn the_cache_clock_starts_when_the_call_is_sent() {
+        let (session, _control) = on("gpt-5.6-sol");
+        session.on_agent(AgentEvent::Streaming(true));
+        let sent = session.lock().sending.expect("stamped");
+        session.on_agent(AgentEvent::Streaming(false));
+        called(&session, 86_000);
+        assert_eq!(session.lock().last_call, Some(sent));
     }
 }

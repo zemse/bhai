@@ -6,6 +6,11 @@ carries the shape of what is there.
 
 ## 2026-09-29
 
+- The prompt cache is assumed to last 30 minutes from when a call was sent, not 5 from
+  when it finished, and the status bar counts down its last five: `cache expires in
+  4:07`, then the `cache expired` hint as before. `$cache_timer` shows the same for a
+  status line template. An effort change that would re-read the conversation uncached
+  now waits out the longer lifetime too.
 - `bhai --cache-check [minutes]` makes one more call that long after the others and
   judges it even past the cache's assumed lifetime, so how long the Codex backend really
   keeps a prefix can be measured instead of assumed.

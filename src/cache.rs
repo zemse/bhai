@@ -137,8 +137,12 @@ impl CacheGuard {
 pub const MIN_CACHED: u64 = 1024;
 /// Cached prefixes grow in steps of this many tokens.
 const CACHE_STEP: u64 = 128;
-/// A call this long after the previous one may find its prefix evicted.
-pub const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+/// A call this long after the previous one was sent may find its prefix evicted: what
+/// OpenAI says a prefix typically lasts after its last write or reuse. The Codex backend
+/// was measured keeping one for an hour, but nothing promises that.
+pub const CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+/// The cache counts down on the status bar for its last this long.
+pub const CACHE_WARNING: Duration = Duration::from_secs(5 * 60);
 /// A hit ratio below this is a miss.
 const MISS_RATIO: f64 = 0.5;
 /// A call sending fewer tokens than this is never judged: the backend takes about ten

@@ -1390,6 +1390,11 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         self.session.cold_tokens()
     }
 
+    /// Time the cached prefix has left, in its last minutes.
+    pub fn cache_left(&self) -> Option<std::time::Duration> {
+        self.session.cache_left()
+    }
+
     /// Put the session on `model`, and say so.
     fn switch_model(&mut self, model: String, effort: String, window: Option<u64>) {
         let notice = match model == self.model {
