@@ -33,6 +33,8 @@ pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often a wait inside [`IDLE_TIMEOUT`] looks at the cancel flag.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 const MAX_ATTEMPTS: usize = 3;
+/// How long a finished call waits on a usage fetch still out, before leaving it.
+const USAGE_WAIT: Duration = Duration::from_secs(2);
 
 /// The `reasoning.effort` values the Responses API takes. The models catalog also lists
 /// `ultra` for some models, which the API refuses.
@@ -553,6 +555,13 @@ impl Client {
             });
         }
 
+        // The credit balance is only in `/wham/usage`, so now and then it is asked for
+        // alongside the stream and reported once the call is done.
+        let usage_fetch = limits::due(chrono::Utc::now().timestamp()).then(|| {
+            let (http, auth) = (self.http.clone(), auth.clone());
+            tokio::spawn(async move { limits::fetch(&http, &auth).await })
+        });
+
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         // The ChatGPT backend leaves `response.completed.response.output` empty, so the
@@ -655,6 +664,12 @@ impl Client {
         if completed {
             if let Some(usage) = usage {
                 on_delta(Delta::Usage(usage));
+            }
+            if let Some(task) = usage_fetch
+                && let Ok(Ok(Ok(body))) = tokio::time::timeout(USAGE_WAIT, task).await
+                && let Some(found) = RateLimits::from_usage(&body, chrono::Utc::now().timestamp())
+            {
+                on_delta(Delta::RateLimits(found));
             }
             Ok(items)
         } else {

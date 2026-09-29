@@ -52,6 +52,14 @@ pub const VARIABLES: &[(&str, &str)] = &[
     ("reset_5h", "when it resets, as `2h14m`"),
     ("limit_week", "the longer rate-limit window used"),
     ("reset_week", "when it resets, as `Fri 09:00`"),
+    (
+        "credits",
+        "the credits left, as `8.3k/10.0k` or `unlimited`",
+    ),
+    ("credits_left", "the credits left, as `8.3k`"),
+    ("credits_used", "the credits spent from the allowance"),
+    ("credits_limit", "the allowance, as `10.0k`"),
+    ("credits_reset", "when the allowance resets, as `Thu 05:30`"),
     ("working", "`working` while a turn runs"),
     ("queued", "prompts waiting behind the turn, as `2 queued`"),
     ("session", "the first 8 characters of the session id"),
@@ -506,6 +514,34 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
             Value::plain(window.and_then(|w| w.resets_in(now)).unwrap_or_default()),
         );
     }
+    let credits = limits.credits;
+    set(
+        "credits",
+        credits.map_or_else(Value::default, |c| Value {
+            text: c.amount(),
+            alert: c.used_percent().and_then(warning),
+        }),
+    );
+    let short = |n: Option<f64>| {
+        n.map(|n| compact(n.max(0.0).floor() as u64))
+            .unwrap_or_default()
+    };
+    set(
+        "credits_left",
+        Value::plain(short(credits.and_then(|c| c.remaining))),
+    );
+    set(
+        "credits_used",
+        Value::plain(short(credits.and_then(|c| c.used))),
+    );
+    set(
+        "credits_limit",
+        Value::plain(short(credits.and_then(|c| c.limit))),
+    );
+    set(
+        "credits_reset",
+        Value::plain(credits.and_then(|c| c.resets_in(now)).unwrap_or_default()),
+    );
     set(
         "working",
         Value::plain(if app.working { "working" } else { "" }),

@@ -810,6 +810,7 @@ impl Session {
             AgentEvent::CacheHit(hit) => Event::CacheHit(hit),
             AgentEvent::CacheStalled(misses) => Event::CacheStalled(misses),
             AgentEvent::RateLimits(limits) => {
+                let limits = limits.over(inner.rate_limits);
                 inner.rate_limits = Some(limits);
                 Event::RateLimits(limits)
             }

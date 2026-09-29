@@ -104,6 +104,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `bhai usage` prints the plan's windows and credits, as `/usage` does.
+    if args.first().is_some_and(|a| a == "usage") {
+        let body = limits::fetch_now().await?;
+        println!("{}", limits::report(&body, chrono::Local::now()));
+        return Ok(());
+    }
+
     // `bhai mcp approve <name>` records a `.mcp.json` server as it is defined now, which
     // is how a server that changed since its approval is accepted again.
     if args.first().is_some_and(|a| a == "mcp") {
@@ -161,7 +168,7 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [sessions [prune [n]]] [mcp approve <server>] [--probe [prompt]] [--cache-check] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [usage] [sessions [prune [n]]] [mcp approve <server>] [--probe [prompt]] [--cache-check] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
@@ -761,6 +768,19 @@ fn start(
     // A panic in the loop or in a tool would otherwise end the task with the session still
     // marked working: no error, no `TurnEnd`, and a spinner that never stops. The panic
     // itself is reported by the hook; this is what lets the session say so and come back.
+    // The windows and the credits before the first call, which is otherwise what
+    // brings them.
+    if client.provider() == client::Provider::Codex && limits::due(chrono::Utc::now().timestamp()) {
+        let tx = tx_agent.clone();
+        tokio::spawn(async move {
+            if let Ok(body) = limits::fetch_now().await
+                && let Some(found) =
+                    limits::RateLimits::from_usage(&body, chrono::Utc::now().timestamp())
+            {
+                let _ = tx.send(AgentEvent::RateLimits(found));
+            }
+        });
+    }
     let watch = tx_agent.clone();
     let loop_task = tokio::spawn(agent::run(
         client,

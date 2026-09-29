@@ -461,8 +461,9 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// `5h 42% (2h14m) · wk 17% (Fri 09:00) `: each window's headroom and when it comes
-/// back, coloured by how close it is to its limit.
+/// `5h 42% (2h14m) · wk 17% (Fri 09:00) · credits 8.3k/10.0k `: each window's headroom
+/// and when it comes back, coloured by how close it is to its limit, then the credits
+/// left where there are some to count.
 fn limit_spans(found: &RateLimits) -> Vec<Span<'static>> {
     let dim = Style::new().fg(Color::DarkGray);
     let now = chrono::Local::now();
@@ -476,6 +477,15 @@ fn limit_spans(found: &RateLimits) -> Vec<Span<'static>> {
             text.push_str(&format!("({left}) "));
         }
         spans.push(Span::styled(text, headroom(window.used_percent)));
+    }
+    if let Some(credits) = found.credits.filter(|c| !c.unlimited) {
+        if !spans.is_empty() {
+            spans.push(Span::styled("· ", dim));
+        }
+        spans.push(Span::styled(
+            format!("credits {} ", credits.amount()),
+            headroom(credits.used_percent().unwrap_or(0.0)),
+        ));
     }
     spans
 }
@@ -2569,6 +2579,7 @@ mod tests {
             app.on_event(Event::RateLimits(RateLimits {
                 primary: Some(window(used, 300)),
                 secondary: Some(window(17.0, 10080)),
+                credits: None,
             }));
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let bar = status(&terminal);
@@ -2589,6 +2600,7 @@ mod tests {
         app.on_event(Event::RateLimits(RateLimits {
             primary: Some(window(8.0, 300)),
             secondary: Some(window(20.0, 10080)),
+            credits: None,
         }));
 
         let mut wide = Terminal::new(TestBackend::new(200, 10)).unwrap();
@@ -2621,6 +2633,7 @@ mod tests {
                 window_minutes: Some(10080),
                 resets_at: Some(at.timestamp()),
             }),
+            credits: None,
         }));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = status(&terminal);

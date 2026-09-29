@@ -123,6 +123,11 @@ pub const COMMANDS: &[Command] = &[
         help: "toggle the per-entry token badges",
     },
     Command {
+        name: "usage",
+        args: "",
+        help: "the plan's rate limits and credits",
+    },
+    Command {
         name: "copy",
         args: "",
         help: "copy the selection to the clipboard",

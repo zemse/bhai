@@ -24,7 +24,7 @@ use crate::diff::DiffView;
 use crate::entries::Entries;
 pub use crate::entries::Entry;
 use crate::input::{Editor, History};
-use crate::limits::RateLimits;
+use crate::limits::{self, RateLimits};
 use crate::models::{Choice, Picker};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
@@ -1121,6 +1121,11 @@ impl App {
             self.all_badges = !self.all_badges;
             return;
         }
+        if message == "/usage" {
+            self.follow = true;
+            self.usage();
+            return;
+        }
         if message == "/copy" {
             self.follow = true;
             self.copy();
@@ -1453,6 +1458,17 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             Ok(()) => self.working = true,
             Err(e) => self.note(Entry::Error(e)),
         }
+    }
+
+    /// `/usage`: ask the backend for the windows and the credits, and show them.
+    fn usage(&mut self) {
+        let session = Arc::clone(&self.session);
+        tokio::spawn(async move {
+            session.publish(match limits::fetch_now().await {
+                Ok(body) => Event::Info(limits::report(&body, chrono::Local::now())),
+                Err(e) => Event::Error(format!("could not read usage: {e:#}")),
+            });
+        });
     }
 
     /// Handle `/context` locally: export the breakdown and report where it went.

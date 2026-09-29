@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-09-29
 
+- Codex credits sit next to the rate-limit windows: `credits 8.3k/10.0k` on the status
+  bar, coloured by how much of the allowance is spent, and `$credits`, `$credits_left`,
+  `$credits_used`, `$credits_limit` and `$credits_reset` for a status line template. The
+  balance is read from `/wham/usage`, a Team seat's under `spend_control` and other
+  plans' from `credits.balance`, once at startup and then alongside a model call at most
+  every five minutes. A plan without credits shows nothing. `/usage` and `bhai usage`
+  print the plan, each window and the credits in full.
 - A workflow step can name its own `model` and `effort`, so an identity's model is a
   default there too rather than a ceiling. The plan the confirmation shows and the final
   report both name the model a step runs on when it is not the session's. A bad `effort`
