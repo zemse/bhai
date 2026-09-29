@@ -10,7 +10,7 @@
 //! nowhere to put one, so a local model is picked and run, with no second question.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::Frame;
@@ -26,6 +26,9 @@ use crate::ollama;
 
 /// Give up on a backend that has not answered the list by then.
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a loaded catalogue answers `cached`. Short, so a model pulled into Ollama
+/// mid-session is servable a minute later rather than at the next run.
+const CACHE_FOR: Duration = Duration::from_secs(60);
 /// The `client_version` the models endpoint insists on, when the Codex CLI's own cache
 /// does not say which version it last asked as.
 const CLIENT_VERSION: &str = "0.154.0";
@@ -104,7 +107,63 @@ pub async fn load(ollama_url: &str, current: &str) -> Catalogue {
     if !found.models.iter().any(|m| m.id == current) {
         found.models.insert(0, running(current));
     }
+    if let Ok(mut slot) = CACHED.lock() {
+        *slot = Some((Instant::now(), Arc::new(found.clone())));
+    }
     found
+}
+
+/// The last catalogue loaded, for the checks that only ask whether an id is real.
+static CACHED: Mutex<Option<(Instant, Arc<Catalogue>)>> = Mutex::new(None);
+
+/// The catalogue, reloaded at most every `CACHE_FOR`. This is what a check that only
+/// needs to know whether an id is real reads, so a fan-out of children pays for one
+/// load rather than one each; `/model` and the `models` tool load their own, so what
+/// the user is shown is never stale.
+pub async fn cached(ollama_url: &str, current: &str) -> Arc<Catalogue> {
+    let found = match take() {
+        Some(found) => found,
+        None => Arc::new(load(ollama_url, current).await),
+    };
+    // A `/model` switch since that load leaves the session's own model off the list it
+    // cached. It is servable by demonstration, so it goes back on rather than being
+    // refused by a check reading a list from before the switch.
+    if found.models.iter().any(|m| m.id == current) {
+        return found;
+    }
+    let mut patched = (*found).clone();
+    patched.models.insert(0, running(current));
+    Arc::new(patched)
+}
+
+/// The cached catalogue while it is still fresh.
+fn take() -> Option<Arc<Catalogue>> {
+    let slot = CACHED.lock().ok()?;
+    let (loaded, found) = slot.as_ref()?;
+    (loaded.elapsed() < CACHE_FOR).then(|| Arc::clone(found))
+}
+
+/// Whether `id` is a model a backend here will serve. A backend that could not be asked
+/// answers for nothing, so an id of its own is let through rather than refused on a list
+/// that was never loaded.
+pub fn serves(found: &Catalogue, id: &str) -> bool {
+    if found.models.iter().any(|m| m.id == id) {
+        return true;
+    }
+    let provider = Provider::of(id).name();
+    found
+        .notes
+        .iter()
+        .any(|note| note.starts_with(&format!("{provider}: ")))
+}
+
+/// What a refusal says, so the reader is pointed at the list rather than left guessing.
+pub fn unknown(found: &Catalogue, id: &str) -> String {
+    let ids: Vec<&str> = found.models.iter().map(|m| m.id.as_str()).collect();
+    format!(
+        "unknown model `{id}`. This session's backends serve: {}",
+        ids.join(", ")
+    )
 }
 
 /// The model this session is on, for when its backend did not list it.
@@ -755,5 +814,38 @@ mod tests {
         let listed = running("gpt-5.5");
         let names: Vec<_> = listed.efforts.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, FALLBACK_EFFORTS);
+    }
+
+    /// A backend that answered has said all it serves, so an id it did not list is not
+    /// one. A backend that could not be asked has said nothing, so it refuses nothing.
+    #[test]
+    fn only_a_backend_that_answered_can_refuse_an_id() {
+        let listed = |id: &str| Model {
+            id: id.to_string(),
+            label: id.to_string(),
+            detail: String::new(),
+            efforts: Vec::new(),
+            default_effort: None,
+            window: None,
+        };
+        let both = Catalogue {
+            models: vec![listed("gpt-5.6-sol"), listed("ollama:gemma4:e4b")],
+            notes: Vec::new(),
+        };
+        assert!(serves(&both, "gpt-5.6-sol"));
+        assert!(serves(&both, "ollama:gemma4:e4b"));
+        assert!(!serves(&both, "gpt-9"));
+        assert!(!serves(&both, "ollama:nope"));
+        assert_eq!(
+            unknown(&both, "gpt-9"),
+            "unknown model `gpt-9`. This session's backends serve: gpt-5.6-sol, ollama:gemma4:e4b"
+        );
+
+        let codex_down = Catalogue {
+            models: vec![listed("ollama:gemma4:e4b")],
+            notes: vec!["codex: the model list timed out".to_string()],
+        };
+        assert!(serves(&codex_down, "gpt-9"), "codex never answered");
+        assert!(!serves(&codex_down, "ollama:nope"), "ollama did");
     }
 }

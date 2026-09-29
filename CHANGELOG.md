@@ -4,6 +4,18 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-09-29
+
+- A workflow step can name its own `model` and `effort`, so an identity's model is a
+  default there too rather than a ceiling. The plan the confirmation shows and the final
+  report both name the model a step runs on when it is not the session's. A bad `effort`
+  is a load error; a model no backend serves is named before the run starts, so a typo
+  costs nothing instead of failing at the first step.
+- The `agent` tool refuses an unknown `model` or `effort` before it spawns the child. The
+  catalogue behind that check is loaded at most once a minute and shared with `/model`
+  and the `models` tool, so a fan-out pays for one list rather than one each. A backend
+  that could not be asked refuses nothing.
+
 ## 2026-09-25
 
 - An effort the API does not take is refused before it is sent: `/effort`, `/model` and

@@ -54,6 +54,10 @@ pub struct Step {
     /// Step ids that must finish first.
     pub needs: Vec<String>,
     pub on_fail: OnFail,
+    /// Run this step on another model, over whatever its identity would use.
+    pub model: Option<String>,
+    /// Run it at this reasoning effort, over whatever its identity would use.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,12 +160,26 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
             Some("continue") => OnFail::Continue,
             Some(other) => bail!("step `{id}` has a bad `on_fail` `{other}`"),
         };
+        // The model is checked against the catalogue when the run starts, since what
+        // the backends serve is not knowable from the file. The effort is: it is the
+        // fixed list the API takes.
+        let effort = value("effort");
+        if let Some(effort) = &effort
+            && !crate::client::EFFORTS.contains(&effort.as_str())
+        {
+            bail!(
+                "step `{id}` has a bad `effort` `{effort}`; the API takes {}",
+                crate::client::EFFORTS.join(", ")
+            );
+        }
         steps.push(Step {
             id,
             identity: value("identity").unwrap_or_else(|| identity::DEFAULT.to_string()),
             prompt,
             needs: frontmatter::list(&item, "needs").unwrap_or_default(),
             on_fail,
+            model: value("model"),
+            effort,
         });
     }
     if steps.is_empty() {
@@ -353,6 +371,7 @@ pub enum Status {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepReport {
     pub id: String,
+    /// The identity, and the model when it is not the session's, as the plan named it.
     pub identity: String,
     pub status: Status,
     pub usage: Usage,
@@ -440,7 +459,21 @@ pub async fn run(run: Run<'_>) -> Report {
             return report;
         }
     };
-    let plan = plan(workflow);
+    // Only when a step names one: a run whose steps all take the session's model has
+    // nothing to check, and asking the backends would cost it a round trip.
+    if identities.iter().any(|i| i.model.is_some()) {
+        let found = crate::models::cached(run.model.ollama_url(), run.model.name()).await;
+        let bad = unserved(&found, &workflow.steps, &identities);
+        if !bad.is_empty() {
+            for line in &bad {
+                let _ = run.tx.send(AgentEvent::Error(format!("workflow: {line}")));
+            }
+            report.refused = Some(format!("not started: {}", bad.join("; ")));
+            let _ = run.tx.send(AgentEvent::Info(report.text()));
+            return report;
+        }
+    }
+    let plan = plan(workflow, &identities);
     let _ = run.tx.send(AgentEvent::Info(plan.clone()));
     if !confirm(run.tx, plan).await {
         report.refused = Some("not started".to_string());
@@ -546,26 +579,25 @@ pub async fn run(run: Run<'_>) -> Report {
     report.steps = workflow
         .steps
         .iter()
-        .zip(status)
-        .zip(usage)
-        .zip(cached)
-        .zip(truncated)
-        .map(
-            |((((step, status), usage), cached), truncated)| StepReport {
-                id: step.id.clone(),
-                identity: step.identity.clone(),
-                status: status.unwrap_or(Status::Skipped("not reached".to_string())),
-                usage,
-                cached,
-                truncated,
-            },
-        )
+        .enumerate()
+        .map(|(index, step)| StepReport {
+            id: step.id.clone(),
+            identity: running_as(&step.identity, &identities[index]),
+            status: status[index]
+                .clone()
+                .unwrap_or(Status::Skipped("not reached".to_string())),
+            usage: usage[index],
+            cached: cached[index],
+            truncated: truncated[index],
+        })
         .collect();
     let _ = run.tx.send(AgentEvent::Info(report.text()));
     report
 }
 
-/// The identity each step runs as; `Err` when a step names one that is not defined.
+/// The identity each step runs as; `Err` when a step names one that is not defined. A
+/// step's own `model` and `effort` win over the identity's, which are only its defaults,
+/// so one identity can serve steps that want different models.
 fn resolve(delegation: &Delegation, steps: &[Step]) -> Result<Vec<Identity>> {
     let choices: Vec<Identity> = delegation
         .identities
@@ -576,17 +608,45 @@ fn resolve(delegation: &Delegation, steps: &[Step]) -> Result<Vec<Identity>> {
     steps
         .iter()
         .map(|step| {
-            identity::find(&choices, &step.identity).with_context(|| format!("step `{}`", step.id))
+            let mut identity = identity::find(&choices, &step.identity)
+                .with_context(|| format!("step `{}`", step.id))?;
+            identity.model = step.model.clone().or(identity.model);
+            identity.effort = step.effort.clone().or(identity.effort);
+            Ok(identity)
+        })
+        .collect()
+}
+
+/// One line per step whose model no backend here serves. A backend that could not be
+/// asked answers for nothing, so a run is never refused on a list that never loaded.
+fn unserved(
+    found: &crate::models::Catalogue,
+    steps: &[Step],
+    identities: &[Identity],
+) -> Vec<String> {
+    steps
+        .iter()
+        .zip(identities)
+        .filter_map(|(step, identity)| {
+            let model = identity.model.as_deref()?;
+            (!crate::models::serves(found, model)).then(|| {
+                format!(
+                    "step `{}`: {}",
+                    step.id,
+                    crate::models::unknown(found, model)
+                )
+            })
         })
         .collect()
 }
 
 /// What the confirmation prompt shows before anything runs.
-fn plan(workflow: &Workflow) -> String {
+fn plan(workflow: &Workflow, identities: &[Identity]) -> String {
     let steps: Vec<String> = workflow
         .steps
         .iter()
-        .map(|s| format!("{} ({})", s.id, s.identity))
+        .zip(identities)
+        .map(|(s, i)| format!("{} ({})", s.id, running_as(&s.identity, i)))
         .collect();
     format!(
         "workflow {}: {} step(s) [{}], budget {} tokens, {} at a time{}",
@@ -597,6 +657,15 @@ fn plan(workflow: &Workflow) -> String {
         workflow.max_parallel,
         caching(workflow)
     )
+}
+
+/// How a step is named in the plan and the report: its identity, and the model it runs
+/// on when that is not simply the session's.
+fn running_as(identity: &str, resolved: &Identity) -> String {
+    match &resolved.model {
+        Some(model) => format!("{identity} on {model}"),
+        None => identity.to_string(),
+    }
 }
 
 /// Ask the user through the session's approval path.
@@ -1269,6 +1338,77 @@ needs: [a]\n    prompt: two\n---\n",
         assert_eq!(workflow.max_parallel, 2);
         assert_eq!(workflow.steps[1].on_fail, OnFail::Continue);
         assert!(workflow.steps[2].prompt.contains("{{steps.diff}}"));
+    }
+
+    /// A step's own model and effort beat the identity's, which are only its defaults,
+    /// and the plan says what each step will run on before the user approves it.
+    #[test]
+    fn a_step_can_run_on_a_model_of_its_own() {
+        let workflow = workflow(
+            "steps:\n  - id: a\n    prompt: one\n  - id: b\n    model: ollama:gemma4:e4b\n    \
+effort: low\n    prompt: two\n",
+        );
+        assert_eq!(workflow.steps[0].model, None);
+        assert_eq!(
+            workflow.steps[1].model.as_deref(),
+            Some("ollama:gemma4:e4b")
+        );
+        assert_eq!(workflow.steps[1].effort.as_deref(), Some("low"));
+        let identities = resolve(&delegation(), &workflow.steps).unwrap();
+        assert_eq!(identities[0].model, None);
+        assert_eq!(identities[1].model.as_deref(), Some("ollama:gemma4:e4b"));
+        assert_eq!(identities[1].effort.as_deref(), Some("low"));
+        let plan = plan(&workflow, &identities);
+        assert!(
+            plan.contains("[a (general), b (general on ollama:gemma4:e4b)]"),
+            "{plan}"
+        );
+
+        let bad = parse(
+            "---\nname: w\nsteps:\n  - id: a\n    effort: whenever\n    prompt: one\n---\n",
+            "./test",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{bad:#}").contains("step `a` has a bad `effort` `whenever`"),
+            "{bad:#}"
+        );
+    }
+
+    /// The catalogue is asked once, before the confirmation. A backend that could not be
+    /// asked answers for nothing, so its models are not refused on a list it is not on.
+    #[test]
+    fn a_model_no_backend_serves_is_named_before_the_run_starts() {
+        use crate::models::{Catalogue, Model as Listed};
+        let listed = |id: &str| Listed {
+            id: id.to_string(),
+            label: id.to_string(),
+            detail: String::new(),
+            efforts: Vec::new(),
+            default_effort: None,
+            window: None,
+        };
+        let workflow = workflow(
+            "steps:\n  - id: a\n    model: gpt-5.6-sol\n    prompt: one\n  - id: b\n    \
+model: ollama:nope\n    prompt: two\n",
+        );
+        let identities = resolve(&delegation(), &workflow.steps).unwrap();
+        let both = Catalogue {
+            models: vec![listed("gpt-5.6-sol")],
+            notes: Vec::new(),
+        };
+        let bad = unserved(&both, &workflow.steps, &identities);
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(
+            bad[0].starts_with("step `b`: unknown model `ollama:nope`"),
+            "{bad:?}"
+        );
+
+        let ollama_down = Catalogue {
+            models: vec![listed("gpt-5.6-sol")],
+            notes: vec!["ollama: connection refused".to_string()],
+        };
+        assert!(unserved(&ollama_down, &workflow.steps, &identities).is_empty());
     }
 
     #[test]

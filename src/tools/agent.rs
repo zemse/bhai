@@ -125,6 +125,11 @@ impl Tool for Agent {
                 Ok(parsed) => parsed,
                 Err(e) => return (e, false),
             };
+            // Before the spawn, not after: a typo otherwise costs a child that runs far
+            // enough to be refused by the backend, and a report the parent has to read.
+            if let Some(e) = self.unserved(&identity).await {
+                return (e, false);
+            }
             let id = uuid::Uuid::new_v4().simple().to_string()[..6].to_string();
             let waiting = MAX_RUNNING.saturating_sub(self.slots.available_permits());
             self.spawn(&id, &identity, description, task);
@@ -233,6 +238,20 @@ impl Agent {
         });
     }
 
+    /// What is wrong with the model the child would run on, if anything. `None` when it
+    /// runs on this session's, which needs no list to be known servable.
+    async fn unserved(&self, identity: &Identity) -> Option<String> {
+        let model = identity.model.as_deref()?;
+        if model == self.model.name() {
+            return None;
+        }
+        let found = crate::models::cached(self.model.ollama_url(), self.model.name()).await;
+        match crate::models::serves(&found, model) {
+            true => None,
+            false => Some(format!("{}.", crate::models::unknown(&found, model))),
+        }
+    }
+
     /// The identity, description and prompt of a call.
     fn parse<'a>(&self, args: &'a Value) -> Result<(Identity, &'a str, &'a str), String> {
         let required = |key: &str| {
@@ -267,6 +286,12 @@ impl Agent {
             identity.model = Some(model);
         }
         if let Some(effort) = given("effort") {
+            if !crate::client::EFFORTS.contains(&effort.as_str()) {
+                return Err(format!(
+                    "unknown effort `{effort}`. The API takes: {}.",
+                    crate::client::EFFORTS.join(", ")
+                ));
+            }
             identity.effort = Some(effort);
         }
         Ok((identity, description, prompt))
@@ -417,6 +442,15 @@ mod tests {
         assert_eq!(
             of(&json!({"description": "d", "prompt": "p", "model": "  "})),
             ("general".to_string(), None, None)
+        );
+        // The efforts are a fixed list, so a bad one is refused without asking a
+        // backend; a bad model needs the catalogue, so it is refused in `execute`.
+        let err = agent
+            .parse(&json!({"description": "d", "prompt": "p", "effort": "whenever"}))
+            .unwrap_err();
+        assert!(
+            err.starts_with("unknown effort `whenever`. The API takes: none, "),
+            "{err}"
         );
         let schema = agent.schema();
         let properties = &schema["parameters"]["properties"];
