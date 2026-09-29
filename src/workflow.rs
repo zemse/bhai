@@ -40,6 +40,8 @@ const HOME_DIR: &str = ".config/bhai/workflows";
 const PROJECT_DIR: &str = ".bhai/workflows";
 /// Cached step results, under the `.bhai` the session transcripts are in.
 const CACHE_DIR: &str = "cache/workflows";
+/// Characters of an item that fit in the label naming one instance of a fan-out.
+const ITEM_LABEL: usize = 48;
 /// Instances one `for_each` step may run unless the file says otherwise. The list is
 /// runtime data, so a step that answers with a hundred lines is capped rather than
 /// allowed to spend the budget on its own; the report says how many of the items ran.
@@ -1259,20 +1261,52 @@ async fn step(
         Ok(text) => tools::truncate(&tools::agent::sanitize(text)),
         Err(e) => format!("step {} failed: {e:#}", step.id),
     };
-    let _ = run.tx.send(AgentEvent::ToolOutput(output));
+    let _ = run
+        .tx
+        .send(AgentEvent::ToolOutput(attributed(item, output)));
     finished
 }
 
 /// How a step is named while it runs: its id, and the item when it is one instance of
 /// a fan-out, cut short so a long item does not take the line over.
 fn label(id: &str, item: Option<&str>) -> String {
-    let Some(item) = item else {
-        return id.to_string();
-    };
-    let short: String = item.chars().take(48).collect();
-    match short.len() < item.len() {
-        true => format!("{id} [{short}...]"),
-        false => format!("{id} [{short}]"),
+    match item {
+        Some(item) => format!("{id} [{}]", short(item)),
+        None => id.to_string(),
+    }
+}
+
+/// An item on one line and short enough to read: cut in the middle, not at the end,
+/// since what tells two items apart is as often their tail as their head. Four paths
+/// under one directory are four of the same label when the tail is what goes.
+fn short(item: &str) -> String {
+    let flat: String = item
+        .chars()
+        .map(|c| match c.is_control() {
+            true => ' ',
+            false => c,
+        })
+        .collect();
+    let chars: Vec<char> = flat.trim().chars().collect();
+    if chars.len() <= ITEM_LABEL {
+        return chars.into_iter().collect();
+    }
+    let head = (ITEM_LABEL - 1) / 2;
+    let tail = ITEM_LABEL - 1 - head;
+    format!(
+        "{}…{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
+}
+
+/// An instance's answer with the item it is for at the head of it. Instances finish in
+/// whatever order they finish and the event pair carries no id, so without this the
+/// answers of a fan-out arrive under one another's headers.
+fn attributed(item: Option<&str>, output: String) -> String {
+    match item {
+        Some(item) => format!("[{}]\n{output}", short(item)),
+        None => output,
     }
 }
 
@@ -1288,8 +1322,9 @@ fn replay(run: &Run<'_>, step: &Step, identity: &Identity, item: Option<&str>, o
             identity.name
         ),
     });
-    let _ = run.tx.send(AgentEvent::ToolOutput(tools::truncate(
-        &tools::agent::sanitize(output),
+    let _ = run.tx.send(AgentEvent::ToolOutput(attributed(
+        item,
+        tools::truncate(&tools::agent::sanitize(output)),
     )));
 }
 
@@ -1878,7 +1913,16 @@ needs: [a]\n    prompt: two\n---\n",
         assert_eq!(workflow.steps[0].effort.as_deref(), Some("low"));
         assert_eq!(workflow.steps[1].for_each.as_deref(), Some("files"));
         assert_eq!(workflow.steps[1].needs, ["files"]);
+        assert_eq!(workflow.steps[0].identity, "worker");
         assert_eq!(workflow.steps[2].output, Output::Json);
+        // The lean identity the example points at, which is what keeps a fan-out from
+        // paying for the instruction files and skills once per item.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/agents/worker.md");
+        let text = std::fs::read_to_string(path).unwrap();
+        let worker = identity::parse(&text, Path::new(path), "./examples/agents").unwrap();
+        assert_eq!(worker.instructions, Some(Vec::new()));
+        assert_eq!(worker.skills, ["!*"]);
+        assert_eq!(worker.tools.unwrap(), ["bash", "read"]);
         assert_eq!(
             workflow.steps[3].when.as_ref().map(|w| w.name.as_str()),
             Some("steps.verdict.blocking")
@@ -2123,6 +2167,27 @@ prompt: summarise {{steps.review}}\n",
 prompt: {{item}}\n  - id: c\n    for_each: b\n    prompt: {{item}}\n"
             )
             .contains("step `c` fans out over `b`, which fans out itself"),
+        );
+    }
+
+    /// Four paths under one directory are four of the same label if the tail is what
+    /// goes, and the answers of a fan-out arrive under one another's headers without
+    /// the item on them.
+    #[test]
+    fn an_instance_is_named_by_what_tells_it_apart() {
+        assert_eq!(label("review", None), "review");
+        assert_eq!(label("review", Some("src/ui.rs")), "review [src/ui.rs]");
+        let one = "/Users/me/workspace/opensource/personal/bhai/src/ui.rs";
+        let two = "/Users/me/workspace/opensource/personal/bhai/src/agent.rs";
+        assert_ne!(label("review", Some(one)), label("review", Some(two)));
+        assert!(label("review", Some(one)).ends_with("src/ui.rs]"));
+        assert_eq!(short(one).chars().count(), ITEM_LABEL);
+        // An item out of a JSON array can carry a line break; a label is one line.
+        assert_eq!(short("a\nb"), "a b");
+        assert_eq!(attributed(None, "done".to_string()), "done");
+        assert_eq!(
+            attributed(Some("src/ui.rs"), "done".to_string()),
+            "[src/ui.rs]\ndone"
         );
     }
 

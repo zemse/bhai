@@ -28,6 +28,17 @@ carries the shape of what is there.
   gate that does not hold skips its own step and nothing else; a field the object does
   not have skips it too, and says which field was missing rather than reading as false.
 
+- A fan-out instance is named by what tells it apart. A long item is cut in the middle
+  rather than at the end, so four paths under one directory no longer read as four of
+  the same label, and each instance's answer carries its item at the head: instances
+  finish in whatever order they finish, and the tool event pair carries no id, so the
+  answers were arriving under one another's headers.
+
+- `examples/agents/worker.md`: a lean identity for a workflow step that only runs a
+  command. A step on `general` carries the instruction files and the skill list, which
+  measured 8.6k input tokens a call against 750 for the same step as `worker`, and a
+  fan-out pays that once per item.
+
 - `max_fanout` sets how many instances one `for_each` step may run, default 20 and
   clamped to 100. `/workflows` says the cap for a definition that fans out.
 
