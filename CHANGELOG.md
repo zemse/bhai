@@ -20,6 +20,14 @@ carries the shape of what is there.
   one failed item does not take the others down under `on_fail: continue`, and the
   report says how many of the items ran. Capped at 20 instances per step.
 
+- A workflow step can say what it answers with and branch on it. `output: json` asks
+  the child for one JSON object and holds it to that, so an answer of another shape is
+  a failed step rather than a value the steps after it have to guess at; nothing of it
+  is cached either. `{{steps.<id>.<field>}}` reads a top-level field of that object, and
+  `when: {{steps.<id>.<field>}} == value` (or `!=`) runs a step only when it holds. A
+  gate that does not hold skips its own step and nothing else; a field the object does
+  not have skips it too, and says which field was missing rather than reading as false.
+
 - The `agent` tool refuses an unknown `model` or `effort` before it spawns the child. The
   catalogue behind that check is loaded at most once a minute and shared with `/model`
   and the `models` tool, so a fan-out pays for one list rather than one each. A backend

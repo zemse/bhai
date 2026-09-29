@@ -18,10 +18,19 @@ steps:
       the file and its diff. Change nothing.
   - id: verdict
     needs: [review]
+    output: json
     prompt: |
-      Split these reviews into what has to be fixed and what can wait.
+      Split these reviews into what has to be fixed and what can wait. Answer with
+      `{"blocking": true|false, "summary": "..."}`.
       {{steps.review}}
+  - id: order
+    needs: [verdict]
+    when: "{{steps.verdict.blocking}} == true"
+    prompt: |
+      Write the order to fix these in, cheapest first: {{steps.verdict.summary}}
 ---
 `review` runs one child per path `files` listed, three at a time, up to the fan-out cap
 of 20. A file whose review fails does not stop the others and is simply missing from
-what `verdict` reads. A step can also name a `model` of its own, not just an `effort`.
+what `verdict` reads. `verdict` is held to answering with one object, so `order` can be
+gated on a field of it and is skipped when nothing is blocking. A step can also name a
+`model` of its own, not just an `effort`.

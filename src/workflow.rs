@@ -2,6 +2,11 @@
 //! budget. Definitions are markdown files with frontmatter, like identities. Only the
 //! user starts one, with `/workflow` or `--workflow`; the model is never offered a
 //! workflow tool, so it cannot spend the budget on its own.
+//!
+//! A step runs once, or once per item an earlier step listed (`for_each`), which is the
+//! one part of the shape the file cannot fix, since the list is runtime data. A step
+//! that declares `output: json` is held to answering with one object, and the steps
+//! after it read its fields and gate themselves on them (`when`).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -49,6 +54,25 @@ pub enum OnFail {
     Continue,
 }
 
+/// What a step says it will answer with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Output {
+    /// Whatever the child wrote, which the next step reads as prose.
+    Text,
+    /// One JSON object, whose fields the steps after it can read and branch on.
+    Json,
+}
+
+/// A step's `when`: a placeholder, `==` or `!=`, and what it is compared to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct When {
+    /// The `{{...}}` name, without the braces.
+    pub name: String,
+    /// `==` rather than `!=`.
+    pub equal: bool,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
     pub id: String,
@@ -61,6 +85,11 @@ pub struct Step {
     /// Run this step once per item of the named step's output, with `{{item}}` filled
     /// in. The size of the fan-out is known only once that step has answered.
     pub for_each: Option<String>,
+    /// What the step answers with; `Json` is checked, and its fields can be read.
+    pub output: Output,
+    /// Run the step only when this holds. It is checked once the steps it needs have
+    /// answered, so a step gated on a field is skipped rather than run on a guess.
+    pub when: Option<When>,
     /// Run this step on another model, over whatever its identity would use.
     pub model: Option<String>,
     /// Run it at this reasoning effort, over whatever its identity would use.
@@ -179,6 +208,15 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
                 crate::client::EFFORTS.join(", ")
             );
         }
+        let output = match value("output").as_deref() {
+            None | Some("text") => Output::Text,
+            Some("json") => Output::Json,
+            Some(other) => bail!("step `{id}` has a bad `output` `{other}`"),
+        };
+        let when = match value("when") {
+            Some(text) => Some(condition(&text).with_context(|| format!("step `{id}`"))?),
+            None => None,
+        };
         steps.push(Step {
             id,
             identity: value("identity").unwrap_or_else(|| identity::DEFAULT.to_string()),
@@ -186,6 +224,8 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
             needs: frontmatter::list(&item, "needs").unwrap_or_default(),
             on_fail,
             for_each: value("for_each"),
+            output,
+            when,
             model: value("model"),
             effort,
         });
@@ -195,11 +235,11 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
     }
     // Fanning out over a step is needing it, so the dependency is implied rather than
     // written twice; everything after this reads one list.
-    for index in 0..steps.len() {
-        if let Some(over) = steps[index].for_each.clone()
-            && !steps[index].needs.contains(&over)
+    for step in &mut steps {
+        if let Some(over) = step.for_each.clone()
+            && !step.needs.contains(&over)
         {
-            steps[index].needs.push(over);
+            step.needs.push(over);
         }
     }
     check(&steps)?;
@@ -213,6 +253,61 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
         steps,
         body: body.trim_end().to_string(),
     })
+}
+
+/// A `when` line: `{{name}} == value` or `{{name}} != value`, with the value quoted or
+/// bare. Compared as text, so `== true` and `== 42` read as they look.
+fn condition(text: &str) -> Result<When> {
+    let (left, equal, right) = match text.split_once("==") {
+        Some((left, right)) => (left, true, right),
+        None => match text.split_once("!=") {
+            Some((left, right)) => (left, false, right),
+            None => bail!("`when` `{text}` is not `{{{{...}}}} == value` or `!=`"),
+        },
+    };
+    let name = left
+        .trim()
+        .strip_prefix("{{")
+        .and_then(|name| name.strip_suffix("}}"))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .with_context(|| format!("`when` `{text}` does not start with a `{{{{...}}}}`"))?;
+    let value = right.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value);
+    Ok(When {
+        name: name.to_string(),
+        equal,
+        value: value.to_string(),
+    })
+}
+
+/// What a `{{...}}` name refers to. Only top-level fields of a step's object are
+/// reachable, so a name with a second dot in it is not one of these.
+enum Ref<'a> {
+    Input,
+    Item,
+    Step(&'a str),
+    Field(&'a str, &'a str),
+}
+
+fn reference(name: &str) -> Option<Ref<'_>> {
+    match name.strip_prefix("steps.") {
+        None if name == "input" => Some(Ref::Input),
+        None if name == "item" => Some(Ref::Item),
+        None => None,
+        Some(rest) => match rest.split_once('.') {
+            None if rest.is_empty() => None,
+            None => Some(Ref::Step(rest)),
+            Some((id, field)) if !id.is_empty() && !field.is_empty() && !field.contains('.') => {
+                Some(Ref::Field(id, field))
+            }
+            Some(_) => None,
+        },
+    }
 }
 
 /// Unique ids, dependencies that exist and are not circular, and placeholders that a
@@ -252,26 +347,50 @@ instance would get the same prompt",
             }
         }
         for name in placeholders(&step.prompt) {
-            match name.strip_prefix("steps.") {
-                None if name == "input" => {}
-                None if name == "item" && step.for_each.is_some() => {}
-                None if name == "item" => bail!(
-                    "step `{}` uses `{{{{item}}}}` but has no `for_each`",
-                    step.id
-                ),
-                Some(id) if step.needs.iter().any(|n| n == id) => {}
-                Some(id) if steps.iter().any(|s| s.id == id) => {
-                    bail!(
-                        "step `{}` uses `{{{{{name}}}}}` but does not need `{id}`",
-                        step.id
-                    )
-                }
-                _ => bail!("step `{}` uses unknown `{{{{{name}}}}}`", step.id),
+            reachable(step, steps, name)?;
+        }
+        if let Some(when) = &step.when {
+            // It is read before the step's items exist, so it cannot be one of them.
+            if when.name == "item" {
+                bail!("step `{}` gates itself on `{{{{item}}}}`", step.id);
             }
+            reachable(step, steps, &when.name)?;
         }
     }
     order(steps)?;
     Ok(())
+}
+
+/// Whether `name` is a placeholder this step will have a value for by the time it runs.
+fn reachable(step: &Step, steps: &[Step], name: &str) -> Result<()> {
+    let id = step.id.as_str();
+    let named = |wanted: &str| steps.iter().find(|s| s.id == wanted);
+    match reference(name) {
+        Some(Ref::Input) => Ok(()),
+        Some(Ref::Item) if step.for_each.is_some() => Ok(()),
+        Some(Ref::Item) => bail!("step `{id}` uses `{{{{item}}}}` but has no `for_each`"),
+        Some(Ref::Step(need)) | Some(Ref::Field(need, _))
+            if !step.needs.iter().any(|n| n == need) =>
+        {
+            match named(need) {
+                Some(_) => bail!("step `{id}` uses `{{{{{name}}}}}` but does not need `{need}`"),
+                None => bail!("step `{id}` uses unknown `{{{{{name}}}}}`"),
+            }
+        }
+        Some(Ref::Step(_)) => Ok(()),
+        // A field is read off the one object a step answered with, so the step has to
+        // have said it answers with one, and has to be a step that answers once.
+        Some(Ref::Field(need, _)) => match named(need) {
+            Some(producer) if producer.output != Output::Json => {
+                bail!("step `{id}` uses `{{{{{name}}}}}` but `{need}` has no `output: json`")
+            }
+            Some(producer) if producer.for_each.is_some() => bail!(
+                "step `{id}` uses `{{{{{name}}}}}` but `{need}` fans out, so it has no one object"
+            ),
+            _ => Ok(()),
+        },
+        None => bail!("step `{id}` uses unknown `{{{{{name}}}}}`"),
+    }
 }
 
 /// Step indexes in dependency order; `Err` names the steps in a cycle.
@@ -323,35 +442,65 @@ fn placeholders(text: &str) -> Vec<&str> {
     found
 }
 
-/// `text` with `{{input}}`, `{{item}}` and `{{steps.<id>}}` filled in. A name with no
-/// value is left as it is; `check` already refused the ones that could not be filled.
-fn render(
-    text: &str,
-    input: &str,
-    results: &HashMap<String, String>,
-    item: Option<&str>,
-) -> String {
+/// What the steps that have finished left for the ones still to run.
+#[derive(Default)]
+struct Done {
+    /// Each step's answer as the next prompt reads it.
+    text: HashMap<String, String>,
+    /// The object a step that declares `output: json` answered with.
+    json: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+}
+
+/// What `{{name}}` stands for now, or `None` when nothing has filled it: a step that
+/// did not run, or a field its object does not have.
+fn lookup(name: &str, input: &str, done: &Done, item: Option<&str>) -> Option<String> {
+    match reference(name)? {
+        Ref::Input => Some(input.to_string()),
+        Ref::Item => item.map(str::to_string),
+        Ref::Step(id) => done.text.get(id).cloned(),
+        Ref::Field(id, field) => done.json.get(id)?.get(field).map(scalar),
+    }
+}
+
+/// A JSON value as text: a string as itself, anything else as it is written, so a
+/// `when` reads `== true` and `== 42` the way it looks.
+fn scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `text` with its placeholders filled in. A name with no value is left as it is;
+/// `check` already refused the ones that could never be filled.
+fn render(text: &str, input: &str, done: &Done, item: Option<&str>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("{{") {
         let after = &rest[start + 2..];
         let Some(end) = after.find("}}") else { break };
         let name = after[..end].trim();
-        let value = match name.strip_prefix("steps.") {
-            Some(id) => results.get(id).map(String::as_str),
-            None if name == "input" => Some(input),
-            None if name == "item" => item,
-            None => None,
-        };
         out.push_str(&rest[..start]);
-        match value {
-            Some(value) => out.push_str(value),
+        match lookup(name, input, done, item) {
+            Some(value) => out.push_str(&value),
             None => out.push_str(&rest[start..start + 4 + end]),
         }
         rest = &after[end + 2..];
     }
     out.push_str(rest);
     out
+}
+
+/// Whether a step's `when` holds. `Err` names what was missing, for a step that is
+/// skipped because the value it is gated on never arrived.
+fn holds(when: &When, input: &str, done: &Done) -> Result<bool> {
+    let found = lookup(&when.name, input, done, None).with_context(|| {
+        format!(
+            "`when` reads `{{{{{}}}}}`, which the step it needs did not answer with",
+            when.name
+        )
+    })?;
+    Ok((found == when.value) == when.equal)
 }
 
 /// The contents of a ``` fence when the whole text is one, since a model asked for a
@@ -379,10 +528,7 @@ fn items(text: &str) -> Vec<String> {
     if let Ok(serde_json::Value::Array(values)) = serde_json::from_str::<serde_json::Value>(text) {
         return values
             .iter()
-            .map(|value| match value {
-                serde_json::Value::String(item) => item.clone(),
-                other => other.to_string(),
-            })
+            .map(scalar)
             .filter(|item| !item.trim().is_empty())
             .collect();
     }
@@ -490,7 +636,12 @@ struct Task {
 /// How one launch ended, before the launches of a step are folded into its `Status`.
 #[derive(Clone)]
 enum Outcome {
-    Ok { output: String, cached: bool },
+    Ok {
+        output: String,
+        /// The object it answered with, for a step that declares `output: json`.
+        json: Option<serde_json::Map<String, serde_json::Value>>,
+        cached: bool,
+    },
     Failed(String),
     Skipped(String),
 }
@@ -625,7 +776,7 @@ pub async fn run(run: Run<'_>) -> Report {
     }
 
     let mut status: Vec<Option<Status>> = vec![None; workflow.steps.len()];
-    let mut results: HashMap<String, String> = HashMap::new();
+    let mut done = Done::default();
     let mut usage = vec![Usage::default(); workflow.steps.len()];
     let mut cached = vec![true; workflow.steps.len()];
     let mut truncated = vec![false; workflow.steps.len()];
@@ -644,11 +795,39 @@ pub async fn run(run: Run<'_>) -> Report {
         for (index, reason) in wave.blocked {
             status[index] = Some(Status::Skipped(reason));
         }
+        // A `when` is read here, once the steps it names have answered and before
+        // anything is launched for this one.
+        let ready: Vec<usize> = wave
+            .ready
+            .into_iter()
+            .filter(|&index| match &workflow.steps[index].when {
+                None => true,
+                Some(when) => match holds(when, run.input, &done) {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        status[index] = Some(Status::Skipped(format!(
+                            "`when` did not hold: {{{{{}}}}} {} {}",
+                            when.name,
+                            match when.equal {
+                                true => "==",
+                                false => "!=",
+                            },
+                            when.value
+                        )));
+                        false
+                    }
+                    Err(e) => {
+                        status[index] = Some(Status::Skipped(format!("{e:#}")));
+                        false
+                    }
+                },
+            })
+            .collect();
         // A `for_each` step becomes one task per item of the step it fans out over.
         // That step is a dependency, so it has already answered: this is the first
         // point in the run where the size of the fan-out is known.
         let mut tasks: Vec<Task> = Vec::new();
-        for &index in &wave.ready {
+        for &index in &ready {
             let Some(over) = &workflow.steps[index].for_each else {
                 tasks.push(Task {
                     step: index,
@@ -656,7 +835,7 @@ pub async fn run(run: Run<'_>) -> Report {
                 });
                 continue;
             };
-            let found = items(results.get(over).map(String::as_str).unwrap_or_default());
+            let found = items(done.text.get(over).map(String::as_str).unwrap_or_default());
             counts[index] = Some(Items {
                 ok: 0,
                 found: found.len(),
@@ -691,7 +870,10 @@ pub async fn run(run: Run<'_>) -> Report {
             for &task in chunk {
                 let Task { step: index, item } = &tasks[task];
                 let step = &workflow.steps[*index];
-                let prompt = render(&step.prompt, run.input, &results, item.as_deref());
+                let prompt = asked(
+                    step,
+                    render(&step.prompt, run.input, &done, item.as_deref()),
+                );
                 let Some(cache) = &cache else {
                     launched.push((task, prompt, None));
                     continue;
@@ -700,10 +882,7 @@ pub async fn run(run: Run<'_>) -> Report {
                 match (!cold).then(|| cache.read(&key)).flatten() {
                     Some(output) => {
                         replay(&run, step, &identities[*index], item.as_deref(), &output);
-                        outcomes[task] = Some(Outcome::Ok {
-                            output,
-                            cached: true,
-                        });
+                        outcomes[task] = Some(answered(step, output, true));
                     }
                     None => {
                         missed = true;
@@ -722,42 +901,40 @@ pub async fn run(run: Run<'_>) -> Report {
                 )
             }))
             .await;
-            for ((task, _, key), done) in launched.iter().zip(finished) {
+            for ((task, _, key), answer) in launched.iter().zip(finished) {
                 let index = tasks[*task].step;
                 let step = &workflow.steps[index];
-                add(&mut usage[index], done.usage);
-                truncated[index] |= done.truncated;
-                add(&mut report.usage, done.usage);
-                match done.result {
-                    Ok(text) => {
-                        // Only on the way out of this arm, so a failed step is not
-                        // stored and the next run retries it. A step that spent its
-                        // budget is not stored either: what it answered with is what it
-                        // had when it was cut off, and a cache would hand that back for
-                        // good.
-                        if let (Some(cache), Some(key), false) = (&cache, key, done.truncated) {
-                            cache.write(key, step, &identities[index], &text);
-                        }
-                        outcomes[*task] = Some(Outcome::Ok {
-                            output: text,
-                            cached: false,
-                        });
-                    }
-                    Err(e) => {
-                        let reason = format!("{e:#}");
-                        outcomes[*task] = Some(Outcome::Failed(reason));
-                        if step.on_fail == OnFail::Stop && stopped.is_none() {
-                            stopped = Some(format!("step `{}` failed", step.id));
-                        }
-                    }
+                add(&mut usage[index], answer.usage);
+                truncated[index] |= answer.truncated;
+                add(&mut report.usage, answer.usage);
+                let outcome = match answer.result {
+                    Ok(text) => answered(step, text, false),
+                    Err(e) => Outcome::Failed(format!("{e:#}")),
+                };
+                // Only what the step said it would answer with, so neither a failure
+                // nor an answer of the wrong shape is stored and the next run asks
+                // again. A step that spent its budget is not stored either: what it
+                // answered with is what it had when it was cut off, and a cache would
+                // hand that back for good.
+                if let (Some(cache), Some(key), false, Outcome::Ok { output, .. }) =
+                    (&cache, key, answer.truncated, &outcome)
+                {
+                    cache.write(key, step, &identities[index], output);
                 }
+                if matches!(outcome, Outcome::Failed(_))
+                    && step.on_fail == OnFail::Stop
+                    && stopped.is_none()
+                {
+                    stopped = Some(format!("step `{}` failed", step.id));
+                }
+                outcomes[*task] = Some(outcome);
             }
         }
         cold |= missed;
         // A step's instances are all in this one wave, so its result is whole here and
         // nowhere earlier. Folding them here is also what keeps a fan-out split across
         // chunks from settling before its later chunks have run.
-        for &index in &wave.ready {
+        for &index in &ready {
             let step = &workflow.steps[index];
             let mine: Vec<&Outcome> = tasks
                 .iter()
@@ -798,7 +975,7 @@ pub async fn run(run: Run<'_>) -> Report {
                 // A fan-out over a step that listed nothing. Nothing ran and nothing
                 // failed, so the steps that need it read an empty result and carry on.
                 (true, None, None) => {
-                    results.insert(step.id.clone(), String::new());
+                    done.text.insert(step.id.clone(), String::new());
                     Status::Ok
                 }
                 (true, None, Some(reason)) => Status::Skipped(reason),
@@ -811,7 +988,17 @@ pub async fn run(run: Run<'_>) -> Report {
                         true => joined(&ok),
                         false => ok[0].1.clone(),
                     };
-                    results.insert(step.id.clone(), output);
+                    // A step that answers once and with an object leaves its fields for
+                    // the steps after it to read and to gate themselves on; a fan-out
+                    // has one object per item, so it leaves only the text.
+                    if step.for_each.is_none()
+                        && let Some(Outcome::Ok {
+                            json: Some(json), ..
+                        }) = mine.first()
+                    {
+                        done.json.insert(step.id.clone(), json.clone());
+                    }
+                    done.text.insert(step.id.clone(), output);
                     Status::Ok
                 }
             });
@@ -894,7 +1081,19 @@ fn plan(workflow: &Workflow, identities: &[Identity]) -> String {
                 Some(over) => format!(", one per item of {over}"),
                 None => String::new(),
             };
-            format!("{} ({}{over})", s.id, running_as(&s.identity, i))
+            let when = match &s.when {
+                Some(when) => format!(
+                    ", when {{{{{}}}}} {} {}",
+                    when.name,
+                    match when.equal {
+                        true => "==",
+                        false => "!=",
+                    },
+                    when.value
+                ),
+                None => String::new(),
+            };
+            format!("{} ({}{over}{when})", s.id, running_as(&s.identity, i))
         })
         .collect();
     format!(
@@ -967,6 +1166,34 @@ fn next_wave(steps: &[Step], status: &[Option<Status>]) -> Option<Wave> {
         }
     }
     (!wave.ready.is_empty() || !wave.blocked.is_empty()).then_some(wave)
+}
+
+/// The prompt as the child is given it: a step that declares `output: json` asks for
+/// one, since the run refuses an answer that is not one and would waste the call.
+fn asked(step: &Step, prompt: String) -> String {
+    match step.output {
+        Output::Text => prompt,
+        Output::Json => format!("{prompt}\n\nAnswer with one JSON object and nothing else."),
+    }
+}
+
+/// One launch's answer, held against what the step said it would answer with.
+fn answered(step: &Step, output: String, cached: bool) -> Outcome {
+    if step.output == Output::Text {
+        return Outcome::Ok {
+            output,
+            json: None,
+            cached,
+        };
+    }
+    match serde_json::from_str(unfenced(&output)) {
+        Ok(serde_json::Value::Object(json)) => Outcome::Ok {
+            output,
+            json: Some(json),
+            cached,
+        },
+        _ => Outcome::Failed("did not answer with one JSON object".to_string()),
+    }
 }
 
 /// Run one step, or one instance of a fan-out, as a child agent with its own
@@ -1620,6 +1847,11 @@ needs: [a]\n    prompt: two\n---\n",
         assert_eq!(workflow.steps[0].effort.as_deref(), Some("low"));
         assert_eq!(workflow.steps[1].for_each.as_deref(), Some("files"));
         assert_eq!(workflow.steps[1].needs, ["files"]);
+        assert_eq!(workflow.steps[2].output, Output::Json);
+        assert_eq!(
+            workflow.steps[3].when.as_ref().map(|w| w.name.as_str()),
+            Some("steps.verdict.blocking")
+        );
     }
 
     /// A step's own model and effort beat the identity's, which are only its defaults,
@@ -1885,6 +2117,182 @@ prompt: {{item}}\n  - id: c\n    for_each: b\n    prompt: {{item}}\n"
         assert_eq!(items("[\"a b\", \"c\"]"), ["a b", "c"]);
         assert_eq!(items("```json\n[]\n```"), Vec::<String>::new());
         assert!(items("   \n  \n").is_empty());
+    }
+
+    /// A step that says it answers with an object has its answer held to that, and the
+    /// steps after it read its fields and gate themselves on them.
+    #[tokio::test]
+    async fn a_step_can_read_and_gate_on_a_field_of_an_earlier_answer() {
+        let workflow = workflow(
+            "steps:\n  - id: triage\n    output: json\n    prompt: triage {{input}}\n  \
+- id: fix\n    needs: [triage]\n    when: \"{{steps.triage.risky}} == true\"\n    \
+prompt: fix the {{steps.triage.area}}\n",
+        );
+        assert_eq!(workflow.steps[0].output, Output::Json);
+        assert_eq!(
+            workflow.steps[1].when,
+            Some(When {
+                name: "steps.triage.risky".to_string(),
+                equal: true,
+                value: "true".to_string()
+            })
+        );
+        let identities = resolve(&delegation(), &workflow.steps).unwrap();
+        let plan = plan(&workflow, &identities);
+        assert!(
+            plan.contains("fix (general, when {{steps.triage.risky}} == true)"),
+            "{plan}"
+        );
+
+        let fake = Fake::new(vec![
+            vec![say(
+                "```json\n{\"risky\": true, \"area\": \"the parser\"}\n```",
+            )],
+            vec![say("fixed it")],
+        ]);
+        let (report, _, dir) = go(&workflow, "the diff", &fake).await;
+        assert_eq!(
+            statuses(&report),
+            [("triage", &Status::Ok), ("fix", &Status::Ok)]
+        );
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let inputs: Vec<String> = bodies.iter().map(|(_, b)| b["input"].to_string()).collect();
+        // The step asks for what it says it answers with, so the call is not wasted.
+        assert!(
+            inputs[0].contains("Answer with one JSON object and nothing else."),
+            "{:?}",
+            inputs[0]
+        );
+        assert!(inputs[1].contains("fix the the parser"), "{:?}", inputs[1]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The gate is read once the step it names has answered. A step it does not hold
+    /// for is skipped, and the run carries on rather than stopping.
+    #[tokio::test]
+    async fn a_gate_that_does_not_hold_skips_only_its_own_step() {
+        let workflow = workflow(
+            "steps:\n  - id: triage\n    output: json\n    prompt: triage it\n  - id: fix\n    \
+needs: [triage]\n    when: {{steps.triage.risky}} == true\n    prompt: fix {{steps.triage.area}}\n  \
+- id: note\n    needs: [triage]\n    prompt: write it down\n",
+        );
+        let fake = Fake::new(vec![
+            vec![say("{\"risky\": false, \"area\": \"none\"}")],
+            vec![say("written")],
+        ]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(report.steps[0].status, Status::Ok);
+        assert_eq!(
+            report.steps[1].status,
+            Status::Skipped("`when` did not hold: {{steps.triage.risky}} == true".to_string())
+        );
+        assert_eq!(report.steps[2].status, Status::Ok);
+        // Two calls: the gated step ran no child.
+        assert_eq!(fake.bodies.lock().unwrap().len(), 2);
+
+        // A field the object does not have is not a false gate, it is a step that
+        // cannot be judged, and it says so.
+        let fake = Fake::new(vec![
+            vec![say("{\"area\": \"none\"}")],
+            vec![say("written")],
+        ]);
+        let (report, _, second) = go(&workflow, "", &fake).await;
+        let Status::Skipped(reason) = &report.steps[1].status else {
+            panic!("{:?}", report.steps[1].status);
+        };
+        assert!(
+            reason.contains("`when` reads `{{steps.triage.risky}}`"),
+            "{reason}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(second);
+    }
+
+    /// An answer that is not the shape the step promised is a failed step, not a value
+    /// the steps after it have to guess at.
+    #[tokio::test]
+    async fn an_answer_that_is_not_an_object_fails_the_step() {
+        let workflow = workflow(
+            "cache: true\nsteps:\n  - id: triage\n    output: json\n    prompt: triage it\n  \
+- id: fix\n    needs: [triage]\n    prompt: fix {{steps.triage}}\n",
+        );
+        let fake = Fake::new(vec![vec![say("it looks risky to me")]]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(
+            statuses(&report),
+            [
+                (
+                    "triage",
+                    &Status::Failed("did not answer with one JSON object".to_string())
+                ),
+                (
+                    "fix",
+                    &Status::Skipped("`triage` did not finish".to_string())
+                )
+            ]
+        );
+        // Nothing of it was stored, so the next run asks again rather than being handed
+        // back an answer the step already refused.
+        let fake = Fake::new(vec![vec![say("{\"risky\": true}")], vec![say("fixed")]]);
+        let (report, _) = go_in(&dir, &workflow, "", &fake).await;
+        assert_eq!(
+            statuses(&report),
+            [("triage", &Status::Ok), ("fix", &Status::Ok)]
+        );
+        assert_eq!(fake.bodies.lock().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_output_or_a_gate_that_could_not_work_is_a_load_error() {
+        let bad = |steps: &str| {
+            format!(
+                "{:#}",
+                parse(&format!("---\nname: w\n{steps}---\n"), "./t").unwrap_err()
+            )
+        };
+        assert!(
+            bad("steps:\n  - id: a\n    output: yaml\n    prompt: one\n")
+                .contains("step `a` has a bad `output` `yaml`"),
+        );
+        assert!(
+            bad("steps:\n  - id: a\n    when: it feels right\n    prompt: one\n")
+                .contains("is not `{{...}} == value` or `!=`"),
+        );
+        assert!(
+            bad("steps:\n  - id: a\n    when: nope == true\n    prompt: one\n")
+                .contains("does not start with a `{{...}}`"),
+        );
+        // A field is read off one object, so the step it comes from has to answer with
+        // one, and has to answer once.
+        assert!(
+            bad(
+                "steps:\n  - id: a\n    prompt: one\n  - id: b\n    needs: [a]\n    \
+prompt: {{steps.a.risky}}\n"
+            )
+            .contains("but `a` has no `output: json`"),
+        );
+        assert!(
+            bad(
+                "steps:\n  - id: a\n    prompt: one\n  - id: b\n    for_each: a\n    \
+output: json\n    prompt: {{item}}\n  - id: c\n    needs: [b]\n    prompt: {{steps.b.risky}}\n"
+            )
+            .contains("but `b` fans out, so it has no one object"),
+        );
+        assert!(
+            bad(
+                "steps:\n  - id: a\n    output: json\n    prompt: one\n  - id: b\n    \
+needs: [a]\n    when: {{steps.a.risky}} == true\n    prompt: {{steps.a.deep.field}}\n"
+            )
+            .contains("uses unknown `{{steps.a.deep.field}}`"),
+        );
+        assert!(
+            bad(
+                "steps:\n  - id: a\n    prompt: one\n  - id: b\n    for_each: a\n    \
+when: {{item}} == x\n    prompt: {{item}}\n"
+            )
+            .contains("step `b` gates itself on `{{item}}`"),
+        );
     }
 
     #[test]
