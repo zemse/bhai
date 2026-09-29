@@ -28,6 +28,9 @@ carries the shape of what is there.
   gate that does not hold skips its own step and nothing else; a field the object does
   not have skips it too, and says which field was missing rather than reading as false.
 
+- `max_fanout` sets how many instances one `for_each` step may run, default 20 and
+  clamped to 100. `/workflows` says the cap for a definition that fans out.
+
 - A `/model` switch no longer doubles how many child agents can run at once. The cap
   was rebuilt with the rest of the tool registry, so children still running from before
   the switch held slots nobody was counting and a fan-out could reach six.

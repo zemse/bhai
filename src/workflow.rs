@@ -40,10 +40,13 @@ const HOME_DIR: &str = ".config/bhai/workflows";
 const PROJECT_DIR: &str = ".bhai/workflows";
 /// Cached step results, under the `.bhai` the session transcripts are in.
 const CACHE_DIR: &str = "cache/workflows";
-/// Instances one `for_each` step may run. The list is runtime data, so a step that
-/// answers with a hundred lines is capped rather than allowed to spend the budget on
-/// its own; the report says how many of the items were run.
-const MAX_FANOUT: usize = 20;
+/// Instances one `for_each` step may run unless the file says otherwise. The list is
+/// runtime data, so a step that answers with a hundred lines is capped rather than
+/// allowed to spend the budget on its own; the report says how many of the items ran.
+const DEFAULT_FANOUT: u64 = 20;
+/// What `max_fanout` may be raised to. The budget is the real backstop, but a run
+/// still has a bound the definition cannot talk its way out of.
+const MAX_FANOUT: u64 = 100;
 
 /// What a step does when it fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +108,8 @@ pub struct Workflow {
     pub budget_tokens: u64,
     /// Steps launched at once, never more than the child agent fan-out cap.
     pub max_parallel: usize,
+    /// Instances one `for_each` step may run.
+    pub max_fanout: usize,
     /// Keep each step's result and hand it back when the step has not changed. Off
     /// unless the file asks for it: a hit answers today's run with yesterday's text.
     pub cache: bool,
@@ -180,6 +185,7 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
     };
     let budget_tokens = number("budget_tokens", DEFAULT_BUDGET)?;
     let max_parallel = number("max_parallel", 1)?.clamp(1, tools::agent::MAX_RUNNING as u64);
+    let max_fanout = number("max_fanout", DEFAULT_FANOUT)?.clamp(1, MAX_FANOUT);
     let cache = match value("cache").as_deref() {
         None | Some("false") => false,
         Some("true") => true,
@@ -249,6 +255,7 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
         source: source.to_string(),
         budget_tokens,
         max_parallel: max_parallel as usize,
+        max_fanout: max_fanout as usize,
         cache,
         steps,
         body: body.trim_end().to_string(),
@@ -587,12 +594,16 @@ pub fn report(found: &Found) -> String {
     for workflow in &found.workflows {
         let _ = writeln!(
             out,
-            "{} ({}): {} step(s), budget {} tokens, {} at a time{}",
+            "{} ({}): {} step(s), budget {} tokens, {} at a time{}{}",
             workflow.name,
             workflow.source,
             workflow.steps.len(),
             workflow.budget_tokens,
             workflow.max_parallel,
+            match workflow.steps.iter().any(|s| s.for_each.is_some()) {
+                true => format!(", up to {} items per fan-out", workflow.max_fanout),
+                false => String::new(),
+            },
             caching(workflow)
         );
         // The description and the file's prose, indented under the definition.
@@ -840,10 +851,15 @@ pub async fn run(run: Run<'_>) -> Report {
                 ok: 0,
                 found: found.len(),
             });
-            tasks.extend(found.into_iter().take(MAX_FANOUT).map(|item| Task {
-                step: index,
-                item: Some(item),
-            }));
+            tasks.extend(
+                found
+                    .into_iter()
+                    .take(workflow.max_fanout)
+                    .map(|item| Task {
+                        step: index,
+                        item: Some(item),
+                    }),
+            );
         }
         let mut outcomes: Vec<Option<Outcome>> = vec![None; tasks.len()];
         let mut missed = false;
@@ -1803,6 +1819,14 @@ needs: [a]\n    prompt: two\n---\n",
         .unwrap();
         assert_eq!(workflow.budget_tokens, DEFAULT_BUDGET);
         assert_eq!(workflow.max_parallel, tools::agent::MAX_RUNNING);
+        // Both caps are clamped, so a definition cannot talk its way past either.
+        assert_eq!(workflow.max_fanout, DEFAULT_FANOUT as usize);
+        let greedy = parse(
+            "---\nname: w\nmax_fanout: 5000\nsteps:\n  - id: a\n    prompt: one\n---\n",
+            "./test",
+        )
+        .unwrap();
+        assert_eq!(greedy.max_fanout, MAX_FANOUT as usize);
         assert!(!workflow.cache);
         assert_eq!(workflow.steps[0].identity, "router");
         assert_eq!(workflow.steps[0].prompt, "read {{input}}\nthen stop");
@@ -2005,33 +2029,27 @@ prompt: summarise {{steps.review}}\n",
     }
 
     /// The list is runtime data, so the cap is what stops a step that answers with a
-    /// hundred lines from spending the budget on its own. The report says it was cut.
+    /// hundred lines from spending the budget on its own. The report says it was cut,
+    /// and a workflow that wants more of them says so.
     #[tokio::test]
     async fn a_fan_out_is_capped_and_the_report_says_how_many_ran() {
         let workflow = workflow(
-            "steps:\n  - id: find\n    prompt: list them\n  - id: review\n    for_each: find\n    \
-prompt: review {{item}}\n",
+            "max_fanout: 3\nsteps:\n  - id: find\n    prompt: list them\n  - id: review\n    \
+for_each: find\n    prompt: review {{item}}\n",
         );
-        let listed: Vec<String> = (0..MAX_FANOUT + 5).map(|n| format!("file{n}.rs")).collect();
+        assert_eq!(workflow.max_fanout, 3);
+        let listed: Vec<String> = (0..5).map(|n| format!("file{n}.rs")).collect();
         let mut script = vec![vec![say(&listed.join("\n"))]];
-        script.extend(vec![vec![say("looked")]; MAX_FANOUT]);
+        script.extend(vec![vec![say("looked")]; 3]);
         let fake = Fake::new(script);
         let (report, _, dir) = go(&workflow, "", &fake).await;
-        assert_eq!(
-            report.steps[1].items,
-            Some(Items {
-                ok: MAX_FANOUT,
-                found: MAX_FANOUT + 5
-            })
-        );
+        assert_eq!(report.steps[1].items, Some(Items { ok: 3, found: 5 }));
         assert!(
-            report
-                .text()
-                .contains(&format!("ok, {MAX_FANOUT} of {} items", MAX_FANOUT + 5)),
+            report.text().contains("review (general) ok, 3 of 5 items"),
             "{}",
             report.text()
         );
-        assert_eq!(fake.bodies.lock().unwrap().len(), MAX_FANOUT + 1);
+        assert_eq!(fake.bodies.lock().unwrap().len(), 4);
         let _ = std::fs::remove_dir_all(dir);
     }
 
