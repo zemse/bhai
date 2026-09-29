@@ -528,6 +528,10 @@ pub(crate) async fn run_with(
         .as_ref()
         .map(|d| d.cache_root.clone())
         .unwrap_or_default();
+    // Outside `build`, like the ledger and the report channel: children outlive the
+    // turn that started them, so a `/model` switch that rebuilt the fan-out cap would
+    // hand the session a second set of slots while the first set is still running.
+    let slots = Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING));
     // Built again when `/model` switches, so a child starts on the model its parent is
     // on. What tools there are does not depend on the model, so the schemas hold.
     let build = |model: &Arc<dyn Model>| {
@@ -545,7 +549,7 @@ pub(crate) async fn run_with(
                 children: Arc::clone(&children),
                 judge: judge.clone(),
                 results: tx_results.clone(),
-                slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
+                slots: Arc::clone(&slots),
             });
             registry = registry.with_models(tools::models::Models {
                 current: Arc::clone(model),
@@ -4099,6 +4103,77 @@ mod tests {
             text.ends_with("keep this in particular: the file paths"),
             "{text}"
         );
+    }
+
+    /// Children outlive the turn that started them, so the cap on how many run at once
+    /// belongs to the session. Rebuilt with the rest of the registry on a `/model`
+    /// switch, it handed out a second set of slots to children still holding the first.
+    #[tokio::test]
+    async fn a_model_switch_does_not_hand_out_a_second_set_of_child_slots() {
+        use fake::{Fake, call, say};
+
+        let dir = crate::tools::temp_dir();
+        let spawn = |n: usize| {
+            call(
+                "agent",
+                json!({"description": format!("look {n}"), "prompt": "go"}),
+            )
+        };
+        let fake = Fake::new(vec![
+            (0..tools::agent::MAX_RUNNING).map(spawn).collect(),
+            vec![say("all three are running")],
+            vec![spawn(9)],
+            vec![say("and one more")],
+        ])
+        .with_children(vec![fake::step(fake::HANG); tools::agent::MAX_RUNNING + 1]);
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            Some(Delegation {
+                identities: vec![Identity::default()],
+                prompt: Arc::new(|identity: &Identity| SystemPrompt {
+                    identity: identity.clone(),
+                    ..crate::prompt::system_prompt(&[], Vec::new())
+                }),
+                sessions: dir.clone(),
+                cache_root: dir.clone(),
+                mailboxes: Default::default(),
+            }),
+            None,
+            Limits::default(),
+        ));
+
+        drive(&tx_user, &mut rx, &cancel, "start them", &[]).await;
+        tx_control
+            .send(Control::Model {
+                model: "gpt-9".to_string(),
+                effort: "high".to_string(),
+                window: None,
+            })
+            .await
+            .unwrap();
+        let events = drive(&tx_user, &mut rx, &cancel, "one more", &[]).await;
+        let queued = events.iter().any(|e| {
+            matches!(e, AgentEvent::ToolOutput(o)
+                if o.contains(&format!("behind the {} already running", tools::agent::MAX_RUNNING)))
+        });
+        assert!(queued, "the fourth child took a slot of its own: {events:?}");
+
+        cancel.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

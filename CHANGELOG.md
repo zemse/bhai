@@ -28,6 +28,10 @@ carries the shape of what is there.
   gate that does not hold skips its own step and nothing else; a field the object does
   not have skips it too, and says which field was missing rather than reading as false.
 
+- A `/model` switch no longer doubles how many child agents can run at once. The cap
+  was rebuilt with the rest of the tool registry, so children still running from before
+  the switch held slots nobody was counting and a fan-out could reach six.
+
 - The `agent` tool refuses an unknown `model` or `effort` before it spawns the child. The
   catalogue behind that check is loaded at most once a minute and shared with `/model`
   and the `models` tool, so a fan-out pays for one list rather than one each. A backend
