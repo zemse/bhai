@@ -11,6 +11,15 @@ carries the shape of what is there.
   report both name the model a step runs on when it is not the session's. A bad `effort`
   is a load error; a model no backend serves is named before the run starts, so a typo
   costs nothing instead of failing at the first step.
+- A workflow step can fan out: `for_each: <step id>` runs it once per item of that
+  step's answer, with `{{item}}` in the prompt, which is the one shape the markdown
+  could not express before. The items are the lines of that answer, or its JSON array
+  when it is one, so a step with nothing to list says `[]` and the fan-out runs nothing
+  rather than blocking what needs it. A bullet or a number in front of an item is
+  dropped. The step that reduces them reads every output under the item it came from,
+  one failed item does not take the others down under `on_fail: continue`, and the
+  report says how many of the items ran. Capped at 20 instances per step.
+
 - The `agent` tool refuses an unknown `model` or `effort` before it spawns the child. The
   catalogue behind that check is loaded at most once a minute and shared with `/model`
   and the `models` tool, so a fan-out pays for one list rather than one each. A backend

@@ -35,6 +35,10 @@ const HOME_DIR: &str = ".config/bhai/workflows";
 const PROJECT_DIR: &str = ".bhai/workflows";
 /// Cached step results, under the `.bhai` the session transcripts are in.
 const CACHE_DIR: &str = "cache/workflows";
+/// Instances one `for_each` step may run. The list is runtime data, so a step that
+/// answers with a hundred lines is capped rather than allowed to spend the budget on
+/// its own; the report says how many of the items were run.
+const MAX_FANOUT: usize = 20;
 
 /// What a step does when it fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +58,9 @@ pub struct Step {
     /// Step ids that must finish first.
     pub needs: Vec<String>,
     pub on_fail: OnFail,
+    /// Run this step once per item of the named step's output, with `{{item}}` filled
+    /// in. The size of the fan-out is known only once that step has answered.
+    pub for_each: Option<String>,
     /// Run this step on another model, over whatever its identity would use.
     pub model: Option<String>,
     /// Run it at this reasoning effort, over whatever its identity would use.
@@ -178,12 +185,22 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
             prompt,
             needs: frontmatter::list(&item, "needs").unwrap_or_default(),
             on_fail,
+            for_each: value("for_each"),
             model: value("model"),
             effort,
         });
     }
     if steps.is_empty() {
         bail!("no `steps`");
+    }
+    // Fanning out over a step is needing it, so the dependency is implied rather than
+    // written twice; everything after this reads one list.
+    for index in 0..steps.len() {
+        if let Some(over) = steps[index].for_each.clone()
+            && !steps[index].needs.contains(&over)
+        {
+            steps[index].needs.push(over);
+        }
     }
     check(&steps)?;
     Ok(Workflow {
@@ -205,6 +222,30 @@ fn check(steps: &[Step]) -> Result<()> {
         if steps[..index].iter().any(|s| s.id == step.id) {
             bail!("two steps are called `{}`", step.id);
         }
+        if let Some(over) = &step.for_each {
+            let producer = steps.iter().find(|s| &s.id == over);
+            match producer {
+                _ if over == &step.id => bail!("step `{}` fans out over itself", step.id),
+                None => bail!(
+                    "step `{}` fans out over `{over}`, which is not a step",
+                    step.id
+                ),
+                // Its output is the items and their results run together, so the lines
+                // of it are not a list of anything.
+                Some(producer) if producer.for_each.is_some() => bail!(
+                    "step `{}` fans out over `{over}`, which fans out itself",
+                    step.id
+                ),
+                Some(_) => {}
+            }
+            if !placeholders(&step.prompt).contains(&"item") {
+                bail!(
+                    "step `{}` has `for_each` but does not use `{{{{item}}}}`, so every \
+instance would get the same prompt",
+                    step.id
+                );
+            }
+        }
         for need in &step.needs {
             if !steps.iter().any(|s| &s.id == need) {
                 bail!("step `{}` needs `{need}`, which is not a step", step.id);
@@ -213,6 +254,11 @@ fn check(steps: &[Step]) -> Result<()> {
         for name in placeholders(&step.prompt) {
             match name.strip_prefix("steps.") {
                 None if name == "input" => {}
+                None if name == "item" && step.for_each.is_some() => {}
+                None if name == "item" => bail!(
+                    "step `{}` uses `{{{{item}}}}` but has no `for_each`",
+                    step.id
+                ),
                 Some(id) if step.needs.iter().any(|n| n == id) => {}
                 Some(id) if steps.iter().any(|s| s.id == id) => {
                     bail!(
@@ -277,9 +323,14 @@ fn placeholders(text: &str) -> Vec<&str> {
     found
 }
 
-/// `text` with `{{input}}` and `{{steps.<id>}}` filled in. A name with no value is left
-/// as it is; `check` already refused the ones that could not be filled.
-fn render(text: &str, input: &str, results: &HashMap<String, String>) -> String {
+/// `text` with `{{input}}`, `{{item}}` and `{{steps.<id>}}` filled in. A name with no
+/// value is left as it is; `check` already refused the ones that could not be filled.
+fn render(
+    text: &str,
+    input: &str,
+    results: &HashMap<String, String>,
+    item: Option<&str>,
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("{{") {
@@ -289,6 +340,7 @@ fn render(text: &str, input: &str, results: &HashMap<String, String>) -> String 
         let value = match name.strip_prefix("steps.") {
             Some(id) => results.get(id).map(String::as_str),
             None if name == "input" => Some(input),
+            None if name == "item" => item,
             None => None,
         };
         out.push_str(&rest[..start]);
@@ -300,6 +352,67 @@ fn render(text: &str, input: &str, results: &HashMap<String, String>) -> String 
     }
     out.push_str(rest);
     out
+}
+
+/// The contents of a ``` fence when the whole text is one, since a model asked for a
+/// list or an object tends to wrap it. Otherwise the text as it stands.
+fn unfenced(text: &str) -> &str {
+    let text = text.trim();
+    let Some(rest) = text.strip_prefix("```") else {
+        return text;
+    };
+    let Some(body) = rest.split_once('\n').map(|(_, body)| body) else {
+        return text;
+    };
+    match body.trim_end().strip_suffix("```") {
+        Some(inner) => inner.trim(),
+        None => text,
+    }
+}
+
+/// The items a `for_each` step runs on. A JSON array is the list when the output is
+/// one, so a step with nothing to list can say `[]`; otherwise the non-blank lines are
+/// it, with a bullet or a number in front of one dropped, since that is how a model
+/// writes a list even when the prompt asked for one item per line.
+fn items(text: &str) -> Vec<String> {
+    let text = unfenced(text);
+    if let Ok(serde_json::Value::Array(values)) = serde_json::from_str::<serde_json::Value>(text) {
+        return values
+            .iter()
+            .map(|value| match value {
+                serde_json::Value::String(item) => item.clone(),
+                other => other.to_string(),
+            })
+            .filter(|item| !item.trim().is_empty())
+            .collect();
+    }
+    text.lines()
+        .map(|line| {
+            let line = line.trim();
+            let line = ["- ", "* ", "\u{2022} "]
+                .iter()
+                .find_map(|bullet| line.strip_prefix(bullet))
+                .unwrap_or(line);
+            let numbered = line
+                .split_once(['.', ')'])
+                .filter(|(head, _)| !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()));
+            match numbered {
+                Some((_, rest)) => rest.trim().to_string(),
+                None => line.to_string(),
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// What a fan-out step leaves for the steps that need it: each item and what its
+/// instance answered, so a step reducing them can tell which output came from which.
+fn joined(outputs: &[(String, String)]) -> String {
+    outputs
+        .iter()
+        .map(|(item, output)| format!("item: {item}\n{output}"))
+        .collect::<Vec<String>>()
+        .join("\n\n")
 }
 
 /// The workflow called `name`, or an error listing the available ones.
@@ -367,6 +480,29 @@ pub enum Status {
     Skipped(String),
 }
 
+/// One launch: a whole step, or one item of a `for_each` step.
+struct Task {
+    /// Its index in the workflow's steps.
+    step: usize,
+    item: Option<String>,
+}
+
+/// How one launch ended, before the launches of a step are folded into its `Status`.
+#[derive(Clone)]
+enum Outcome {
+    Ok { output: String, cached: bool },
+    Failed(String),
+    Skipped(String),
+}
+
+/// What a `for_each` step ran on: the instances that answered, of the items the step it
+/// fans out over listed. They differ when an instance failed or the cap cut the list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Items {
+    pub ok: usize,
+    pub found: usize,
+}
+
 /// One step's line of the final report.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepReport {
@@ -379,6 +515,8 @@ pub struct StepReport {
     pub cached: bool,
     /// The step spent its whole budget, so its result is partial.
     pub truncated: bool,
+    /// What a `for_each` step ran on; `None` for a step that runs once.
+    pub items: Option<Items>,
 }
 
 /// What a finished run spent, step by step.
@@ -410,9 +548,14 @@ impl Report {
                 Status::Failed(e) => format!("failed: {e}"),
                 Status::Skipped(reason) => format!("did not run: {reason}"),
             };
+            let items = match &step.items {
+                Some(Items { ok, found }) if ok == found => format!(", {found} items"),
+                Some(Items { ok, found }) => format!(", {ok} of {found} items"),
+                None => String::new(),
+            };
             let _ = write!(
                 out,
-                "\n  {} ({}) {status}, {}/{} tokens",
+                "\n  {} ({}) {status}{items}, {}/{} tokens",
                 step.id, step.identity, step.usage.input, step.usage.output
             );
         }
@@ -484,8 +627,9 @@ pub async fn run(run: Run<'_>) -> Report {
     let mut status: Vec<Option<Status>> = vec![None; workflow.steps.len()];
     let mut results: HashMap<String, String> = HashMap::new();
     let mut usage = vec![Usage::default(); workflow.steps.len()];
-    let mut cached = vec![false; workflow.steps.len()];
+    let mut cached = vec![true; workflow.steps.len()];
     let mut truncated = vec![false; workflow.steps.len()];
+    let mut counts: Vec<Option<Items>> = vec![None; workflow.steps.len()];
     let cache = Cache::open(&run);
     // Once a wave holds a step the cache does not have, every later wave runs cold and
     // is not asked about. A changed result changes the prompts rendered after it, so
@@ -500,8 +644,32 @@ pub async fn run(run: Run<'_>) -> Report {
         for (index, reason) in wave.blocked {
             status[index] = Some(Status::Skipped(reason));
         }
+        // A `for_each` step becomes one task per item of the step it fans out over.
+        // That step is a dependency, so it has already answered: this is the first
+        // point in the run where the size of the fan-out is known.
+        let mut tasks: Vec<Task> = Vec::new();
+        for &index in &wave.ready {
+            let Some(over) = &workflow.steps[index].for_each else {
+                tasks.push(Task {
+                    step: index,
+                    item: None,
+                });
+                continue;
+            };
+            let found = items(results.get(over).map(String::as_str).unwrap_or_default());
+            counts[index] = Some(Items {
+                ok: 0,
+                found: found.len(),
+            });
+            tasks.extend(found.into_iter().take(MAX_FANOUT).map(|item| Task {
+                step: index,
+                item: Some(item),
+            }));
+        }
+        let mut outcomes: Vec<Option<Outcome>> = vec![None; tasks.len()];
         let mut missed = false;
-        for chunk in wave.ready.chunks(workflow.max_parallel) {
+        let order: Vec<usize> = (0..tasks.len()).collect();
+        for chunk in order.chunks(workflow.max_parallel) {
             if stopped.is_none() && run.cancel.load(Ordering::Relaxed) {
                 stopped = Some("the run was interrupted".to_string());
             }
@@ -512,43 +680,53 @@ pub async fn run(run: Run<'_>) -> Report {
                 ));
             }
             if let Some(reason) = &stopped {
-                for &index in chunk {
-                    status[index] = Some(Status::Skipped(reason.clone()));
+                for &task in chunk {
+                    outcomes[task] = Some(Outcome::Skipped(reason.clone()));
                 }
                 continue;
             }
-            // The key, kept beside each launched step so the result can be stored under
+            // The key, kept beside each launched task so the result can be stored under
             // it. A cold run still stores what it produces; it only stops reading.
             let mut launched: Vec<(usize, String, Option<String>)> = Vec::new();
-            for &index in chunk {
-                let step = &workflow.steps[index];
-                let prompt = render(&step.prompt, run.input, &results);
+            for &task in chunk {
+                let Task { step: index, item } = &tasks[task];
+                let step = &workflow.steps[*index];
+                let prompt = render(&step.prompt, run.input, &results, item.as_deref());
                 let Some(cache) = &cache else {
-                    launched.push((index, prompt, None));
+                    launched.push((task, prompt, None));
                     continue;
                 };
-                let key = key(step, &identities[index], &prompt);
+                let key = key(step, &identities[*index], &prompt);
                 match (!cold).then(|| cache.read(&key)).flatten() {
                     Some(output) => {
-                        replay(&run, step, &identities[index], &output);
-                        results.insert(step.id.clone(), output);
-                        status[index] = Some(Status::Ok);
-                        cached[index] = true;
+                        replay(&run, step, &identities[*index], item.as_deref(), &output);
+                        outcomes[task] = Some(Outcome::Ok {
+                            output,
+                            cached: true,
+                        });
                     }
                     None => {
                         missed = true;
-                        launched.push((index, prompt, Some(key)));
+                        launched.push((task, prompt, Some(key)));
                     }
                 }
             }
-            let finished = join_all(launched.iter().map(|(index, prompt, _)| {
-                step(&run, &workflow.steps[*index], &identities[*index], prompt)
+            let finished = join_all(launched.iter().map(|(task, prompt, _)| {
+                let Task { step: index, item } = &tasks[*task];
+                step(
+                    &run,
+                    &workflow.steps[*index],
+                    &identities[*index],
+                    item.as_deref(),
+                    prompt,
+                )
             }))
             .await;
-            for ((index, _, key), done) in launched.iter().zip(finished) {
-                let step = &workflow.steps[*index];
-                usage[*index] = done.usage;
-                truncated[*index] = done.truncated;
+            for ((task, _, key), done) in launched.iter().zip(finished) {
+                let index = tasks[*task].step;
+                let step = &workflow.steps[index];
+                add(&mut usage[index], done.usage);
+                truncated[index] |= done.truncated;
                 add(&mut report.usage, done.usage);
                 match done.result {
                     Ok(text) => {
@@ -558,14 +736,16 @@ pub async fn run(run: Run<'_>) -> Report {
                         // had when it was cut off, and a cache would hand that back for
                         // good.
                         if let (Some(cache), Some(key), false) = (&cache, key, done.truncated) {
-                            cache.write(key, step, &identities[*index], &text);
+                            cache.write(key, step, &identities[index], &text);
                         }
-                        results.insert(step.id.clone(), text);
-                        status[*index] = Some(Status::Ok);
+                        outcomes[*task] = Some(Outcome::Ok {
+                            output: text,
+                            cached: false,
+                        });
                     }
                     Err(e) => {
                         let reason = format!("{e:#}");
-                        status[*index] = Some(Status::Failed(reason.clone()));
+                        outcomes[*task] = Some(Outcome::Failed(reason));
                         if step.on_fail == OnFail::Stop && stopped.is_none() {
                             stopped = Some(format!("step `{}` failed", step.id));
                         }
@@ -574,6 +754,68 @@ pub async fn run(run: Run<'_>) -> Report {
             }
         }
         cold |= missed;
+        // A step's instances are all in this one wave, so its result is whole here and
+        // nowhere earlier. Folding them here is also what keeps a fan-out split across
+        // chunks from settling before its later chunks have run.
+        for &index in &wave.ready {
+            let step = &workflow.steps[index];
+            let mine: Vec<&Outcome> = tasks
+                .iter()
+                .zip(&outcomes)
+                .filter(|(task, _)| task.step == index)
+                .filter_map(|(_, outcome)| outcome.as_ref())
+                .collect();
+            let ok: Vec<(String, String)> = tasks
+                .iter()
+                .zip(&outcomes)
+                .filter(|(task, _)| task.step == index)
+                .filter_map(|(task, outcome)| match outcome {
+                    Some(Outcome::Ok { output, .. }) => Some((
+                        task.item.clone().unwrap_or_else(|| step.id.clone()),
+                        output.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            if let Some(count) = &mut counts[index] {
+                count.ok = ok.len();
+            }
+            // Only a step every instance of which was answered from the cache is
+            // reported as cached: one that ran even a single child did not come free.
+            cached[index] = !mine.is_empty()
+                && mine
+                    .iter()
+                    .all(|o| matches!(o, Outcome::Ok { cached: true, .. }));
+            let failed = mine.iter().find_map(|o| match o {
+                Outcome::Failed(reason) => Some(reason.clone()),
+                _ => None,
+            });
+            let skipped = mine.iter().find_map(|o| match o {
+                Outcome::Skipped(reason) => Some(reason.clone()),
+                _ => None,
+            });
+            status[index] = Some(match (ok.is_empty(), failed, skipped) {
+                // A fan-out over a step that listed nothing. Nothing ran and nothing
+                // failed, so the steps that need it read an empty result and carry on.
+                (true, None, None) => {
+                    results.insert(step.id.clone(), String::new());
+                    Status::Ok
+                }
+                (true, None, Some(reason)) => Status::Skipped(reason),
+                (true, Some(reason), _) => Status::Failed(reason),
+                // At least one instance answered. Under `on_fail: continue` the ones
+                // that did not are simply missing from what the next step reads; under
+                // `stop` nothing more was launched anyway.
+                (false, _, _) => {
+                    let output = match step.for_each.is_some() {
+                        true => joined(&ok),
+                        false => ok[0].1.clone(),
+                    };
+                    results.insert(step.id.clone(), output);
+                    Status::Ok
+                }
+            });
+        }
     }
 
     report.steps = workflow
@@ -589,6 +831,7 @@ pub async fn run(run: Run<'_>) -> Report {
             usage: usage[index],
             cached: cached[index],
             truncated: truncated[index],
+            items: counts[index].clone(),
         })
         .collect();
     let _ = run.tx.send(AgentEvent::Info(report.text()));
@@ -646,7 +889,13 @@ fn plan(workflow: &Workflow, identities: &[Identity]) -> String {
         .steps
         .iter()
         .zip(identities)
-        .map(|(s, i)| format!("{} ({})", s.id, running_as(&s.identity, i)))
+        .map(|(s, i)| {
+            let over = match &s.for_each {
+                Some(over) => format!(", one per item of {over}"),
+                None => String::new(),
+            };
+            format!("{} ({}{over})", s.id, running_as(&s.identity, i))
+        })
         .collect();
     format!(
         "workflow {}: {} step(s) [{}], budget {} tokens, {} at a time{}",
@@ -720,21 +969,30 @@ fn next_wave(steps: &[Step], status: &[Option<Status>]) -> Option<Wave> {
     (!wave.ready.is_empty() || !wave.blocked.is_empty()).then_some(wave)
 }
 
-/// Run one step as a child agent, with its own transcript entry.
-async fn step(run: &Run<'_>, step: &Step, identity: &Identity, prompt: &str) -> agent::Finished {
+/// Run one step, or one instance of a fan-out, as a child agent with its own
+/// transcript entry.
+async fn step(
+    run: &Run<'_>,
+    step: &Step,
+    identity: &Identity,
+    item: Option<&str>,
+    prompt: &str,
+) -> agent::Finished {
     let id = uuid::Uuid::new_v4().simple().to_string()[..6].to_string();
     let _ = run.tx.send(AgentEvent::ToolStart {
         tool: crate::tools::agent::NAME.to_string(),
         summary: format!(
             "workflow {} step {} ({})",
-            run.workflow.name, step.id, identity.name
+            run.workflow.name,
+            label(&step.id, item),
+            identity.name
         ),
     });
     let model = run.model.child(identity);
     let (_mailbox, steer) = agent::Mailbox::open(&run.delegation.mailboxes, &id);
     let finished = agent::run_child(Child {
         id: &id,
-        description: &step.id,
+        description: &label(&step.id, item),
         task: prompt,
         prompt: (run.delegation.prompt)(identity),
         model: model.as_ref(),
@@ -755,14 +1013,29 @@ async fn step(run: &Run<'_>, step: &Step, identity: &Identity, prompt: &str) -> 
     finished
 }
 
+/// How a step is named while it runs: its id, and the item when it is one instance of
+/// a fan-out, cut short so a long item does not take the line over.
+fn label(id: &str, item: Option<&str>) -> String {
+    let Some(item) = item else {
+        return id.to_string();
+    };
+    let short: String = item.chars().take(48).collect();
+    match short.len() < item.len() {
+        true => format!("{id} [{short}...]"),
+        false => format!("{id} [{short}]"),
+    }
+}
+
 /// Put a cached step through the transcript the way a run one goes, so a re-run reads
 /// as the first one did.
-fn replay(run: &Run<'_>, step: &Step, identity: &Identity, output: &str) {
+fn replay(run: &Run<'_>, step: &Step, identity: &Identity, item: Option<&str>, output: &str) {
     let _ = run.tx.send(AgentEvent::ToolStart {
         tool: crate::tools::agent::NAME.to_string(),
         summary: format!(
             "workflow {} step {} ({}), from cache",
-            run.workflow.name, step.id, identity.name
+            run.workflow.name,
+            label(&step.id, item),
+            identity.name
         ),
     });
     let _ = run.tx.send(AgentEvent::ToolOutput(tools::truncate(
@@ -1328,9 +1601,12 @@ needs: [a]\n    prompt: two\n---\n",
     }
 
     #[test]
-    fn the_shipped_example_loads() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/workflows/review.md");
-        let Ok(text) = std::fs::read_to_string(path) else {
+    fn the_shipped_examples_load() {
+        let read = |name: &str| {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/workflows/");
+            std::fs::read_to_string(format!("{dir}{name}"))
+        };
+        let Ok(text) = read("review.md") else {
             return;
         };
         let workflow = parse(&text, "./examples/workflows").unwrap();
@@ -1338,6 +1614,12 @@ needs: [a]\n    prompt: two\n---\n",
         assert_eq!(workflow.max_parallel, 2);
         assert_eq!(workflow.steps[1].on_fail, OnFail::Continue);
         assert!(workflow.steps[2].prompt.contains("{{steps.diff}}"));
+
+        let workflow = parse(&read("review-each.md").unwrap(), "./examples/workflows").unwrap();
+        assert_eq!(workflow.name, "review-each");
+        assert_eq!(workflow.steps[0].effort.as_deref(), Some("low"));
+        assert_eq!(workflow.steps[1].for_each.as_deref(), Some("files"));
+        assert_eq!(workflow.steps[1].needs, ["files"]);
     }
 
     /// A step's own model and effort beat the identity's, which are only its defaults,
@@ -1409,6 +1691,200 @@ model: ollama:nope\n    prompt: two\n",
             notes: vec!["ollama: connection refused".to_string()],
         };
         assert!(unserved(&ollama_down, &workflow.steps, &identities).is_empty());
+    }
+
+    /// The size of the fan-out is the earlier step's answer, so it is known only once
+    /// that step has run. Each instance is its own child, and the step that reduces
+    /// them reads every output labelled with the item it came from.
+    #[tokio::test]
+    async fn a_step_runs_once_per_item_of_the_step_it_fans_out_over() {
+        let workflow = workflow(
+            "steps:\n  - id: find\n    prompt: list the files in {{input}}\n  - id: review\n    \
+for_each: find\n    prompt: review {{item}}\n  - id: sum\n    needs: [review]\n    \
+prompt: summarise {{steps.review}}\n",
+        );
+        // `for_each` is a dependency, so it does not have to be written twice.
+        assert_eq!(workflow.steps[1].needs, ["find"]);
+        let fake = Fake::new(vec![
+            vec![say("- a.rs\n2. b.rs")],
+            vec![say("a.rs is fine")],
+            vec![say("b.rs is not")],
+            vec![say("one of two is fine")],
+        ]);
+        let (report, _, dir) = go(&workflow, "the repo", &fake).await;
+        assert_eq!(
+            statuses(&report),
+            [
+                ("find", &Status::Ok),
+                ("review", &Status::Ok),
+                ("sum", &Status::Ok)
+            ]
+        );
+        assert_eq!(report.steps[1].items, Some(Items { ok: 2, found: 2 }));
+        assert_eq!(report.steps[0].items, None);
+        assert!(
+            report.text().contains("review (general) ok, 2 items"),
+            "{}",
+            report.text()
+        );
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let inputs: Vec<String> = bodies.iter().map(|(_, b)| b["input"].to_string()).collect();
+        // A bullet and a number in front of an item are how a model writes a list.
+        assert!(inputs[1].contains("review a.rs"), "{:?}", inputs[1]);
+        assert!(inputs[2].contains("review b.rs"), "{:?}", inputs[2]);
+        // The reducer reads every instance, each under the item it ran on.
+        let last = &inputs[3];
+        assert!(last.contains("item: a.rs\\na.rs is fine"), "{last}");
+        assert!(last.contains("item: b.rs\\nb.rs is not"), "{last}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A step with nothing to list says so with `[]`. Nothing ran and nothing failed,
+    /// so the steps that need it read an empty result rather than being blocked.
+    #[tokio::test]
+    async fn a_fan_out_over_an_empty_list_runs_nothing_and_blocks_nothing() {
+        let workflow = workflow(
+            "steps:\n  - id: find\n    prompt: list what changed\n  - id: review\n    \
+for_each: find\n    prompt: review {{item}}\n  - id: sum\n    needs: [review]\n    \
+prompt: summarise {{steps.review}}\n",
+        );
+        let fake = Fake::new(vec![
+            vec![say("```json\n[]\n```")],
+            vec![say("nothing to do")],
+        ]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(
+            statuses(&report),
+            [
+                ("find", &Status::Ok),
+                ("review", &Status::Ok),
+                ("sum", &Status::Ok)
+            ]
+        );
+        assert_eq!(report.steps[1].items, Some(Items { ok: 0, found: 0 }));
+        assert!(
+            report.text().contains("review (general) ok, 0 items"),
+            "{}",
+            report.text()
+        );
+        // Two calls, not three: the fan-out ran no child at all.
+        assert_eq!(fake.bodies.lock().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The list is runtime data, so the cap is what stops a step that answers with a
+    /// hundred lines from spending the budget on its own. The report says it was cut.
+    #[tokio::test]
+    async fn a_fan_out_is_capped_and_the_report_says_how_many_ran() {
+        let workflow = workflow(
+            "steps:\n  - id: find\n    prompt: list them\n  - id: review\n    for_each: find\n    \
+prompt: review {{item}}\n",
+        );
+        let listed: Vec<String> = (0..MAX_FANOUT + 5).map(|n| format!("file{n}.rs")).collect();
+        let mut script = vec![vec![say(&listed.join("\n"))]];
+        script.extend(vec![vec![say("looked")]; MAX_FANOUT]);
+        let fake = Fake::new(script);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(
+            report.steps[1].items,
+            Some(Items {
+                ok: MAX_FANOUT,
+                found: MAX_FANOUT + 5
+            })
+        );
+        assert!(
+            report
+                .text()
+                .contains(&format!("ok, {MAX_FANOUT} of {} items", MAX_FANOUT + 5)),
+            "{}",
+            report.text()
+        );
+        assert_eq!(fake.bodies.lock().unwrap().len(), MAX_FANOUT + 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One instance failing is the step failing, under the step's own `on_fail`: with
+    /// `continue` the run carries on and the item is simply missing from what the next
+    /// step reads.
+    #[tokio::test]
+    async fn a_failed_instance_leaves_the_rest_of_the_fan_out_standing() {
+        let workflow = workflow(
+            "steps:\n  - id: find\n    prompt: list them\n  - id: review\n    for_each: find\n    \
+on_fail: continue\n    prompt: review {{item}}\n  - id: sum\n    needs: [review]\n    \
+prompt: summarise {{steps.review}}\n",
+        );
+        let fake = Fake::new(vec![
+            vec![say("a.rs\nb.rs")],
+            fake::step(fake::FAIL),
+            vec![say("b.rs is fine")],
+            vec![say("one of two")],
+        ]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(
+            statuses(&report),
+            [
+                ("find", &Status::Ok),
+                ("review", &Status::Ok),
+                ("sum", &Status::Ok)
+            ]
+        );
+        assert_eq!(report.steps[1].items, Some(Items { ok: 1, found: 2 }));
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let last = bodies.last().unwrap().1["input"].to_string();
+        assert!(last.contains("item: b.rs"), "{last}");
+        assert!(!last.contains("item: a.rs"), "{last}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_fan_out_that_could_not_work_is_a_load_error() {
+        let bad = |steps: &str| {
+            format!(
+                "{:#}",
+                parse(&format!("---\nname: w\n{steps}---\n"), "./t").unwrap_err()
+            )
+        };
+        assert!(
+            bad("steps:\n  - id: a\n    for_each: nope\n    prompt: do {{item}}\n")
+                .contains("step `a` fans out over `nope`, which is not a step"),
+        );
+        assert!(
+            bad("steps:\n  - id: a\n    for_each: a\n    prompt: do {{item}}\n")
+                .contains("step `a` fans out over itself"),
+        );
+        assert!(
+            bad(
+                "steps:\n  - id: a\n    prompt: one\n  - id: b\n    for_each: a\n    prompt: two\n"
+            )
+            .contains("step `b` has `for_each` but does not use `{{item}}`"),
+        );
+        assert!(
+            bad("steps:\n  - id: a\n    prompt: do {{item}}\n")
+                .contains("step `a` uses `{{item}}` but has no `for_each`"),
+        );
+        assert!(
+            bad(
+                "steps:\n  - id: a\n    prompt: one\n  - id: b\n    for_each: a\n    \
+prompt: {{item}}\n  - id: c\n    for_each: b\n    prompt: {{item}}\n"
+            )
+            .contains("step `c` fans out over `b`, which fans out itself"),
+        );
+    }
+
+    /// A list is a list however the model wrote it, but a JSON array is taken whole, so
+    /// an item with a line break or a bullet in it survives.
+    #[test]
+    fn a_list_is_read_as_lines_unless_it_is_json() {
+        assert_eq!(items("a.rs\n\n  b.rs  \n"), ["a.rs", "b.rs"]);
+        assert_eq!(
+            items("- a.rs\n* b.rs\n1. c.rs\n2) d.rs"),
+            ["a.rs", "b.rs", "c.rs", "d.rs"]
+        );
+        // Not a bullet and not a number: a flag and a file keep their punctuation.
+        assert_eq!(items("-Xmx2g\nsrc/main.rs"), ["-Xmx2g", "src/main.rs"]);
+        assert_eq!(items("[\"a b\", \"c\"]"), ["a b", "c"]);
+        assert_eq!(items("```json\n[]\n```"), Vec::<String>::new());
+        assert!(items("   \n  \n").is_empty());
     }
 
     #[test]
