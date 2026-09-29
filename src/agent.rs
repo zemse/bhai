@@ -4170,7 +4170,10 @@ mod tests {
             matches!(e, AgentEvent::ToolOutput(o)
                 if o.contains(&format!("behind the {} already running", tools::agent::MAX_RUNNING)))
         });
-        assert!(queued, "the fourth child took a slot of its own: {events:?}");
+        assert!(
+            queued,
+            "the fourth child took a slot of its own: {events:?}"
+        );
 
         cancel.stop();
         let _ = std::fs::remove_dir_all(&dir);
