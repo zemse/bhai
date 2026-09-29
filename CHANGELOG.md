@@ -6,6 +6,9 @@ carries the shape of what is there.
 
 ## 2026-09-29
 
+- `bhai --cache-check [minutes]` makes one more call that long after the others and
+  judges it even past the cache's assumed lifetime, so how long the Codex backend really
+  keeps a prefix can be measured instead of assumed.
 - Codex credits sit next to the rate-limit windows: `credits 8.3k/10.0k` on the status
   bar, coloured by how much of the allowance is spent, and `$credits`, `$credits_left`,
   `$credits_used`, `$credits_limit` and `$credits_reset` for a status line template. The

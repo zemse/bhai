@@ -142,11 +142,21 @@ async fn main() -> Result<()> {
         shutdown(hub).await;
         return result;
     }
-    // `bhai --cache-check` sends a few calls on one prefix and checks the cache served it.
+    // `bhai --cache-check [minutes]` sends a few calls on one prefix and checks the cache
+    // served it; with minutes, one more call after that long checks it lasted.
     if args.first().is_some_and(|a| a == "--cache-check") {
+        let wait = match args.get(1) {
+            Some(m) => Some(
+                m.trim_end_matches('m')
+                    .parse::<u64>()
+                    .map(|m| Duration::from_secs(m * 60))
+                    .with_context(|| format!("--cache-check takes minutes, not {m}"))?,
+            ),
+            None => None,
+        };
         let setup = load(Flags::default(), identity::DEFAULT).await?;
         let hub = setup.prompt.mcp.clone();
-        let result = cache_check(setup).await;
+        let result = cache_check(setup, wait).await;
         shutdown(hub).await;
         if !result? {
             std::process::exit(1);
@@ -168,7 +178,7 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [usage] [sessions [prune [n]]] [mcp approve <server>] [--probe [prompt]] [--cache-check] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [usage] [sessions [prune [n]]] [mcp approve <server>] [--probe [prompt]] [--cache-check [minutes]] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
@@ -990,8 +1000,9 @@ struct CacheRow {
 
 /// Send a few tiny calls with the session's real instructions and tools through the
 /// real client, and report how much of each the cache served. `false` when call 2 or
-/// later got nothing from the cache.
-async fn cache_check(setup: Setup) -> Result<bool> {
+/// later got nothing from the cache. With `wait`, one more call is sent that long after
+/// the others and judged even past `CACHE_TTL`, to measure how long the backend keeps it.
+async fn cache_check(setup: Setup, wait: Option<Duration>) -> Result<bool> {
     let (system, policy, delegation) = (setup.prompt, setup.policy, setup.delegation);
     let client = client::Client::new(&setup.choice)?
         .with_overrides(
@@ -1033,9 +1044,15 @@ async fn cache_check(setup: Setup) -> Result<bool> {
     let mut input = cache_check_prefix(&system, &tools);
     let mut monitor = cache::CacheMonitor::default();
     let mut rows = Vec::new();
-    for call in 1..=CACHE_CHECK_CALLS {
+    let calls = CACHE_CHECK_CALLS + usize::from(wait.is_some());
+    for call in 1..=calls {
+        let waited = wait.filter(|_| call > CACHE_CHECK_CALLS);
+        if let Some(wait) = waited {
+            println!("waiting {} minutes", wait.as_secs() / 60);
+            tokio::time::sleep(wait).await;
+        }
         input.push(user_message(&format!(
-            "Call {call} of {CACHE_CHECK_CALLS}. Reply with just: ok"
+            "Call {call} of {calls}. Reply with just: ok"
         )));
         let mut usage = None;
         let mut on_delta = |delta: client::Delta| match delta {
@@ -1052,7 +1069,16 @@ async fn cache_check(setup: Setup) -> Result<bool> {
             .respond(&system.text, &tools, &input, &mut on_delta, &cancel.flag())
             .await?;
         let usage = usage.ok_or_else(|| anyhow::anyhow!("call {call} reported no usage"))?;
-        let hit = monitor.observe(&usage, std::time::Instant::now());
+        let mut hit = monitor.observe(&usage, std::time::Instant::now());
+        if waited.is_some() {
+            let expected = rows
+                .last()
+                .map(|row: &CacheRow| cache::expected_cached(row.usage.input));
+            hit = cache::Hit {
+                expected_cached: expected,
+                hit_ratio: expected.map(|e| usage.cached as f64 / e as f64),
+            };
+        }
         rows.push(CacheRow { usage, hit });
         input.extend(items);
     }
