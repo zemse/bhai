@@ -770,10 +770,22 @@ pub async fn run(run: Run<'_>) -> Report {
         let found = crate::models::cached(run.model.ollama_url(), run.model.name()).await;
         let bad = unserved(&found, &workflow.steps, &identities);
         if !bad.is_empty() {
-            for line in &bad {
-                let _ = run.tx.send(AgentEvent::Error(format!("workflow: {line}")));
+            // The error line carries what the backends do serve; the report only says
+            // which step named what, so a run refused over three of them stays short.
+            for (id, model) in &bad {
+                let _ = run.tx.send(AgentEvent::Error(format!(
+                    "workflow: step `{id}`: {}",
+                    crate::models::unknown(&found, model)
+                )));
             }
-            report.refused = Some(format!("not started: {}", bad.join("; ")));
+            let named: Vec<String> = bad
+                .iter()
+                .map(|(id, model)| format!("step `{id}` names `{model}`"))
+                .collect();
+            report.refused = Some(format!(
+                "not started: {}, which no backend here serves",
+                named.join(", ")
+            ));
             let _ = run.tx.send(AgentEvent::Info(report.text()));
             return report;
         }
@@ -1063,25 +1075,20 @@ fn resolve(delegation: &Delegation, steps: &[Step]) -> Result<Vec<Identity>> {
         .collect()
 }
 
-/// One line per step whose model no backend here serves. A backend that could not be
-/// asked answers for nothing, so a run is never refused on a list that never loaded.
-fn unserved(
+/// Each step whose model no backend here serves, with that model. A backend that could
+/// not be asked answers for nothing, so a run is never refused on a list that never
+/// loaded.
+fn unserved<'a>(
     found: &crate::models::Catalogue,
-    steps: &[Step],
-    identities: &[Identity],
-) -> Vec<String> {
+    steps: &'a [Step],
+    identities: &'a [Identity],
+) -> Vec<(&'a str, &'a str)> {
     steps
         .iter()
         .zip(identities)
         .filter_map(|(step, identity)| {
             let model = identity.model.as_deref()?;
-            (!crate::models::serves(found, model)).then(|| {
-                format!(
-                    "step `{}`: {}",
-                    step.id,
-                    crate::models::unknown(found, model)
-                )
-            })
+            (!crate::models::serves(found, model)).then_some((step.id.as_str(), model))
         })
         .collect()
 }
@@ -1935,11 +1942,9 @@ model: ollama:nope\n    prompt: two\n",
             models: vec![listed("gpt-5.6-sol")],
             notes: Vec::new(),
         };
-        let bad = unserved(&both, &workflow.steps, &identities);
-        assert_eq!(bad.len(), 1, "{bad:?}");
-        assert!(
-            bad[0].starts_with("step `b`: unknown model `ollama:nope`"),
-            "{bad:?}"
+        assert_eq!(
+            unserved(&both, &workflow.steps, &identities),
+            [("b", "ollama:nope")]
         );
 
         let ollama_down = Catalogue {

@@ -18,7 +18,7 @@ carries the shape of what is there.
   rather than blocking what needs it. A bullet or a number in front of an item is
   dropped. The step that reduces them reads every output under the item it came from,
   one failed item does not take the others down under `on_fail: continue`, and the
-  report says how many of the items ran. Capped at 20 instances per step.
+  report says how many of the items ran.
 
 - A workflow step can say what it answers with and branch on it. `output: json` asks
   the child for one JSON object and holds it to that, so an answer of another shape is
