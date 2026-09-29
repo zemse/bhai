@@ -292,9 +292,8 @@ fn render_queued(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// What a segment of the bar gives up its room for. Everything fits on a wide
-/// terminal; on a narrow one the highest number goes first.
+/// terminal; on a narrow one the hint is what goes.
 const HINT: u8 = 2;
-const COUNTS: u8 = 1;
 const ALWAYS: u8 = 0;
 
 /// The bottom bar: where the session is running, how full its context is, and what is
@@ -338,18 +337,6 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ALWAYS,
             Span::styled(format!("ctx {percent:.0}% "), headroom(percent)),
         ));
-    }
-    if app.tokens_in + app.tokens_out > 0 {
-        bar.push((
-            COUNTS,
-            Span::styled(
-                format!("↑{} ↓{} ", compact(app.tokens_in), compact(app.tokens_out)),
-                dim,
-            ),
-        ));
-    }
-    if let Some(rate) = app.last_usage.and_then(|u| u.cache_rate()) {
-        bar.push((COUNTS, Span::styled(format!("cache {rate:.0}% "), dim)));
     }
     if let Some(field) = &app.cache_break {
         bar.push((
@@ -408,13 +395,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ));
     // A terminal too narrow for all of it keeps the branch, the fill and the windows:
-    // the bar is read for where the session stands, not for its running totals.
+    // the bar is read for where the session stands, and the keys are also in /help.
     let width = |bar: &[(u8, Span)]| bar.iter().map(|(_, span)| span.width()).sum::<usize>();
-    for level in [HINT, COUNTS] {
-        if width(&bar) <= area.width as usize {
-            break;
-        }
-        bar.retain(|(drop, _)| *drop < level);
+    if width(&bar) > area.width as usize {
+        bar.retain(|(drop, _)| *drop < HINT);
     }
     let spans: Vec<Span> = bar.into_iter().map(|(_, span)| span).collect();
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -2614,11 +2598,9 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_bar_drops_its_totals_before_where_the_session_stands() {
+    fn a_narrow_bar_drops_its_hint_before_where_the_session_stands() {
         let mut app = App::detached();
         app.branch = crate::branch::Branch::named("side");
-        app.tokens_in = 8_200;
-        app.tokens_out = 500;
         app.on_event(Event::RateLimits(RateLimits {
             primary: Some(window(8.0, 300)),
             secondary: Some(window(20.0, 10080)),
@@ -2628,10 +2610,7 @@ mod tests {
         let mut wide = Terminal::new(TestBackend::new(200, 10)).unwrap();
         wide.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = status(&wide);
-        assert!(
-            bar.contains("↑8.2k ↓500 ") && bar.contains("/ for commands"),
-            "{bar}"
-        );
+        assert!(bar.contains("/ for commands"), "{bar}");
 
         let mut narrow = Terminal::new(TestBackend::new(50, 10)).unwrap();
         narrow.draw(|frame| render(frame, &mut app)).unwrap();
@@ -2640,7 +2619,7 @@ mod tests {
             bar.contains("on side ") && bar.contains("5h 8% (2h) "),
             "{bar}"
         );
-        assert!(!bar.contains('↑') && !bar.contains("for commands"), "{bar}");
+        assert!(!bar.contains("for commands"), "{bar}");
     }
 
     #[test]

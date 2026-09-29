@@ -6,6 +6,9 @@ carries the shape of what is there.
 
 ## 2026-09-29
 
+- The running token totals and the cache hit rate are off the status bar. They were
+  the two segments a narrow terminal dropped first, and `$tokens_in`, `$tokens_out`
+  and `$cache` still carry them for a status line template.
 - The prompt cache is assumed to last 30 minutes from when a call was sent, not 5 from
   when it finished, and the status bar counts down its last five: `cache expires in
   4:07`, then the `cache expired` hint as before. `$cache_timer` shows the same for a
