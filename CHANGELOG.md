@@ -28,6 +28,24 @@ carries the shape of what is there.
   gate that does not hold skips its own step and nothing else; a field the object does
   not have skips it too, and says which field was missing rather than reading as false.
 
+- What a workflow step answered is neutralised on the way into the next step's prompt,
+  the way a child's report already was on the way into its parent's conversation. It is
+  the same untrusted text: a step that read a file wrote it. A `when` still compares
+  what the step answered rather than the neutralised copy.
+
+- A `--workflow` run tells a child that a refused call is refused for good. Nothing is
+  attached to such a run that can answer an approval, so the usual "ask what they want
+  instead" is advice it cannot take, and a model spends its steps rephrasing the same
+  call into the same no.
+
+- `budget_tokens` stops a chunk it would not cover, rather than only a chunk that has
+  already passed it. A launch costs nothing measurable until it has run, so the old
+  check could only ever notice the budget after it was spent: a 20k budget spent 25.7k
+  in a live run, and three children of a fan-out can cost more than the whole budget
+  between one check and the next. A chunk is now weighed against the most expensive
+  launch so far, which keeps a run under the number the file asked for at the price of
+  stopping with some of it unspent.
+
 - A fan-out instance is named by what tells it apart. A long item is cut in the middle
   rather than at the end, so four paths under one directory no longer read as four of
   the same label, and each instance's answer carries its item at the head: instances

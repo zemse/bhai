@@ -822,6 +822,9 @@ pub async fn run(run: Run<'_>) -> Report {
     let mut cold = false;
     // Set once no more steps are launched, with the reason the rest did not run.
     let mut stopped: Option<String> = None;
+    // What the most expensive launch so far cost, which is all there is to weigh the
+    // next chunk against before it runs.
+    let mut worst = 0;
 
     while let Some(wave) = next_wave(&workflow.steps, &status) {
         for (index, reason) in wave.blocked {
@@ -895,6 +898,23 @@ pub async fn run(run: Run<'_>) -> Report {
                     workflow.budget_tokens
                 ));
             }
+            // A launch costs nothing measurable until it has run, so the budget would
+            // otherwise only ever be checked after it had been passed: three children
+            // of a fan-out can cost more than the whole budget between one check and
+            // the next. Weighing the chunk against the most expensive launch so far
+            // keeps the run under the number the file asked for, at the price of
+            // stopping with some of it unspent. The first chunk has nothing to go on.
+            let ahead = worst * chunk.len() as u64;
+            if stopped.is_none() && spent(&report.usage) + ahead >= workflow.budget_tokens {
+                stopped = Some(format!(
+                    "the {} token budget would not cover {}",
+                    workflow.budget_tokens,
+                    match chunk.len() {
+                        1 => "another step".to_string(),
+                        n => format!("another {n} steps"),
+                    }
+                ));
+            }
             if let Some(reason) = &stopped {
                 for &task in chunk {
                     outcomes[task] = Some(Outcome::Skipped(reason.clone()));
@@ -944,6 +964,7 @@ pub async fn run(run: Run<'_>) -> Report {
                 add(&mut usage[index], answer.usage);
                 truncated[index] |= answer.truncated;
                 add(&mut report.usage, answer.usage);
+                worst = worst.max(spent(&answer.usage));
                 let outcome = match answer.result {
                     Ok(text) => answered(step, text, false),
                     Err(e) => Outcome::Failed(format!("{e:#}")),
@@ -1623,6 +1644,55 @@ needs: [a]\n    prompt: two {{steps.a}}\n",
         );
         assert_eq!(spent(&report.usage), 12);
         assert!(report.text().contains("10/2 tokens of a 11 budget"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A launch costs nothing measurable until it has run, so a budget checked only
+    /// against what is already spent is passed before it is ever seen to be. The chunk
+    /// about to run is weighed against the most expensive launch so far.
+    #[tokio::test]
+    async fn the_budget_stops_a_chunk_it_would_not_cover() {
+        // Each step costs 12. Two have run at 24 of 30, and the third would reach 36.
+        let workflow = workflow(
+            "budget_tokens: 30\nsteps:\n  - id: a\n    prompt: one\n  - id: b\n    \
+needs: [a]\n    prompt: two\n  - id: c\n    needs: [b]\n    prompt: three\n",
+        );
+        let fake = Fake::new(vec![vec![say("one")], vec![say("two")], vec![say("three")]]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(report.steps[0].status, Status::Ok);
+        assert_eq!(report.steps[1].status, Status::Ok);
+        assert_eq!(
+            report.steps[2].status,
+            Status::Skipped("the 30 token budget would not cover another step".to_string())
+        );
+        // Under the number the file asked for, where the old rule spent 36 of 30.
+        assert_eq!(spent(&report.usage), 24);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A whole chunk is weighed, not one step of it: three children that each cost what
+    /// the worst so far cost is what actually passes a budget between two checks.
+    #[tokio::test]
+    async fn a_fan_out_is_weighed_by_the_size_of_its_chunk() {
+        let workflow = workflow(
+            "budget_tokens: 45\nmax_parallel: 3\nsteps:\n  - id: list\n    prompt: list\n  \
+- id: each\n    for_each: list\n    prompt: do {{item}}\n",
+        );
+        let fake = Fake::new(vec![
+            vec![say("[\"a\", \"b\", \"c\"]")],
+            vec![say("one")],
+            vec![say("two")],
+            vec![say("three")],
+        ]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        // 12 spent, and three more at 12 each would reach 48 of 45 with no check in
+        // between; the chunk is refused whole, so the fan-out ran nothing.
+        assert_eq!(
+            report.steps[1].status,
+            Status::Skipped("the 45 token budget would not cover another 3 steps".to_string())
+        );
+        assert_eq!(report.steps[1].items, Some(Items { ok: 0, found: 3 }));
+        assert_eq!(spent(&report.usage), 12);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -190,6 +190,13 @@ async fn main() -> Result<()> {
         choice,
         statusline,
     } = load(args.flags, &name).await?;
+    // `--workflow` answers every approval but the workflow's own with no, so a call the
+    // rules leave at `Ask` is refused for good. The agent is told that rather than told
+    // to ask someone who is not there.
+    let policy = match args.workflow.is_some() {
+        true => policy.unattended(),
+        false => policy,
+    };
     let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
     let mut client = client::Client::new(&choice)?

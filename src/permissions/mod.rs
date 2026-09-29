@@ -223,6 +223,10 @@ pub struct Policy {
     relax: Relax,
     /// Where every decision is appended, if anywhere.
     log: Option<PathBuf>,
+    /// Whether anything can answer an approval. A `--workflow` run answers every one of
+    /// them with no, so a call left at `Ask` is refused for good rather than put to
+    /// someone, and what the agent is told to do about it differs.
+    attended: bool,
 }
 
 impl Policy {
@@ -238,7 +242,21 @@ impl Policy {
             trusted: AtomicBool::new(false),
             relax: Relax::default(),
             log: None,
+            attended: true,
         }
+    }
+
+    /// Nothing is there to answer an approval: every call the rules leave at `Ask` is
+    /// refused, and no asking will change it.
+    pub fn unattended(self) -> Self {
+        Self {
+            attended: false,
+            ..self
+        }
+    }
+
+    pub fn attended(&self) -> bool {
+        self.attended
     }
 
     pub fn with_store(self, store: PathBuf) -> Self {

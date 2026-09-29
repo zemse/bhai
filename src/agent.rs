@@ -1936,10 +1936,20 @@ async fn ask(
         by: Rejecter::User,
         reason: String::new(),
     });
+    // Telling an unattended run to ask is advice it cannot take: there is nobody to
+    // ask, and every later call the rules leave at `Ask` gets the same no. Left at the
+    // usual wording, a model spends the rest of its steps rephrasing the same call.
     Some((
-        "The user rejected this call; it did not run. Do not retry it as-is. Ask what they \
-want instead, or try a different approach."
-            .to_string(),
+        match policy.attended() {
+            true => "The user rejected this call; it did not run. Do not retry it as-is. \
+Ask what they want instead, or try a different approach."
+                .to_string(),
+            false => "This call did not run, and nothing is attached to this run that can \
+approve one: every call the rules do not already allow is refused the same way. Do not \
+retry it, do not rephrase it, and do not ask. Carry on with the calls that do go \
+through, or answer with what you could not do and why."
+                .to_string(),
+        },
         false,
     ))
 }
