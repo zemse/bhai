@@ -24,8 +24,10 @@ pub const ALERT: f64 = 90.0;
 /// Rate limits and credits, as openai/codex reads them. Not under `/backend-api/codex`:
 /// that copy of the path answers 403.
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-/// Seconds between the usage fetches that ride along with model calls.
-const REFRESH_SECS: i64 = 300;
+/// Seconds between usage fetches, whether a session is idle or a call brings one.
+const REFRESH_SECS: i64 = 60;
+/// How often an idle session asks whether a fetch is due.
+pub const REFRESH: Duration = Duration::from_secs(REFRESH_SECS as u64);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// When the last usage fetch was started, unix seconds.
 static LAST_FETCH: AtomicI64 = AtomicI64::new(0);

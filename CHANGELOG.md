@@ -6,6 +6,8 @@ carries the shape of what is there.
 
 ## 2026-09-30
 
+- The rate-limit windows and the credits refresh every minute, idle or not, instead of
+  only alongside a model call at most every five minutes.
 - The status bar's context fill drops as soon as history is compacted, by an estimate
   of what the compaction took out, rather than holding the old number until the next
   call. `/clear` blanks it. The `compacted` event on `/events` carries the estimate as

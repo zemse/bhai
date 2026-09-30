@@ -778,16 +778,26 @@ fn start(
     // A panic in the loop or in a tool would otherwise end the task with the session still
     // marked working: no error, no `TurnEnd`, and a spinner that never stops. The panic
     // itself is reported by the hook; this is what lets the session say so and come back.
-    // The windows and the credits before the first call, which is otherwise what
-    // brings them.
-    if client.provider() == client::Provider::Codex && limits::due(chrono::Utc::now().timestamp()) {
+    // The windows and the credits before the first call, and then every minute while
+    // the session sits idle, since otherwise only a model call brings them. A call
+    // that fetched lately claims the slot, so the two never both ask.
+    if client.provider() == client::Provider::Codex {
         let tx = tx_agent.clone();
         tokio::spawn(async move {
-            if let Ok(body) = limits::fetch_now().await
-                && let Some(found) =
-                    limits::RateLimits::from_usage(&body, chrono::Utc::now().timestamp())
-            {
-                let _ = tx.send(AgentEvent::RateLimits(found));
+            let mut every = tokio::time::interval(limits::REFRESH);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await;
+                if !limits::due(chrono::Utc::now().timestamp()) {
+                    continue;
+                }
+                if let Ok(body) = limits::fetch_now().await
+                    && let Some(found) =
+                        limits::RateLimits::from_usage(&body, chrono::Utc::now().timestamp())
+                    && tx.send(AgentEvent::RateLimits(found)).is_err()
+                {
+                    break;
+                }
             }
         });
     }
