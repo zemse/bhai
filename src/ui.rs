@@ -164,12 +164,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let working_height = u16::from(app.working && app.pending.is_none());
 
     // The turn's subagents sit above all of that, so the panel does not move as the
-    // menu opens or the spinner comes and goes. Once the turn is over there is nothing
-    // to watch, so the rows go rather than sitting between the transcript and the
-    // prompt; a pane that is open keeps them, since the panel is its title and its way
-    // back out.
+    // menu opens or the spinner comes and goes. Once the turn is over and every child
+    // has ended there is nothing to watch, so the rows go rather than sitting between
+    // the transcript and the prompt. Children run detached, so one can outlive its turn;
+    // a pane that is open keeps them too, since the panel is its title and its way out.
     let children = app.children();
-    let watching = app.working || app.inside.is_some();
+    let watching = app.working
+        || app.inside.is_some()
+        || children.iter().any(|c| c.state == ChildState::Running);
     let children_height = match children.len() {
         0 => 0,
         _ if !watching => 0,
@@ -1870,6 +1872,10 @@ mod tests {
         assert_eq!(app.child_rows.len(), 1);
 
         // Nothing left to watch, so the rows stop sitting above the prompt.
+        app.session().publish(Event::ChildEnded {
+            id: "a1".to_string(),
+            ok: true,
+        });
         app.on_event(Event::TurnEnd);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!screen(&terminal).contains("subagents"));
@@ -1882,6 +1888,33 @@ mod tests {
         assert!(shown.contains("subagents"), "{shown}");
         assert!(shown.contains("✕ close"), "{shown}");
         assert_eq!(app.child_rows.len(), 1);
+    }
+
+    #[test]
+    fn a_child_still_running_keeps_the_panel_after_its_turn() {
+        let mut app = App::detached();
+        app.working = true;
+        app.session().publish(Event::ChildStarted {
+            id: "a1".to_string(),
+            identity: "worker".to_string(),
+            description: "read the docs".to_string(),
+            task: "go".to_string(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+
+        // The child is detached, so the turn ending does not end it.
+        app.on_event(Event::TurnEnd);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("a1 worker · read the docs"), "{shown}");
+        assert_eq!(app.child_rows.len(), 1);
+
+        app.session().publish(Event::ChildEnded {
+            id: "a1".to_string(),
+            ok: true,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("subagents"));
     }
 
     #[test]

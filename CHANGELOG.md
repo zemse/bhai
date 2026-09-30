@@ -6,6 +6,9 @@ carries the shape of what is there.
 
 ## 2026-09-30
 
+- The subagent panel stays up while any child is still running, not only while the
+  turn that started it is. Children run detached, so the panel used to go at the end
+  of the turn and hide the ones still working.
 - The rate-limit windows and the credits refresh every minute, idle or not, instead of
   only alongside a model call at most every five minutes.
 - The status bar's context fill drops as soon as history is compacted, by an estimate
