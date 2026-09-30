@@ -67,10 +67,12 @@ pub enum AgentEvent {
     /// The auto-approval judge is deciding this call, or `None` once it has.
     Judging(Option<String>),
     /// History was compacted, so earlier item indexes no longer hold; with a notice,
-    /// and the summary the earlier turns were folded into when there was one.
+    /// and the summary the earlier turns were folded into when there was one. `freed`
+    /// is an estimate of the tokens gone from what the last call read.
     Compacted {
         notice: String,
         summary: Option<String>,
+        freed: u64,
     },
     /// History was dropped: the conversation starts again from nothing.
     Cleared,
@@ -1276,13 +1278,13 @@ impl Compaction<'_> {
         if let Some(size) = size {
             let excess = size.saturating_sub(self.limits.target(name));
             if compact::evict(&mut next, excess, tokenizer) >= excess {
-                self.commit(before, next, None, history, sink);
+                self.commit(before, before, next, None, history, sink);
                 return Ok(());
             }
         }
         if compact::fold(&next, "").is_none() {
             if next != *history {
-                self.commit(before, next, None, history, sink);
+                self.commit(before, before, next, None, history, sink);
             } else {
                 let _ = self.tx.send(AgentEvent::Info(
                     "nothing to compact: there is no earlier turn to summarise".to_string(),
@@ -1294,15 +1296,18 @@ impl Compaction<'_> {
             // The summary call already sends the evicted outputs.
             self.model.reset("compaction: evict before summary");
         }
+        // The summary call is the last one read, and it read `next` and the request.
+        let read = compact::estimate(&next, tokenizer)
+            + compact::estimate(&[compact::request(self.asked.as_deref())], tokenizer);
         match self.summarize(&next).await {
             Ok(summary) => {
                 let folded = compact::fold(&next, &summary).expect("checked above");
-                self.commit(before, folded, Some(summary), history, sink);
+                self.commit(before, read, folded, Some(summary), history, sink);
                 Ok(())
             }
             Err(e) => {
                 if next != *history {
-                    self.commit(before, next, None, history, sink);
+                    self.commit(before, read, next, None, history, sink);
                 }
                 Err(e)
             }
@@ -1341,10 +1346,12 @@ impl Compaction<'_> {
 
     /// Replace `history` with `next`, reset the cache guard, record it and say so.
     /// `summary` is what the earlier turns were folded into; without one, `next` is the
-    /// same history with its old tool outputs evicted.
+    /// same history with its old tool outputs evicted. `read` is the history the last
+    /// call read, so the status bar can take off what is gone from it.
     fn commit(
         &self,
         before: u64,
+        read: u64,
         next: Vec<Value>,
         summary: Option<String>,
         history: &mut Vec<Value>,
@@ -1367,6 +1374,7 @@ impl Compaction<'_> {
         let _ = self.tx.send(AgentEvent::Compacted {
             notice: format!("compacted history ({what}): ~{before} -> ~{after} tokens"),
             summary,
+            freed: read.saturating_sub(after),
         });
     }
 }
@@ -3922,9 +3930,9 @@ mod tests {
             events
                 .iter()
                 .filter_map(|e| match e {
-                    AgentEvent::Compacted { notice, summary } => {
-                        Some((notice.clone(), summary.clone()))
-                    }
+                    AgentEvent::Compacted {
+                        notice, summary, ..
+                    } => Some((notice.clone(), summary.clone())),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -3935,6 +3943,11 @@ mod tests {
         let events = drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
         let notices = compacted(&events);
         assert_eq!(notices.len(), 1);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compacted { freed, .. } if *freed > 0))
+        );
         assert!(
             notices[0]
                 .0

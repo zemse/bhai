@@ -921,7 +921,9 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
                 false => println!("[{}] {summary} ({reason})", by.label()),
             },
             AgentEvent::Info(message) => println!("[info] {message}"),
-            AgentEvent::Compacted { notice, summary } => {
+            AgentEvent::Compacted {
+                notice, summary, ..
+            } => {
                 println!("[info] {notice}");
                 if let Some(summary) = summary {
                     println!("{summary}");

@@ -4,6 +4,13 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-09-30
+
+- The status bar's context fill drops as soon as history is compacted, by an estimate
+  of what the compaction took out, rather than holding the old number until the next
+  call. `/clear` blanks it. The `compacted` event on `/events` carries the estimate as
+  `freed`.
+
 ## 2026-09-29
 
 - The running token totals and the cache hit rate are off the status bar. They were

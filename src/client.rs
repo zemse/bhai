@@ -141,6 +141,12 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Take `freed` tokens off the input, as compaction does to the next call's.
+    pub fn shrink(&mut self, freed: u64) {
+        self.input = self.input.saturating_sub(freed);
+        self.cached = self.cached.min(self.input);
+    }
+
     /// Read the counts from a `response.completed` event; missing fields count as zero.
     pub fn from_completed(event: &Value) -> Self {
         let count = |path: &str| {

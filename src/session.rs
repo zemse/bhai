@@ -118,6 +118,8 @@ pub enum Event {
         notice: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
+        /// Tokens gone from what the last call read, as estimated.
+        freed: u64,
     },
     /// History was dropped, so the transcript that showed it goes too.
     Cleared,
@@ -839,12 +841,24 @@ impl Session {
             AgentEvent::Judging(what) => Event::Judging(what),
             AgentEvent::Titled(name) => Event::Titled(name),
             // Either way the next call reads a history the cache has never seen.
-            AgentEvent::Compacted { notice, summary } => {
+            AgentEvent::Compacted {
+                notice,
+                summary,
+                freed,
+            } => {
                 inner.last_call = None;
-                Event::Compacted { notice, summary }
+                if let Some(usage) = &mut inner.last_usage {
+                    usage.shrink(freed);
+                }
+                Event::Compacted {
+                    notice,
+                    summary,
+                    freed,
+                }
             }
             AgentEvent::Cleared => {
                 inner.last_call = None;
+                inner.last_usage = None;
                 Event::Cleared
             }
             AgentEvent::Effort(effort) => {
@@ -1278,11 +1292,12 @@ mod tests {
         let json = serde_json::to_value(Event::Compacted {
             notice: "compacted history".to_string(),
             summary: None,
+            freed: 7,
         })
         .unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"type": "compacted", "data": {"notice": "compacted history"}})
+            serde_json::json!({"type": "compacted", "data": {"notice": "compacted history", "freed": 7}})
         );
     }
 
@@ -1620,6 +1635,29 @@ mod tests {
         assert_eq!(state.last_usage, Some(usage(4, 2, 2, 0)));
         let json = serde_json::to_value(&state).unwrap();
         assert_eq!(json["children"]["input"], 11);
+    }
+
+    #[test]
+    fn compaction_takes_what_it_freed_off_the_last_call() {
+        let (session, _rx) = session();
+        let usage = |input, cached| Usage {
+            input,
+            cached,
+            output: 5,
+            reasoning: 0,
+        };
+        session.on_agent(AgentEvent::Usage(usage(900, 800)));
+        session.on_agent(AgentEvent::Compacted {
+            notice: "compacted history".to_string(),
+            summary: None,
+            freed: 600,
+        });
+        // The totals are what was spent and stay; only the fill the bar reads goes down.
+        let state = session.state();
+        assert_eq!(state.input_tokens, 900);
+        assert_eq!(state.last_usage, Some(usage(300, 300)));
+        session.on_agent(AgentEvent::Cleared);
+        assert_eq!(session.state().last_usage, None);
     }
 
     /// A session on `model`, with the control end kept open so a switch goes through.

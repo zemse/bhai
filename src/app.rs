@@ -1001,6 +1001,14 @@ impl App {
                 self.tokens_out += usage.output;
                 self.last_usage = Some(usage);
             }
+            // The bar reads its context fill from the last call, which compaction and
+            // `/clear` leave behind until the next one.
+            Event::Compacted { freed, .. } => {
+                if let Some(usage) = &mut self.last_usage {
+                    usage.shrink(freed);
+                }
+            }
+            Event::Cleared => self.last_usage = None,
             Event::Sending(tokens) => self.speed.sending(Instant::now(), tokens),
             Event::Streaming(on) => match on {
                 true => self.speed.start(Instant::now()),

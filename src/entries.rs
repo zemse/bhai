@@ -138,7 +138,9 @@ impl Entries {
                 "cache missed {misses} calls in a row; the prefix may no longer be served"
             ))),
             Event::Info(message) => self.push(Entry::Info(message.clone())),
-            Event::Compacted { notice, summary } => {
+            Event::Compacted {
+                notice, summary, ..
+            } => {
                 self.attribution.items.clear();
                 self.push(Entry::Info(notice.clone()));
                 if let Some(summary) = summary {
@@ -640,6 +642,7 @@ mod tests {
         app.apply(&Event::Compacted {
             notice: "compacted history (summarised earlier turns): ~9 -> ~4 tokens".to_string(),
             summary: Some("did things".to_string()),
+            freed: 5,
         });
         let kinds: Vec<_> = app.list[1..].iter().map(Entry::kind).collect();
         assert_eq!(kinds, ["user", "info", "summary"]);
@@ -651,6 +654,7 @@ mod tests {
         app.apply(&Event::Compacted {
             notice: "compacted history (evicted old tool outputs): ~4 -> ~2 tokens".to_string(),
             summary: None,
+            freed: 2,
         });
         assert_eq!(app.list.len(), 5);
         assert_eq!(app.list[4].kind(), "info");
