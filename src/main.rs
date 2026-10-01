@@ -687,10 +687,15 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     startup::mark("mcp");
     let bhai = roots.cwd.join(".bhai");
     let notes = memory::path(&bhai);
+    let (memory, refused) = match memory::load(&notes, instructions::label(&notes, &roots)) {
+        Ok(memory) => (memory, None),
+        Err(notice) => (None, Some(notice)),
+    };
     // Children are built without it: they neither see the notes nor save one.
     let mut prompt = identity::build(&config, &roots, &identity, &identities)
         .with_mcp(hub.clone())
-        .with_memory(memory::load(&notes, instructions::label(&notes, &roots)));
+        .with_memory(memory);
+    prompt.skipped.extend(refused);
     let delegation = Delegation {
         identities,
         sessions: bhai.join("sessions"),

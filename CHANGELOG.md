@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-02
+
+- `.bhai/MEMORY.md` that resolves outside the project (the file or `.bhai` a symlink out) is not loaded into the prompt, and startup says it was skipped; `remember` refuses to append to it.
+
 ## 2026-10-01
 
 - An instruction file edited, added or removed during a session reaches the model before the next turn as a developer item in the history, carrying the file's whole new text or saying it went, and the transcript shows `instructions changed: ./CLAUDE.md`. The system prompt is never rebuilt, so the cached prefix holds; a compaction keeps the latest update per file, and a `/clear` sends it again.

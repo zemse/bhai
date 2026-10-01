@@ -30,13 +30,38 @@ pub struct Memory {
     pub cut: usize,
 }
 
+/// Whether `path`, or the directory it would be created in, really lives in the project:
+/// the directory holding `.bhai`. A cloned repo can commit the file, or `.bhai`, as a
+/// symlink to `~/.aws/credentials`; a dangling link counts as outside.
+fn inside(path: &Path) -> bool {
+    let Some(bhai) = path.parent() else {
+        return false;
+    };
+    let Some(Ok(root)) = bhai.parent().map(Path::canonicalize) else {
+        return false;
+    };
+    let real = match path.symlink_metadata() {
+        Ok(_) => path.canonicalize(),
+        Err(_) => bhai.canonicalize(),
+    };
+    real.is_ok_and(|real| real.starts_with(root))
+}
+
 /// The file's last `MAX_LOAD` bytes of whole lines; `None` when it is missing, empty or
-/// not text.
-pub fn load(path: &Path, label: String) -> Option<Memory> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// not text, and the startup notice when it resolves outside the project.
+pub fn load(path: &Path, label: String) -> Result<Option<Memory>, String> {
+    if path.symlink_metadata().is_err() {
+        return Ok(None);
+    }
+    if !inside(path) {
+        return Err(format!("skipped {label} (outside project)"));
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
     let text = text.trim_end();
     if text.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut start = 0;
     if text.len() > MAX_LOAD {
@@ -53,11 +78,11 @@ pub fn load(path: &Path, label: String) -> Option<Memory> {
                 .map_or(text.len(), |at| from + at + 1),
         };
     }
-    Some(Memory {
+    Ok(Some(Memory {
         label,
         content: text[start..].to_string(),
         cut: start,
-    })
+    }))
 }
 
 /// A note as the line it is saved as: dated, and on one line however it was written.
@@ -79,6 +104,9 @@ pub fn entry(note: &str, date: &str) -> Result<String, String> {
 pub fn append(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    if !inside(path) {
+        return Err(std::io::Error::other("it resolves outside the project"));
     }
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -108,11 +136,11 @@ mod tests {
     fn a_missing_or_blank_file_loads_nothing() {
         let dir = crate::tools::temp_dir();
         let file = path(&dir);
-        assert_eq!(load(&file, "m".to_string()), None);
+        assert_eq!(load(&file, "m".to_string()), Ok(None));
         std::fs::write(&file, "\n  \n").unwrap();
-        assert_eq!(load(&file, "m".to_string()), None);
+        assert_eq!(load(&file, "m".to_string()), Ok(None));
         std::fs::write(&file, b"\xff\xfe").unwrap();
-        assert_eq!(load(&file, "m".to_string()), None);
+        assert_eq!(load(&file, "m".to_string()), Ok(None));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -121,7 +149,9 @@ mod tests {
         let dir = crate::tools::temp_dir();
         let file = path(&dir);
         std::fs::write(&file, "- a\n- b\n\n").unwrap();
-        let memory = load(&file, "./.bhai/MEMORY.md".to_string()).unwrap();
+        let memory = load(&file, "./.bhai/MEMORY.md".to_string())
+            .unwrap()
+            .unwrap();
         assert_eq!(memory.content, "- a\n- b");
         assert_eq!(memory.cut, 0);
         assert_eq!(memory.label, "./.bhai/MEMORY.md");
@@ -135,7 +165,7 @@ mod tests {
         let file = path(&dir);
         let lines: Vec<String> = (0..1000).map(|i| format!("- note {i:04}")).collect();
         std::fs::write(&file, lines.join("\n")).unwrap();
-        let memory = load(&file, "m".to_string()).unwrap();
+        let memory = load(&file, "m".to_string()).unwrap().unwrap();
         assert!(memory.content.len() <= MAX_LOAD);
         assert!(
             memory.content.starts_with("- note "),
@@ -149,7 +179,7 @@ mod tests {
 
         // One line past the budget leaves nothing to keep, never half a line.
         std::fs::write(&file, "é".repeat(MAX_LOAD)).unwrap();
-        let memory = load(&file, "m".to_string()).unwrap();
+        let memory = load(&file, "m".to_string()).unwrap().unwrap();
         assert_eq!(memory.content, "");
         assert_eq!(memory.cut, MAX_LOAD * 2);
         let _ = std::fs::remove_dir_all(dir);
@@ -178,6 +208,53 @@ mod tests {
         std::fs::write(&file, "- mine").unwrap();
         append(&file, "- three").unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "- mine\n- three\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_linked_out_of_the_project_is_neither_read_nor_written() {
+        let dir = crate::tools::temp_dir();
+        let secret = dir.join("credentials");
+        std::fs::write(&secret, "aws_secret_access_key = x\n").unwrap();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join(".bhai")).unwrap();
+        let file = path(&repo.join(".bhai"));
+        std::os::unix::fs::symlink(&secret, &file).unwrap();
+        assert_eq!(
+            load(&file, "./.bhai/MEMORY.md".to_string()),
+            Err("skipped ./.bhai/MEMORY.md (outside project)".to_string())
+        );
+        assert!(append(&file, "- note").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "aws_secret_access_key = x\n"
+        );
+
+        // `.bhai` itself linked out, with no memory file yet.
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::remove_dir_all(repo.join(".bhai")).unwrap();
+        std::os::unix::fs::symlink(&other, repo.join(".bhai")).unwrap();
+        assert!(append(&file, "- note").is_err());
+        assert!(!other.join(FILE).exists());
+        std::fs::write(other.join(FILE), "- planted").unwrap();
+        assert!(load(&file, "m".to_string()).is_err());
+
+        // A link that stays in the project is followed.
+        std::fs::remove_file(repo.join(".bhai")).unwrap();
+        std::fs::create_dir_all(repo.join(".bhai")).unwrap();
+        std::fs::write(repo.join("notes.md"), "- kept").unwrap();
+        std::os::unix::fs::symlink(repo.join("notes.md"), &file).unwrap();
+        assert_eq!(
+            load(&file, "m".to_string()).unwrap().unwrap().content,
+            "- kept"
+        );
+        append(&file, "- two").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("notes.md")).unwrap(),
+            "- kept\n- two\n"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
