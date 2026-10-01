@@ -1,5 +1,8 @@
-//! Markdown to styled, pre-wrapped lines for assistant text. Display only: the raw
-//! text stays what is stored and copied.
+//! Markdown to styled, pre-wrapped lines for assistant text. The raw text stays what is
+//! stored, and every drawn char remembers the bytes of it that it came from, so a copy
+//! of what is on screen is the markdown that drew it.
+
+use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Style};
@@ -9,8 +12,43 @@ use crate::mermaid;
 use crate::syntax::{self, PLAIN};
 use crate::wrap::Join;
 
-/// One styled character; lines are built from these so wrapping keeps styles.
-type Cell = (char, Style);
+/// One styled character and where it came from; lines are built from these so wrapping
+/// keeps both.
+type Cell = (char, Style, Option<Origin>);
+
+/// The bytes of the source a drawn char came from. Every char of an inline element
+/// (`**bold**`, a link, `code`) has the whole element, so a copy keeps its delimiters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Origin {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl From<Range<usize>> for Origin {
+    fn from(range: Range<usize>) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+        }
+    }
+}
+
+/// What `render` draws, row by row.
+#[derive(Default)]
+pub struct Rendered {
+    pub lines: Vec<Line<'static>>,
+    /// How each row joins the one above it.
+    pub joins: Vec<Join>,
+    /// Chars at the start of each row that are layout rather than text.
+    pub margins: Vec<usize>,
+    /// Where each char of each row came from, `None` for what the renderer adds.
+    pub origins: Vec<Vec<Option<Origin>>>,
+    /// The `[copy]` label over each code block: its row, its chars and the code it copies.
+    pub copies: Vec<(usize, Range<usize>, String)>,
+}
+
+/// The label over a code block that a click copies the block by.
+pub const COPY_LABEL: &str = "[copy]";
 
 const CODE: Style = Style::new().fg(Color::Green);
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -18,24 +56,26 @@ const DIM: Style = Style::new().fg(Color::DarkGray);
 const CODE_INDENT: &str = "  ";
 
 /// Renders `text` into lines no wider than `width` chars, each with how it joins the one
-/// above and how many chars in front of it are layout, so a copy of a selection can undo
-/// the wrapping and the indenting done here.
-pub fn render(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Join>, Vec<usize>) {
+/// above, how many chars in front of it are layout and where its chars came from, so a
+/// copy of a selection can undo what was done here. Origins are offsets into
+/// `wrap::readable(text)`, which is what is parsed.
+pub fn render(text: &str, width: usize) -> Rendered {
     let text = &crate::wrap::readable(text);
     let mut renderer = Renderer {
         width: width.max(1),
         ..Renderer::default()
     };
-    let options = Options::ENABLE_TABLES
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_FOOTNOTES;
-    for event in Parser::new_ext(text, options) {
-        renderer.event(event);
+    for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
+        renderer.event(event, range);
     }
     renderer.flush();
-    (renderer.lines, renderer.joins, renderer.margins)
+    renderer.out
 }
+
+const OPTIONS: Options = Options::ENABLE_TABLES
+    .union(Options::ENABLE_STRIKETHROUGH)
+    .union(Options::ENABLE_TASKLISTS)
+    .union(Options::ENABLE_FOOTNOTES);
 
 /// A block that prefixes every line inside it: a list item or a block quote.
 struct Container {
@@ -44,24 +84,32 @@ struct Container {
     used: bool,
 }
 
+/// A fenced or indented code block while its text arrives.
+struct Code {
+    lang: String,
+    text: String,
+    /// Where each char of `text` came from.
+    origins: Vec<Option<Origin>>,
+    /// The whole block, fences and all.
+    block: Origin,
+}
+
 #[derive(Default)]
 struct Renderer {
     width: usize,
-    lines: Vec<Line<'static>>,
-    /// How each line joins the one above it.
-    joins: Vec<Join>,
-    /// Chars at the start of each line that are layout rather than text.
-    margins: Vec<usize>,
+    out: Rendered,
     /// Inline content of the block being built.
     inline: Vec<Cell>,
     styles: Vec<Style>,
+    /// The open inline elements; the outermost is what their chars copy as.
+    elements: Vec<Origin>,
     containers: Vec<Container>,
     /// Next number of each open list, `None` for bullets.
     lists: Vec<Option<u64>>,
     /// Destination and start in `inline` of each open link or image.
     links: Vec<(String, usize)>,
-    /// Language and text of the open code block.
-    code: Option<(String, String)>,
+    /// The open code block.
+    code: Option<Code>,
     /// Rows of the open table, each a row of cells, each cell its styled chars.
     table: Vec<Vec<Vec<Cell>>>,
     row: Vec<Vec<Cell>>,
@@ -70,41 +118,60 @@ struct Renderer {
 }
 
 impl Renderer {
-    fn event(&mut self, event: Event) {
+    fn event(&mut self, event: Event, range: Range<usize>) {
         match event {
-            Event::Start(tag) => self.start(tag),
-            Event::End(tag) => self.end(tag),
+            Event::Start(tag) => self.start(tag, range),
+            Event::End(tag) => self.end(tag, range),
             Event::Text(text) => match &mut self.code {
-                Some((_, code)) => code.push_str(&text),
-                None => self.push(&text, self.style()),
+                Some(code) => {
+                    code.text.push_str(&text);
+                    code.origins.extend(origins(&text, range));
+                }
+                None => self.push(&text, self.style(), range),
             },
-            Event::Code(text) => self.push(&text, self.style().patch(CODE)),
-            Event::InlineMath(text) | Event::DisplayMath(text) => self.push(&text, self.style()),
-            Event::Html(text) | Event::InlineHtml(text) => {
-                self.push(text.trim_end_matches('\n'), self.style())
+            Event::Code(text) => self.push(&text, self.style().patch(CODE), range),
+            Event::InlineMath(text) | Event::DisplayMath(text) => {
+                self.push(&text, self.style(), range)
             }
-            Event::FootnoteReference(name) => self.push(&format!("[^{name}]"), self.style()),
+            Event::Html(text) | Event::InlineHtml(text) => {
+                self.push(text.trim_end_matches('\n'), self.style(), range)
+            }
+            Event::FootnoteReference(name) => self.push(&format!("[^{name}]"), self.style(), range),
             Event::SoftBreak | Event::HardBreak => self.flush(),
             Event::Rule => {
                 self.block();
                 let rule = "─".repeat(self.width.saturating_sub(self.prefix_width()).min(40));
-                self.emit(rule.chars().map(|c| (c, DIM)).collect(), Join::Newline);
+                let origin = Some(range.into());
+                self.emit(
+                    rule.chars().map(|c| (c, DIM, origin)).collect(),
+                    Join::Newline,
+                );
                 self.gap = true;
             }
             Event::TaskListMarker(done) => {
-                self.push(if done { "[x] " } else { "[ ] " }, self.style())
+                self.push(if done { "[x] " } else { "[ ] " }, self.style(), range)
             }
         }
     }
 
-    fn start(&mut self, tag: Tag) {
+    fn start(&mut self, tag: Tag, range: Range<usize>) {
         match tag {
-            Tag::Emphasis => self.styles.push(Style::new().italic()),
-            Tag::Strong => self.styles.push(Style::new().bold()),
-            Tag::Strikethrough => self.styles.push(Style::new().crossed_out()),
+            Tag::Emphasis => {
+                self.styles.push(Style::new().italic());
+                self.elements.push(range.into());
+            }
+            Tag::Strong => {
+                self.styles.push(Style::new().bold());
+                self.elements.push(range.into());
+            }
+            Tag::Strikethrough => {
+                self.styles.push(Style::new().crossed_out());
+                self.elements.push(range.into());
+            }
             Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
                 self.styles.push(Style::new().underlined());
                 self.links.push((dest_url.to_string(), self.inline.len()));
+                self.elements.push(range.into());
             }
             Tag::Heading { level, .. } => {
                 self.block();
@@ -120,7 +187,12 @@ impl Renderer {
                     CodeBlockKind::Fenced(lang) => lang.to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                self.code = Some((lang, String::new()));
+                self.code = Some(Code {
+                    lang,
+                    text: String::new(),
+                    origins: Vec::new(),
+                    block: range.into(),
+                });
             }
             Tag::List(start) => {
                 // A nested list follows its item's text without a gap.
@@ -163,19 +235,21 @@ impl Renderer {
         }
     }
 
-    fn end(&mut self, tag: TagEnd) {
+    fn end(&mut self, tag: TagEnd, range: Range<usize>) {
         match tag {
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                 self.styles.pop();
+                self.elements.pop();
             }
             TagEnd::Link | TagEnd::Image => {
                 self.styles.pop();
                 if let Some((url, start)) = self.links.pop() {
-                    let label: String = self.inline[start..].iter().map(|(c, _)| c).collect();
+                    let label: String = self.inline[start..].iter().map(|(c, ..)| c).collect();
                     if !url.is_empty() && label != url {
-                        self.push(&format!(" ({url})"), DIM);
+                        self.push(&format!(" ({url})"), DIM, range);
                     }
                 }
+                self.elements.pop();
             }
             TagEnd::Heading(_) => {
                 self.styles.pop();
@@ -224,8 +298,19 @@ impl Renderer {
             .fold(Style::new(), |style, patch| style.patch(*patch))
     }
 
-    fn push(&mut self, text: &str, style: Style) {
-        self.inline.extend(text.chars().map(|c| (c, style)));
+    /// Text that came from `range` of the source, or from the inline element it sits in.
+    fn push(&mut self, text: &str, style: Style, range: Range<usize>) {
+        match self.elements.first() {
+            Some(&element) => {
+                let cells = text.chars().map(|c| (c, style, Some(element)));
+                self.inline.extend(cells);
+            }
+            None => {
+                let cells = text.chars().zip(origins(text, range));
+                self.inline
+                    .extend(cells.map(|(c, origin)| (c, style, origin)));
+            }
+        }
     }
 
     /// Starts a block: pending text is flushed and the gap, if owed, drawn.
@@ -233,17 +318,18 @@ impl Renderer {
         self.flush();
         // A block right after a list marker shares its line.
         let fresh_item = self.containers.last().is_some_and(|c| !c.used);
-        if std::mem::take(&mut self.gap) && !self.lines.is_empty() && !fresh_item {
+        if std::mem::take(&mut self.gap) && !self.out.lines.is_empty() && !fresh_item {
             let prefix: Vec<Span> = self.containers.iter().map(|c| c.rest.clone()).collect();
             let blank = Line::from(prefix);
             let trimmed = blank.to_string().trim_end().to_string();
-            self.lines.push(if trimmed.is_empty() {
+            self.out.origins.push(vec![None; trimmed.chars().count()]);
+            self.out.lines.push(if trimmed.is_empty() {
                 Line::from("")
             } else {
                 Line::from(Span::styled(trimmed, DIM))
             });
-            self.joins.push(Join::Newline);
-            self.margins.push(0);
+            self.out.joins.push(Join::Newline);
+            self.out.margins.push(0);
         }
     }
 
@@ -260,30 +346,34 @@ impl Renderer {
     }
 
     fn code_block(&mut self) {
-        let Some((lang, code)) = self.code.take() else {
+        let Some(Code {
+            lang,
+            text,
+            origins,
+            block,
+        }) = self.code.take()
+        else {
             return;
         };
+        let code = text.strip_suffix('\n').unwrap_or(&text);
+        self.code_header(&lang, code);
         // Only the word before any attributes, which fences carry in several dialects.
         let name = lang.split([' ', ',', '{', ':']).next().unwrap_or("").trim();
-        if mermaid::is_mermaid(name) && self.diagram(&code) {
+        if mermaid::is_mermaid(name) && self.diagram(code, block) {
             self.gap = true;
             return;
-        }
-        if !lang.is_empty() {
-            let cells: Vec<Cell> = lang.chars().map(|c| (c, DIM)).collect();
-            let width = self.width.saturating_sub(self.prefix_width()).max(4);
-            for (line, join) in wrap(&cells, width) {
-                self.emit(line, join);
-            }
         }
         let width = self
             .width
             .saturating_sub(self.prefix_width() + CODE_INDENT.len())
             .max(4);
-        let code = code.strip_suffix('\n').unwrap_or(&code);
         // Coloured as a whole, since a string or a comment can cross a line, then cut
         // back into the lines the code has.
-        let painted = syntax::highlight(code, &lang);
+        let painted: Vec<Cell> = syntax::highlight(code, &lang)
+            .into_iter()
+            .zip(origins)
+            .map(|((c, style), origin)| (c, style, origin))
+            .collect();
         for line in split_lines(&painted) {
             let cells: Vec<Cell> = line.to_vec();
             // Long lines are split, never reflowed.
@@ -293,7 +383,7 @@ impl Renderer {
                 cells.chunks(width).collect()
             };
             for (index, chunk) in chunks.into_iter().enumerate() {
-                let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, PLAIN)).collect();
+                let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, PLAIN, None)).collect();
                 row.extend_from_slice(chunk);
                 // The line was split to fit, not reflowed, so nothing stands between.
                 let join = match index {
@@ -306,11 +396,45 @@ impl Renderer {
         self.gap = true;
     }
 
+    /// The row over a code block: its language, if the fence names one, and the label a
+    /// click copies the code by. A view too narrow for the label goes without.
+    fn code_header(&mut self, lang: &str, code: &str) {
+        let width = self.width.saturating_sub(self.prefix_width()).max(4);
+        let mut rows = match lang.is_empty() {
+            true => Vec::new(),
+            false => wrap(
+                &lang.chars().map(|c| (c, DIM, None)).collect::<Vec<_>>(),
+                width,
+            ),
+        };
+        let label = COPY_LABEL.chars().count();
+        let last = rows.last().map_or(0, |(row, _)| cells_width(row));
+        match rows.last_mut() {
+            Some((row, _)) if last + 1 + label <= width => row.push((' ', DIM, None)),
+            _ if label <= width => rows.push((Vec::new(), Join::Newline)),
+            _ => {}
+        }
+        let at = rows.last().map(|(row, _)| row.len());
+        if let (Some(at), Some((row, _))) = (at, rows.last_mut())
+            && label <= width
+        {
+            row.extend(COPY_LABEL.chars().map(|c| (c, DIM, None)));
+            let start = self.prefix_width() + at;
+            let line = self.out.lines.len() + rows.len() - 1;
+            self.out
+                .copies
+                .push((line, start..start + label, code.to_string()));
+        }
+        for (row, join) in rows {
+            self.emit(row, join);
+        }
+    }
+
     /// A mermaid fence drawn as a diagram, or `false` when it is to be shown as source.
     /// A diagram is art rather than text: splitting a line of it to fit the view leaves
     /// something worse to read than the source it was drawn from, so one too wide for
-    /// the view is not drawn at all.
-    fn diagram(&mut self, source: &str) -> bool {
+    /// the view is not drawn at all. Each char of it copies as the whole fence.
+    fn diagram(&mut self, source: &str, block: Origin) -> bool {
         let width = self
             .width
             .saturating_sub(self.prefix_width() + CODE_INDENT.len());
@@ -321,8 +445,8 @@ impl Renderer {
             return false;
         }
         for line in lines {
-            let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, PLAIN)).collect();
-            row.extend(line.chars().map(|c| (c, PLAIN)));
+            let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, PLAIN, None)).collect();
+            row.extend(line.chars().map(|c| (c, PLAIN, Some(block))));
             self.emit_code(row, Join::Newline);
         }
         true
@@ -338,7 +462,7 @@ impl Renderer {
             .map(|i| {
                 rows.iter()
                     .filter_map(|row| row.get(i))
-                    .map(Vec::len)
+                    .map(|cell| cells_width(cell))
                     .max()
                     .unwrap_or(0)
             })
@@ -363,17 +487,17 @@ impl Renderer {
                 let mut text: Vec<Cell> = Vec::new();
                 for (i, w) in widths.iter().enumerate() {
                     if i > 0 {
-                        text.extend([(' ', Style::new()); 2]);
+                        text.extend([(' ', Style::new(), None); 2]);
                     }
                     let part = cells[i].get(line).map_or(&[][..], Vec::as_slice);
-                    text.extend(part.iter().map(|(c, style)| match head {
-                        true => (*c, style.bold()),
-                        false => (*c, *style),
+                    text.extend(part.iter().map(|&(c, style, origin)| match head {
+                        true => (c, style.bold(), origin),
+                        false => (c, style, origin),
                     }));
-                    let pad = w.saturating_sub(part.len());
-                    text.extend(std::iter::repeat_n((' ', Style::new()), pad));
+                    let pad = w.saturating_sub(cells_width(part));
+                    text.extend(std::iter::repeat_n((' ', Style::new(), None), pad));
                 }
-                while text.last().is_some_and(|(c, _)| *c == ' ') {
+                while text.last().is_some_and(|(c, ..)| *c == ' ') {
                     text.pop();
                 }
                 // The line is a grid row, so it goes out as it was laid out: the wrap
@@ -381,7 +505,7 @@ impl Renderer {
                 // continuation line sits under. Only a table squeezed into a view too
                 // narrow to give every column a character can still be too wide, and
                 // that one is past keeping its shape anyway.
-                match text.len() > width {
+                match cells_width(&text) > width {
                     true => {
                         for (line, _) in wrap(&text, width) {
                             self.emit(line, Join::Newline);
@@ -392,7 +516,10 @@ impl Renderer {
             }
             if head {
                 let rule = "─".repeat((widths.iter().sum::<usize>() + gaps).min(width));
-                self.emit(rule.chars().map(|c| (c, DIM)).collect(), Join::Newline);
+                self.emit(
+                    rule.chars().map(|c| (c, DIM, None)).collect(),
+                    Join::Newline,
+                );
             }
         }
         self.gap = true;
@@ -408,18 +535,21 @@ impl Renderer {
     /// Pushes one screen line behind the container prefixes.
     fn emit(&mut self, cells: Vec<Cell>, join: Join) {
         let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut origins = Vec::with_capacity(cells.len());
         for container in &mut self.containers {
             let prefix = if container.used {
                 &container.rest
             } else {
                 &container.first
             };
+            origins.extend(prefix.content.chars().map(|_| None));
             spans.push(prefix.clone());
             container.used = true;
         }
         let mut run = String::new();
         let mut style = None;
-        for (c, s) in cells {
+        for (c, s, origin) in cells {
+            origins.push(origin);
             if style.is_some_and(|current| current != s) {
                 spans.push(Span::styled(std::mem::take(&mut run), style.unwrap()));
             }
@@ -434,9 +564,10 @@ impl Renderer {
             Join::Newline => 0,
             _ => self.prefix_width(),
         };
-        self.lines.push(Line::from(spans));
-        self.joins.push(join);
-        self.margins.push(margin);
+        self.out.lines.push(Line::from(spans));
+        self.out.joins.push(join);
+        self.out.margins.push(margin);
+        self.out.origins.push(origins);
     }
 
     /// A row of a code block: what a copy takes is the code, without the indent it is
@@ -444,7 +575,7 @@ impl Renderer {
     fn emit_code(&mut self, cells: Vec<Cell>, join: Join) {
         let margin = self.prefix_width() + CODE_INDENT.len();
         self.emit(cells, join);
-        if let Some(last) = self.margins.last_mut() {
+        if let Some(last) = self.out.margins.last_mut() {
             *last = margin;
         }
     }
@@ -454,7 +585,7 @@ impl Renderer {
 fn split_lines(painted: &[Cell]) -> Vec<&[Cell]> {
     let mut lines = Vec::new();
     let mut start = 0;
-    for (index, (c, _)) in painted.iter().enumerate() {
+    for (index, (c, ..)) in painted.iter().enumerate() {
         if *c == '\n' {
             lines.push(&painted[start..index]);
             start = index + 1;
@@ -489,7 +620,7 @@ fn wrap(cells: &[Cell], width: usize) -> Vec<(Vec<Cell>, Join)> {
     let mut join = Join::Newline;
     let mut pos: usize = 0;
     let mut line_width = 0;
-    for word in cells.split(|(c, _)| *c == ' ') {
+    for word in cells.split(|(c, ..)| *c == ' ') {
         let space = pos.checked_sub(1).map(|i| cells[i]);
         pos += word.len() + 1;
         let mut word = word;
@@ -526,14 +657,14 @@ fn wrap(cells: &[Cell], width: usize) -> Vec<(Vec<Cell>, Join)> {
 /// The columns these cells take on screen; one cell is one character, which may be two
 /// columns wide.
 fn cells_width(cells: &[Cell]) -> usize {
-    cells.iter().map(|(c, _)| char_width(*c)).sum()
+    cells.iter().map(|(c, ..)| char_width(*c)).sum()
 }
 
 /// How many cells reach `columns` on screen, never leaving a two-column character
 /// straddling the edge.
 fn cells_split(cells: &[Cell], columns: usize) -> usize {
     let mut used = 0;
-    for (i, (c, _)) in cells.iter().enumerate() {
+    for (i, (c, ..)) in cells.iter().enumerate() {
         let next = used + char_width(*c);
         if next > columns {
             return i;
@@ -547,6 +678,113 @@ fn char_width(c: char) -> usize {
     unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
+/// Where each char of `text` came from, given that it came from `range`. Text that is
+/// the source byte for byte maps char by char; text the parser changed on the way, an
+/// escape or an entity say, all maps to the whole range.
+fn origins(text: &str, range: Range<usize>) -> Vec<Option<Origin>> {
+    match text.len() == range.len() {
+        true => text
+            .char_indices()
+            .map(|(at, c)| {
+                let start = range.start + at;
+                Some(Origin {
+                    start,
+                    end: start + c.len_utf8(),
+                })
+            })
+            .collect(),
+        false => vec![Some(range.into()); text.chars().count()],
+    }
+}
+
+/// What a copy of `range` of `source` takes so that it is still markdown: a table it cuts
+/// across rows of, or a code block it runs out of, whole, and the marker the first line
+/// opens with (`## `, `- `, `> `) when the copy starts at that line's text.
+pub fn excerpt(source: &str, range: Range<usize>) -> &str {
+    let (mut lo, mut hi) = (range.start, range.end.min(source.len()));
+    let mut wholes = Vec::new();
+    for (event, block) in Parser::new_ext(source, OPTIONS).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Table(_)) => wholes.push((block, true)),
+            Event::Start(Tag::CodeBlock(_)) => wholes.push((block, false)),
+            _ => {}
+        }
+    }
+    // Taking one in can reach another, a table and the code block after it say.
+    loop {
+        let before = (lo, hi);
+        for (block, table) in &wholes {
+            if lo >= block.end || hi <= block.start {
+                continue;
+            }
+            let inside = lo >= block.start && hi <= block.end;
+            let rows = *table && source[lo..hi].contains('\n');
+            if !inside || rows {
+                lo = lo.min(block.start);
+                hi = hi.max(block.end);
+            }
+        }
+        if (lo, hi) == before {
+            break;
+        }
+    }
+    let line = source[..lo].rfind('\n').map_or(0, |at| at + 1);
+    if lo <= line + markup(&source[line..]) {
+        lo = line;
+    }
+    while !source.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    while !source.is_char_boundary(hi) {
+        hi += 1;
+    }
+    source[lo..hi].trim_end_matches('\n')
+}
+
+/// The bytes of block markup a line opens with: quote marks, then a heading's `#`s or a
+/// list's bullet and task box, each with the spaces after it.
+fn markup(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let spaces = |mut at: usize| {
+        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        at
+    };
+    let mut at = spaces(0);
+    let mut found = false;
+    while bytes.get(at) == Some(&b'>') {
+        found = true;
+        at = spaces(at + 1);
+    }
+    let hashes = bytes[at..].iter().take_while(|b| **b == b'#').count();
+    if (1..=6).contains(&hashes) && bytes.get(at + hashes) == Some(&b' ') {
+        return spaces(at + hashes);
+    }
+    let digits = bytes[at..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    let bullet = match bytes.get(at) {
+        Some(b'-' | b'*' | b'+') => Some(at + 1),
+        _ if digits > 0 && matches!(bytes.get(at + digits), Some(b'.' | b')')) => {
+            Some(at + digits + 1)
+        }
+        _ => None,
+    };
+    if let Some(end) = bullet.filter(|end| bytes.get(*end) == Some(&b' ')) {
+        let mut end = spaces(end);
+        if bytes.get(end) == Some(&b'[')
+            && bytes.get(end + 2) == Some(&b']')
+            && matches!(bytes.get(end + 1), Some(b' ' | b'x' | b'X'))
+        {
+            end = spaces(end + 3);
+        }
+        return end;
+    }
+    if found { at } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,7 +792,7 @@ mod tests {
 
     /// The lines alone, for the tests that have nothing to say about the wrapping.
     fn lines(source: &str, width: usize) -> Vec<Line<'static>> {
-        render(source, width).0
+        render(source, width).lines
     }
 
     fn text(lines: &[Line]) -> Vec<String> {
@@ -590,7 +828,7 @@ mod tests {
             vec![
                 "before",
                 "",
-                "rust",
+                "rust [copy]",
                 "  fn main() {",
                 "      let  x = 1;",
                 "  }",
@@ -598,7 +836,7 @@ mod tests {
                 "after"
             ]
         );
-        assert_eq!(style_of(&lines, "rust"), DIM);
+        assert_eq!(style_of(&lines, "rust [copy]"), DIM);
         // The block is coloured as the language the fence names, so the keyword and the
         // literal are told apart. Which colours exactly is the theme's business.
         let keyword = style_of(&lines, "fn");
@@ -611,7 +849,7 @@ mod tests {
         let lines = lines("text\n\n```py\nprint(1)\nx = [", 40);
         assert_eq!(
             text(&lines),
-            vec!["text", "", "py", "  print(1)", "  x = ["]
+            vec!["text", "", "py [copy]", "  print(1)", "  x = ["]
         );
     }
 
@@ -637,14 +875,11 @@ mod tests {
         let source = "```mermaid\nsequenceDiagram\n    A->>B: hello\n```";
         let lines = lines(source, 80);
         let drawn = text(&lines).join("\n");
-        // The diagram, not its source: no fence language line, no `->>`.
+        // The diagram, not its source: no `->>`, and only the header names the fence.
         assert!(drawn.contains("hello"), "{drawn}");
         assert!(!drawn.contains("->>"), "{drawn}");
         assert!(!drawn.contains("sequenceDiagram"), "{drawn}");
-        assert!(
-            !text(&lines).iter().any(|l| l.trim() == "mermaid"),
-            "{drawn}"
-        );
+        assert_eq!(text(&lines)[0], "mermaid [copy]");
     }
 
     #[test]
@@ -660,13 +895,14 @@ mod tests {
     #[test]
     fn a_mermaid_fence_that_does_not_parse_is_shown_as_its_source() {
         let lines = lines("```mermaid\nnot a diagram\n```", 80);
-        assert_eq!(text(&lines), vec!["mermaid", "  not a diagram"]);
+        assert_eq!(text(&lines), vec!["mermaid [copy]", "  not a diagram"]);
     }
 
     #[test]
     fn a_fence_with_no_language_stays_plain() {
         let lines = lines("```\nit's fine # not a comment\n```", 40);
-        for span in lines.iter().flat_map(|l| l.spans.iter()) {
+        // Under the header, which is dim like any fence's.
+        for span in lines.iter().skip(1).flat_map(|l| l.spans.iter()) {
             assert_eq!(span.style, PLAIN);
         }
     }
@@ -674,13 +910,14 @@ mod tests {
     #[test]
     fn long_code_lines_are_split_not_reflowed() {
         let lines = lines("```\nabcdefghij klm\n```", 8);
-        assert_eq!(text(&lines), vec!["  abcdef", "  ghij k", "  lm"]);
+        assert_eq!(text(&lines), vec!["[copy]", "  abcdef", "  ghij k", "  lm"]);
     }
 
     #[test]
     fn a_long_language_tag_fits_the_width() {
         let lines = lines("```abcdefghijkl\nx\n```", 8);
-        assert_eq!(text(&lines), vec!["abcdefgh", "ijkl", "  x"]);
+        // The label does not fit beside the tag's last row, so it takes one of its own.
+        assert_eq!(text(&lines), vec!["abcdefgh", "ijkl", "[copy]", "  x"]);
     }
 
     #[test]

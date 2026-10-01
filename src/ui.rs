@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use crate::app::{App, Entry, TrustGate};
+use crate::app::{App, Entry, Source, TrustGate};
 use crate::client::Usage;
 use crate::commands::{self, Item};
 use crate::input::Row;
 use crate::limits::{self, RateLimits};
-use crate::markdown;
+use crate::markdown::{self, Origin};
 use crate::models::Picker;
 use crate::permissions::Mode;
 use crate::profile::{Method, Tokens};
@@ -550,6 +550,8 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut spans = Vec::with_capacity(entries.list.len());
     let mut joins: Vec<Join> = Vec::new();
     let mut margins: Vec<usize> = Vec::new();
+    let mut sources: Vec<Option<Source>> = Vec::new();
+    let mut copies = Vec::new();
     let mut folds = HashMap::new();
     for (index, entry) in entries.list.iter().enumerate() {
         let start = lines.len();
@@ -577,6 +579,17 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         lines.extend(rows.lines);
         joins.extend(rows.joins);
         margins.extend(rows.margins);
+        sources.extend(rows.origins.into_iter().map(|row| {
+            row.map(|origins| Source {
+                entry: index,
+                origins,
+            })
+        }));
+        copies.extend(
+            rows.copies
+                .into_iter()
+                .map(|(row, chars, code)| (start + row, chars, code)),
+        );
         if rows.folded || owner != index {
             folds.insert(index, owner);
         }
@@ -600,6 +613,8 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     app.lines = lines.iter().map(plain).collect();
     app.joins = joins;
     app.margins = margins;
+    app.sources = sources;
+    app.copies = copies;
     app.rehover();
 
     if let Some(selection) = app.selection {
@@ -834,12 +849,14 @@ fn shell_status(result: &Entry) -> Option<(String, Color)> {
 }
 
 /// What an entry draws: its rows, how each one joins the row above it, how many chars
-/// in front of each are drawn rather than text, and whether it has rows a click folds
-/// away.
+/// in front of each are drawn rather than text, where each char of a markdown row came
+/// from, the code blocks a click copies and whether it has rows a click folds away.
 struct Rows {
     lines: Vec<Line<'static>>,
     joins: Vec<Join>,
     margins: Vec<usize>,
+    origins: Vec<Option<Vec<Option<Origin>>>>,
+    copies: Vec<(usize, Range<usize>, String)>,
     folded: bool,
 }
 
@@ -856,10 +873,21 @@ fn entry_lines(
     if let Entry::Assistant(text) = entry {
         let lead = MESSAGE_MARK.chars().count();
         let indent = " ".repeat(lead);
-        let (rendered, mut joins, margins) =
-            markdown::render(text, width.saturating_sub(lead).max(4));
-        let mut margins: Vec<usize> = margins.into_iter().map(|m| m + lead).collect();
+        let rendered = markdown::render(text, width.saturating_sub(lead).max(4));
+        let mut joins = rendered.joins;
+        let mut margins: Vec<usize> = rendered.margins.iter().map(|m| m + lead).collect();
+        let mut origins: Vec<Option<Vec<Option<Origin>>>> = rendered
+            .origins
+            .into_iter()
+            .map(|row| Some([vec![None; lead], row].concat()))
+            .collect();
+        let copies = rendered
+            .copies
+            .into_iter()
+            .map(|(row, chars, code)| (row, chars.start + lead..chars.end + lead, code))
+            .collect();
         let mut lines: Vec<Line> = rendered
+            .lines
             .into_iter()
             .enumerate()
             .map(|(i, mut line)| {
@@ -879,14 +907,18 @@ fn entry_lines(
             lines.push(Line::from(MESSAGE_MARK));
             joins.push(Join::Newline);
             margins.push(lead);
+            origins.push(None);
         }
         lines.push(Line::from(""));
         joins.push(Join::Newline);
         margins.push(0);
+        origins.push(None);
         return Rows {
             lines,
             joins,
             margins,
+            origins,
+            copies,
             folded: false,
         };
     }
@@ -1018,9 +1050,11 @@ fn entry_lines(
     joins.push(Join::Newline);
     margins.resize(lines.len(), 0);
     Rows {
+        origins: vec![None; lines.len()],
         lines,
         joins,
         margins,
+        copies: Vec::new(),
         folded: hidden > 0 || printed > 0,
     }
 }
@@ -2415,27 +2449,115 @@ mod tests {
         assert_eq!(app.selected_text().as_deref(), Some("hello"));
     }
 
-    #[test]
-    fn a_copy_leaves_the_indent_the_transcript_draws() {
-        let key = "ab".repeat(60);
+    /// The transcript line and char where `needle` is drawn.
+    fn find(app: &App, needle: &str) -> (usize, usize) {
+        app.lines
+            .iter()
+            .enumerate()
+            .find_map(|(line, text)| {
+                let at = text.find(needle)?;
+                Some((line, text[..at].chars().count()))
+            })
+            .unwrap_or_else(|| panic!("{needle:?} is not drawn: {:?}", app.lines))
+    }
+
+    /// A drag from one transcript cell to another, both in view, ending on `to`.
+    fn drag(app: &mut App, from: (usize, usize), to: (usize, usize)) {
+        let area = app.transcript_area.unwrap();
+        let at = |(line, column): (usize, usize)| {
+            (area.x + column as u16, area.y + (line - app.scroll) as u16)
+        };
+        let (from, to) = (at(from), at(to));
+        app.on_mouse(down(from.0, from.1));
+        app.on_mouse(left(MouseEventKind::Drag(MouseButton::Left), to.0, to.1));
+    }
+
+    fn drawn(source: &str, width: u16) -> (App, Terminal<TestBackend>) {
         let mut app = App::detached();
-        app.entries().push(Entry::Assistant(format!(
-            "run this:\n\n```\nfn main() {{\n    go();\n}}\n```\n\n{key}"
-        )));
-        let mut terminal = Terminal::new(TestBackend::new(40, 30)).unwrap();
+        app.entries().push(Entry::Assistant(source.to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        (app, terminal)
+    }
+
+    #[test]
+    fn a_whole_message_copies_as_the_markdown_that_drew_it() {
+        let key = "ab".repeat(60);
+        let source = format!(
+            "## Plan\n\nrun **this** now:\n\n```\nfn main() {{\n    go();\n}}\n```\n\n\
+             | a | b |\n|---|---|\n| 1 | 2 |\n\n{key}"
+        );
+        let (mut app, _) = drawn(&source, 40);
         app.on_key(ratatui::crossterm::event::KeyEvent::new(
             KeyCode::Char('a'),
             KeyModifiers::CONTROL,
         ));
-
         let text = app.selected_text().unwrap();
+        // The greeting above it is a note, copied as it reads; the message is its source.
         assert!(
-            text.contains("run this:\n\nfn main() {\n    go();\n}\n\n"),
+            text.trim_end().ends_with(&format!("\n{source}")),
             "{text:?}"
         );
-        // Split across three rows, the key comes back as one run of chars.
-        assert!(text.trim_end().ends_with(&format!("\n{key}")), "{text:?}");
+    }
+
+    #[test]
+    fn a_selection_copies_the_markdown_under_it() {
+        let source = "## Plan\n\nrun **this one** now\n\n```rust\nfn main() {\n    go();\n}\n```\n\n\
+                      | a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\n- first\n- second";
+        let (mut app, _) = drawn(source, 40);
+        // From the first char of `from` to the last of `to`.
+        let copy = |app: &mut App, from: &str, to: &str| {
+            let (start, end) = (find(app, from), find(app, to));
+            drag(app, start, (end.0, end.1 + to.chars().count() - 1));
+            app.selected_text().unwrap()
+        };
+
+        // A heading's text copies with its `#`s.
+        assert_eq!(copy(&mut app, "Plan", "Plan"), "## Plan");
+        // Part of a bold run takes the whole of it, so its stars stay paired.
+        assert_eq!(copy(&mut app, "run this", "this"), "run **this one**");
+        // Inside a code block, the code and nothing the view drew around it.
+        assert_eq!(copy(&mut app, "fn main", "go()"), "fn main() {\n    go()");
+        // Two rows of a table are the whole table, or it is no table at all.
+        assert_eq!(
+            copy(&mut app, "1  2", "3  4"),
+            "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |"
+        );
+        // A list item keeps its bullet.
+        assert_eq!(copy(&mut app, "first", "second"), "- first\n- second");
+        // Out of the paragraph and into the code block takes its fences too.
+        assert_eq!(
+            copy(&mut app, "now", "go();"),
+            "now\n\n```rust\nfn main() {\n    go();\n}\n```"
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_copy_label_copies_the_code() {
+        let (mut app, _) = drawn("look:\n\n```sh\ncargo test\nls -la\n```", 40);
+        let (line, column) = find(&app, markdown::COPY_LABEL);
+        let area = app.transcript_area.unwrap();
+        let (x, y) = (
+            area.x + column as u16 + 2,
+            area.y + (line - app.scroll) as u16,
+        );
+        assert!(click(&mut app, x, y));
+        assert_eq!(
+            crate::clipboard::last_copied().as_deref(),
+            Some("cargo test\nls -la")
+        );
+        assert!(app.copied.is_some(), "the copy is not said");
+    }
+
+    #[test]
+    fn a_table_with_wide_chars_keeps_its_columns() {
+        let (app, _) = drawn("| 名前 | x |\n|---|---|\n| ab | y |", 40);
+        let (head, _) = find(&app, "名前");
+        let column = |line: usize, needle: &str| {
+            let text = &app.lines[line];
+            crate::wrap::width(&text[..text.find(needle).unwrap()])
+        };
+        assert_eq!(column(head, "x"), column(head + 2, "y"), "{:?}", app.lines);
     }
 
     #[test]

@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A selection over an assistant message copies the markdown that drew it: a heading
+  with its `#`s, a list item with its bullet, part of a bold run or a link as the whole
+  of it. A table cut across rows, or a code block a selection runs out of, comes whole,
+  fences and pipes included; a selection inside one code block is just the code. Every
+  code block has a `[copy]` label above it, beside the language, that a click copies the
+  code by. Table columns are measured in screen columns, so a CJK or emoji cell keeps
+  them lined up.
 - A transcript copy leaves out what the renderer drew in front of the text: the `⏺ `
   and `› ` marks, the indent under them, a code block's indent and a wrapped list
   item's. A word the wrap split mid-word, a key say, comes back whole.

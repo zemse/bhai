@@ -25,6 +25,7 @@ use crate::entries::Entries;
 pub use crate::entries::Entry;
 use crate::input::{Editor, History};
 use crate::limits::{self, RateLimits};
+use crate::markdown::{self, Origin};
 use crate::models::{Choice, Picker};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
@@ -118,6 +119,14 @@ impl Selection {
     }
 }
 
+/// Where the chars of one transcript row came from in the markdown of the entry that
+/// drew it, `None` for each char the renderer added.
+#[derive(Debug, Clone)]
+pub struct Source {
+    pub entry: usize,
+    pub origins: Vec<Option<Origin>>,
+}
+
 /// What a drag's copy left behind: when it happened, how much it took and the cell the
 /// drag ended on, which the note is drawn beside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +202,10 @@ pub struct App {
     /// Chars at the start of each of those lines that the renderer drew rather than the
     /// text has: the entry's mark and indent, a code block's indent. A copy leaves them.
     pub margins: Vec<usize>,
+    /// Where each of those lines came from, for the ones an assistant message drew.
+    pub sources: Vec<Option<Source>>,
+    /// The `[copy]` label over each code block: its line, its chars and the code.
+    pub copies: Vec<(usize, Range<usize>, String)>,
     /// The transcript's text area, filled in by the renderer.
     pub transcript_area: Option<Rect>,
     /// The selected span of the transcript, drawn reversed and copied by `ctrl+y`.
@@ -304,6 +317,8 @@ impl App {
             lines: Vec::new(),
             joins: Vec::new(),
             margins: Vec::new(),
+            sources: Vec::new(),
+            copies: Vec::new(),
             transcript_area: None,
             selection: None,
             anchor: None,
@@ -649,7 +664,8 @@ impl App {
                     let at = Position::new(mouse.column, mouse.row);
                     return self.copy_selection(at) | self.rehover();
                 }
-                return clicked && self.click_entry(mouse.row);
+                return clicked
+                    && (self.click_copy(mouse.column, mouse.row) || self.click_entry(mouse.row));
             }
             _ => return false,
         }
@@ -706,6 +722,33 @@ impl App {
         };
         if count > 1 {
             self.press = None;
+        }
+        true
+    }
+
+    /// A click on a code block's `[copy]` label: the code goes on the clipboard, said
+    /// beside the label the way a drag's copy is. Returns whether it was one.
+    fn click_copy(&mut self, x: u16, y: u16) -> bool {
+        let Some((line, column)) = self.cell_at(x, y) else {
+            return false;
+        };
+        let Some((_, _, code)) = self
+            .copies
+            .iter()
+            .find(|(at, chars, _)| *at == line && chars.contains(&column))
+        else {
+            return false;
+        };
+        let chars = code.chars().count();
+        match clipboard::copy(code) {
+            Ok(()) => {
+                self.copied = Some(Copied {
+                    at: Instant::now(),
+                    chars,
+                    cell: Position::new(x, y),
+                })
+            }
+            Err(err) => self.note(Entry::Error(format!("copy failed: {err}"))),
         }
         true
     }
@@ -841,37 +884,94 @@ impl App {
         std::mem::replace(&mut self.selection, selection) != selection || scrolled
     }
 
-    /// The selected transcript text, trailing spaces and the renderer's margins trimmed.
-    /// Rows the wrap broke go back on one line: only the newlines the text itself has
-    /// survive the copy.
+    /// The selected transcript text. What an assistant message drew copies as the
+    /// markdown under it; anything else as the text on screen, with trailing spaces and
+    /// the renderer's margins trimmed and the rows the wrap broke back on one line.
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
         let (from, to) = selection.range();
-        let rows: Vec<(usize, String)> = (from.0..=to.0.min(self.lines.len().checked_sub(1)?))
-            .map(|line| {
-                let chars = self.lines[line].chars();
-                let range = selection.on_line(line, self.lines[line].chars().count());
-                let range = range.unwrap_or(0..0);
-                let margin = self.margins.get(line).copied().unwrap_or(0);
-                let start = range.start.max(margin);
-                let part: String = chars
-                    .skip(start)
-                    .take(range.end.saturating_sub(start))
-                    .collect();
-                (line, part.trim_end().to_string())
-            })
-            .collect();
-        if rows.iter().all(|(_, part)| part.is_empty()) {
+        let last = to.0.min(self.lines.len().checked_sub(1)?);
+        let mut parts: Vec<(Join, String)> = Vec::new();
+        let mut line = from.0;
+        while line <= last {
+            let entry = self.source_at(line);
+            let mut end = line;
+            while entry.is_some() && end < last && self.source_at(end + 1) == entry {
+                end += 1;
+            }
+            match entry.and_then(|entry| self.markdown_of(selection, entry, line..end + 1)) {
+                Some(text) => parts.push((self.join_at(line), text)),
+                None => {
+                    for line in line..=end {
+                        parts.push((self.join_at(line), self.screen_text(selection, line)));
+                    }
+                }
+            }
+            line = end + 1;
+        }
+        if parts.iter().all(|(_, part)| part.is_empty()) {
             return None;
         }
         let mut text = String::new();
-        for (index, (line, part)) in rows.iter().enumerate() {
+        for (index, (join, part)) in parts.iter().enumerate() {
             match index {
                 0 => text.push_str(part),
-                _ => self.join_at(*line).append(&mut text, part),
+                _ => join.append(&mut text, part),
             }
         }
         Some(text)
+    }
+
+    /// The entry whose markdown drew transcript line `line`.
+    fn source_at(&self, line: usize) -> Option<usize> {
+        self.sources.get(line)?.as_ref().map(|source| source.entry)
+    }
+
+    /// The markdown of `entry` under the selected part of `lines`, or `None` when the
+    /// selection covers none of its text.
+    fn markdown_of(
+        &self,
+        selection: Selection,
+        entry: usize,
+        lines: Range<usize>,
+    ) -> Option<String> {
+        let (mut lo, mut hi) = (usize::MAX, 0);
+        for line in lines {
+            let Some(Some(source)) = self.sources.get(line) else {
+                continue;
+            };
+            let Some(range) = selection.on_line(line, source.origins.len()) else {
+                continue;
+            };
+            for origin in source.origins[range].iter().flatten() {
+                lo = lo.min(origin.start);
+                hi = hi.max(origin.end);
+            }
+        }
+        if lo >= hi {
+            return None;
+        }
+        let entries = self.entries();
+        let Some(Entry::Assistant(text)) = entries.list.get(entry) else {
+            return None;
+        };
+        let text = crate::wrap::readable(text);
+        Some(markdown::excerpt(&text, lo..hi).to_string())
+    }
+
+    /// The selected part of transcript line `line` as it reads on screen, less its
+    /// margin and trailing spaces.
+    fn screen_text(&self, selection: Selection, line: usize) -> String {
+        let chars = self.lines[line].chars().count();
+        let range = selection.on_line(line, chars).unwrap_or(0..0);
+        let margin = self.margins.get(line).copied().unwrap_or(0);
+        let start = range.start.max(margin);
+        let part: String = self.lines[line]
+            .chars()
+            .skip(start)
+            .take(range.end.saturating_sub(start))
+            .collect();
+        part.trim_end().to_string()
     }
 
     /// How transcript line `line` joins the one above it. A renderer that has not run
