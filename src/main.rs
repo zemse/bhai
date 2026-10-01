@@ -174,7 +174,7 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let args = match parse_args(&args) {
+    let args = match parse_args(&args).and_then(with_env_mode) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
@@ -751,6 +751,28 @@ fn parse_args(args: &[String]) -> Result<Args> {
         bail!("--resume keeps the session's identity, so it takes no --as");
     }
     Ok(parsed)
+}
+
+/// `BHAI_MODE` where `--mode` was not given. It is read like the flag, but `bypass` is
+/// refused: a variable in the environment must not be what turns the safeties off.
+fn with_env_mode(mut args: Args) -> Result<Args> {
+    if args.flags.mode.is_none() {
+        args.flags.mode = env_mode(std::env::var("BHAI_MODE").ok().as_deref())?;
+    }
+    Ok(args)
+}
+
+fn env_mode(value: Option<&str>) -> Result<Option<permissions::Mode>> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let mode: permissions::Mode = value
+        .parse()
+        .map_err(|e| anyhow::anyhow!("BHAI_MODE: {e}"))?;
+    if mode == permissions::Mode::Bypass {
+        bail!("BHAI_MODE cannot be bypass, pass --mode bypass instead");
+    }
+    Ok(Some(mode))
 }
 
 /// Spawn the agent behind a session. The returned receiver is subscribed before the
@@ -1699,6 +1721,24 @@ mod tests {
         );
         assert!(picked(&["--model"]).is_err());
         assert!(picked(&["--effort"]).is_err());
+    }
+
+    #[test]
+    fn env_mode_reads_ask_and_auto_and_refuses_bypass() {
+        use permissions::Mode;
+        assert_eq!(env_mode(None).unwrap(), None);
+        assert_eq!(env_mode(Some("  ")).unwrap(), None);
+        assert_eq!(env_mode(Some("auto")).unwrap(), Some(Mode::Auto));
+        assert_eq!(env_mode(Some("ask")).unwrap(), Some(Mode::Ask));
+        assert!(env_mode(Some("bypass")).is_err());
+        assert!(env_mode(Some("yolo")).is_err());
+    }
+
+    #[test]
+    fn the_mode_flag_wins_over_the_env_mode() {
+        let mut args = parsed(&["--mode", "bypass"]).unwrap();
+        args.flags.mode = args.flags.mode.or(env_mode(Some("auto")).unwrap());
+        assert_eq!(args.flags.mode, Some(permissions::Mode::Bypass));
     }
 
     #[test]

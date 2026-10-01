@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `BHAI_MODE=ask|auto` sets the permission mode for a run where `--mode` is not given, over the config file's `permission_mode`; `--mode` still wins. `BHAI_MODE=bypass` is refused with an error, so the environment cannot turn the safeties off. `BHAI_MODEL` and `BHAI_EFFORT` already worked the same way.
 - Esc while busy asks "esc again to interrupt" and only interrupts on a second press within a second; ctrl+c still interrupts at once.
 - `bhai exec <prompt>` runs one prompt through the same session as the TUI with no terminal and no port, on an unattended policy so a call the rules leave at Ask is refused (pass `--mode auto` to let tools run). It prints the model's text on stdout, or with `--json` every `session::Event` as one JSON line (the shape of `/events`), and exits 1 when the turn fails or is interrupted. `-` as the prompt reads it from stdin.
 - ctrl+c with text in the prompt clears it instead of quitting, and ctrl+z puts it back; on an empty prompt the first ctrl+c says "press again to quit" and a second within a second quits. ctrl+d on an empty prompt asks the same way while a turn or a child agent is running.
