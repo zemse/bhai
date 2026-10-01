@@ -6,6 +6,9 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A token refresh writes `~/.codex/auth.json` readable only by the user: the temp file is
+  created 0600 and synced before it is renamed over the old one, where it used to land
+  0644.
 - `/compact` sent while a turn runs queues instead of failing with `a turn is already
   running`, and runs once that turn ends. Prompts queued ahead of it still join the
   running turn; those queued after it wait for the compaction. `/events` carries its

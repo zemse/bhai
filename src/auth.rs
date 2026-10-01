@@ -4,6 +4,7 @@
 //! Protocol lifted from openai/codex (`codex-rs/login`): the OAuth client id, the
 //! refresh endpoint, and the shape of `auth.json`.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -105,12 +106,23 @@ async fn refresh(http: &reqwest::Client, path: &Path) -> Result<Value> {
 }
 
 /// Write through a neighbouring temp file and rename, so a concurrent reader sees either
-/// the old credentials or the new ones and never half of a file.
+/// the old credentials or the new ones and never half of a file. The temp file is created
+/// 0600 and synced before the rename, so the rename never exposes a world-readable file.
 fn write_atomically(path: &Path, contents: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("auth");
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, contents)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -236,6 +248,23 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(left, ["auth.json"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refreshed_file_is_readable_only_by_the_user() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("bhai-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_atomically(&path, r#"{"tokens":{"access_token":"new"}}"#).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
