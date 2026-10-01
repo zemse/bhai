@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- An edit or write approval shows the diff it would make, folded under the call in the transcript. The preview reads only a regular file of 1 MiB or less, so a path like /dev/zero or a fifo cannot hang the prompt.
 - `tests/fake_backend.rs` runs the real binary with `--serve --headless` against a local fake Responses backend and drives it over HTTP: a text answer, an approved bash call and a rejected one, checking the requests bhai sends, what `/events` and `/state` report, and the files on disk, with no quota spent. `BHAI_TEST_BASE_URL` points the ChatGPT backend root (responses, models, usage) at the fake, and only in a debug build.
 - Bash and stdio MCP children no longer inherit variables whose name has a KEY, TOKEN, SECRET, PASS, PASSWORD, AUTH, COOKIE or CREDENTIAL part (split on `_`), so `env` no longer prints bhai's tokens into the transcript. `[bash] pass_env = ["NAME", ...]` in the global config lets chosen names through; a login profile can still export a secret again, and a server's own `env` in the config is still set.
 - `/events` frames carry the session's event `seq` as their SSE id (1 for the first event of the run). The newest 4096 events are kept, and a `Last-Event-ID` header replays the ones after it before going live: `0` replays all that are kept, a reader further back gets `{"type":"lagged","data":n}` first, a non-number is a 400 and an id past the newest (from another run) is a 409. `/state` has a `seq` field, so a snapshot followed by `/events` from that id misses nothing.

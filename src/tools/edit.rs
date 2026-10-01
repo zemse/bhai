@@ -79,7 +79,7 @@ impl Tool for Edit {
 
     fn preview(&self, args: &Value) -> Option<String> {
         let args = parse(args).ok()?;
-        let content = std::fs::read_to_string(args.path).ok()?;
+        let content = super::preview_text(args.path).ok()?;
         let (updated, _) = apply(&content, args.old, args.new, args.replace_all).ok()?;
         crate::diff::unified(&content, &updated)
     }
@@ -283,6 +283,13 @@ mod tests {
             "new_string": "4",
         });
         assert_eq!(Edit.preview(&missing), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn previews_nothing_for_a_path_that_is_not_a_regular_file() {
+        let args = json!({"path": "/dev/zero", "old_string": "\0", "new_string": "a"});
+        assert_eq!(Edit.preview(&args), None);
     }
 
     #[test]

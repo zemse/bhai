@@ -63,7 +63,7 @@ impl Tool for Write {
     fn preview(&self, args: &Value) -> Option<String> {
         let (path, content) = parse(args).ok()?;
         // A file that is there but not text has nothing to diff against.
-        let old = match std::fs::read_to_string(path) {
+        let old = match super::preview_text(path) {
             Ok(old) => old,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(_) => return None,
@@ -123,6 +123,25 @@ mod tests {
         assert_eq!(Write.preview(&args).unwrap(), "@@ -1,2 +1,2 @@\n a\n-c\n+b");
         std::fs::write(&path, b"\xff\xfe").unwrap();
         assert_eq!(Write.preview(&args), None, "not text, so nothing to diff");
+        std::fs::write(&path, vec![b'a'; (1 << 20) + 1]).unwrap();
+        assert_eq!(
+            Write.preview(&args),
+            None,
+            "too large to read before asking"
+        );
+    }
+
+    #[test]
+    fn previews_nothing_for_a_path_that_is_not_a_regular_file() {
+        let dir = super::super::temp_dir();
+        assert_eq!(Write.preview(&json!({"path": dir, "content": "a"})), None);
+        // Read to the end, this would never return.
+        #[cfg(unix)]
+        assert_eq!(
+            Write.preview(&json!({"path": "/dev/zero", "content": "a"})),
+            None
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

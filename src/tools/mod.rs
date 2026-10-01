@@ -185,6 +185,28 @@ fn path_arg(args: &Value) -> Result<&Path, String> {
     Ok(Path::new(path))
 }
 
+/// A file read for an approval preview is skipped past this.
+const MAX_PREVIEW_BYTES: u64 = 1 << 20;
+
+/// The text a write or edit preview diffs against. It runs before the user is asked, so
+/// anything but a small regular file is an error: a fifo blocks and `/dev/zero` never ends.
+pub(crate) fn preview_text(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read};
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() > MAX_PREVIEW_BYTES {
+        return Err(Error::from(ErrorKind::InvalidInput));
+    }
+    let mut bytes = Vec::new();
+    // Bounded again in case the file grew since the check.
+    std::fs::File::open(path)?
+        .take(MAX_PREVIEW_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PREVIEW_BYTES {
+        return Err(Error::from(ErrorKind::InvalidInput));
+    }
+    String::from_utf8(bytes).map_err(|_| Error::from(ErrorKind::InvalidData))
+}
+
 pub fn truncate(s: &str) -> String {
     if s.len() <= MAX_OUTPUT {
         return s.to_string();
