@@ -16,7 +16,7 @@ pub mod rules;
 pub mod settings;
 pub mod trust;
 
-use crate::tools::{patch, view_image};
+use crate::tools::{image_gen, patch, view_image};
 use rules::Base;
 pub use rules::Rule;
 pub use trust::Trust;
@@ -407,11 +407,12 @@ impl Policy {
                 rules::exact_command(command),
                 rules::prefix_command(command),
             ),
-            ("write" | "edit", _, Some(Value::String(path))) => {
+            ("write" | "edit" | image_gen::NAME, _, Some(Value::String(path))) => {
                 let path = Path::new(path);
                 if rules::is_protected(path, base.home) {
                     (None, None)
                 } else {
+                    let tool = if tool == "edit" { "edit" } else { "write" };
                     (
                         rules::exact_path(tool, path, base),
                         rules::dir_path(path, base),
@@ -647,7 +648,9 @@ pub fn written(tool: &str, args: &Value, cwd: &Path, home: Option<&Path>) -> Vec
     };
     match (tool, text("path"), text("command")) {
         (patch::NAME, ..) => patch::paths(args, cwd).unwrap_or_default(),
-        ("write" | "edit", Some(path), _) => resolve(cwd, path).into_iter().collect(),
+        ("write" | "edit" | image_gen::NAME, Some(path), _) => {
+            resolve(cwd, path).into_iter().collect()
+        }
         ("bash", _, Some(command)) => {
             let mut cwd = match text("workdir").filter(|w| !w.is_empty()) {
                 Some(dir) => cwd.join(dir),
@@ -708,6 +711,11 @@ impl Checker<'_> {
             // The same file in the transcript as a `read`, so `Read` rules decide it.
             view_image::NAME => match text("path") {
                 Some(path) => self.check_path("read", Path::new(path), needs_approval),
+                None => Decision::Ask,
+            },
+            // It saves a file, so `Write` and `Edit` rules decide it like a `write`.
+            image_gen::NAME => match text("path") {
+                Some(path) => self.check_path("write", Path::new(path), needs_approval),
                 None => Decision::Ask,
             },
             "mcp_call" => match mcp_name(args) {
@@ -941,9 +949,10 @@ impl Checker<'_> {
         if !self.relaxed() {
             return Err(Reserved::Untrusted);
         }
-        // As in `check`, `Read` rules and the protected paths decide it.
+        // As in `check`, the `Read` or `Write` rules and the protected paths decide these.
         let tool = match tool {
             view_image::NAME => "read",
+            image_gen::NAME => "write",
             _ => tool,
         };
         let text = |key| args.get(key).and_then(Value::as_str);
@@ -1632,6 +1641,27 @@ mod tests {
                 "/home/u/repo/k.pem",
                 Decision::Deny("deny rule Read(*.pem)".to_string()),
             ),
+            // A generated image is saved like a `write` of its path.
+            (
+                &auto,
+                "image_gen",
+                "/home/u/repo/src/logo.png",
+                allowed("rule Edit(src/**)"),
+            ),
+            (
+                &auto,
+                "image_gen",
+                "/home/u/repo/src/generated/a.png",
+                Decision::Ask,
+            ),
+            (
+                &auto,
+                "image_gen",
+                "/home/u/repo/secrets/a.png",
+                Decision::Deny("deny rule Edit(secrets/**)".to_string()),
+            ),
+            (&auto, "image_gen", "/home/u/repo/.git/a.png", Decision::Ask),
+            (&ask_mode, "image_gen", "/home/u/x.png", Decision::Ask),
         ];
         for (policy, tool, path, want) in cases {
             assert_eq!(
@@ -1818,6 +1848,10 @@ mod tests {
         assert_eq!(
             offers("write", json!({"path": "/home/u/repo/.env"})),
             Offers::default()
+        );
+        assert_eq!(
+            offers("image_gen", json!({"path": "/home/u/repo/assets/logo.png"})),
+            both("Write(/assets/logo.png)", "Edit(/assets/**)")
         );
         assert_eq!(offers("skill", json!({"name": "x"})), Offers::default());
     }
@@ -2102,6 +2136,15 @@ mod tests {
         assert!(
             asking
                 .judgeable("view_image", &json!({"path": repo.join("docs/a.png")}))
+                .is_ok()
+        );
+        assert_eq!(
+            asking.judgeable("image_gen", &json!({"path": repo.join("gen/a.png")})),
+            asked("Write(gen/**)")
+        );
+        assert!(
+            asking
+                .judgeable("image_gen", &json!({"path": repo.join("assets/a.png")}))
                 .is_ok()
         );
 

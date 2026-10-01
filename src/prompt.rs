@@ -40,6 +40,8 @@ pub struct SystemPrompt {
     pub identity: Identity,
     /// `web_search` is offered: the config turned it on and the identity allows it.
     pub web_search: bool,
+    /// `image_gen` is offered: the config turned it on and the identity may write.
+    pub image_gen: bool,
 }
 
 /// One appended instruction file.
@@ -212,6 +214,7 @@ pub fn system_prompt_for(tools: &[&str], files: &[File], skills: Vec<Skill>) -> 
         reload: None,
         identity: Identity::default(),
         web_search: false,
+        image_gen: false,
     }
 }
 

@@ -731,6 +731,13 @@ pub fn target(tool: &str, args: &Value, summary: &str) -> (String, String) {
                 ),
             )
         }
+        "image_gen" => (
+            text("path"),
+            format!(
+                "a generated image, from the prompt `{}`",
+                first(&text("prompt"))
+            ),
+        ),
         // The summary names every file with its counts; the patch is what it does to them.
         "apply_patch" => (summary.to_string(), text("input")),
         "edit" => (
@@ -771,7 +778,7 @@ pub fn location(tool: &str, written: &[PathBuf], root: &Path) -> String {
     };
     match (tool, written) {
         (_, []) => String::new(),
-        ("write" | "edit", [path]) => place(path),
+        ("write" | "edit" | "image_gen", [path]) => place(path),
         _ => {
             let each: Vec<String> = written
                 .iter()
@@ -1723,6 +1730,19 @@ regression test for it in src/tools/write.rs"
         assert_eq!(
             target("bash", &args, "cargo test"),
             ("cargo test".to_string(), "runs in /p/sub".to_string())
+        );
+        let args = json!({"path": "/p/assets/logo.png", "prompt": "a fox\nflat"});
+        assert_eq!(
+            target("image_gen", &args, "image_gen /p/assets/logo.png"),
+            (
+                "/p/assets/logo.png".to_string(),
+                "a generated image, from the prompt `a fox`".to_string()
+            )
+        );
+        let root = Path::new("/p");
+        assert_eq!(
+            at("image_gen", "/p/assets/logo.png", root),
+            "inside the project root"
         );
     }
 }

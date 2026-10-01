@@ -13,7 +13,8 @@
 //! never the reverse. `[bash] sudo` likewise: a project file may turn it off, never on.
 //! `web_search` is off unless the global file turns it on, since each search sends the
 //! last two user messages and some of the answers between them to the ChatGPT backend's
-//! undocumented search endpoint; a project file may turn it off.
+//! undocumented search endpoint; a project file may turn it off. `image_gen` likewise,
+//! since every image is spent from the subscription.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -53,6 +54,8 @@ pub struct Config {
     pub title: bool,
     /// `web_search`: offer the `web_search` tool, which runs on the Codex backend only.
     pub web_search: bool,
+    /// `image_gen`: offer the `image_gen` tool, which runs on the Codex backend only.
+    pub image_gen: bool,
     /// `code_theme`: the syntect theme fenced code is coloured with. `None` for the
     /// default, which is dark like the rest of what bhai draws.
     pub code_theme: Option<String>,
@@ -92,6 +95,7 @@ impl Default for Config {
             judge: crate::judge::Settings::default(),
             title: true,
             web_search: false,
+            image_gen: false,
             code_theme: None,
             import_claude_permissions: true,
             limits: Limits::default(),
@@ -176,6 +180,7 @@ struct Layer {
     judge_max_per_turn: Option<usize>,
     title: Option<bool>,
     web_search: Option<bool>,
+    image_gen: Option<bool>,
     code_theme: Option<String>,
     import_claude_permissions: Option<bool>,
     model: Option<String>,
@@ -273,6 +278,7 @@ impl Config {
                 skills: false,
                 mcp: false,
                 web_search: false,
+                image_gen: false,
                 import_claude_permissions: false,
                 ..self
             };
@@ -335,6 +341,7 @@ impl Config {
             (&mut self.judge.on, layer.judge),
             (&mut self.title, layer.title),
             (&mut self.web_search, layer.web_search),
+            (&mut self.image_gen, layer.image_gen),
             (
                 &mut self.import_claude_permissions,
                 layer.import_claude_permissions,
@@ -841,6 +848,27 @@ mod tests {
         assert!(!bare.web_search);
         write(&project, "web_search = false\n");
         assert!(!Config::load(Some(&home), &cwd).unwrap().web_search);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn image_gen_is_off_until_the_global_file_turns_it_on() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        let global = home.join(".config/bhai/config.toml");
+        let project = cwd.join(".bhai/config.toml");
+        write(&project, "image_gen = true\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().image_gen);
+        write(&global, "image_gen = true\n");
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(config.image_gen);
+        let bare = config.with_flags(Flags {
+            bare: true,
+            ..Flags::default()
+        });
+        assert!(!bare.image_gen);
+        write(&project, "image_gen = false\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().image_gen);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

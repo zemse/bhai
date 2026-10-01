@@ -13,6 +13,7 @@ pub mod bash;
 pub mod edit;
 pub mod goal;
 pub mod history;
+pub mod image_gen;
 pub mod mcp;
 pub mod memory;
 pub mod models;
@@ -202,7 +203,7 @@ pub trait Tool: Send + Sync {
     }
 
     /// Run the call like `execute_live`, also returning the images it brought in. Only
-    /// `view_image` and `mcp_call` bring any.
+    /// `view_image`, `image_gen` and `mcp_call` bring any.
     fn execute_images<'a>(
         &'a self,
         args: &'a Value,
@@ -356,12 +357,16 @@ impl Registry {
         registry
     }
 
-    /// The tools a session's prompt allows: its skills, MCP tools and web search, narrowed
-    /// to its identity's tools. Its identity's `mcp` globs already narrowed the MCP tools.
+    /// The tools a session's prompt allows: its skills, MCP tools, web search and image
+    /// generation, narrowed to its identity's tools. Its identity's `mcp` globs already
+    /// narrowed the MCP tools.
     pub fn for_prompt(prompt: &crate::prompt::SystemPrompt) -> Self {
         let mut registry = Self::new(prompt.skills.clone()).with_mcp(prompt.mcp.clone());
         if prompt.web_search {
             registry.tools.push(Box::new(web::WebSearch::codex()));
+        }
+        if prompt.image_gen {
+            registry.tools.push(Box::new(image_gen::ImageGen::codex()));
         }
         registry
             .tools
@@ -564,6 +569,20 @@ mod tests {
         assert!(!registry.get("view_image").unwrap().needs_approval());
         assert!(!registry.get("skill").unwrap().needs_approval());
         assert!(Registry::new(Vec::new()).get("skill").is_none());
+    }
+
+    #[test]
+    fn image_gen_is_offered_when_the_prompt_turns_it_on_and_needs_approval() {
+        let off = crate::prompt::system_prompt(&[], Vec::new());
+        assert!(Registry::for_prompt(&off).get(image_gen::NAME).is_none());
+        let on = crate::prompt::SystemPrompt {
+            image_gen: true,
+            ..crate::prompt::system_prompt(&[], Vec::new())
+        };
+        let registry = Registry::for_prompt(&on);
+        assert!(registry.get(image_gen::NAME).unwrap().needs_approval());
+        let call = serde_json::json!({"type": "function_call", "name": image_gen::NAME});
+        assert!(!registry.parallel(&call));
     }
 
     #[test]

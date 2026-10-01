@@ -224,9 +224,56 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// The bytes of standard base64, padded or not, whitespace ignored; `None` when it is not
+/// base64.
+pub(crate) fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let digits: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let digits = match digits.iter().position(|&b| b == b'=') {
+        Some(at) if digits[at..].iter().all(|&b| b == b'=') && digits.len().is_multiple_of(4) => {
+            &digits[..at]
+        }
+        Some(_) => return None,
+        None => &digits[..],
+    };
+    if digits.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(digits.len() / 4 * 3 + 2);
+    for chunk in digits.chunks(4) {
+        let mut bits = 0u32;
+        for (i, &digit) in chunk.iter().enumerate() {
+            let value = u32::from(match digit {
+                b'A'..=b'Z' => digit - b'A',
+                b'a'..=b'z' => digit - b'a' + 26,
+                b'0'..=b'9' => digit - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => return None,
+            });
+            bits |= value << (18 - 6 * i);
+        }
+        out.extend_from_slice(&bits.to_be_bytes()[1..chunk.len()]);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unbase64_reverses_base64() {
+        for bytes in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar"] {
+            assert_eq!(unbase64(&base64(bytes)).unwrap(), bytes);
+        }
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(unbase64(&base64(&all)).unwrap(), all);
+        assert_eq!(unbase64("Zm9v\nYg").unwrap(), b"foob");
+        assert_eq!(unbase64("Zm9vYg=="), Some(b"foob".to_vec()));
+        assert_eq!(unbase64("Zm9vY"), None, "one digit past a block");
+        assert_eq!(unbase64("Zm=9"), None, "padding inside");
+        assert_eq!(unbase64("Zm9v!"), None);
+    }
 
     #[test]
     fn base64_matches_the_known_vectors() {

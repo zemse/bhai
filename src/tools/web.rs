@@ -202,45 +202,57 @@ impl Tool for WebSearch {
 }
 
 impl WebSearch {
-    /// The search's text, after one retry of a failed send or a 5xx, and one fresh token
-    /// after a 401.
+    /// The search's text.
     async fn search(&self, body: &Value) -> Result<String, String> {
-        let http = http();
-        let mut auth = auth::load(http).await.map_err(|e| format!("{e:#}"))?;
-        let mut recovered = false;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let (status, bytes) = match post(http, &self.endpoint, &auth, body).await {
-                Ok(answered) => answered,
-                Err(failure) if failure.retry && attempt < ATTEMPTS => {
-                    tokio::time::sleep(RETRY_DELAY).await;
-                    continue;
-                }
-                Err(failure) => return Err(failure.message),
-            };
-            // A token revoked early is not near expiry, so `load` sent it.
-            if status == reqwest::StatusCode::UNAUTHORIZED && !recovered {
-                recovered = true;
-                attempt -= 1;
-                auth = auth::recover(http, &auth)
-                    .await
-                    .map_err(|e| format!("{e:#}"))?;
-                continue;
-            }
-            if status.is_server_error() && attempt < ATTEMPTS {
-                tokio::time::sleep(RETRY_DELAY).await;
-                continue;
-            }
-            if !status.is_success() {
-                return Err(refused(status, &bytes));
-            }
-            return answer(&bytes);
-        }
+        let bytes = send(&self.endpoint, body, "search", MAX_RESPONSE).await?;
+        answer(&bytes)
     }
 }
 
-/// One client for every search, so its connections are reused.
+/// The body of a POST of `body` to a Codex endpoint that succeeded, after one retry of a
+/// failed send or a 5xx, and one fresh token after a 401. `what` names the request in
+/// errors, and `limit` caps the bytes read of the answer.
+pub(super) async fn send(
+    endpoint: &str,
+    body: &Value,
+    what: &str,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let http = http();
+    let mut auth = auth::load(http).await.map_err(|e| format!("{e:#}"))?;
+    let mut recovered = false;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let (status, bytes) = match post(http, endpoint, &auth, body, what, limit).await {
+            Ok(answered) => answered,
+            Err(failure) if failure.retry && attempt < ATTEMPTS => {
+                tokio::time::sleep(RETRY_DELAY).await;
+                continue;
+            }
+            Err(failure) => return Err(failure.message),
+        };
+        // A token revoked early is not near expiry, so `load` sent it.
+        if status == reqwest::StatusCode::UNAUTHORIZED && !recovered {
+            recovered = true;
+            attempt -= 1;
+            auth = auth::recover(http, &auth)
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            continue;
+        }
+        if status.is_server_error() && attempt < ATTEMPTS {
+            tokio::time::sleep(RETRY_DELAY).await;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(refused(status, &bytes, what));
+        }
+        return Ok(bytes);
+    }
+}
+
+/// One client for every request, so its connections are reused.
 fn http() -> &'static reqwest::Client {
     static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
     HTTP.get_or_init(|| {
@@ -261,6 +273,8 @@ async fn post(
     endpoint: &str,
     auth: &Auth,
     body: &Value,
+    what: &str,
+    limit: usize,
 ) -> Result<(reqwest::StatusCode, Vec<u8>), Failure> {
     let mut request = http
         .post(endpoint)
@@ -276,25 +290,22 @@ async fn post(
         request = request.header("ChatGPT-Account-ID", account_id);
     }
     let mut response = request.send().await.map_err(|e| Failure {
-        message: format!("the search request failed: {e}"),
+        message: format!("the {what} request failed: {e}"),
         retry: true,
     })?;
     let status = response.status();
     let too_large = || Failure {
-        message: format!("the search answered with more than {MAX_RESPONSE} bytes"),
+        message: format!("the {what} answered with more than {limit} bytes"),
         retry: false,
     };
-    if response
-        .content_length()
-        .is_some_and(|n| n > MAX_RESPONSE as u64)
-    {
+    if response.content_length().is_some_and(|n| n > limit as u64) {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                if bytes.len() + chunk.len() > MAX_RESPONSE {
+                if bytes.len() + chunk.len() > limit {
                     return Err(too_large());
                 }
                 bytes.extend_from_slice(&chunk);
@@ -302,7 +313,7 @@ async fn post(
             Ok(None) => return Ok((status, bytes)),
             Err(e) => {
                 return Err(Failure {
-                    message: format!("could not read the search's answer: {e}"),
+                    message: format!("could not read the {what}'s answer: {e}"),
                     retry: true,
                 });
             }
@@ -311,16 +322,18 @@ async fn post(
 }
 
 /// What a refusal says, with the start of its body.
-fn refused(status: reqwest::StatusCode, bytes: &[u8]) -> String {
+fn refused(status: reqwest::StatusCode, bytes: &[u8], what: &str) -> String {
     let text = String::from_utf8_lossy(bytes);
     let end = floor_boundary(&text, ERROR_PREVIEW.min(text.len()));
     let more = if end < text.len() { "..." } else { "" };
     let hint = match status.as_u16() {
-        403 | 404 => " The search endpoint is undocumented and may not be open to this plan.",
-        _ => "",
+        403 | 404 => {
+            format!(" The {what} endpoint is undocumented and may not be open to this plan.")
+        }
+        _ => String::new(),
     };
     format!(
-        "the search answered {status}: {}{more}{hint}",
+        "the {what} answered {status}: {}{more}{hint}",
         text[..end].trim()
     )
 }
@@ -681,7 +694,11 @@ mod tests {
                 .contains("no `output`")
         );
         assert!(answer(b"<html>").unwrap_err().contains("not JSON"));
-        let refusal = refused(reqwest::StatusCode::FORBIDDEN, "x".repeat(2_000).as_bytes());
+        let refusal = refused(
+            reqwest::StatusCode::FORBIDDEN,
+            "x".repeat(2_000).as_bytes(),
+            "search",
+        );
         assert!(
             refusal.starts_with("the search answered 403 Forbidden: xxx"),
             "{refusal}"
@@ -735,15 +752,16 @@ mod tests {
         };
         let body = json!({});
         let endpoint = serve(502, "bad gateway".to_string()).await;
-        let (status, bytes) = match post(http(), &endpoint, &auth, &body).await {
-            Ok(answered) => answered,
-            Err(f) => panic!("{}", f.message),
-        };
+        let (status, bytes) =
+            match post(http(), &endpoint, &auth, &body, "search", MAX_RESPONSE).await {
+                Ok(answered) => answered,
+                Err(f) => panic!("{}", f.message),
+            };
         assert_eq!(status, 502);
         assert_eq!(bytes, b"bad gateway");
 
         let endpoint = serve(200, "x".repeat(MAX_RESPONSE + 1)).await;
-        match post(http(), &endpoint, &auth, &body).await {
+        match post(http(), &endpoint, &auth, &body, "search", MAX_RESPONSE).await {
             Ok(_) => panic!("a body over the cap was read"),
             Err(f) => assert!(!f.retry && f.message.contains("more than"), "{}", f.message),
         }

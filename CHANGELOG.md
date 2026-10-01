@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- `image_gen = true` in the global config gives the model an `image_gen` tool. It draws a PNG from a prompt with gpt-image-2 through the Codex backend's `/images/generations`, on the session's own credentials, and saves it to the path the model gives; the image comes back with the result. Each call is approved, judged and offered rules (`Write`/`Edit`) exactly like a `write` of that path. A project file can only turn it off, `--bare` turns it off, an identity that may not write is not offered it, and Ollama never sees it.
 - A browser MCP server (chrome-devtools-mcp, Playwright's, Puppeteer's) runs in a profile of its own. One set to attach to the user's running browser (`--autoConnect`, `--extension`), point at a real Chrome/Firefox/Edge/Brave profile directory, or load cookies (`--storage-state`) is skipped, and everything such a server returns starts with a line framing it as untrusted page content.
 - A prompt can carry images: ctrl+v (or a terminal's empty paste) attaches the clipboard's image and pasting the path of an image file attaches that file, each shown in the prompt as `[image #N]`. Only the images whose placeholder is still in the text are sent, after the text, and they are kept in the session file; the transcript, token counts and Ollama see the placeholder.
 - `view_image` is judged like a read: in auto mode, a protected path or a `Read` ask rule keeps it for the user instead of handing it to the auto-approval judge.

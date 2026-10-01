@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::client::{self, Delta, Error, Usage};
-use crate::tools::view_image;
+use crate::tools::{image_gen, view_image};
 
 pub const DEFAULT_URL: &str = "http://localhost:11434";
 /// What picks this backend in a model id: `ollama:gemma4:e2b`.
@@ -131,8 +131,11 @@ pub fn tool_defs(tools: &[Value]) -> Vec<Value> {
         .iter()
         .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
         // Tool output reaches Ollama as text only, so a tool whose answer is an image has
-        // nothing to give it.
-        .filter(|tool| tool.get("name").and_then(Value::as_str) != Some(view_image::NAME))
+        // nothing to give it; `image_gen` runs on the Codex backend only.
+        .filter(|tool| {
+            let name = tool.get("name").and_then(Value::as_str);
+            name != Some(view_image::NAME) && name != Some(image_gen::NAME)
+        })
         .map(|tool| {
             let field = |key: &str| tool.get(key).cloned();
             json!({
@@ -688,7 +691,8 @@ mod tests {
         assert_eq!(out[1]["content"], "a screenshot\n[image image/png]");
         assert_eq!(out[2]["content"], "and [image #1]\n[image image/png]");
         let view = crate::tools::view_image::ViewImage.schema();
-        assert!(tool_defs(&[view]).is_empty());
+        let generate = crate::tools::image_gen::ImageGen::codex().schema();
+        assert!(tool_defs(&[view, generate]).is_empty());
     }
 
     #[test]

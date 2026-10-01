@@ -88,6 +88,10 @@ impl Identity {
         if name == tools::view_image::NAME {
             return self.allows_tool(tools::read::NAME);
         }
+        // Saves a file like `write`.
+        if name == tools::image_gen::NAME {
+            return self.allows_tool(tools::write::NAME);
+        }
         let mcp = [tools::mcp::SEARCH, tools::mcp::CALL].contains(&name);
         self.tools
             .as_ref()
@@ -324,6 +328,7 @@ pub fn build(
     prompt.reload = Some(instructions::Reload::new(config.clone(), roots.clone()));
     prompt.identity = identity.clone();
     prompt.web_search = config.web_search && identity.allows_tool(tools::web::NAME);
+    prompt.image_gen = config.image_gen && identity.allows_tool(tools::image_gen::NAME);
     prompt
 }
 
@@ -436,6 +441,8 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         assert_eq!(claude.instructions, None);
         assert!(!claude.allows_tool("write"));
         assert!(!claude.allows_tool("apply_patch"));
+        assert!(!claude.allows_tool("image_gen"), "it follows `write`");
+        assert!(bhai.allows_tool("image_gen") == bhai.allows_tool("write"));
 
         let mcp = identity("---\nname: m\ntools: read, mcp, mcp_call, mcp__x__y\n---\n");
         assert_eq!(
@@ -446,6 +453,7 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         let open = identity("---\nname: open\ntools:\n---\n");
         assert_eq!(open.tools, None);
         assert!(open.allows_tool("write"));
+        assert!(open.allows_tool("image_gen"));
         assert!(parse("---\ndescription: x\n---\n", Path::new("/b.md"), "").is_none());
     }
 
