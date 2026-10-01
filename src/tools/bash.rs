@@ -103,6 +103,7 @@ impl Tool for Bash {
         let live = Live {
             progress: &|_| {},
             cancel: &NEVER,
+            conversation: None,
         };
         self.execute_live(args, live)
     }
@@ -436,6 +437,7 @@ mod tests {
         Live {
             progress: &|_| {},
             cancel: &NOT_CANCELLED,
+            conversation: None,
         }
     }
 
@@ -558,6 +560,7 @@ mod tests {
         let live = Live {
             progress: &progress,
             cancel: &cancel,
+            conversation: None,
         };
         let out = run(command, None, live).await;
         let total = start.elapsed();
@@ -608,6 +611,7 @@ mod tests {
         let live = Live {
             progress: &progress,
             cancel: &cancel,
+            conversation: None,
         };
         let start = Instant::now();
         let out = run(&command, None, live).await;

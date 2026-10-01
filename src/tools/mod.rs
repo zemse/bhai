@@ -19,10 +19,11 @@ pub mod plan;
 pub mod read;
 pub mod skill;
 pub mod submit;
+pub mod web;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 9] = [
+pub const NAMES: [&str; 10] = [
     bash::NAME,
     read::NAME,
     write::NAME,
@@ -32,6 +33,7 @@ pub const NAMES: [&str; 9] = [
     models::NAME,
     history::FIND,
     history::READ,
+    web::NAME,
 ];
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
@@ -69,6 +71,18 @@ pub struct Live<'a> {
     pub progress: &'a (dyn Fn(String) + Send + Sync),
     /// Set when the user interrupts the turn.
     pub cancel: &'a AtomicBool,
+    /// The conversation the call was made in; `None` outside a turn.
+    pub conversation: Option<Conversation<'a>>,
+}
+
+/// What a tool that sends some of the conversation along is told about it.
+#[derive(Clone, Copy)]
+pub struct Conversation<'a> {
+    /// The id the backend knows the conversation by.
+    pub id: &'a str,
+    pub model: &'a str,
+    /// The history up to the call, the call's own response not yet in it.
+    pub history: &'a [Value],
 }
 
 pub struct Registry {
@@ -176,10 +190,13 @@ impl Registry {
         registry
     }
 
-    /// The tools a session's prompt allows: its skills and MCP tools, narrowed to its
-    /// identity's tools. Its identity's `mcp` globs already narrowed the MCP tools.
+    /// The tools a session's prompt allows: its skills, MCP tools and web search, narrowed
+    /// to its identity's tools. Its identity's `mcp` globs already narrowed the MCP tools.
     pub fn for_prompt(prompt: &crate::prompt::SystemPrompt) -> Self {
         let mut registry = Self::new(prompt.skills.clone()).with_mcp(prompt.mcp.clone());
+        if prompt.web_search {
+            registry.tools.push(Box::new(web::WebSearch::codex()));
+        }
         registry
             .tools
             .retain(|t| prompt.identity.allows_tool(t.name()));

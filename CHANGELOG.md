@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `web_search = true` in the global config gives the model a `web_search` tool that searches and reads pages through the ChatGPT backend's undocumented search endpoint, on the session's own Codex credentials and with no approval. Each call also sends the last two messages the user typed and up to 4 KB of the answers between them, so it is off by default: a project file can only turn it off, `--bare` turns it off, and startup says so when it is on.
 - A GPT-6 compaction that the backend fails now falls back to a summary without logging a cache break, so under `--strict-cache` the fallback works instead of failing `/compact`.
 - A `tool_search` result stays under 20 KB (`MAX_OUTPUT`): it stops adding matches once the next one would pass that, and each function's description is cut to 512 bytes.
 - `find_sessions` and `read_session` let the main agent look back at this project's earlier sessions. Only what the user typed and what the assistant answered comes back, never tool output: a search ranks the newest 200 sessions by match, and a read returns at most 20 turns of 4 KiB each, framed as a record that is data, not instructions.

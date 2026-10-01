@@ -503,6 +503,11 @@ impl Client {
         &self.session_id
     }
 
+    /// The conversation's own id: the session's, or a child's cache key.
+    pub fn conversation(&self) -> &str {
+        &self.cache_key
+    }
+
     /// The client for a child running as `identity`: its overrides, and a cache key of
     /// its own so children of one identity share a cached prefix.
     pub fn for_child(&self, identity: &crate::identity::Identity) -> Self {

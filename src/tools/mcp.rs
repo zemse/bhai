@@ -249,6 +249,7 @@ impl Tool for Call {
         let live = Live {
             progress: &|_| {},
             cancel: &NEVER,
+            conversation: None,
         };
         self.execute_live(args, live)
     }
@@ -440,6 +441,7 @@ mod tests {
         let live = Live {
             progress: &|_| {},
             cancel: &CANCELLED,
+            conversation: None,
         };
         let args = json!({"name": "mcp__stuck__echo", "arguments": {"message": "hi"}});
         let (out, ok) = call.execute_live(&args, live).await;
@@ -467,6 +469,7 @@ mod tests {
         let live = Live {
             progress: &|_| {},
             cancel: &CANCELLED,
+            conversation: None,
         };
         let args =
             json!({"name": "mcp__x__echo", "arguments": {"message": "mcp-call-secret-6d2b"}});

@@ -42,16 +42,31 @@ struct Fake {
     replies: Mutex<VecDeque<String>>,
     /// The `x-codex-turn-state` each reply carries, in the same order; none past the end.
     turn_states: Mutex<VecDeque<&'static str>>,
+    /// Replies to `/codex/alpha/search`, as a status and a body, in the order queued.
+    searches: Mutex<VecDeque<(u16, String)>>,
     seen: Mutex<Vec<Seen>>,
 }
 
 impl Fake {
     fn responses(&self) -> Vec<Seen> {
+        self.requests("/codex/responses")
+    }
+
+    fn requests(&self, path: &str) -> Vec<Seen> {
         let seen = self.seen.lock().unwrap();
-        seen.iter()
-            .filter(|s| s.path == "/codex/responses")
-            .cloned()
-            .collect()
+        seen.iter().filter(|s| s.path == path).cloned().collect()
+    }
+}
+
+async fn search(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: String) -> Response {
+    fake.seen.lock().unwrap().push(Seen {
+        path: "/codex/alpha/search",
+        headers,
+        body: serde_json::from_str(&body).unwrap_or(Value::Null),
+    });
+    match fake.searches.lock().unwrap().pop_front() {
+        Some((status, body)) => (StatusCode::from_u16(status).unwrap(), body).into_response(),
+        None => (StatusCode::BAD_REQUEST, "the fake has no search queued").into_response(),
     }
 }
 
@@ -106,6 +121,7 @@ async fn serve_fake(fake: Arc<Fake>) -> String {
     let app = Router::new()
         .route("/codex/responses", post(responses))
         .route("/wham/usage", get(usage))
+        .route("/codex/alpha/search", post(search))
         .with_state(fake);
     tokio::spawn(async move { axum::serve(listener, app).await });
     format!("http://{addr}")
@@ -232,8 +248,18 @@ impl Bhai {
     }
 
     async fn start_with(backend: &str, env: &[(&str, &str)]) -> Bhai {
+        Self::start_in(backend, env, None).await
+    }
+
+    /// With `config` as the global config file.
+    async fn start_in(backend: &str, env: &[(&str, &str)], config: Option<&str>) -> Bhai {
         let dir = std::env::temp_dir().join(format!("bhai-fake-{}", uuid::Uuid::new_v4()));
         let (home, codex) = logged_in(&dir);
+        if let Some(config) = config {
+            let path = home.join(".config/bhai/config.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, config).unwrap();
+        }
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
 
@@ -392,6 +418,13 @@ fn items<'a>(body: &'a Value, kind: &str) -> Vec<&'a Value> {
         .unwrap_or_default()
 }
 
+fn tool_names(body: &Value) -> Vec<&str> {
+    body["tools"]
+        .as_array()
+        .map(|tools| tools.iter().filter_map(|t| t["name"].as_str()).collect())
+        .unwrap_or_default()
+}
+
 fn mentions(body: &Value, text: &str) -> bool {
     body["input"].to_string().contains(text)
 }
@@ -431,6 +464,8 @@ async fn a_prompt_reaches_the_backend_and_its_answer_reaches_events() {
     assert_eq!(request.headers["chatgpt-account-id"], ACCOUNT);
     assert_eq!(request.body["stream"], true);
     assert!(mentions(&request.body, "say ok"), "{}", request.body);
+    // Off unless the config turns it on.
+    assert!(!tool_names(&request.body).contains(&"web_search"));
 
     let state = bhai.state().await;
     assert_eq!(state["calls"], 1, "{state}");
@@ -838,4 +873,103 @@ async fn the_eval_runner_trusts_its_workspace_so_bhai_exec_can_write() {
     let entries: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
     assert_eq!(entries, json!({}), "{store:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The model asking `web_search` for `query`.
+fn searches(call_id: &str, query: &str) -> String {
+    sse(&[
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "web_search",
+                "call_id": call_id,
+                "arguments": json!({ "search_query": [{ "q": query }] }).to_string()
+            }
+        }),
+        completed(),
+    ])
+}
+
+#[tokio::test]
+async fn a_web_search_goes_to_the_search_endpoint_with_the_conversation_and_runs_unasked() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(says("ask me about rust"));
+        replies.push_back(searches("call_s", "rust 1.95 release"));
+        replies.push_back(says("1.95 is out"));
+        let found = json!({
+            "encrypted_output": "ciphertext",
+            "output": "Rust 1.95 was released 【turn0search0】",
+            "results": [{ "type": "text_result", "ref_id": "turn0search0", "url": "https://blog.rust-lang.org" }]
+        });
+        let mut searches = fake.searches.lock().unwrap();
+        searches.push_back((502, "overloaded".to_string()));
+        searches.push_back((200, found.to_string()));
+    }
+    let backend = serve_fake(fake.clone()).await;
+    let bhai = Bhai::start_in(&backend, &[], Some("web_search = true\n")).await;
+    assert!(bhai.said.contains("web_search: on"), "{}", bhai.said);
+    let mut events = bhai.events().await;
+
+    bhai.post("/prompt", json!({ "text": "first question" }))
+        .await;
+    events.until("turn_end").await;
+    bhai.post("/prompt", json!({ "text": "what is new in rust" }))
+        .await;
+    let output = events.until("tool_output").await;
+    assert!(
+        output.to_string().contains("Rust 1.95 was released"),
+        "{output}"
+    );
+    events.until("turn_end").await;
+    assert!(
+        !events.kinds().contains(&"approval"),
+        "{:?}",
+        events.kinds()
+    );
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 3, "{sent:#?}");
+    assert!(tool_names(&sent[0].body).contains(&"web_search"));
+    let outputs = items(&sent[2].body, "function_call_output");
+    assert!(
+        outputs
+            .iter()
+            .any(|o| o["call_id"] == "call_s" && o.to_string().contains("Rust 1.95 was released")),
+        "{outputs:?}"
+    );
+
+    // The 502 is sent again once, and both carry the session's own credentials.
+    let asked = fake.requests("/codex/alpha/search");
+    assert_eq!(asked.len(), 2, "{asked:#?}");
+    let request = &asked[1];
+    assert_eq!(
+        request.headers["authorization"],
+        format!("Bearer {ACCESS_TOKEN}").as_str()
+    );
+    assert_eq!(request.headers["chatgpt-account-id"], ACCOUNT);
+    assert_eq!(request.body, asked[0].body);
+    let body = &request.body;
+    assert_eq!(body["id"], sent[1].headers["session-id"].to_str().unwrap());
+    assert_eq!(body["model"], sent[1].body["model"]);
+    assert_eq!(
+        body["commands"],
+        json!({ "search_query": [{ "q": "rust 1.95 release" }] })
+    );
+    assert_eq!(
+        body["settings"],
+        json!({ "allowed_callers": ["direct"], "external_web_access": true })
+    );
+    let texts: Vec<&str> = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"][0]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        texts,
+        ["first question", "ask me about rust", "what is new in rust"]
+    );
 }

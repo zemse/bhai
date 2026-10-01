@@ -313,6 +313,7 @@ pub fn build(
     prompt.skipped = loaded.skipped;
     prompt.skipped.extend(found.shadowed);
     prompt.identity = identity.clone();
+    prompt.web_search = config.web_search && identity.allows_tool(tools::web::NAME);
     prompt
 }
 

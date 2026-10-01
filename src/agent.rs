@@ -256,6 +256,11 @@ pub trait Model: Send + Sync {
     /// The model's name, which picks its tokenizer.
     fn name(&self) -> &str;
 
+    /// The id the backend knows this conversation by, which a web search is filed under.
+    fn conversation(&self) -> &str {
+        ""
+    }
+
     /// Where the Ollama server is, for listing what it serves.
     fn ollama_url(&self) -> &str {
         crate::ollama::DEFAULT_URL
@@ -321,6 +326,10 @@ impl Model for Client {
 
     fn name(&self) -> &str {
         self.model()
+    }
+
+    fn conversation(&self) -> &str {
+        Client::conversation(self)
     }
 
     fn effort_updates(&self) -> Option<(&str, &str)> {
@@ -1750,7 +1759,13 @@ async fn turn(
             // A `tool_search_call` runs as a call to `tool_search` and is answered in kind.
             let search = tools::mcp::search_call(call);
             let run = search.as_ref().unwrap_or(call);
-            let (output, ok) = execute(registry, policy, judge, run, tx, cancel).await;
+            let conversation = tools::Conversation {
+                id: model.conversation(),
+                model: model.name(),
+                history: history.as_slice(),
+            };
+            let (output, ok) =
+                execute(registry, policy, judge, run, Some(conversation), tx, cancel).await;
             all_failed &= !ok;
             let _ = tx.send(AgentEvent::Item(sent + items.len() + index));
             results.push(match search {
@@ -2575,6 +2590,7 @@ async fn execute(
     policy: &Policy,
     judge: Option<&Judge>,
     call: &Value,
+    conversation: Option<tools::Conversation<'_>>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     cancel: &Arc<AtomicBool>,
 ) -> (String, bool) {
@@ -2782,6 +2798,7 @@ as-is. Try a different approach, or ask the user."
     let live = tools::Live {
         progress: &progress,
         cancel,
+        conversation,
     };
     let (output, ok) = tool.execute_live(&args, live).await;
     if let Some(judge) = judge {
@@ -4890,7 +4907,7 @@ mod tests {
             fake::call("bash", json!({ "command": "rm -rf x" })),
         ];
         for call in &calls {
-            let _ = execute(&registry, &policy, None, call, &tx, &cancel.flag()).await;
+            let _ = execute(&registry, &policy, None, call, None, &tx, &cancel.flag()).await;
         }
 
         let lines: Vec<Value> = std::fs::read_to_string(&log)
@@ -4947,6 +4964,7 @@ mod tests {
             &policy,
             Some(&judge),
             &fake::call("write", json!({"path": target, "content": "x"})),
+            None,
             &tx,
             &cancel.flag(),
         )
@@ -5005,6 +5023,7 @@ mod tests {
             &policy,
             Some(&judge),
             &fake::call("write", json!({"path": target, "content": "x"})),
+            None,
             &tx,
             &cancel.flag(),
         )
@@ -5049,6 +5068,7 @@ mod tests {
             &Policy::default(),
             None,
             &fake::call("write", json!({"path": target, "content": "x"})),
+            None,
             &tx,
             &cancel.flag(),
         )
@@ -5090,6 +5110,7 @@ mod tests {
             &Policy::default(),
             None,
             &fake::call("write", json!({"path": target, "content": "a\nc\n"})),
+            None,
             &tx,
             &cancel.flag(),
         )

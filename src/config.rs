@@ -9,6 +9,9 @@
 //! dropping the user's standing instructions or widening what it can put in the prompt.
 //! `statusline` is read from the global file only, and `/statusline` writes it there.
 //! So is `[bash] pass_env`, the credential-looking variables children may still inherit.
+//! `web_search` is off unless the global file turns it on, since each search sends the
+//! last two user messages and some of the answers between them to the ChatGPT backend's
+//! undocumented search endpoint; a project file may turn it off.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -46,6 +49,8 @@ pub struct Config {
     pub judge: crate::judge::Settings,
     /// `title`: name the session for the terminal's title, which is one small call.
     pub title: bool,
+    /// `web_search`: offer the `web_search` tool, which runs on the Codex backend only.
+    pub web_search: bool,
     /// `code_theme`: the syntect theme fenced code is coloured with. `None` for the
     /// default, which is dark like the rest of what bhai draws.
     pub code_theme: Option<String>,
@@ -80,6 +85,7 @@ impl Default for Config {
             auto_project_commands: true,
             judge: crate::judge::Settings::default(),
             title: true,
+            web_search: false,
             code_theme: None,
             import_claude_permissions: true,
             limits: Limits::default(),
@@ -161,6 +167,7 @@ struct Layer {
     judge_timeout_ms: Option<u64>,
     judge_max_per_turn: Option<usize>,
     title: Option<bool>,
+    web_search: Option<bool>,
     code_theme: Option<String>,
     import_claude_permissions: Option<bool>,
     model: Option<String>,
@@ -252,6 +259,7 @@ impl Config {
                 load_project_instructions: false,
                 skills: false,
                 mcp: false,
+                web_search: false,
                 import_claude_permissions: false,
                 ..self
             };
@@ -313,6 +321,7 @@ impl Config {
             (&mut self.auto_project_commands, layer.auto_project_commands),
             (&mut self.judge.on, layer.judge),
             (&mut self.title, layer.title),
+            (&mut self.web_search, layer.web_search),
             (
                 &mut self.import_claude_permissions,
                 layer.import_claude_permissions,
@@ -735,6 +744,28 @@ mod tests {
         write(&project, "import_claude_permissions = false\n");
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert!(!config.import_claude_permissions);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn web_search_is_off_until_the_global_file_turns_it_on() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        let global = home.join(".config/bhai/config.toml");
+        let project = cwd.join(".bhai/config.toml");
+        // A cloned repo must not start sending the conversation to the search.
+        write(&project, "web_search = true\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().web_search);
+        write(&global, "web_search = true\n");
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(config.web_search);
+        let bare = config.with_flags(Flags {
+            bare: true,
+            ..Flags::default()
+        });
+        assert!(!bare.web_search);
+        write(&project, "web_search = false\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().web_search);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

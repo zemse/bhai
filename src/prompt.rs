@@ -31,6 +31,8 @@ pub struct SystemPrompt {
     pub skipped: Vec<String>,
     /// The identity the prompt was built for.
     pub identity: Identity,
+    /// `web_search` is offered: the config turned it on and the identity allows it.
+    pub web_search: bool,
 }
 
 /// One appended instruction file.
@@ -62,6 +64,9 @@ impl SystemPrompt {
         }
         lines.extend(self.skipped.iter().cloned());
         lines.extend(self.mcp.iter().flat_map(|hub| hub.notices()));
+        if self.web_search {
+            lines.push(crate::tools::web::NOTICE.to_string());
+        }
         lines
     }
 
@@ -165,6 +170,7 @@ pub fn system_prompt_for(tools: &[&str], files: &[File], skills: Vec<Skill>) -> 
         agents_bytes: 0,
         skipped: Vec::new(),
         identity: Identity::default(),
+        web_search: false,
     }
 }
 

@@ -288,7 +288,7 @@ fn message_text(item: &Value) -> String {
 
 /// Whether a user message is one the user wrote, rather than one bhai put in their
 /// place: a child's report, a goal turn's opening, an interrupt note or a summary.
-fn typed(text: &str) -> bool {
+pub(crate) fn typed(text: &str) -> bool {
     !text.is_empty()
         && text != crate::agent::TURN_ABORTED
         && ![
