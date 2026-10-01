@@ -19,10 +19,10 @@ steps:
       the file and its diff. Change nothing.
   - id: verdict
     needs: [review]
-    output: json
+    output_contract: {"type": "object", "properties": {"blocking": {"type": "boolean"}, "summary": {"type": "string"}}, "required": ["blocking", "summary"]}
     prompt: |
-      Split these reviews into what has to be fixed and what can wait. Answer with
-      `{"blocking": true|false, "summary": "..."}`.
+      Split these reviews into what has to be fixed and what can wait: `blocking` says
+      whether anything has to be fixed, `summary` what.
       {{steps.review}}
   - id: order
     needs: [verdict]
@@ -35,6 +35,8 @@ steps:
 files and skill list `general` carries, and on a fan-out that overhead is paid once per
 item. `review` runs one child per path `files` listed, three at a time, up to the
 fan-out cap of 20. A file whose review fails does not stop the others and is simply missing from
-what `verdict` reads. `verdict` is held to answering with one object, so `order` can be
-gated on a field of it and is skipped when nothing is blocking. A step can also name a
+what `verdict` reads. `verdict` hands in an object that has to match its
+`output_contract`, through `submit_result`, so `order` can be gated on a field of it and
+is skipped when nothing is blocking. A plain `output: json` asks for an object without
+a schema. A step can also name a
 `model` of its own, not just an `effort`.

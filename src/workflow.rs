@@ -6,7 +6,9 @@
 //! A step runs once, or once per item an earlier step listed (`for_each`), which is the
 //! one part of the shape the file cannot fix, since the list is runtime data. A step
 //! that declares `output: json` is held to answering with one object, and the steps
-//! after it read its fields and gate themselves on them (`when`).
+//! after it read its fields and gate themselves on them (`when`). One that declares an
+//! `output_contract` hands its object in through `submit_result`, which checks it
+//! against the schema while the child can still correct it.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -29,6 +31,7 @@ use crate::instructions::{self, Roots};
 use crate::judge::Judge;
 use crate::permissions::{Offers, Policy};
 use crate::tools;
+use crate::tools::submit::Contract;
 
 /// The tool name the confirmation prompt carries.
 pub const TOOL: &str = "workflow";
@@ -99,6 +102,8 @@ pub struct Step {
     pub model: Option<String>,
     /// Run it at this reasoning effort, over whatever its identity would use.
     pub effort: Option<String>,
+    /// The schema its object must match, handed in through `submit_result`.
+    pub contract: Option<Arc<Contract>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -216,10 +221,20 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
                 crate::client::EFFORTS.join(", ")
             );
         }
-        let output = match value("output").as_deref() {
-            None | Some("text") => Output::Text,
-            Some("json") => Output::Json,
-            Some(other) => bail!("step `{id}` has a bad `output` `{other}`"),
+        let contract = match value("output_contract") {
+            Some(text) => Some(Arc::new(Contract::parse(&text).map_err(|e| {
+                anyhow::anyhow!("step `{id}` has an `output_contract` that {e}")
+            })?)),
+            None => None,
+        };
+        // A contract is an object by construction, so it implies `output: json`.
+        let output = match (value("output").as_deref(), &contract) {
+            (None, Some(_)) | (Some("json"), _) => Output::Json,
+            (None | Some("text"), None) => Output::Text,
+            (Some("text"), Some(_)) => {
+                bail!("step `{id}` has an `output_contract` but `output: text`")
+            }
+            (Some(other), _) => bail!("step `{id}` has a bad `output` `{other}`"),
         };
         let when = match value("when") {
             Some(text) => Some(condition(&text).with_context(|| format!("step `{id}`"))?),
@@ -236,6 +251,7 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
             when,
             model: value("model"),
             effort,
+            contract,
         });
     }
     if steps.is_empty() {
@@ -1225,9 +1241,16 @@ fn next_wave(steps: &[Step], status: &[Option<Status>]) -> Option<Wave> {
 /// The prompt as the child is given it: a step that declares `output: json` asks for
 /// one, since the run refuses an answer that is not one and would waste the call.
 fn asked(step: &Step, prompt: String) -> String {
-    match step.output {
-        Output::Text => prompt,
-        Output::Json => format!("{prompt}\n\nAnswer with one JSON object and nothing else."),
+    match (step.output, &step.contract) {
+        (_, Some(_)) => format!(
+            "{prompt}\n\nHand in your result by calling `{}`. Only an accepted call counts; \
+an answer written out instead is not a result.",
+            tools::submit::NAME
+        ),
+        (Output::Text, None) => prompt,
+        (Output::Json, None) => {
+            format!("{prompt}\n\nAnswer with one JSON object and nothing else.")
+        }
     }
 }
 
@@ -1241,6 +1264,17 @@ fn answered(step: &Step, output: String, cached: bool) -> Outcome {
         };
     }
     match serde_json::from_str(unfenced(&output)) {
+        // A cached result is held to the contract too: one stored under an older schema
+        // is not handed back as fitting this one.
+        Ok(serde_json::Value::Object(json))
+            if step.contract.as_ref().is_some_and(|contract| {
+                !contract
+                    .check(&serde_json::Value::Object(json.clone()))
+                    .is_empty()
+            }) =>
+        {
+            Outcome::Failed("answered with an object that does not match its contract".to_string())
+        }
         Ok(serde_json::Value::Object(json)) => Outcome::Ok {
             output,
             json: Some(json),
@@ -1285,6 +1319,7 @@ async fn step(
         children: run.children,
         steer: Some(steer),
         judge: run.judge.map(|judge| judge.child(&id, prompt)),
+        contract: step.contract.clone(),
     })
     .await;
     let output = match &finished.result {
@@ -1419,11 +1454,16 @@ impl Cache {
 }
 
 /// What a cached result is keyed on: the step's id, the prompt as it will be sent, and
-/// the whole identity definition, so an edited agent file runs the step again.
+/// the whole identity definition, so an edited agent file runs the step again. A
+/// contract is part of it when there is one, so an edited schema does too.
 fn key(step: &Step, identity: &Identity, prompt: &str) -> String {
     let identity = format!("{identity:?}");
+    let contract = step.contract.as_ref().map(|c| c.schema.to_string());
     let mut hasher = Sha256::new();
-    for part in [step.id.as_str(), prompt, identity.as_str()] {
+    for part in [step.id.as_str(), prompt, identity.as_str()]
+        .into_iter()
+        .chain(contract.as_deref())
+    {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
@@ -1995,6 +2035,7 @@ needs: [a]\n    prompt: two\n---\n",
         assert_eq!(workflow.steps[1].needs, ["files"]);
         assert_eq!(workflow.steps[0].identity, "worker");
         assert_eq!(workflow.steps[2].output, Output::Json);
+        assert!(workflow.steps[2].contract.is_some());
         // The lean identity the example points at, which is what keeps a fan-out from
         // paying for the instruction files and skills once per item.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/agents/worker.md");
@@ -2515,5 +2556,88 @@ when: {{item}} == x\n    prompt: {{item}}\n"
             format!("{error:#}").contains("step `a`: unknown identity `nope`"),
             "{error:#}"
         );
+    }
+
+    const CONTRACT: &str = r#"{"type": "object", "properties": {"risky": {"type": "boolean"}}, "required": ["risky"]}"#;
+
+    /// A typed step's child corrects a refused result in the same turn, and the object
+    /// it had accepted is what the steps after it read.
+    #[tokio::test]
+    async fn a_typed_step_is_corrected_in_its_turn_and_read_by_the_next() {
+        let workflow = workflow(&format!(
+            "steps:\n  - id: triage\n    output_contract: {CONTRACT}\n    prompt: triage it\n  \
+- id: fix\n    needs: [triage]\n    when: \"{{{{steps.triage.risky}}}} == true\"\n    \
+prompt: fix it\n"
+        ));
+        assert_eq!(workflow.steps[0].output, Output::Json);
+        let fake = Fake::new(vec![
+            vec![fake::call(
+                tools::submit::NAME,
+                serde_json::json!({"output": {"risky": "very"}}),
+            )],
+            vec![fake::call(
+                tools::submit::NAME,
+                serde_json::json!({"output": {"risky": true}}),
+            )],
+            // The prose after it is not the result.
+            vec![say("I think it is fine")],
+            vec![say("fixed")],
+        ]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(
+            statuses(&report),
+            [("triage", &Status::Ok), ("fix", &Status::Ok)]
+        );
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let refused = bodies[1].1["input"].to_string();
+        assert!(
+            refused.contains("`/risky`: expected boolean, got string"),
+            "{refused}"
+        );
+        let asked = bodies[0].1["input"].to_string();
+        assert!(asked.contains("submit_result"), "{asked}");
+        // Only the typed step's child is offered the tool.
+        let offered = fake.offered.lock().unwrap().clone();
+        assert!(offered[0].iter().any(|n| n == tools::submit::NAME));
+        assert!(!offered[3].iter().any(|n| n == tools::submit::NAME));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Plain JSON is never taken for a typed step's result, however well it fits.
+    #[tokio::test]
+    async fn a_typed_step_that_never_submits_fails_closed() {
+        let workflow = workflow(&format!(
+            "steps:\n  - id: triage\n    output_contract: {CONTRACT}\n    prompt: triage it\n"
+        ));
+        let fake = Fake::new(vec![vec![say("{\"risky\": true}")]]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(
+            statuses(&report),
+            [(
+                "triage",
+                &Status::Failed("ended without a result accepted by submit_result".to_string())
+            )]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_contract_that_could_not_work_is_a_load_error() {
+        let bad = |steps: &str| {
+            format!(
+                "{:#}",
+                parse(&format!("---\nname: w\n{steps}---\n"), "./test").unwrap_err()
+            )
+        };
+        let error =
+            bad("steps:\n  - id: a\n    output_contract: {\"type\": \"array\"}\n    prompt: x\n");
+        assert!(
+            error.contains("step `a` has an `output_contract` that must have"),
+            "{error}"
+        );
+        let error = bad(&format!(
+            "steps:\n  - id: a\n    output: text\n    output_contract: {CONTRACT}\n    prompt: x\n"
+        ));
+        assert!(error.contains("but `output: text`"), "{error}");
     }
 }

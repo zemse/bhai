@@ -262,6 +262,7 @@ impl Agent {
                 children: &children,
                 steer: Some(steer),
                 judge,
+                contract: None,
             })
             .await;
             let name = &identity.name;

@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod models;
 pub mod read;
 pub mod skill;
+pub mod submit;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
@@ -107,6 +108,13 @@ impl Registry {
     /// The `models` tool, which only a session that can delegate has a use for.
     pub fn with_models(mut self, models: models::Models) -> Self {
         self.tools.push(Box::new(models));
+        self
+    }
+
+    /// `submit_result`, for a child whose step holds it to a contract. It is added past
+    /// the identity's narrowing, since without it the child has no way to answer.
+    pub fn with_submit(mut self, submit: submit::Submit) -> Self {
+        self.tools.push(Box::new(submit));
         self
     }
 

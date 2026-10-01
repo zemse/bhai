@@ -1209,10 +1209,7 @@ async fn turn(
                     "role": "user",
                     "content": [{
                         "type": "input_text",
-                        "text": format!(
-                            "You have reached your budget of {limit} steps. Stop calling \
-                tools and answer now with what you have found, saying what you did not get to."
-                        ),
+                        "text": budget_note(limit),
                     }],
                 }));
                 record(sink, &history[from..], tx);
@@ -1371,6 +1368,14 @@ async fn turn(
             return Turn::ended(step, truncated);
         }
     }
+}
+
+/// What a bounded turn is told on its last step.
+fn budget_note(limit: usize) -> String {
+    format!(
+        "You have reached your budget of {limit} steps. Stop calling tools and answer now \
+with what you have found, saying what you did not get to."
+    )
 }
 
 /// Put a finished child's report into the history, where it reads as the tool result
@@ -1668,6 +1673,8 @@ pub struct Child<'a> {
     pub steer: Option<mpsc::UnboundedReceiver<String>>,
     /// Decides the calls `auto` mode would prompt for, from `Judge::child`.
     pub judge: Option<Judge>,
+    /// Hold the child to answering through `submit_result` with a result that fits.
+    pub contract: Option<Arc<tools::submit::Contract>>,
 }
 
 /// How a child agent ended.
@@ -1686,7 +1693,14 @@ pub struct Finished {
 /// the `agent` tool, so children cannot spawn children.
 pub async fn run_child(child: Child<'_>) -> Finished {
     let identity = child.prompt.identity.name.clone();
-    let registry = Registry::for_prompt(&child.prompt);
+    let accepted: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let mut registry = Registry::for_prompt(&child.prompt);
+    if let Some(contract) = &child.contract {
+        registry = registry.with_submit(tools::submit::Submit {
+            contract: Arc::clone(contract),
+            accepted: Arc::clone(&accepted),
+        });
+    }
     let tools = registry.schemas();
     child
         .children
@@ -1850,6 +1864,15 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     } = result;
     let result = match result {
         Ok(()) if child.cancel.load(Ordering::Relaxed) => Err(anyhow!("interrupted by the user")),
+        // An accepted result is the answer however the turn went on after it; without
+        // one it fails closed, and what it wrote instead is never taken for one.
+        ended if child.contract.is_some() => {
+            let accepted = accepted.lock().unwrap_or_else(|e| e.into_inner());
+            submitted(&history, &accepted).map_err(|why| match ended {
+                Err(e) if why == UNSUBMITTED => e,
+                _ => anyhow!(why),
+            })
+        }
         Ok(()) => final_text(&history).ok_or_else(|| {
             anyhow!(failure.unwrap_or_else(|| "ended without a final message".to_string()))
         }),
@@ -1881,6 +1904,49 @@ fn attribute(children: &Children, id: &str, usage: Usage) {
         child.cached_tokens += usage.cached;
         child.output_tokens += usage.output;
     }
+}
+
+/// Why a child held to a contract has no result, when it never had one accepted.
+const UNSUBMITTED: &str = "ended without a result accepted by submit_result";
+
+/// The result a child held to a contract handed in: the last one accepted, with every
+/// string in it neutralised. A message typed into the child after that acceptance
+/// supersedes it, so a result from before the change of plan is not taken for one after.
+fn submitted(history: &[Value], accepted: &[Value]) -> Result<String, &'static str> {
+    let text = |item: &Value, key: &str| {
+        item.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let submits: Vec<String> = history
+        .iter()
+        .filter(|item| text(item, "type") == "function_call")
+        .filter(|item| text(item, "name") == tools::submit::NAME)
+        .map(|item| text(item, "call_id"))
+        .collect();
+    let last = history.iter().rposition(|item| {
+        text(item, "type") == "function_call_output"
+            && submits.contains(&text(item, "call_id"))
+            && text(item, "output").starts_with(tools::submit::ACCEPTED)
+    });
+    let (Some(last), Some(value)) = (last, accepted.last()) else {
+        return Err(UNSUBMITTED);
+    };
+    // The note on a child's last step is the harness's, not a change of plan.
+    let note = budget_note(CHILD_STEPS);
+    let steered = history[last..].iter().any(|item| {
+        let said = item
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|parts| parts.first())
+            .map(|part| text(part, "text"));
+        text(item, "role") == "user" && said.as_deref() != Some(note.as_str())
+    });
+    if steered {
+        return Err("was sent a message after its result was accepted and submitted none after it");
+    }
+    serde_json::to_string_pretty(&tools::submit::sanitized(value.clone())).map_err(|_| UNSUBMITTED)
 }
 
 /// The assistant text of the model's last answer, when it ended without tool calls.
@@ -2804,6 +2870,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A message typed after a typed result was accepted supersedes it: the child has to
+    /// submit again, or it has no result.
+    #[tokio::test]
+    async fn a_message_after_an_accepted_result_supersedes_it() {
+        use fake::{Fake, call, say};
+
+        let contract = Arc::new(
+            tools::submit::Contract::parse(
+                r#"{"type": "object", "properties": {"n": {"type": "integer"}}}"#,
+            )
+            .unwrap(),
+        );
+        let run = |resubmit: bool| {
+            let contract = Arc::clone(&contract);
+            async move {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let (post, steer) = mpsc::unbounded_channel();
+                let mut script = vec![
+                    vec![call(tools::submit::NAME, json!({"output": {"n": 1}}))],
+                    vec![say("done")],
+                ];
+                script.push(match resubmit {
+                    true => vec![call(tools::submit::NAME, json!({"output": {"n": 2}}))],
+                    false => vec![say("noted")],
+                });
+                script.push(vec![say("done again")]);
+                // Typed while it writes the answer after the accepted call.
+                let fake = Fake::new(script).during(move |call| {
+                    if call == 1 {
+                        post.send("count again".to_string()).unwrap();
+                    }
+                });
+                let policy = Policy::default();
+                run_child(Child {
+                    id: "c1",
+                    description: "count",
+                    task: "go",
+                    prompt: crate::prompt::system_prompt(&[], Vec::new()),
+                    model: &fake,
+                    policy: &policy,
+                    tx: &tx,
+                    cancel: &Arc::new(AtomicBool::new(false)),
+                    transcript: None,
+                    children: &Children::default(),
+                    steer: Some(steer),
+                    judge: None,
+                    contract: Some(contract),
+                })
+                .await
+                .result
+            }
+        };
+
+        let stale = format!("{:#}", run(false).await.unwrap_err());
+        assert!(stale.contains("after its result was accepted"), "{stale}");
+        let fresh: Value = serde_json::from_str(&run(true).await.unwrap()).unwrap();
+        assert_eq!(fresh, json!({"n": 2}));
+    }
+
     #[tokio::test]
     async fn a_message_typed_into_a_child_joins_its_history() {
         use fake::{Fake, say};
@@ -2830,6 +2955,7 @@ mod tests {
             children: &Children::default(),
             steer: Some(steer),
             judge: None,
+            contract: None,
         })
         .await;
 
@@ -2867,6 +2993,7 @@ mod tests {
             children: &Children::default(),
             steer: None,
             judge: None,
+            contract: None,
         })
         .await;
 
@@ -2937,6 +3064,7 @@ mod tests {
             children: &Children::default(),
             steer: None,
             judge: Some(parent.child("c1", "note what the parser does")),
+            contract: None,
         })
         .await;
 
