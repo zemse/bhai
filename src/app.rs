@@ -5,7 +5,7 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::layout::{Position, Rect};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
+use crate::askpass::{self, Secret};
 use crate::branch::Branch;
 use crate::client::Usage;
 use crate::clipboard;
@@ -249,6 +250,10 @@ pub struct App {
     pub approval_page: usize,
     /// The trust question, until it is answered.
     pub trust_gate: Option<TrustGate>,
+    /// sudo asking for a password, the front one on screen.
+    pub passwords: VecDeque<askpass::Request>,
+    /// What has been typed for the front one; it is never drawn.
+    pub typed: Secret,
     pub scroll: usize,
     pub max_scroll: usize,
     /// Transcript viewport height, filled in by the renderer so page keys match the view.
@@ -366,6 +371,8 @@ impl App {
             approval_seen: false,
             approval_page: 1,
             trust_gate: None,
+            passwords: VecDeque::new(),
+            typed: Secret::new(),
             scroll: 0,
             max_scroll: 0,
             page: 10,
@@ -424,6 +431,26 @@ impl App {
                 KeyCode::Char('y') => self.answer_trust(true),
                 KeyCode::Char('n') | KeyCode::Esc => self.answer_trust(false),
                 KeyCode::Char('c') | KeyCode::Char('d') if ctrl => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
+
+        // sudo is blocked on it inside a command that is already running, so it comes
+        // before any approval.
+        if !self.passwords.is_empty() {
+            match key.code {
+                KeyCode::Enter => self.answer_password(true),
+                KeyCode::Esc => self.answer_password(false),
+                KeyCode::Char('c') if ctrl => {
+                    self.answer_password(false);
+                    if self.busy() {
+                        self.interrupt();
+                    }
+                }
+                KeyCode::Char('u') if ctrl => self.typed.clear(),
+                KeyCode::Backspace => self.typed.pop(),
+                KeyCode::Char(c) if !ctrl => self.typed.push(c),
                 _ => {}
             }
             return;
@@ -642,6 +669,10 @@ impl App {
 
     /// Bracketed paste: the text goes into the input as typed, newlines and all.
     pub fn on_paste(&mut self, text: &str) {
+        if !self.passwords.is_empty() {
+            let line = text.lines().next().unwrap_or_default();
+            return line.chars().for_each(|c| self.typed.push(c));
+        }
         if let Some(search) = &mut self.search
             && self.pending.is_none()
         {
@@ -1375,6 +1406,13 @@ impl App {
             self.extend_selection(x, y, self.edge_scroll(y));
             changed = true;
         }
+        // A command that ended, or a sudo that gave up, takes its question with it.
+        if self.passwords.front().is_some_and(|r| r.reply.is_closed()) {
+            self.typed.clear();
+        }
+        let asked = self.passwords.len();
+        self.passwords.retain(|r| !r.reply.is_closed());
+        changed |= self.passwords.len() != asked;
         // The backends answer on a task of their own; this is where the picker hears.
         if let Some(picker) = &mut self.picker {
             changed |= picker.poll();
@@ -2265,6 +2303,19 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         let id = pending.id;
         self.pending = None;
         self.session.answer(answer, Some(id));
+    }
+
+    /// Put sudo's question to the user, after any already waiting.
+    pub fn ask_password(&mut self, request: askpass::Request) {
+        self.passwords.push_back(request);
+    }
+
+    /// Send what was typed to the front question's sudo, or refuse it.
+    fn answer_password(&mut self, give: bool) {
+        let typed = std::mem::take(&mut self.typed);
+        if let Some(request) = self.passwords.pop_front() {
+            let _ = request.reply.send(give.then_some(typed));
+        }
     }
 
     fn interrupt(&mut self) {
@@ -4107,5 +4158,64 @@ mod tests {
             !matches!(app.entries().list.last(), Some(Entry::Error(t)) if t.starts_with("no command")),
             "a path is a prompt, not a command"
         );
+    }
+
+    fn asked(
+        command: &str,
+    ) -> (
+        askpass::Request,
+        tokio::sync::oneshot::Receiver<Option<Secret>>,
+    ) {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let request = askpass::Request {
+            command: command.to_string(),
+            prompt: "Password:".to_string(),
+            reply,
+        };
+        (request, answer)
+    }
+
+    #[test]
+    fn a_password_typed_for_sudo_goes_to_it_and_nowhere_else() {
+        let mut app = App::detached();
+        app.input.set("draft".to_string());
+        let (request, mut answer) = asked("sudo -A ls");
+        app.ask_password(request);
+        for c in "hunter3".chars() {
+            app.on_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        app.on_paste("2\nnext line");
+        assert_eq!(app.input.value(), "draft", "the prompt box never sees it");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let sent = answer.try_recv().unwrap().unwrap();
+        assert_eq!(sent.expose(), "hunter2");
+        assert!(app.passwords.is_empty() && app.typed.is_empty());
+    }
+
+    #[test]
+    fn esc_refuses_and_the_next_question_starts_empty() {
+        let mut app = App::detached();
+        let (first, mut refused) = asked("sudo -A one");
+        let (second, mut given) = asked("sudo -A two");
+        app.ask_password(first);
+        app.ask_password(second);
+        app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(refused.try_recv().unwrap().is_none());
+        assert_eq!(app.passwords.front().unwrap().command, "sudo -A two");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(given.try_recv().unwrap().unwrap().expose(), "");
+    }
+
+    #[test]
+    fn a_question_whose_sudo_went_away_is_dropped_on_the_tick() {
+        let mut app = App::detached();
+        let (request, answer) = asked("sudo -A ls");
+        app.ask_password(request);
+        app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        drop(answer);
+        assert!(app.tick());
+        assert!(app.passwords.is_empty() && app.typed.is_empty());
     }
 }

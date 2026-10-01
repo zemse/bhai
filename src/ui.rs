@@ -140,6 +140,36 @@ fn draw(frame: &mut Frame, app: &mut App) {
         render_trust(frame, bottom_area, &gate);
         return;
     }
+    // sudo's question takes the bottom area next, over an approval or the prompt.
+    if let Some(request) = app.passwords.front() {
+        let width = frame.area().width.saturating_sub(4).max(10) as usize;
+        let body = wrap(&request.command, width).len() as u16;
+        let height = (body + 5).min(frame.area().height.saturating_sub(2)).max(5);
+        let [transcript_area, bottom_area, status_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(height),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+        let lines = password_lines(
+            app,
+            bottom_area.width.saturating_sub(2).max(4) as usize,
+            bottom_area.height.saturating_sub(2) as usize,
+        );
+        render_status(frame, status_area, app);
+        render_transcript(frame, transcript_area, app);
+        app.input_area = None;
+        app.buttons.clear();
+        app.child_rows.clear();
+        let block = Block::bordered()
+            .title(" sudo wants your password ")
+            .border_style(Style::new().fg(Color::Yellow));
+        let inner = block.inner(bottom_area);
+        frame.render_widget(Clear, bottom_area);
+        frame.render_widget(block, bottom_area);
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
     // The `/model` picker and the history search take the prompt's place, sized to the
     // list they are showing. An approval that comes in meanwhile is drawn over them.
     let search = app.search.as_ref().filter(|_| app.pending.is_none());
@@ -1708,6 +1738,62 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|(spot, k)| (spot.intersection(inner), KeyCode::Char(k)))
         .filter(|(spot, _)| !spot.is_empty())
         .collect();
+}
+
+/// The front password question in `rows` rows: the command it is for, which the end of
+/// is kept when it does not fit, sudo's prompt, a mask of fixed length so the password's
+/// length does not show, and the keys.
+fn password_lines(app: &App, width: usize, rows: usize) -> Vec<Line<'static>> {
+    let Some(request) = app.passwords.front() else {
+        return Vec::new();
+    };
+    let key = |k: &'static str, color| Span::styled(k, Style::new().fg(color).bold());
+    let prompt = match request.prompt.trim() {
+        "" => "Password:".to_string(),
+        prompt => prompt.to_string(),
+    };
+    let mask = match app.typed.is_empty() {
+        true => "",
+        false => "********",
+    };
+    let mut tail = vec![
+        Line::from(vec![
+            Span::styled(prompt, Style::new().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::raw(mask),
+            Span::styled("_", Style::new().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+    ];
+    let mut keys = vec![
+        key("[enter]", Color::Green),
+        Span::raw(" send it to sudo   "),
+        key("[esc]", Color::Red),
+        Span::raw(" refuse"),
+    ];
+    if app.passwords.len() > 1 {
+        keys.push(Span::raw(format!(
+            "   {} more waiting",
+            app.passwords.len() - 1
+        )));
+    }
+    tail.push(Line::from(keys));
+    let command: Vec<String> = wrap(&request.command, width);
+    let room = rows.saturating_sub(tail.len()).max(1);
+    let skip = command.len().saturating_sub(room);
+    let mut lines: Vec<Line> = command
+        .into_iter()
+        .skip(skip)
+        .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Yellow))))
+        .collect();
+    if skip > 0 {
+        lines[0] = Line::styled(
+            format!("[{} lines above]", skip + 1),
+            Style::new().fg(Color::Cyan),
+        );
+    }
+    lines.extend(tail);
+    lines
 }
 
 /// What trusting this project would let it do.
@@ -3920,5 +4006,26 @@ mod tests {
             })
             .collect();
         assert_eq!(linked, "https://example.com/d");
+    }
+
+    #[test]
+    fn the_password_box_shows_the_command_and_never_the_password() {
+        let mut app = App::detached();
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        app.ask_password(crate::askpass::Request {
+            command: "sudo -A launchctl kickstart system/x".to_string(),
+            prompt: "[sudo] password for u:".to_string(),
+            reply,
+        });
+        "s3cret".chars().for_each(|c| app.typed.push(c));
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(
+            shown.contains("sudo -A launchctl kickstart system/x"),
+            "{shown}"
+        );
+        assert!(shown.contains("[sudo] password for u: ********"), "{shown}");
+        assert!(!shown.contains("s3cret"), "{shown}");
     }
 }

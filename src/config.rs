@@ -10,7 +10,7 @@
 //! `statusline` is read from the global file only, and `/statusline` writes it there.
 //! So is `[bash] pass_env`, the credential-looking variables children may still inherit,
 //! and `[bash] writable`; a project file may turn `[bash] sandbox` on and `network` off,
-//! never the reverse.
+//! never the reverse. `[bash] sudo` likewise: a project file may turn it off, never on.
 //! `web_search` is off unless the global file turns it on, since each search sends the
 //! last two user messages and some of the answers between them to the ChatGPT backend's
 //! undocumented search endpoint; a project file may turn it off.
@@ -70,6 +70,8 @@ pub struct Config {
     pub pass_env: Vec<String>,
     /// `[bash] sandbox`, `network` and `writable`: the OS sandbox bash runs in.
     pub sandbox: crate::sandbox::Settings,
+    /// `[bash] sudo`: `sudo -A` asks for the password in the terminal.
+    pub sudo: bool,
 }
 
 impl Default for Config {
@@ -97,6 +99,7 @@ impl Default for Config {
             statusline: None,
             pass_env: Vec::new(),
             sandbox: crate::sandbox::Settings::default(),
+            sudo: false,
         }
     }
 }
@@ -196,6 +199,7 @@ struct BashLayer {
     network: Option<bool>,
     #[serde(default)]
     writable: Vec<String>,
+    sudo: Option<bool>,
 }
 
 /// `skills = false`, or a `[skills]` table.
@@ -364,6 +368,11 @@ impl Config {
             && (trusted || !network)
         {
             self.sandbox.network = network;
+        }
+        if let Some(sudo) = layer.bash.sudo
+            && (trusted || !sudo)
+        {
+            self.sudo = sudo;
         }
         if trusted {
             if layer.statusline.is_some() {
@@ -671,6 +680,21 @@ mod tests {
         );
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert!(config.sandbox.on && !config.sandbox.network);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_project_file_may_turn_sudo_off_but_not_on() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(&cwd.join(".bhai/config.toml"), "[bash]\nsudo = true\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().sudo);
+
+        write(&global_path(&home), "[bash]\nsudo = true\n");
+        assert!(Config::load(Some(&home), &cwd).unwrap().sudo);
+
+        write(&cwd.join(".bhai/config.toml"), "[bash]\nsudo = false\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().sudo);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

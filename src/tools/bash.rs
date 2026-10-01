@@ -132,8 +132,13 @@ fn tool_schema() -> Value {
     `workdir` when given, and return its combined stdout and stderr plus the exit code. The user approves every command \
     before it runs; a rejected command does not execute. Use absolute paths. Commands time out \
     after 120 seconds, so avoid anything interactive or long-running. A job sent to the \
-    background must redirect its output to a file, since it inherits this command's own.{}",
-        crate::sandbox::active().map_or("", Sandbox::describe)
+    background must redirect its output to a file, since it inherits this command's own.{}{}",
+        crate::sandbox::active().map_or("", Sandbox::describe),
+        match crate::askpass::active() {
+            true =>
+                " For root, use `sudo -A`: it asks the user for their password, which you never see.",
+            false => "",
+        }
     );
     json!({
         "type": "function",
@@ -208,6 +213,11 @@ async fn run_in(
     };
     crate::childenv::scrub(bash);
     crate::childenv::non_interactive(bash);
+    // Held until the command ends: its sudo can ask only while it is registered.
+    let asking = crate::askpass::register(command);
+    if let Some(call) = &asking {
+        call.env(bash);
+    }
     if let Some(dir) = workdir {
         bash.current_dir(dir);
     }

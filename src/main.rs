@@ -3,6 +3,7 @@
 
 mod agent;
 mod app;
+mod askpass;
 mod auth;
 mod branch;
 mod cache;
@@ -97,6 +98,8 @@ enum Event {
     Resize,
     /// Whether the terminal is in front, for notifications.
     Focus(bool),
+    /// sudo in a bash call wants a password.
+    Askpass(askpass::Request),
     Tick,
 }
 
@@ -104,6 +107,10 @@ enum Event {
 async fn main() -> Result<()> {
     startup::begin();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // sudo runs this as `SUDO_ASKPASS`, and reads its stdout as the password.
+    if args.first().is_some_and(|a| a == askpass::FLAG) {
+        std::process::exit(askpass::helper(&args[1..]));
+    }
     if args.first().is_some_and(|a| a == "identities") {
         return identities();
     }
@@ -235,6 +242,7 @@ async fn main() -> Result<()> {
         title: titled,
         choice,
         statusline,
+        sudo,
     } = load(args.flags, &name).await?;
     // `--workflow` and `exec` answer every approval but the workflow's own with no, so a
     // call the rules leave at `Ask` is refused for good. The agent is told that rather
@@ -358,6 +366,25 @@ async fn main() -> Result<()> {
     if trust_gate.is_none() {
         notices.extend(policy.trust_notice());
     }
+    // Before the session starts, so the bash tool's description never changes under the
+    // cached prefix.
+    let askpass = match (sudo, interactive) {
+        (true, true) => match askpass::start() {
+            Ok(started) => Some(started),
+            Err(e) => {
+                notices.push(format!(
+                    "[bash] sudo is off: could not listen for sudo: {e}"
+                ));
+                None
+            }
+        },
+        (true, false) => {
+            notices.push("[bash] sudo asks in the terminal, so it is off without one".to_string());
+            None
+        }
+        (false, _) => None,
+    };
+    let (guard, requests) = askpass.unzip();
     // Nothing will ask, so say why the mode is not the one that was asked for.
     if held_back && !interactive {
         notices.push(format!(
@@ -512,8 +539,10 @@ allow it.",
         statusline,
         designer,
         defaults,
+        requests,
     )
     .await;
+    drop(guard);
     modes.release();
     title::pop();
     ratatui::restore();
@@ -665,6 +694,8 @@ struct Setup {
     choice: client::Choice,
     /// `statusline`: the status bar's template, which may not parse.
     statusline: Option<String>,
+    /// `[bash] sudo`.
+    sudo: bool,
 }
 
 /// Config and instruction files for the working directory, as the system prompt for
@@ -716,6 +747,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let titled = config.title;
     let choice = config.choice.clone();
     let statusline = config.statusline.clone();
+    let sudo = config.sudo;
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
     startup::mark("prompt");
@@ -728,6 +760,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
         title: titled,
         choice,
         statusline,
+        sudo,
     })
 }
 
@@ -1530,8 +1563,20 @@ async fn run(
     statusline: Option<String>,
     designer: Arc<dyn statusline::Design>,
     defaults: (String, String),
+    askpass: Option<mpsc::UnboundedReceiver<askpass::Request>>,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
+
+    if let Some(mut requests) = askpass {
+        let asked_tx = tx_event.clone();
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                if asked_tx.send(Event::Askpass(request)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     // Terminal input lives on its own thread; crossterm's reader is blocking.
     let input_tx = tx_event.clone();
@@ -1703,13 +1748,19 @@ fn apply(
             notifier.focus(focused);
             false
         }
+        Event::Askpass(request) => {
+            let dir = title::compose(tab.root(), None);
+            notifier.notify(&format!("bhai · {dir}: sudo needs a password"));
+            app.ask_password(request);
+            true
+        }
         Event::Tick => app.tick(),
     }
 }
 
 /// What the tab says the session is doing.
 fn tab_state(app: &App) -> title::State {
-    if app.pending.is_some() {
+    if app.pending.is_some() || !app.passwords.is_empty() {
         title::State::Approval
     } else if app.working {
         title::State::Working
