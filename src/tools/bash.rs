@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
 use super::{BoxFuture, Live, Tool, string_arg, truncate};
+use crate::sandbox::Sandbox;
 
 pub const NAME: &str = "bash";
 
@@ -115,7 +116,10 @@ impl Tool for Bash {
     ) -> BoxFuture<'a, (String, bool)> {
         Box::pin(async move {
             match parse_command(args).and_then(|c| Ok((c, parse_workdir(args)?))) {
-                Ok((command, dir)) => (run(&command, dir, live).await, true),
+                Ok((command, dir)) => {
+                    let sandbox = crate::sandbox::active();
+                    (run_in(&command, dir, sandbox, live).await, true)
+                }
                 Err(e) => (e, false),
             }
         })
@@ -123,14 +127,18 @@ impl Tool for Bash {
 }
 
 fn tool_schema() -> Value {
-    json!({
-        "type": "function",
-        "name": NAME,
-        "description": "Run a shell command with `bash -lc` in the current working directory, or in \
+    let description = format!(
+        "Run a shell command with `bash -lc` in the current working directory, or in \
     `workdir` when given, and return its combined stdout and stderr plus the exit code. The user approves every command \
     before it runs; a rejected command does not execute. Use absolute paths. Commands time out \
     after 120 seconds, so avoid anything interactive or long-running. A job sent to the \
-    background must redirect its output to a file, since it inherits this command's own.",
+    background must redirect its output to a file, since it inherits this command's own.{}",
+        crate::sandbox::active().map_or("", Sandbox::describe)
+    );
+    json!({
+        "type": "function",
+        "name": NAME,
+        "description": description,
         "strict": false,
         "parameters": {
             "type": "object",
@@ -176,11 +184,30 @@ fn parse_workdir(args: &Value) -> Result<Option<&str>, String> {
     }
 }
 
+#[cfg(test)]
 async fn run(command: &str, workdir: Option<&str>, live: Live<'_>) -> String {
+    run_in(command, workdir, None, live).await
+}
+
+async fn run_in(
+    command: &str,
+    workdir: Option<&str>,
+    sandbox: Option<&Sandbox>,
+    live: Live<'_>,
+) -> String {
     let started = Instant::now();
-    let mut bash = Command::new("bash");
-    crate::childenv::scrub(&mut bash);
-    crate::childenv::non_interactive(&mut bash);
+    // Kept to the end: on Linux it holds the Landlock ruleset the child applies.
+    let mut shell = match sandbox.map(Sandbox::bash).transpose() {
+        Err(e) => return format!("{UNSTARTED} in the sandbox: {e}"),
+        Ok(shell) => shell,
+    };
+    let mut plain = Command::new("bash");
+    let bash = match &mut shell {
+        Some(shell) => &mut shell.command,
+        None => &mut plain,
+    };
+    crate::childenv::scrub(bash);
+    crate::childenv::non_interactive(bash);
     if let Some(dir) = workdir {
         bash.current_dir(dir);
     }
@@ -542,6 +569,65 @@ mod tests {
         assert!(out.contains("out [REDACTED]"), "{out}");
         assert!(out.contains("err [REDACTED]"), "{out}");
         assert!(!out.contains("bash-test-secret-value"), "{out}");
+    }
+
+    /// `None` when this kernel has no Landlock to test with.
+    async fn sandboxed(command: &str, sandbox: &Sandbox) -> Option<String> {
+        let out = run_in(command, None, Some(sandbox), quiet()).await;
+        if cfg!(target_os = "linux") && out.starts_with(UNSTARTED) && out.contains("Landlock") {
+            return None;
+        }
+        Some(out)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_sandboxed_command_writes_only_under_its_writable_dirs() {
+        let (inside, outside) = (crate::tools::temp_dir(), crate::tools::temp_dir());
+        let sandbox = Sandbox::with(vec![inside.clone(), "/dev".into()], true);
+        let command = format!(
+            "echo a > {0}/a; mkdir {0}/d; echo b > {1}/b; mkdir {1}/d; \
+             echo c > /dev/null && echo done",
+            inside.display(),
+            outside.display(),
+        );
+        let Some(out) = sandboxed(&command, &sandbox).await else {
+            return;
+        };
+        assert!(out.contains("done"), "{out}");
+        assert!(out.contains("Operation not permitted"), "{out}");
+        assert!(
+            inside.join("a").exists() && inside.join("d").is_dir(),
+            "{out}"
+        );
+        assert!(!outside.join("b").exists(), "{out}");
+        assert!(!outside.join("d").exists(), "{out}");
+        // Reads are not confined.
+        std::fs::write(outside.join("r"), "readable").unwrap();
+        let read = format!("cat {}/r", outside.display());
+        let out = sandboxed(&read, &sandbox).await.unwrap();
+        assert!(out.starts_with("exit code: 0\nreadable"), "{out}");
+        let _ = std::fs::remove_dir_all(inside);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_sandbox_without_network_refuses_a_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let command = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo connected");
+        let open = Sandbox::with(vec!["/dev".into()], true);
+        let Some(out) = sandboxed(&command, &open).await else {
+            return;
+        };
+        assert!(out.contains("connected"), "{out}");
+        let Some(out) = sandboxed(&command, &Sandbox::with(vec!["/dev".into()], false)).await
+        else {
+            return;
+        };
+        assert!(!out.contains("connected"), "{out}");
+        assert!(!out.starts_with("exit code: 0"), "{out}");
     }
 
     #[tokio::test]

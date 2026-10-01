@@ -8,7 +8,9 @@
 //! `sources` list are ignored in a project file, since a clone that switched them would be
 //! dropping the user's standing instructions or widening what it can put in the prompt.
 //! `statusline` is read from the global file only, and `/statusline` writes it there.
-//! So is `[bash] pass_env`, the credential-looking variables children may still inherit.
+//! So is `[bash] pass_env`, the credential-looking variables children may still inherit,
+//! and `[bash] writable`; a project file may turn `[bash] sandbox` on and `network` off,
+//! never the reverse.
 //! `web_search` is off unless the global file turns it on, since each search sends the
 //! last two user messages and some of the answers between them to the ChatGPT backend's
 //! undocumented search endpoint; a project file may turn it off.
@@ -66,6 +68,8 @@ pub struct Config {
     /// `[bash] pass_env`: credential-looking variable names that bash and stdio MCP
     /// children still inherit.
     pub pass_env: Vec<String>,
+    /// `[bash] sandbox`, `network` and `writable`: the OS sandbox bash runs in.
+    pub sandbox: crate::sandbox::Settings,
 }
 
 impl Default for Config {
@@ -92,6 +96,7 @@ impl Default for Config {
             choice: crate::client::Choice::default(),
             statusline: None,
             pass_env: Vec::new(),
+            sandbox: crate::sandbox::Settings::default(),
         }
     }
 }
@@ -187,6 +192,10 @@ struct Layer {
 struct BashLayer {
     #[serde(default)]
     pass_env: Vec<String>,
+    sandbox: Option<bool>,
+    network: Option<bool>,
+    #[serde(default)]
+    writable: Vec<String>,
 }
 
 /// `skills = false`, or a `[skills]` table.
@@ -341,6 +350,22 @@ impl Config {
         if trusted {
             // What a child may see of the environment is the user's call, never a cloned repo's.
             self.pass_env.extend(layer.bash.pass_env.iter().cloned());
+            self.sandbox
+                .writable
+                .extend(layer.bash.writable.iter().cloned());
+        }
+        // A project file may turn the sandbox on and the network off, never the reverse.
+        if let Some(on) = layer.bash.sandbox
+            && (trusted || on)
+        {
+            self.sandbox.on = on;
+        }
+        if let Some(network) = layer.bash.network
+            && (trusted || !network)
+        {
+            self.sandbox.network = network;
+        }
+        if trusted {
             if layer.statusline.is_some() {
                 self.statusline = layer.statusline.clone();
             }
@@ -620,6 +645,32 @@ mod tests {
         write(&global_path(&home), "[bash]\npass_env = [\"NPM_TOKEN\"]\n");
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert_eq!(config.pass_env, ["NPM_TOKEN"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_project_file_may_only_tighten_the_sandbox() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &global_path(&home),
+            "[bash]\nsandbox = true\nnetwork = false\nwritable = [\"~/w\"]\n",
+        );
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[bash]\nsandbox = false\nnetwork = true\nwritable = [\"/\"]\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(config.sandbox.on && !config.sandbox.network);
+        assert_eq!(config.sandbox.writable, ["~/w"]);
+
+        std::fs::remove_file(global_path(&home)).unwrap();
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[bash]\nsandbox = true\nnetwork = false\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(config.sandbox.on && !config.sandbox.network);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -37,6 +37,7 @@ mod plan;
 mod profile;
 mod prompt;
 mod redact;
+mod sandbox;
 mod search;
 mod server;
 mod session;
@@ -673,6 +674,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
     childenv::set_pass(&config.pass_env);
+    sandbox::set(&config.sandbox, &roots.cwd, roots.home.as_deref());
     // Named once for the process: code already on screen is not repainted.
     if let Some(theme) = &config.code_theme {
         syntax::set_theme(theme);
