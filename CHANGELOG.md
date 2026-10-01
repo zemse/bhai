@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on macOS and Linux for every push to main and every pull request, and `cargo deny check advisories` alongside. Actions are pinned by commit SHA and checkout does not persist credentials.
 - `deny.toml` sets the dependency policy for `cargo deny check`: yanked crates and wildcard versions are denied, only listed licences and the crates.io registry are allowed, and RUSTSEC-2025-0141 (bincode via syntect) is ignored with its reason.
 - A token refresh that the server refuses, because the `codex` CLI or another bhai spent the same refresh token first, adopts the tokens that process wrote to `~/.codex/auth.json` instead of failing the turn. A `refresh_token_reused` refusal with nothing newer on disk says the token was already spent.
 - The release binary is stripped and built with thin LTO, so it is about 12% smaller
