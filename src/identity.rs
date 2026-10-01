@@ -301,7 +301,7 @@ pub fn build(
         .filter(|s| identity.allows_skill(&s.name))
         .collect();
     let loaded = instructions::load(&config, roots);
-    let mut files = loaded.files;
+    let mut files = loaded.files.clone();
     if !identity.prompt.is_empty() {
         files.push(File {
             path: identity.path.clone().unwrap_or_default(),
@@ -316,6 +316,8 @@ pub fn build(
     }
     prompt.skipped = loaded.skipped;
     prompt.skipped.extend(found.shadowed);
+    prompt.instructions = loaded.files;
+    prompt.reload = Some(instructions::Reload::new(config.clone(), roots.clone()));
     prompt.identity = identity.clone();
     prompt.web_search = config.web_search && identity.allows_tool(tools::web::NAME);
     prompt

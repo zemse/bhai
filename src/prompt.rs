@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use crate::identity::Identity;
-use crate::instructions::File;
+use crate::instructions::{File, Reload};
 use crate::mcp::Hub;
 use crate::skills::Skill;
 use crate::tools::{bash, edit, read, write};
@@ -29,6 +29,10 @@ pub struct SystemPrompt {
     pub agents_bytes: usize,
     /// Imports refused while loading the instruction files.
     pub skipped: Vec<String>,
+    /// The instruction files in `text`, the identity's own prompt left out.
+    pub instructions: Vec<File>,
+    /// How to read them again, for the updates a turn carries when they change.
+    pub reload: Option<Reload>,
     /// The identity the prompt was built for.
     pub identity: Identity,
     /// `web_search` is offered: the config turned it on and the identity allows it.
@@ -169,6 +173,8 @@ pub fn system_prompt_for(tools: &[&str], files: &[File], skills: Vec<Skill>) -> 
         mcp_bytes: 0,
         agents_bytes: 0,
         skipped: Vec::new(),
+        instructions: Vec::new(),
+        reload: None,
         identity: Identity::default(),
         web_search: false,
     }

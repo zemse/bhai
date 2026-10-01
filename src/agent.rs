@@ -1075,6 +1075,16 @@ pub(crate) async fn run_with(
         {
             history.push(context);
         }
+        if opens && let Some(reload) = &prompt.reload {
+            for update in
+                crate::instructions::updates(&history, &prompt.instructions, &reload.files())
+            {
+                if let Some(note) = crate::instructions::note(&update) {
+                    let _ = tx.send(AgentEvent::Info(note));
+                }
+                history.push(update);
+            }
+        }
         let mut update_at = None;
         if opens && let Some(update) = effort_change(model.as_ref(), &history) {
             update_at = Some(history.len());
@@ -7267,6 +7277,89 @@ mod tests {
         assert!(crate::environment::is_context(&sent[0]));
         assert_eq!(sent[1], crate::client::effort_update("high"));
         assert_eq!(sent[2]["content"][0]["text"], "second");
+    }
+
+    #[tokio::test]
+    async fn an_instruction_file_edited_mid_session_rides_in_the_history() {
+        use crate::instructions::{Reload, Roots};
+        use fake::{Fake, say};
+
+        let dir = tools::temp_dir().canonicalize().unwrap();
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "be terse\n").unwrap();
+        let config = crate::config::Config {
+            load_global_claude: false,
+            load_global_agents: false,
+            ..crate::config::Config::default()
+        };
+        let roots = Roots {
+            home: None,
+            codex_home: None,
+            cwd: dir.clone(),
+        };
+        let reload = Reload::new(config, roots);
+        let files = reload.files();
+        let mut prompt = crate::prompt::system_prompt(&files, Vec::new());
+        prompt.instructions = files;
+        prompt.reload = Some(reload);
+
+        let script = vec![vec![say("one")], vec![say("two")], vec![say("three")]];
+        let fake = Fake::new(script);
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            prompt,
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        std::fs::write(dir.join("CLAUDE.md"), "be verbose\n").unwrap();
+        let events = drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::Info(note) if note == "instructions changed: ./CLAUDE.md")
+            ),
+            "{events:?}"
+        );
+        drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        let updates = |i: usize| -> Vec<String> {
+            bodies[i].1["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| crate::instructions::note(item).is_some())
+                .map(|item| item["content"][0]["text"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(updates(0).is_empty());
+        assert_eq!(updates(1).len(), 1);
+        assert!(
+            updates(1)[0].contains("\n\nbe verbose\n"),
+            "{:?}",
+            updates(1)
+        );
+        // Told once: the next turn finds the history current.
+        assert_eq!(updates(2), updates(1));
+        // The system prompt never moves, so the cache holds across the edit.
+        assert_eq!(bodies[0].1["instructions"], bodies[2].1["instructions"]);
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A session that misses the cache on every judged call, one call per script step,

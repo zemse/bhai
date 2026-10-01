@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- An instruction file edited, added or removed during a session reaches the model before the next turn as a developer item in the history, carrying the file's whole new text or saying it went, and the transcript shows `instructions changed: ./CLAUDE.md`. The system prompt is never rebuilt, so the cached prefix holds; a compaction keeps the latest update per file, and a `/clear` sends it again.
 - `[bash] sandbox = true` in the config runs every bash command in an OS sandbox (Seatbelt on macOS, Landlock on Linux). Commands can write only under the project root, the temp dirs, `/dev`, the toolchain caches (`~/.cargo/registry`, `~/.npm`, `~/.cache` and the like, not their `bin` dirs) and any `[bash] writable` dirs from the global file. `network = false` also cuts off IP traffic (TCP only on Linux). A project file may turn the sandbox on and the network off, never the reverse, the model is told when it is sandboxed, and a command that cannot be sandboxed does not run.
 - Calls from one response to `read`, `find_sessions`, `read_session`, `web_search` and `mcp_search` run concurrently, and any other call waits for the ones before it. The transcript still shows each call's start and output in call order, approvals are still asked one at a time, and Codex requests now allow parallel tool calls.
 - Instruction files that add up to more than 32 KiB still all load, and the startup lines warn with the total, like `instruction files total 40 KiB, over the 32 KiB they should be together`.

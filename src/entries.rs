@@ -218,6 +218,9 @@ impl Entries {
                     },
                 },
                 Some("message") if crate::environment::is_context(item) => continue,
+                Some("message") if let Some(note) = crate::instructions::note(item) => {
+                    Entry::Info(note)
+                }
                 Some("message") if crate::client::is_commentary(item) => {
                     Entry::Commentary(text("content"))
                 }

@@ -160,9 +160,9 @@ pub fn evict(history: &mut [Value], excess: u64, tokenizer: &dyn Tokenizer) -> u
     freed
 }
 
-/// The history after a summary: the environment it told the model, the first user
-/// message, the summary, and the last user turn onward. `None` when there is no earlier
-/// turn to fold.
+/// The history after a summary: the environment and instruction updates it told the
+/// model, the first user message, the summary, and the last user turn onward. `None` when
+/// there is no earlier turn to fold.
 pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
     let mut users = history
         .iter()
@@ -172,6 +172,7 @@ pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
     let first = users.next()?;
     let last = users.next_back().filter(|&last| last > first)?;
     let mut folded: Vec<Value> = crate::environment::restated(history).into_iter().collect();
+    folded.extend(crate::instructions::restated(history));
     folded.push(history[first].clone());
     folded.push(user_message(&format!(
         "{SUMMARY_PREFIX}\n{}",
@@ -181,9 +182,10 @@ pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
     Some(folded)
 }
 
-/// The history after a server compaction: the environment it told the model, the user
-/// messages that fit in `budget` tokens, newest first and the one that crosses it cut in
-/// the middle, and last the `compaction` item that stands for the rest.
+/// The history after a server compaction: the environment and instruction updates it
+/// told the model, the user messages that fit in `budget` tokens, newest first and the one
+/// that crosses it cut in the middle, and last the `compaction` item that stands for the
+/// rest.
 pub fn install(
     history: &[Value],
     compaction: Value,
@@ -212,6 +214,7 @@ pub fn install(
     }
     kept.reverse();
     let mut installed: Vec<Value> = crate::environment::restated(history).into_iter().collect();
+    installed.extend(crate::instructions::restated(history));
     installed.extend(kept);
     installed.push(compaction);
     installed
@@ -430,5 +433,33 @@ mod tests {
         assert_eq!(folded[0], restated(&history).unwrap());
         assert_eq!(folded[1], user_message("one"));
         assert_eq!(update(&folded, &env("2026-10-03")), None);
+    }
+
+    #[test]
+    fn fold_and_install_keep_the_instruction_updates() {
+        use crate::instructions::{File, updates};
+
+        let file = |content: &str| File {
+            path: "CLAUDE.md".into(),
+            label: "./CLAUDE.md".to_string(),
+            content: content.to_string(),
+        };
+        let prompt = [file("be terse")];
+        let mut history = Vec::new();
+        turn(&mut history, "one", 1);
+        history.extend(updates(&history, &prompt, &[file("be verbose")]));
+        turn(&mut history, "two", 1);
+        turn(&mut history, "three", 1);
+        let item = json!({"type": "compaction", "encrypted_content": "opaque"});
+        for kept in [
+            fold(&history, "s").unwrap(),
+            install(&history, item, u64::MAX, &ByteEstimate),
+        ] {
+            assert_eq!(
+                crate::instructions::note(&kept[0]).unwrap(),
+                "instructions changed: ./CLAUDE.md"
+            );
+            assert!(updates(&kept, &prompt, &[file("be verbose")]).is_empty());
+        }
     }
 }
