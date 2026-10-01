@@ -84,6 +84,10 @@ impl Identity {
         if name == tools::patch::NAME {
             return self.allows_tool(tools::edit::NAME);
         }
+        // Reads a file like `read`, so an identity that may read may look.
+        if name == tools::view_image::NAME {
+            return self.allows_tool(tools::read::NAME);
+        }
         let mcp = [tools::mcp::SEARCH, tools::mcp::CALL].contains(&name);
         self.tools
             .as_ref()
@@ -472,10 +476,10 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         };
         let both = ["mcp_search", "mcp_call"];
         assert!(names(None).ends_with(&both.map(String::from)));
-        assert_eq!(names(Some(&["read"])), ["read"]);
+        assert_eq!(names(Some(&["read"])), ["read", "view_image"]);
         assert_eq!(
             names(Some(&["read", "mcp"])),
-            ["read", "mcp_search", "mcp_call"]
+            ["read", "view_image", "mcp_search", "mcp_call"]
         );
         assert_eq!(names(Some(&["mcp_call"])), ["mcp_call"]);
 
@@ -610,7 +614,7 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
             .iter()
             .map(|s| s["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, ["read", "skill"]);
+        assert_eq!(names, ["read", "view_image", "skill"]);
         assert!(registry.get("bash").is_none());
         let skill = registry.get("skill").unwrap();
         assert!(

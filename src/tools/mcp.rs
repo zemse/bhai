@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{BoxFuture, Live, Tool, string_arg, truncate};
+use super::{BoxFuture, Image, Live, Tool, string_arg, truncate, with_images};
 use crate::mcp::Hub;
 
 pub const SEARCH: &str = "mcp_search";
@@ -258,17 +258,28 @@ impl Tool for Call {
         self.execute_live(args, live)
     }
 
-    /// Dropping the call's future is what abandons a server that stopped answering.
     fn execute_live<'a>(
         &'a self,
         args: &'a Value,
         live: Live<'a>,
     ) -> BoxFuture<'a, (String, bool)> {
         Box::pin(async move {
+            let (output, ok, images) = self.execute_images(args, live).await;
+            (with_images(&output, &images), ok)
+        })
+    }
+
+    /// Dropping the call's future is what abandons a server that stopped answering.
+    fn execute_images<'a>(
+        &'a self,
+        args: &'a Value,
+        live: Live<'a>,
+    ) -> BoxFuture<'a, (String, bool, Vec<Image>)> {
+        Box::pin(async move {
             let name = string_arg(args, "name").unwrap_or_default();
             let arguments = match arguments(args) {
                 Ok(arguments) => arguments,
-                Err(e) => return (e, false),
+                Err(e) => return (e, false, Vec::new()),
             };
             let call = self.hub.call(name, arguments);
             tokio::pin!(call);
@@ -279,7 +290,7 @@ impl Tool for Call {
                     _ = tick.tick() => {
                         if live.cancel.load(Ordering::Relaxed) {
                             let why = format!("The user interrupted the turn; `{name}` did not finish.");
-                            return (why, false);
+                            return (why, false, Vec::new());
                         }
                     }
                     out = &mut call => return out,
@@ -319,7 +330,7 @@ mod tests {
         let empty = Arc::new(Hub::offline(vec![("gh", Vec::new())]));
         let without = Registry::new(Vec::new()).with_mcp(Some(empty));
         assert!(without.get(SEARCH).is_none() && without.get(CALL).is_none());
-        assert_eq!(Registry::new(Vec::new()).with_mcp(None).schemas().len(), 5);
+        assert_eq!(Registry::new(Vec::new()).with_mcp(None).schemas().len(), 6);
     }
 
     #[test]

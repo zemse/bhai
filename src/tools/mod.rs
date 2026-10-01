@@ -21,6 +21,7 @@ pub mod plan;
 pub mod read;
 pub mod skill;
 pub mod submit;
+pub mod view_image;
 pub mod web;
 pub mod write;
 
@@ -41,6 +42,119 @@ pub const NAMES: [&str; 11] = [
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
 pub(crate) const MAX_OUTPUT: usize = 20_000;
+
+/// An image past this many bytes is not sent: it would ride in every later request until
+/// compaction took it out.
+pub(crate) const MAX_IMAGE_BYTES: usize = 10 << 20;
+
+/// The image types the Responses API reads.
+const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// An image a tool brings in, which goes to the model beside its text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Image {
+    pub mime: String,
+    /// Standard base64.
+    pub data: String,
+}
+
+impl Image {
+    /// The image, or why it cannot be sent: a type the model cannot read, or too large.
+    pub fn new(mime: &str, data: &str) -> Result<Self, String> {
+        let mime = mime.trim().to_ascii_lowercase();
+        if !IMAGE_TYPES.contains(&mime.as_str()) {
+            return Err(format!("[image {mime}: not a type the model reads]"));
+        }
+        let data: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let bytes = data.len() / 4 * 3;
+        if bytes > MAX_IMAGE_BYTES {
+            return Err(format!(
+                "[image {mime}: {bytes} bytes, past the {MAX_IMAGE_BYTES} the model is sent]"
+            ));
+        }
+        Ok(Self { mime, data })
+    }
+
+    fn url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, self.data)
+    }
+
+    /// What stands for it where only text goes: the transcript, Ollama, a token count.
+    fn placeholder(mime: &str) -> String {
+        format!("[image {mime}]")
+    }
+}
+
+/// `text` with a placeholder line for each image, for where only text goes.
+pub fn with_images(text: &str, images: &[Image]) -> String {
+    let mut out = text.to_string();
+    for image in images {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&Image::placeholder(&image.mime));
+    }
+    out
+}
+
+/// The `function_call_output` that answers `call_id`: its output a string, or with images
+/// a content array of the text and each image.
+pub fn function_output(call_id: &str, text: &str, images: &[Image]) -> Value {
+    let output = if images.is_empty() {
+        Value::String(text.to_string())
+    } else {
+        let mut parts = vec![serde_json::json!({"type": "input_text", "text": text})];
+        parts.extend(
+            images
+                .iter()
+                .map(|image| serde_json::json!({"type": "input_image", "image_url": image.url()})),
+        );
+        Value::Array(parts)
+    };
+    serde_json::json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": output,
+    })
+}
+
+/// A tool output's text: the string, or a content array's text with a placeholder for
+/// each image.
+pub fn output_text(output: &Value) -> String {
+    match output {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => {
+            let texts: Vec<String> = parts
+                .iter()
+                .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("input_image") => {
+                        let url = part.get("image_url").and_then(Value::as_str);
+                        let mime = url
+                            .and_then(|u| u.strip_prefix("data:"))
+                            .and_then(|u| u.split_once(';'))
+                            .map_or("", |(mime, _)| mime);
+                        Some(Image::placeholder(mime))
+                    }
+                    _ => part.get("text").and_then(Value::as_str).map(str::to_string),
+                })
+                .filter(|text| !text.is_empty())
+                .collect();
+            texts.join("\n")
+        }
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// How many images a tool output carries.
+pub fn output_images(output: &Value) -> usize {
+    output.as_array().map_or(0, |parts| {
+        parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
+            .count()
+    })
+}
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -69,6 +183,19 @@ pub trait Tool: Send + Sync {
         _live: Live<'a>,
     ) -> BoxFuture<'a, (String, bool)> {
         self.execute(args)
+    }
+
+    /// Run the call like `execute_live`, also returning the images it brought in. Only
+    /// `view_image` and `mcp_call` bring any.
+    fn execute_images<'a>(
+        &'a self,
+        args: &'a Value,
+        live: Live<'a>,
+    ) -> BoxFuture<'a, (String, bool, Vec<Image>)> {
+        Box::pin(async move {
+            let (output, ok) = self.execute_live(args, live).await;
+            (output, ok, Vec::new())
+        })
     }
 }
 
@@ -108,6 +235,7 @@ impl Registry {
             Box::new(write::Write),
             Box::new(edit::Edit),
             Box::new(patch::ApplyPatch),
+            Box::new(view_image::ViewImage),
         ];
         if !skills.is_empty() {
             tools.push(Box::new(skill::Skill { skills }));
@@ -397,11 +525,14 @@ mod tests {
                 s["name"].as_str().unwrap().to_string()
             })
             .collect();
-        assert_eq!(names, ["bash", "read", "write", "edit", "apply_patch"]);
+        assert_eq!(
+            names,
+            ["bash", "read", "write", "edit", "apply_patch", "view_image"]
+        );
     }
 
     #[test]
-    fn only_read_and_skill_skip_approval() {
+    fn only_read_view_image_and_skill_skip_approval() {
         let skill = crate::skills::Skill {
             name: "s".to_string(),
             description: String::new(),
@@ -409,11 +540,12 @@ mod tests {
             source: "~/.claude/skills".to_string(),
         };
         let registry = Registry::new(vec![skill]);
-        assert_eq!(registry.schemas().len(), 6);
+        assert_eq!(registry.schemas().len(), 7);
         for name in ["bash", "write", "edit", "apply_patch"] {
             assert!(registry.get(name).unwrap().needs_approval(), "{name}");
         }
         assert!(!registry.get("read").unwrap().needs_approval());
+        assert!(!registry.get("view_image").unwrap().needs_approval());
         assert!(!registry.get("skill").unwrap().needs_approval());
         assert!(Registry::new(Vec::new()).get("skill").is_none());
     }
@@ -442,6 +574,43 @@ mod tests {
         assert_eq!(output["type"], "custom_tool_call_output");
         assert_eq!(output["call_id"], "c1");
         assert_eq!(output["output"], "done");
+    }
+
+    #[test]
+    fn images_ride_in_a_content_array_and_read_back_as_placeholders() {
+        let plain = function_output("c1", "ok", &[]);
+        assert_eq!(plain["output"], "ok");
+        assert_eq!(output_images(&plain["output"]), 0);
+
+        let image = Image::new("Image/PNG", "iVBO\nRw0K").unwrap();
+        assert_eq!(image.mime, "image/png");
+        assert_eq!(image.data, "iVBORw0K");
+        let item = function_output("c1", "shot", &[image.clone(), image]);
+        assert_eq!(item["type"], "function_call_output");
+        assert_eq!(item["call_id"], "c1");
+        let parts = item["output"].as_array().unwrap();
+        assert_eq!(parts[0], json!({"type": "input_text", "text": "shot"}));
+        assert_eq!(
+            parts[1],
+            json!({"type": "input_image", "image_url": "data:image/png;base64,iVBORw0K"})
+        );
+        assert_eq!(output_images(&item["output"]), 2);
+        assert_eq!(
+            output_text(&item["output"]),
+            "shot\n[image image/png]\n[image image/png]"
+        );
+    }
+
+    #[test]
+    fn an_image_the_model_cannot_take_is_refused_with_a_reason() {
+        let svg = Image::new("image/svg+xml", "PHN2Zz4=").unwrap_err();
+        assert!(svg.contains("not a type the model reads"), "{svg}");
+        let huge = "A".repeat(MAX_IMAGE_BYTES / 3 * 4 + 8);
+        let large = Image::new("image/png", &huge).unwrap_err();
+        assert!(large.contains("past the"), "{large}");
+        assert_eq!(with_images("", &[]), "");
+        let image = Image::new("image/jpeg", "/9j/").unwrap();
+        assert_eq!(with_images("", &[image]), "[image image/jpeg]");
     }
 
     #[test]

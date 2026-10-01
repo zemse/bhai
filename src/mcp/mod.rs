@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, McpServer};
 use crate::identity::Identity;
 use crate::instructions::Roots;
+use crate::tools::Image;
 
 pub mod servers;
 
@@ -618,9 +619,9 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n"
         })
     }
 
-    /// Run `full_name`; returns the output and whether it succeeded. A tool of a deferred
-    /// server starts that server first.
-    pub async fn call(&self, full_name: &str, arguments: Value) -> (String, bool) {
+    /// Run `full_name`; returns the output, whether it succeeded and the images it
+    /// returned. A tool of a deferred server starts that server first.
+    pub async fn call(&self, full_name: &str, arguments: Value) -> (String, bool, Vec<Image>) {
         let found = match self.find(full_name) {
             Some(tool) => {
                 let peer = self.peer(&tool.server);
@@ -634,12 +635,14 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n"
                     "No MCP tool named `{full_name}`. Use `mcp_search` to find the exact name."
                 ),
                 false,
+                Vec::new(),
             );
         };
         let Some(peer) = peer else {
             return (
                 format!("MCP server `{}` is not connected.", tool.server),
                 false,
+                Vec::new(),
             );
         };
         let timeout = self
@@ -659,6 +662,7 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n"
             Ok(Err(e)) => (
                 crate::redact::apply(&format!("MCP call failed: {e}")).into_owned(),
                 false,
+                Vec::new(),
             ),
             Err(_) => (
                 format!(
@@ -667,6 +671,7 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n"
                     timeout.as_secs_f64()
                 ),
                 false,
+                Vec::new(),
             ),
         }
     }
@@ -1240,31 +1245,34 @@ fn score(tool: &ToolInfo, words: &[String]) -> usize {
     scores.iter().sum::<usize>() + bonus
 }
 
-/// The text of a tool result; other content is summarized.
-fn render(result: &CallToolResult) -> (String, bool) {
+/// The text of a tool result and the images in it; other content is summarized, and an
+/// image that cannot be sent is a line saying why.
+fn render(result: &CallToolResult) -> (String, bool, Vec<Image>) {
+    let mut images = Vec::new();
     let mut parts: Vec<String> = result
         .content
         .iter()
-        .map(|block| match block {
-            ContentBlock::Text(text) => text.text.clone(),
-            ContentBlock::Image(image) => {
-                format!(
-                    "[image {}, {} bytes base64]",
-                    image.mime_type,
-                    image.data.len()
-                )
-            }
-            other => serde_json::to_string(other).unwrap_or_default(),
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.clone()),
+            ContentBlock::Image(image) => match Image::new(&image.mime_type, &image.data) {
+                Ok(image) => {
+                    images.push(image);
+                    None
+                }
+                Err(why) => Some(why),
+            },
+            other => Some(serde_json::to_string(other).unwrap_or_default()),
         })
         .collect();
     if parts.is_empty()
+        && images.is_empty()
         && let Some(structured) = &result.structured_content
     {
         parts.push(structured.to_string());
     }
     let ok = result.is_error != Some(true);
     let text = crate::redact::apply(&parts.join("\n")).into_owned();
-    (crate::tools::truncate(&text), ok)
+    (crate::tools::truncate(&text), ok, images)
 }
 
 fn first_line(text: &str) -> &str {
@@ -1301,6 +1309,28 @@ mod tests {
     }
 
     #[test]
+    fn an_image_in_a_result_is_forwarded_and_one_it_cannot_send_is_a_line() {
+        let result = CallToolResult::success(vec![
+            ContentBlock::text("took a screenshot"),
+            ContentBlock::image("iVBORw0K", "image/png"),
+            ContentBlock::image("PHN2Zz4=", "image/svg+xml"),
+        ]);
+        let (out, ok, images) = render(&result);
+        assert!(ok);
+        assert_eq!(
+            out,
+            "took a screenshot\n[image image/svg+xml: not a type the model reads]"
+        );
+        assert_eq!(images, [Image::new("image/png", "iVBORw0K").unwrap()]);
+
+        // An image alone is the whole answer; the structured content does not stand in.
+        let mut alone = CallToolResult::success(vec![ContentBlock::image("iVBORw0K", "image/png")]);
+        alone.structured_content = Some(serde_json::json!({"ok": true}));
+        let (out, _, images) = render(&alone);
+        assert_eq!((out.as_str(), images.len()), ("", 1));
+    }
+
+    #[test]
     fn a_secret_across_the_truncation_cut_is_redacted_whole() {
         crate::redact::register("mcp-render-secret-0f9e2d");
         let half = crate::tools::MAX_OUTPUT / 2;
@@ -1311,7 +1341,7 @@ mod tests {
             "b".repeat(half * 2)
         );
         let result = CallToolResult::success(vec![ContentBlock::text(text)]);
-        let (out, ok) = render(&result);
+        let (out, ok, _) = render(&result);
         let around = &out[half - 20..half + 40];
         assert!(ok && out.contains("bytes trimmed"), "{around}");
         assert!(out.contains("a[REDA"), "{around}");
@@ -1446,7 +1476,7 @@ mod tests {
         .await;
         assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
         let args = serde_json::json!({"message": "hi"});
-        let (out, ok) = hub.call("mcp__moved__echo", args).await;
+        let (out, ok, _) = hub.call("mcp__moved__echo", args).await;
         assert_eq!((out.as_str(), ok), ("echo: hi", true));
         hub.shutdown().await;
         child.kill().unwrap();
@@ -1475,17 +1505,17 @@ mod tests {
         );
 
         let args = serde_json::json!({"message": "hi"});
-        let (out, ok) = hub.call("mcp__fake__echo", args).await;
+        let (out, ok, _) = hub.call("mcp__fake__echo", args).await;
         assert_eq!((out.as_str(), ok), ("echo: hi", true));
-        let (out, ok) = hub.call("mcp__fake__fail", serde_json::json!({})).await;
+        let (out, ok, _) = hub.call("mcp__fake__fail", serde_json::json!({})).await;
         assert_eq!((out.as_str(), ok), ("it failed", false));
-        let (out, ok) = hub.call("mcp__fake__nope", serde_json::json!({})).await;
+        let (out, ok, _) = hub.call("mcp__fake__nope", serde_json::json!({})).await;
         assert!(!ok && out.contains("mcp_search"), "{out}");
 
         let log = std::fs::read_to_string(dir.join("mcp-fake.log")).unwrap();
         assert!(log.contains("fake_mcp started"), "{log}");
         hub.shutdown().await;
-        let (out, ok) = hub.call("mcp__fake__echo", serde_json::json!({})).await;
+        let (out, ok, _) = hub.call("mcp__fake__echo", serde_json::json!({})).await;
         assert!(!ok, "{out}");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1547,7 +1577,7 @@ mod tests {
         .await;
         assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
         let started = std::time::Instant::now();
-        let (out, ok) = hub
+        let (out, ok, _) = hub
             .call("mcp__stuck__echo", serde_json::json!({"message": "hi"}))
             .await;
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -1622,7 +1652,7 @@ mod tests {
             "{why}"
         );
         assert!(!hub.has_tools());
-        let (out, ok) = hub
+        let (out, ok, _) = hub
             .call("mcp__fake__echo", serde_json::json!({"message": "hi"}))
             .await;
         assert!(!ok, "{out}");
@@ -1711,7 +1741,7 @@ mod tests {
         let names: Vec<_> = hub.tools().map(ToolInfo::full_name).collect();
         assert_eq!(names, ["mcp__web__echo", "mcp__web__fail"]);
         let args = serde_json::json!({"message": "hi"});
-        let (out, ok) = hub.call("mcp__web__echo", args).await;
+        let (out, ok, _) = hub.call("mcp__web__echo", args).await;
         assert_eq!((out.as_str(), ok), ("echo: hi", true));
         assert_eq!(crate::redact::apply("Bearer s3cret"), "[REDACTED]");
 
@@ -1828,17 +1858,17 @@ mod tests {
         let out = child.search("fake").await;
         assert!(out.starts_with("mcp__fake__echo: "), "{out}");
         assert!(!out.contains("mcp__fake__fail"), "{out}");
-        let (out, ok) = child
+        let (out, ok, _) = child
             .call("mcp__fake__echo", serde_json::json!({"message": "hi"}))
             .await;
         assert_eq!((out.as_str(), ok), ("echo: hi", true));
-        let (_, ok) = child.call("mcp__fake__fail", serde_json::json!({})).await;
+        let (_, ok, _) = child.call("mcp__fake__fail", serde_json::json!({})).await;
         assert!(!ok);
 
         // A later child reuses the running server, and the child cannot close it.
         child.shutdown().await;
         let other = hub.narrowed(&Identity::default());
-        let (out, ok) = other.call("mcp__fake__fail", serde_json::json!({})).await;
+        let (out, ok, _) = other.call("mcp__fake__fail", serde_json::json!({})).await;
         assert_eq!((out.as_str(), ok), ("it failed", false));
         assert_eq!(hub.shared.late.lock().await.len(), 1);
         assert_eq!(child.prompt_section(), section);
@@ -1849,7 +1879,7 @@ mod tests {
         );
 
         hub.shutdown().await;
-        let (out, ok) = other.call("mcp__fake__echo", serde_json::json!({})).await;
+        let (out, ok, _) = other.call("mcp__fake__echo", serde_json::json!({})).await;
         assert!(!ok, "{out}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1891,7 +1921,7 @@ mod tests {
         let out = hub.search("flaky echo").await;
         assert!(out.starts_with("mcp__flaky__echo: "), "{out}");
         let args = serde_json::json!({"message": "hi"});
-        let (out, ok) = hub.call("mcp__flaky__echo", args.clone()).await;
+        let (out, ok, _) = hub.call("mcp__flaky__echo", args.clone()).await;
         assert_eq!((out.as_str(), ok), ("echo: hi", true));
         let report = hub.report();
         assert!(
@@ -1900,7 +1930,7 @@ mod tests {
         );
         // A child made after the reload sees it too.
         let child = hub.narrowed(&Identity::default());
-        let (out, ok) = child.call("mcp__flaky__echo", args.clone()).await;
+        let (out, ok, _) = child.call("mcp__flaky__echo", args.clone()).await;
         assert_eq!((out.as_str(), ok), ("echo: hi", true));
 
         // A running server is closed, with its group, before the new one starts.
@@ -1910,7 +1940,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(!alive(&old), "grandchild {old} outlived the reload");
-        let (out, ok) = hub.call("mcp__good__echo", args).await;
+        let (out, ok, _) = hub.call("mcp__good__echo", args).await;
         assert_eq!((out.as_str(), ok), ("echo: hi", true));
         assert_eq!(
             hub.shared.services.lock().unwrap().as_ref().unwrap().len(),
@@ -1985,7 +2015,7 @@ mod tests {
             "{line}"
         );
         assert!(hub.find("mcp__fake__echo").is_none());
-        let (out, ok) = hub
+        let (out, ok, _) = hub
             .call("mcp__fake__echo", serde_json::json!({"message": "hi"}))
             .await;
         assert!(!ok && out.contains("No MCP tool"), "{out}");
@@ -2038,7 +2068,7 @@ mod tests {
         .await;
         let child = hub.narrowed(&Identity::default());
         let args = serde_json::json!({"message": "hi"});
-        let (_, ok) = child.call("mcp__fake__echo", args.clone()).await;
+        let (_, ok, _) = child.call("mcp__fake__echo", args.clone()).await;
         assert!(ok);
         let section = child.prompt_section();
         hub.reload_from("fake", vec![fake("fake", "")])
@@ -2049,7 +2079,7 @@ mod tests {
             hub.shared.services.lock().unwrap().as_ref().unwrap().len(),
             1
         );
-        let (out, ok) = child.call("mcp__fake__echo", args).await;
+        let (out, ok, _) = child.call("mcp__fake__echo", args).await;
         assert_eq!((out.as_str(), ok), ("echo: hi", true));
         assert_eq!(child.prompt_section(), section);
         hub.shutdown().await;

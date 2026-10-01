@@ -68,15 +68,29 @@ pub fn item_text(item: &Value) -> Option<String> {
             field("name").unwrap_or_default(),
             field("input").unwrap_or_default()
         )),
-        Some("function_call_output" | "custom_tool_call_output") => {
-            Some(match item.get("output") {
-                Some(Value::String(s)) => s.clone(),
-                Some(other) => other.to_string(),
-                None => String::new(),
-            })
-        }
+        Some("function_call_output" | "custom_tool_call_output") => Some(
+            item.get("output")
+                .map(crate::tools::output_text)
+                .unwrap_or_default(),
+        ),
         _ => Some(item.to_string()),
     }
+}
+
+/// What one image in a tool output counts as. Its pixels are not decoded, so this is a
+/// fixed guess near what a high-detail screenshot costs.
+pub const IMAGE_TOKENS: u64 = 1_500;
+
+/// How many images a history item carries.
+pub fn images(item: &Value) -> usize {
+    item.get("output").map_or(0, crate::tools::output_images)
+}
+
+/// Tokens the model reads in a history item, each image at `IMAGE_TOKENS`, or `None`
+/// for encrypted reasoning.
+pub fn item_tokens(item: &Value, tokenizer: &dyn Tokenizer) -> Option<u64> {
+    let text = item_text(item)?;
+    Some(tokenizer.count(&text) as u64 + images(item) as u64 * IMAGE_TOKENS)
 }
 
 #[cfg(test)]
@@ -128,5 +142,20 @@ mod tests {
         assert_eq!(item_text(&patched).unwrap(), "done");
         let reasoning = json!({"type": "reasoning", "encrypted_content": "xyz"});
         assert_eq!(item_text(&reasoning), None);
+    }
+
+    #[test]
+    fn an_image_counts_as_a_fixed_cost_not_its_base64() {
+        let image = crate::tools::Image::new("image/png", &"A".repeat(40_000)).unwrap();
+        let output = crate::tools::function_output("c1", "shot", &[image]);
+        assert_eq!(item_text(&output).unwrap(), "shot\n[image image/png]");
+        assert_eq!(images(&output), 1);
+        let text = ByteEstimate.count("shot\n[image image/png]") as u64;
+        assert_eq!(
+            item_tokens(&output, &ByteEstimate),
+            Some(text + IMAGE_TOKENS)
+        );
+        let plain = json!({"type": "function_call_output", "output": "ok"});
+        assert_eq!(item_tokens(&plain, &ByteEstimate), Some(1));
     }
 }

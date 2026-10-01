@@ -16,7 +16,7 @@ pub mod rules;
 pub mod settings;
 pub mod trust;
 
-use crate::tools::patch;
+use crate::tools::{patch, view_image};
 use rules::Base;
 pub use rules::Rule;
 pub use trust::Trust;
@@ -705,6 +705,11 @@ impl Checker<'_> {
                 Some(path) => self.check_path(tool, Path::new(path), needs_approval),
                 None => Decision::Ask,
             },
+            // The same file in the transcript as a `read`, so `Read` rules decide it.
+            view_image::NAME => match text("path") {
+                Some(path) => self.check_path("read", Path::new(path), needs_approval),
+                None => Decision::Ask,
+            },
             "mcp_call" => match mcp_name(args) {
                 Some(name) => self.check_other(&name, needs_approval),
                 None => Decision::Ask,
@@ -1181,7 +1186,11 @@ mod tests {
     }
 
     fn file(policy: &Policy, tool: &str, path: &str) -> Decision {
-        policy.check(tool, &json!({ "path": path }), tool != "read")
+        policy.check(
+            tool,
+            &json!({ "path": path }),
+            !["read", "view_image"].contains(&tool),
+        )
     }
 
     fn allowed(reason: &str) -> Decision {
@@ -1602,6 +1611,20 @@ mod tests {
                 &ask_mode,
                 "read",
                 "/home/u/repo/k.PEM",
+                Decision::Deny("deny rule Read(*.pem)".to_string()),
+            ),
+            // An image is read into the transcript the same way.
+            (
+                &ask_mode,
+                "view_image",
+                "/home/u/repo/shot.png",
+                allowed(""),
+            ),
+            (&auto, "view_image", "/home/u/repo/.env", Decision::Ask),
+            (
+                &ask_mode,
+                "view_image",
+                "/home/u/repo/k.pem",
                 Decision::Deny("deny rule Read(*.pem)".to_string()),
             ),
         ];

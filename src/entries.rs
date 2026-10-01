@@ -254,9 +254,7 @@ impl Entries {
                     }
                 }
                 Some("function_call_output" | "custom_tool_call_output") => Entry::Output(
-                    item["output"]
-                        .as_str()
-                        .unwrap_or_default()
+                    crate::tools::output_text(&item["output"])
                         .trim_end()
                         .to_string(),
                 ),

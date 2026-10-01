@@ -226,8 +226,7 @@ pub fn call_tokens(
     items: &[Value],
     tokenizer: &dyn Tokenizer,
 ) -> CallTokens {
-    let weight =
-        |item: &Value| tokens::item_text(item).map_or(0, |text| tokenizer.count(&text) as u64);
+    let weight = |item: &Value| tokens::item_tokens(item, tokenizer).unwrap_or_default();
     let start = prev.map_or(0, |p| (p.sent + p.outputs).min(call.sent));
     let new = &history[start..call.sent];
     let weights: Vec<u64> = new.iter().map(weight).collect();
@@ -346,8 +345,8 @@ pub fn build(
             None => format!("#{index} {category}"),
         };
         let mut item = row(label, category, &json_string(entry));
-        match tokens::item_text(entry) {
-            Some(text) => item.tokens = tokenizer.count(&text) as u64,
+        match tokens::item_tokens(entry, tokenizer) {
+            Some(tokens) => item.tokens = tokens,
             None => (item.method, item.tokens) = (Method::Unknown, 0),
         }
         items.push(item);

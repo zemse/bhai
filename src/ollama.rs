@@ -18,6 +18,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::client::{self, Delta, Error, Usage};
+use crate::tools::view_image;
 
 pub const DEFAULT_URL: &str = "http://localhost:11434";
 /// What picks this backend in a model id: `ollama:gemma4:e2b`.
@@ -129,6 +130,9 @@ pub fn tool_defs(tools: &[Value]) -> Vec<Value> {
     tools
         .iter()
         .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        // Tool output reaches Ollama as text only, so a tool whose answer is an image has
+        // nothing to give it.
+        .filter(|tool| tool.get("name").and_then(Value::as_str) != Some(view_image::NAME))
         .map(|tool| {
             let field = |key: &str| tool.get(key).cloned();
             json!({
@@ -668,6 +672,21 @@ mod tests {
             tool_defs(&[custom]).is_empty(),
             "Ollama has no custom tools"
         );
+    }
+
+    #[test]
+    fn an_image_result_goes_over_as_text_and_view_image_is_left_out() {
+        use crate::tools::Tool as _;
+        let image = crate::tools::Image::new("image/png", "iVBORw0K").unwrap();
+        let input = [
+            json!({"type": "function_call", "call_id": "c1", "name": "mcp_call",
+                   "arguments": "{}"}),
+            crate::tools::function_output("c1", "a screenshot", &[image]),
+        ];
+        let out = messages("", &input);
+        assert_eq!(out[1]["content"], "a screenshot\n[image image/png]");
+        let view = crate::tools::view_image::ViewImage.schema();
+        assert!(tool_defs(&[view]).is_empty());
     }
 
     #[test]

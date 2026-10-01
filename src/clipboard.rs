@@ -142,8 +142,8 @@ fn sequence(text: &str, tmux: bool) -> String {
     }
 }
 
-/// Standard base64 with padding, so OSC 52 needs no crate.
-fn base64(bytes: &[u8]) -> String {
+/// Standard base64 with padding, so OSC 52 and images need no crate.
+pub(crate) fn base64(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let mut block = [0u8; 3];

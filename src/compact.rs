@@ -126,8 +126,7 @@ pub fn request(asked: Option<&str>) -> Value {
 pub fn estimate(items: &[Value], tokenizer: &dyn Tokenizer) -> u64 {
     items
         .iter()
-        .filter_map(tokens::item_text)
-        .map(|text| tokenizer.count(&text) as u64)
+        .filter_map(|item| tokens::item_tokens(item, tokenizer))
         .sum()
 }
 
@@ -149,13 +148,20 @@ pub fn evict(history: &mut [Value], excess: u64, tokenizer: &dyn Tokenizer) -> u
         }
         let item = &mut history[index];
         let text = tokens::item_text(item).unwrap_or_default();
-        let placeholder = format!("[output removed to save context: {} bytes]", text.len());
-        let (before, after) = (tokenizer.count(&text), tokenizer.count(&placeholder));
+        let placeholder = match tokens::images(item) {
+            0 => format!("[output removed to save context: {} bytes]", text.len()),
+            n => format!(
+                "[output removed to save context: {} bytes and {n} image(s)]",
+                text.len()
+            ),
+        };
+        let before = tokens::item_tokens(item, tokenizer).unwrap_or_default();
+        let after = tokenizer.count(&placeholder) as u64;
         if text.starts_with("[output removed") || after >= before {
             continue;
         }
         item["output"] = json!(placeholder);
-        freed += (before - after) as u64;
+        freed += before - after;
     }
     freed
 }
@@ -349,6 +355,26 @@ mod tests {
         let mut history = before;
         assert_eq!(evict(&mut history, 1, &ByteEstimate), 89);
         assert_eq!(evict(&mut history, u64::MAX, &ByteEstimate), 3 * 89);
+    }
+
+    #[test]
+    fn an_evicted_image_frees_its_fixed_cost_and_leaves_text() {
+        let image = crate::tools::Image::new("image/png", "iVBORw0K").unwrap();
+        let mut history = vec![
+            call(0),
+            crate::tools::function_output("c0", "shot", &[image]),
+        ];
+        turn(&mut history, "next", KEEP_RESULTS);
+        let before = estimate(&history, &ByteEstimate);
+        assert!(before > crate::tokens::IMAGE_TOKENS);
+
+        let freed = evict(&mut history, 1, &ByteEstimate);
+        assert_eq!(
+            history[1]["output"],
+            "[output removed to save context: 22 bytes and 1 image(s)]"
+        );
+        assert!(freed > crate::tokens::IMAGE_TOKENS - 20, "{freed}");
+        assert_eq!(estimate(&history, &ByteEstimate), before - freed);
     }
 
     #[test]

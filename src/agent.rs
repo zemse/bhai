@@ -1808,6 +1808,7 @@ async fn turn(
                         let search = tools::mcp::search_call(call);
                         let custom = tools::custom_call(call);
                         let run = search.as_ref().or(custom.as_ref()).unwrap_or(call);
+                        let mut images = Vec::new();
                         let (output, ok) = execute(
                             registry,
                             policy,
@@ -1816,17 +1817,16 @@ async fn turn(
                             Some(conversation),
                             &events,
                             cancel,
+                            &mut images,
                         )
                         .await;
                         let _ = events.send(AgentEvent::Item(first + index));
+                        // Only a function call's output may carry images; neither of the
+                        // others ever brings one.
                         let result = match (search, custom) {
                             (Some(_), _) => tools::mcp::search_output(&call_id, &output),
                             (None, Some(_)) => tools::custom_output(&call_id, &output),
-                            (None, None) => json!({
-                                "type": "function_call_output",
-                                "call_id": call_id,
-                                "output": output,
-                            }),
+                            (None, None) => tools::function_output(&call_id, &output, &images),
                         };
                         (result, ok)
                     };
@@ -2770,7 +2770,9 @@ fn final_text(history: &[Value]) -> Option<String> {
     Some(text.join("\n")).filter(|text| !text.trim().is_empty())
 }
 
-/// Returns the tool output and whether it counts as a success.
+/// Returns the tool output and whether it counts as a success; the images it brought in
+/// go to `images`.
+#[allow(clippy::too_many_arguments)]
 async fn execute(
     registry: &Registry,
     policy: &Policy,
@@ -2779,6 +2781,7 @@ async fn execute(
     conversation: Option<tools::Conversation<'_>>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     cancel: &Arc<AtomicBool>,
+    images: &mut Vec<tools::Image>,
 ) -> (String, bool) {
     if cancel.load(Ordering::Relaxed) {
         return (
@@ -2986,14 +2989,17 @@ as-is. Try a different approach, or ask the user."
         cancel,
         conversation,
     };
-    let (output, ok) = tool.execute_live(&args, live).await;
+    let (output, ok, brought) = tool.execute_images(&args, live).await;
     if let Some(judge) = judge {
         judge.note(&format!(
             "{summary} -> {}",
             output.lines().next().unwrap_or_default()
         ));
     }
-    let _ = tx.send(AgentEvent::ToolOutput(output.clone()));
+    let _ = tx.send(AgentEvent::ToolOutput(tools::with_images(
+        &output, &brought,
+    )));
+    *images = brought;
     (output, ok)
 }
 
@@ -3615,6 +3621,78 @@ mod tests {
         let output = history[2]["output"].as_str().unwrap();
         assert!(output.starts_with("Applied: update "), "{output}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\nthree\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_image_a_tool_brings_in_reaches_the_model_and_the_transcript_names_it() {
+        use fake::{Fake, call, say};
+
+        let dir = tools::temp_dir();
+        let shot = dir.join("shot.png");
+        std::fs::write(&shot, b"\x89PNG\r\n\x1a\n").unwrap();
+        let fake = Fake::new(vec![
+            vec![call("view_image", json!({"path": shot}))],
+            vec![say("a red button")],
+        ]);
+        let registry = Registry::new(Vec::new());
+        let schemas = registry.schemas();
+        let policy = Policy::new(
+            Mode::Ask,
+            crate::permissions::Rules::default(),
+            None,
+            dir.clone(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut history = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "look" }],
+        })];
+        let Turn { result, .. } = turn(
+            &fake,
+            &registry,
+            &policy,
+            None,
+            &schemas,
+            "",
+            &mut history,
+            &tx,
+            &Arc::new(AtomicBool::new(false)),
+            &mut Vec::new(),
+            &mut CacheMonitor::default(),
+            None,
+            &mut Sink::Discard,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        let parts = history[2]["output"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(
+            parts[1],
+            json!({"type": "input_image",
+                   "image_url": format!("data:image/png;base64,{}", crate::clipboard::base64(b"\x89PNG\r\n\x1a\n"))})
+        );
+        // The second request carried it.
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let sent = bodies.last().unwrap().1["input"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(sent.iter().any(|i| i["output"] == history[2]["output"]));
+        let mut shown = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::ToolOutput(output) = event {
+                shown.push(output);
+            }
+        }
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].ends_with("\n[image image/png]"), "{}", shown[0]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4480,7 +4558,11 @@ mod tests {
             .iter()
             .partition(|names| !names.contains(&"agent".to_string()));
         assert_eq!(narrowed.len(), 2, "{offered:?}");
-        assert!(narrowed.iter().all(|names| *names == &["bash", "read"]));
+        assert!(
+            narrowed
+                .iter()
+                .all(|names| *names == &["bash", "read", "view_image"])
+        );
         assert_eq!(full.len(), 3, "{offered:?}");
         // The parent can look back at earlier sessions and save a note; a child cannot.
         for name in [
@@ -5339,7 +5421,17 @@ mod tests {
             fake::call("bash", json!({ "command": "rm -rf x" })),
         ];
         for call in &calls {
-            let _ = execute(&registry, &policy, None, call, None, &tx, &cancel.flag()).await;
+            let _ = execute(
+                &registry,
+                &policy,
+                None,
+                call,
+                None,
+                &tx,
+                &cancel.flag(),
+                &mut Vec::new(),
+            )
+            .await;
         }
 
         let lines: Vec<Value> = std::fs::read_to_string(&log)
@@ -5399,6 +5491,7 @@ mod tests {
             None,
             &tx,
             &cancel.flag(),
+            &mut Vec::new(),
         )
         .await;
         assert!(!ok);
@@ -5458,6 +5551,7 @@ mod tests {
             None,
             &tx,
             &cancel.flag(),
+            &mut Vec::new(),
         )
         .await;
         interrupting.await.unwrap();
@@ -5503,6 +5597,7 @@ mod tests {
             None,
             &tx,
             &cancel.flag(),
+            &mut Vec::new(),
         )
         .await;
         answering.await.unwrap();
@@ -5545,6 +5640,7 @@ mod tests {
             None,
             &tx,
             &cancel.flag(),
+            &mut Vec::new(),
         )
         .await;
         let (asked, started) = answering.await.unwrap();
