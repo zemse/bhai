@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `POST /prompt` takes an optional `id`. A retry with an id the server has already accepted, and the same text, gets the first answer back (`{"ok": true}` or the queue position) and submits nothing; the same id with different text is a 409. Failed submits are not remembered, and the ids live in memory for the run of the server.
 - A long approval no longer cuts its command off silently: the box shows `[+N lines hidden]` and scrolls with up/down, j/k, PageUp/PageDown and Home/End. `y`, `a` and `p` (and clicks on them) do nothing until the last line of the command has been on screen; `n`, `r` and esc always answer.
 - `Auth` no longer derives `Debug`: its impl prints the access token as `<redacted>` and keeps the account id, so a `{:?}` of an `Auth` or a struct holding one cannot leak the bearer token.
 - `.config/nextest.toml` defines a `ci` profile for `cargo nextest run --profile ci` that does not stop at the first failure and kills a test still running after five minutes (60s slow-timeout, terminate after 5 periods); CI itself still runs `cargo test`.

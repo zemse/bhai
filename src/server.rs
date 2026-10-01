@@ -1,6 +1,7 @@
 //! A localhost debug server: inspect and drive a running session over HTTP.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::{Request, State};
@@ -9,7 +10,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{self, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -66,6 +67,7 @@ fn router(session: Arc<Session>, token: String) -> Router {
             let token = token.clone();
             async move { local_only(&token, request, next).await }
         }))
+        .layer(Extension(Arc::new(Seen::default())))
         .with_state(session)
 }
 
@@ -116,6 +118,7 @@ fn constant_eq(given: &str, token: &str) -> bool {
 #[derive(Deserialize)]
 struct Prompt {
     text: String,
+    id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -213,28 +216,67 @@ async fn steer(State(session): State<Arc<Session>>, Json(body): Json<Steer>) -> 
     }
 }
 
-async fn prompt(State(session): State<Arc<Session>>, Json(body): Json<Prompt>) -> Response {
+/// Prompts accepted under a client-chosen `id`, with the text and the answer given.
+#[derive(Default)]
+struct Seen(Mutex<HashMap<String, (String, Value)>>);
+
+/// `{"text", "id"?}`. A retry carrying the `id` of an accepted prompt gets the original
+/// answer back and submits nothing; the same `id` with other text is a conflict.
+async fn prompt(
+    State(session): State<Arc<Session>>,
+    Extension(seen): Extension<Arc<Seen>>,
+    Json(body): Json<Prompt>,
+) -> Response {
     let text = body.text.trim().to_string();
     if text.is_empty() {
         return error(StatusCode::BAD_REQUEST, "text is empty");
     }
-    if let Some(rest) = crate::session::compact_then(&text) {
-        if rest.is_empty() {
-            return error(StatusCode::BAD_REQUEST, "/compact-then takes a prompt");
+    let Some(id) = body.id else {
+        return match admit(&session, &text) {
+            Ok(answer) => Json(answer).into_response(),
+            Err((status, message)) => error(status, &message),
+        };
+    };
+    // Held across the submit so two requests with one id cannot both get through.
+    let mut seen = seen.0.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((first, answer)) = seen.get(&id) {
+        if *first != text {
+            return error(
+                StatusCode::CONFLICT,
+                "that id was used for a different prompt",
+            );
         }
-        let prompt = crate::session::Prompt::shown_as(rest.to_string(), text.clone());
+        return Json(answer.clone()).into_response();
+    }
+    match admit(&session, &text) {
+        Ok(answer) => {
+            seen.insert(id, (text, answer.clone()));
+            Json(answer).into_response()
+        }
+        Err((status, message)) => error(status, &message),
+    }
+}
+
+/// Submit `text`, answering `{"ok": true}` or, when it joined the queue, the position too.
+fn admit(session: &Session, text: &str) -> Result<Value, (StatusCode, String)> {
+    if let Some(rest) = crate::session::compact_then(text) {
+        if rest.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "/compact-then takes a prompt".to_string(),
+            ));
+        }
+        let prompt = crate::session::Prompt::shown_as(rest.to_string(), text.to_string());
         return match session.submit_forked(prompt) {
-            Ok(()) => ok(),
-            Err(e) => error(StatusCode::CONFLICT, &e.to_string()),
+            Ok(()) => Ok(json!({ "ok": true })),
+            Err(e) => Err((StatusCode::CONFLICT, e.to_string())),
         };
     }
-    match session.submit(text) {
-        Ok(Submitted::Started) => ok(),
-        Ok(Submitted::Queued { position }) => {
-            Json(json!({ "ok": true, "queued": position })).into_response()
-        }
+    match session.submit(text.to_string()) {
+        Ok(Submitted::Started) => Ok(json!({ "ok": true })),
+        Ok(Submitted::Queued { position }) => Ok(json!({ "ok": true, "queued": position })),
         // A busy session queues instead of refusing, so the agent is gone.
-        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+        Err(e) => Err((StatusCode::SERVICE_UNAVAILABLE, e.to_string())),
     }
 }
 
@@ -535,9 +577,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(empty.status(), StatusCode::CONFLICT);
+        let go = |text: &str| {
+            http.post(format!("{base}/prompt"))
+                .header(TOKEN_HEADER, TOKEN)
+                .json(&json!({"text": text, "id": "r1"}))
+                .send()
+        };
+        assert_eq!(go("go").await.unwrap().status().as_u16(), 200);
+        // A retry with the same id is answered again and starts nothing.
+        let retry = go("go").await.unwrap();
+        assert_eq!(retry.status().as_u16(), 200);
+        assert_eq!(retry.json::<Value>().await.unwrap(), json!({"ok": true}));
+        assert_eq!(go("other").await.unwrap().status().as_u16(), 409);
         assert_eq!(
-            post(&http, format!("{base}/prompt"), json!({"text": "go"})).await,
-            StatusCode::OK
+            get_json(&http, format!("{base}/state")).await["queued"],
+            json!([])
         );
         // A second prompt joins the queue instead of being refused.
         assert_eq!(
