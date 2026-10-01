@@ -975,6 +975,37 @@ impl Session {
         Ok(())
     }
 
+    /// `/btw`: one call on the history with `question` after it, the answer shown and
+    /// neither kept. Refused while a turn runs, which holds the history it would read.
+    pub fn btw(&self, question: &str) -> Result<(), SubmitError> {
+        let mut inner = self.lock();
+        if inner.working {
+            return Err(SubmitError::Busy);
+        }
+        self.cancel.clear();
+        self.tx_control
+            .try_send(Control::Btw(question.to_string()))
+            .map_err(|_| SubmitError::Closed)?;
+        inner.start();
+        self.publish(Event::Info(format!(
+            "btw, not kept in the conversation: {question}"
+        )));
+        Ok(())
+    }
+
+    /// `/fork`: copy the conversation into a new session file, which the agent names in
+    /// the transcript. Refused while a turn runs, since its history is half written.
+    pub fn fork_session(&self) -> Result<(), SubmitError> {
+        let inner = self.lock();
+        if inner.working {
+            return Err(SubmitError::Busy);
+        }
+        self.tx_control
+            .try_send(Control::ForkSession)
+            .map_err(|_| SubmitError::Closed)?;
+        Ok(())
+    }
+
     /// Drop the conversation: the agent's history and the transcript that showed it.
     /// Refused while a turn runs, since the turn holds the history it would drop.
     pub fn clear(&self) -> Result<(), SubmitError> {
@@ -1444,6 +1475,12 @@ fn said(event: AgentEvent) -> Option<Event> {
 /// the full history: whatever follows `/compact-then`.
 pub fn compact_then(text: &str) -> Option<&str> {
     let rest = text.trim_start().strip_prefix("/compact-then")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
+/// The question of a `/btw` message: whatever follows it.
+pub fn btw(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix("/btw")?;
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
@@ -2415,6 +2452,25 @@ mod tests {
         );
         session.on_agent(AgentEvent::Fork(None));
         assert_eq!(session.fork(), None);
+    }
+
+    #[test]
+    fn btw_takes_the_question_after_it_and_runs_only_between_turns() {
+        assert_eq!(btw("/btw why?"), Some("why?"));
+        assert_eq!(btw("/btw"), Some(""));
+        assert_eq!(btw("/btwx"), None);
+        assert_eq!(btw("so /btw"), None);
+
+        let (session, mut control) = on("gpt-5.5");
+        session.btw("why?").unwrap();
+        assert!(matches!(control.try_recv(), Ok(Control::Btw(q)) if q == "why?"));
+        assert!(session.state().working, "the call holds the session");
+        assert_eq!(session.btw("and?"), Err(SubmitError::Busy));
+        assert_eq!(session.fork_session(), Err(SubmitError::Busy));
+        session.on_agent(AgentEvent::TurnEnd);
+        assert!(!session.state().working);
+        session.fork_session().unwrap();
+        assert!(matches!(control.try_recv(), Ok(Control::ForkSession)));
     }
 
     #[test]

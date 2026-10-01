@@ -217,6 +217,11 @@ pub enum Control {
     /// Run a turn again on the history as it stands, after one failed. Nothing is added
     /// to the history, so the call goes out as the failed one did.
     Retry,
+    /// Answer this side question from the history as it stands, for `/btw`, keeping
+    /// neither the question nor the answer.
+    Btw(String),
+    /// Copy the history into a new session file, for `/fork`.
+    ForkSession,
     /// Run a workflow now, as a turn of its own. Only the user starts one.
     Workflow {
         workflow: Arc<Workflow>,
@@ -931,6 +936,17 @@ pub(crate) async fn run_with(
                     }
                     Control::Retry => Next::Retry,
                     Control::Forked(message) => Next::Forked(message),
+                    // Nothing joins the history, so the compacted copy still stands for it.
+                    Control::Btw(question) => {
+                        btw(model.as_ref(), &prompt.text, &tools, &history, &question, &tx, &cancel)
+                            .await;
+                        let _ = tx.send(AgentEvent::TurnEnd);
+                        continue;
+                    }
+                    Control::ForkSession => {
+                        fork_session(writer.as_ref(), &history, &plan, &tx);
+                        continue;
+                    }
                 }
             }
             message = rx_user.recv() => match message {
@@ -1202,7 +1218,10 @@ pub(crate) async fn run_with(
                                     .to_string(),
                             ));
                         }
-                        Control::Retry | Control::Forked(_) => {
+                        Control::Retry
+                        | Control::Forked(_)
+                        | Control::Btw(_)
+                        | Control::ForkSession => {
                             let _ = tx.send(AgentEvent::Error(
                                 "a turn is already running".to_string(),
                             ));
@@ -2205,6 +2224,100 @@ impl Compaction<'_> {
             freed: read.saturating_sub(after),
         });
     }
+}
+
+/// What `/btw` adds after the history: the question, framed so the model answers from
+/// what it already has rather than going off to work.
+fn btw_request(question: &str) -> Value {
+    compact::user_message(&format!(
+        "A side question while the work is paused. Answer it briefly from what this conversation already holds, and call no tools. Neither the question nor the answer is kept in the conversation.\n\n{question}"
+    ))
+}
+
+/// One call on `history` with a side question after it, the answer streamed to the
+/// transcript and kept nowhere. The request extends the conversation's last one, so it
+/// reads the cached prefix under the same key; the cache guard is put back on the
+/// history after, which the next turn extends rather than this call.
+async fn btw(
+    model: &dyn Model,
+    instructions: &str,
+    tools: &[Value],
+    history: &[Value],
+    question: &str,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+    cancel: &Arc<AtomicBool>,
+) {
+    let mut input = history.to_vec();
+    input.push(btw_request(question));
+    let mut on_delta = |delta: Delta| match delta {
+        Delta::Reasoning(s) => {
+            let _ = tx.send(AgentEvent::Reasoning(s));
+        }
+        Delta::Text(s) => {
+            let _ = tx.send(AgentEvent::Text(s));
+        }
+        Delta::Usage(usage) => {
+            let _ = tx.send(AgentEvent::Usage(usage));
+        }
+        Delta::RateLimits(limits) => {
+            let _ = tx.send(AgentEvent::RateLimits(limits));
+        }
+        _ => {}
+    };
+    let _ = tx.send(AgentEvent::Sending(prompt_tokens(
+        model.name(),
+        instructions,
+        tools,
+        &input,
+    )));
+    let _ = tx.send(AgentEvent::Streaming(true));
+    let answer = model
+        .respond(instructions, tools, &input, &mut on_delta, cancel)
+        .await;
+    let _ = tx.send(AgentEvent::Streaming(false));
+    match answer {
+        Ok(items) if final_text(&items).is_none_or(|text| text.trim().is_empty()) => {
+            let reached = items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
+            let _ = tx.send(AgentEvent::Info(match reached {
+                true => "btw: the model reached for a tool rather than answering; ask it as a prompt to let it work".to_string(),
+                false => "btw: the model wrote no answer".to_string(),
+            }));
+        }
+        Ok(_) => {}
+        Err(_) if cancel.load(Ordering::Relaxed) => {}
+        Err(e) => {
+            let _ = tx.send(AgentEvent::Error(format!("btw: {e:#}")));
+        }
+    }
+    model.seed(instructions, tools, history);
+}
+
+/// `/fork`: the history, and the plan, copied into a new session file that
+/// `--resume` opens, while this session carries on in its own.
+fn fork_session(
+    writer: Option<&Writer>,
+    history: &[Value],
+    plan: &crate::plan::Shared,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    let event = match writer {
+        None => {
+            AgentEvent::Error("this session is not saved, so there is no file to fork".to_string())
+        }
+        Some(_) if history.is_empty() => {
+            AgentEvent::Error("nothing to fork: the conversation has not started".to_string())
+        }
+        Some(writer) => match writer.fork(history, lock_plan(plan).as_ref()) {
+            Ok(id) => AgentEvent::Info(format!(
+                "forked into session {id} ({} items), which carries on from here: bhai --resume {id}",
+                history.len()
+            )),
+            Err(e) => AgentEvent::Error(format!("fork: {e:#}")),
+        },
+    };
+    let _ = tx.send(event);
 }
 
 /// Write `items` to the sink.
@@ -7095,6 +7208,151 @@ mod tests {
         assert_eq!(input[5]["content"][0]["text"], "again");
         let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
         assert_eq!(&loaded.items[..6], &input[..6]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn btw_answers_from_the_history_and_leaves_it_and_its_cache_as_they_were() {
+        use fake::{Fake, call, say};
+
+        let fake = Fake::new(vec![
+            vec![say("one")],
+            vec![say("it was one")],
+            vec![call("bash", json!({"command": "ls"}))],
+            vec![say("two")],
+        ]);
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        tx_control
+            .send(Control::Btw("what was it?".to_string()))
+            .await
+            .unwrap();
+        let events = settle(&mut rx).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Item(_) | AgentEvent::Error(_))),
+            "{events:?}"
+        );
+        // An answer that is a tool call runs nothing and says why there is no answer.
+        tx_control
+            .send(Control::Btw("and now?".to_string()))
+            .await
+            .unwrap();
+        let events = settle(&mut rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Info(t) if t.contains("reached for a tool"))),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStart { .. }))
+        );
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        let input = |n: usize| bodies[n].1["input"].as_array().unwrap().clone();
+        let (first, aside, next) = (input(0), input(1), input(3));
+        // The side question extends the conversation's last request under its key.
+        assert_eq!(
+            bodies[1].1["prompt_cache_key"],
+            bodies[0].1["prompt_cache_key"]
+        );
+        assert_eq!(&aside[..first.len()], &first[..]);
+        assert_eq!(aside[first.len()], say("one"));
+        let asked = aside.last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(asked.ends_with("what was it?"), "{asked}");
+        // The next turn reads the history as it was, so neither question is in it.
+        assert_eq!(&next[..=first.len()], &aside[..=first.len()]);
+        assert_eq!(next.last().unwrap()["content"][0]["text"], "second");
+        assert!(!next.iter().any(|i| i.to_string().contains("what was it?")));
+        assert!(!next.iter().any(|i| i.to_string().contains("it was one")));
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn fork_copies_the_history_into_a_session_that_resumes_on_the_same_cache_key() {
+        use fake::{Fake, say};
+
+        let dir = tools::temp_dir();
+        let fake = Fake::new(vec![vec![say("one")]]);
+        let cancel = Arc::new(Cancel::default());
+        let saved = Saved {
+            writer: Writer::create(
+                &dir,
+                sessions::Header::new("sess", "general", "fake", "medium", &dir),
+            ),
+            history: Vec::new(),
+        };
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            Some(saved),
+            Limits::default(),
+        ));
+        tx_control.send(Control::ForkSession).await.unwrap();
+        assert!(
+            matches!(rx.recv().await, Some(AgentEvent::Error(e)) if e.starts_with("nothing to fork")),
+        );
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        tx_control.send(Control::ForkSession).await.unwrap();
+        let Some(AgentEvent::Info(said)) = rx.recv().await else {
+            panic!("no notice");
+        };
+        let id = said
+            .strip_prefix("forked into session ")
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap();
+        assert!(said.ends_with(&format!("bhai --resume {id}")), "{said}");
+
+        let parent = sessions::load(&sessions::path(&dir, "sess")).unwrap();
+        let fork = sessions::load(&sessions::path(&dir, id)).unwrap();
+        assert_eq!(fork.items, parent.items);
+        assert_eq!(fork.header.session, id);
+        assert_eq!(fork.header.cache_key.as_deref(), Some("sess"));
+        assert_eq!(fork.header.prefix, parent.header.prefix);
+        // The fork is a file of its own: resuming it takes its lock, not the parent's.
+        let writer = Writer::resume(&dir, &fork).unwrap();
+        assert_eq!(writer.cache_key(), "sess");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

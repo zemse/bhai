@@ -479,6 +479,15 @@ impl Client {
         self
     }
 
+    /// Send under this prompt cache key rather than the session id, for a session
+    /// `/fork` copied from another. Call after `with_session`, which sets the key too.
+    pub fn with_cache_key(mut self, key: Option<&str>) -> Self {
+        if let Some(key) = key {
+            self.cache_key = key.to_string();
+        }
+        self
+    }
+
     /// Take `input` as already sent with these instructions and tools.
     pub fn seed(&self, instructions: &str, tools: &[Value], input: &[Value]) {
         if self.provider() != Provider::Codex {
@@ -1365,6 +1374,18 @@ mod tests {
         assert_eq!(metadata_turn_state(&event), Some("sticky"));
         let without = json!({ "type": "response.metadata", "headers": { "x-other": "no" } });
         assert_eq!(metadata_turn_state(&without), None);
+    }
+
+    #[test]
+    fn a_forked_session_keeps_the_cache_key_it_was_copied_with() {
+        let client = Client::new(&Choice::default()).unwrap();
+        let resumed = client.clone().with_session("fork").with_cache_key(None);
+        assert_eq!(resumed.cache_key, "fork");
+        let forked = client.with_session("fork").with_cache_key(Some("parent"));
+        assert_eq!(
+            (forked.session_id(), forked.cache_key.as_str()),
+            ("fork", "parent")
+        );
     }
 
     #[test]

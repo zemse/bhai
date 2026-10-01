@@ -44,6 +44,16 @@ pub const COMMANDS: &[Command] = &[
         help: "drop the conversation and start over",
     },
     Command {
+        name: "btw",
+        args: " <question>",
+        help: "ask about the conversation without adding to it",
+    },
+    Command {
+        name: "fork",
+        args: "",
+        help: "copy the conversation into a new session to resume elsewhere",
+    },
+    Command {
         name: "context",
         args: "",
         help: "write the context to .bhai/debug",

@@ -70,6 +70,10 @@ pub struct Header {
     /// Fingerprint of the model, instructions and tools; see [`prefix`].
     #[serde(default)]
     pub prefix: String,
+    /// The prompt cache key, when it is not the session id: a `/fork` keeps the one it
+    /// was copied from, so its first call reads the cached prefix they share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
 }
 
 impl Header {
@@ -83,6 +87,7 @@ impl Header {
             created: Local::now(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             prefix: String::new(),
+            cache_key: None,
         }
     }
 }
@@ -218,6 +223,44 @@ impl Writer {
             "after": after,
             "items": items,
         }))
+    }
+
+    /// Copy `items` and `plan` into a new session file beside this one, on the same
+    /// model and prompt cache key, and return its id. A child transcript an item points
+    /// at stays this session's.
+    pub fn fork(&self, items: &[Value], plan: Option<&crate::plan::Plan>) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut header = Header::new(
+            &id,
+            &self.header.identity,
+            &self.header.model,
+            &self.header.effort,
+            &self.header.cwd,
+        );
+        header.prefix = self.header.prefix.clone();
+        header.cache_key = Some(self.cache_key().to_string());
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let mut fork = Writer::create(dir, header);
+        for item in items {
+            let mut record = json!({ "type": "item", "item": item });
+            if let Some(sidechain) = self.sidechain(item) {
+                record["sidechain"] = json!(sidechain);
+            }
+            fork.write(record)?;
+        }
+        if let Some(plan) = plan {
+            fork.plan(&Some(plan.clone()))?;
+        }
+        fork.sync()?;
+        Ok(id)
+    }
+
+    /// The prompt cache key this session's calls go out under.
+    pub fn cache_key(&self) -> &str {
+        self.header
+            .cache_key
+            .as_deref()
+            .unwrap_or(&self.header.session)
     }
 
     /// Push what was appended to disk, which `flush` does not: it only reaches the OS,

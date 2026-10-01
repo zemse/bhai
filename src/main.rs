@@ -251,7 +251,8 @@ async fn main() -> Result<()> {
     if let Some(loaded) = &resumed {
         client = client
             .with_overrides(Some(loaded.model.clone()), Some(loaded.effort.clone()))
-            .with_session(&loaded.header.session);
+            .with_session(&loaded.header.session)
+            .with_cache_key(loaded.header.cache_key.as_deref());
     }
     // On a model that takes effort updates, the history's last one is the effort in
     // force, and `--effort` becomes the next one rather than a new request effort.

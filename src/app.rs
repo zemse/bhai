@@ -1467,6 +1467,24 @@ impl App {
             self.clear();
             return;
         }
+        if let Some(question) = crate::session::btw(&message) {
+            self.follow = true;
+            let result = match question.is_empty() {
+                true => Err("/btw <question>: ask something about the conversation".to_string()),
+                false => self.session.btw(question).map_err(|e| e.to_string()),
+            };
+            if let Err(e) = result {
+                self.note(Entry::Error(e));
+            }
+            return;
+        }
+        if message == "/fork" {
+            self.follow = true;
+            if let Err(e) = self.session.fork_session() {
+                self.note(Entry::Error(e.to_string()));
+            }
+            return;
+        }
         // Before `/compact`, which it starts with.
         if let Some(rest) = crate::session::compact_then(&message) {
             self.follow = true;

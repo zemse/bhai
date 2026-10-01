@@ -352,6 +352,21 @@ fn admit(session: &Session, text: &str) -> Result<Value, (StatusCode, String)> {
             Err(e) => Err((StatusCode::CONFLICT, e.to_string())),
         };
     }
+    if let Some(question) = crate::session::btw(text) {
+        if question.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "/btw takes a question".to_string()));
+        }
+        return match session.btw(question) {
+            Ok(()) => Ok(json!({ "ok": true })),
+            Err(e) => Err((StatusCode::CONFLICT, e.to_string())),
+        };
+    }
+    if text.trim() == "/fork" {
+        return match session.fork_session() {
+            Ok(()) => Ok(json!({ "ok": true })),
+            Err(e) => Err((StatusCode::CONFLICT, e.to_string())),
+        };
+    }
     match session.submit(text.to_string()) {
         Ok(Submitted::Started) => Ok(json!({ "ok": true })),
         Ok(Submitted::Queued { position }) => Ok(json!({ "ok": true, "queued": position })),
