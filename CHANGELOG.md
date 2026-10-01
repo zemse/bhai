@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `bhai exec <prompt>` runs one prompt through the same session as the TUI with no terminal and no port, on an unattended policy so a call the rules leave at Ask is refused (pass `--mode auto` to let tools run). It prints the model's text on stdout, or with `--json` every `session::Event` as one JSON line (the shape of `/events`), and exits 1 when the turn fails or is interrupted. `-` as the prompt reads it from stdin.
 - ctrl+c with text in the prompt clears it instead of quitting, and ctrl+z puts it back; on an empty prompt the first ctrl+c says "press again to quit" and a second within a second quits. ctrl+d on an empty prompt asks the same way while a turn or a child agent is running.
 - `permissions.jsonl`, `judge.jsonl` and the `BHAI_DEBUG_SSE` file are created 0600, and the first two's `debug` directory 0700, through the same `private_*` helpers as the other logs; they used to land 0644 under the default umask.
 - `POST /prompt` takes an optional `id`. A retry with an id the server has already accepted, and the same text, gets the first answer back (`{"ok": true}` or the queue position) and submits nothing; the same id with different text is a 409. Failed submits are not remembered, and the ids live in memory for the run of the server.

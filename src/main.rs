@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [usage] [sessions [prune [n]]] [mcp approve <server>] [--probe [prompt]] [--cache-check [minutes]] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [usage] [sessions [prune [n]]] [mcp approve <server>] [--probe [prompt]] [--cache-check [minutes]] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [exec <prompt|-> [--json]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
@@ -207,10 +207,10 @@ async fn main() -> Result<()> {
         choice,
         statusline,
     } = load(args.flags, &name).await?;
-    // `--workflow` answers every approval but the workflow's own with no, so a call the
-    // rules leave at `Ask` is refused for good. The agent is told that rather than told
-    // to ask someone who is not there.
-    let policy = match args.workflow.is_some() {
+    // `--workflow` and `exec` answer every approval but the workflow's own with no, so a
+    // call the rules leave at `Ask` is refused for good. The agent is told that rather
+    // than told to ask someone who is not there.
+    let policy = match args.workflow.is_some() || args.exec.is_some() {
         true => policy.unattended(),
         false => policy,
     };
@@ -309,7 +309,7 @@ async fn main() -> Result<()> {
     // project. Until it is answered the session is in `ask`, whatever the config asked
     // for, since `auto` and `bypass` run code the project supplies.
     let held_back = policy.mode() != policy.wanted();
-    let interactive = !args.headless && args.workflow.is_none();
+    let interactive = !args.headless && args.workflow.is_none() && args.exec.is_none();
     let trust_gate = (held_back && interactive).then(|| app::TrustGate {
         root: cwd.display().to_string(),
         rules: policy.repo_rules(),
@@ -367,8 +367,8 @@ allow it.",
         policy,
         judge,
         // Only the terminal shows a title, so a run with no terminal does not pay for
-        // one: `--headless` and `--workflow` both end without ever drawing a frame.
-        titled && !args.headless && args.workflow.is_none(),
+        // one: `--headless`, `--workflow` and `exec` all end without ever drawing a frame.
+        titled && interactive,
         usage_log,
         delegation,
         saved,
@@ -385,6 +385,18 @@ allow it.",
         };
         shutdown(hub).await;
         return result;
+    }
+    // `exec` is one prompt, run to the end of its turn with the events on stdout.
+    if let Some(prompt) = args.exec.clone() {
+        for notice in &notices {
+            eprintln!("bhai: {notice}");
+        }
+        let result = headless_exec(&session, prompt, args.json).await;
+        shutdown(hub).await;
+        if !result? {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
@@ -517,6 +529,10 @@ struct Args {
     workflow: Option<(String, String)>,
     /// Answer the workflow confirmation with yes; without it the plan is only printed.
     workflow_yes: bool,
+    /// `exec <prompt>`: run one prompt without the TUI; `-` reads it from stdin.
+    exec: Option<String>,
+    /// `--json`: print `exec`'s events as JSON lines instead of text.
+    json: bool,
     flags: Flags,
 }
 
@@ -654,8 +670,15 @@ fn identities() -> Result<()> {
 fn parse_args(args: &[String]) -> Result<Args> {
     let mut parsed = Args::default();
     let mut args = args.iter().peekable();
+    if args.next_if(|a| *a == "exec").is_some() {
+        let prompt = args
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("exec needs a prompt, or - to read it from stdin"))?;
+        parsed.exec = Some(prompt.clone());
+    }
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--json" => parsed.json = true,
             "--serve" => {
                 let port = args.next_if(|a| !a.starts_with("--"));
                 parsed.serve = Some(match port {
@@ -715,6 +738,14 @@ fn parse_args(args: &[String]) -> Result<Args> {
     }
     if parsed.workflow.is_some() && (parsed.serve.is_some() || parsed.headless) {
         bail!("--workflow runs on its own, so it takes no --serve or --headless");
+    }
+    if parsed.exec.is_some()
+        && (parsed.serve.is_some() || parsed.headless || parsed.workflow.is_some())
+    {
+        bail!("exec runs on its own, so it takes no --serve, --headless or --workflow");
+    }
+    if parsed.json && parsed.exec.is_none() {
+        bail!("--json is for exec");
     }
     if parsed.resume.is_some() && parsed.identity.is_some() {
         bail!("--resume keeps the session's identity, so it takes no --as");
@@ -885,6 +916,90 @@ async fn headless_workflow(
         }
     }
     Ok(())
+}
+
+/// What `exec` makes of the events of its one turn.
+#[derive(Default)]
+struct ExecRun {
+    failed: bool,
+}
+
+impl ExecRun {
+    /// Print one event, as a JSON line or as text, and say whether the turn is over. Text
+    /// mode puts the model's words on stdout and everything else on stderr.
+    fn event(
+        &mut self,
+        event: &session::Event,
+        json: bool,
+        out: &mut impl std::io::Write,
+        err: &mut impl std::io::Write,
+    ) -> std::io::Result<bool> {
+        use session::Event;
+        if matches!(event, Event::TurnFailed(_) | Event::Interrupted) {
+            self.failed = true;
+        }
+        if json {
+            if let Ok(line) = serde_json::to_string(event) {
+                writeln!(out, "{line}")?;
+            }
+        } else {
+            match event {
+                Event::Text(delta) => write!(out, "{delta}")?,
+                Event::ToolStart { summary, .. } => writeln!(err, "$ {summary}")?,
+                Event::ToolRejected {
+                    summary, reason, ..
+                } => writeln!(err, "[rejected] {summary} {reason}")?,
+                Event::Info(message) => writeln!(err, "{message}")?,
+                Event::Error(message) | Event::TurnFailed(message) => {
+                    writeln!(err, "[error] {message}")?
+                }
+                Event::Interrupted => writeln!(err, "[interrupted]")?,
+                Event::TurnEnd => writeln!(out)?,
+                _ => {}
+            }
+        }
+        out.flush()?;
+        Ok(matches!(event, Event::TurnEnd))
+    }
+}
+
+/// Run one prompt to the end of its turn without the TUI. Returns `false` when the turn
+/// failed or was interrupted, which is the exit status. The policy is unattended, so an
+/// approval is not expected; one that arrives anyway is rejected.
+async fn headless_exec(session: &Arc<Session>, prompt: String, json: bool) -> Result<bool> {
+    let prompt = match prompt.as_str() {
+        "-" => std::io::read_to_string(std::io::stdin()).context("could not read stdin")?,
+        _ => prompt,
+    };
+    let mut events = session.subscribe();
+    session.submit(prompt).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut run = ExecRun::default();
+    loop {
+        let event = match events.recv().await {
+            Ok(event) => event,
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                eprintln!("bhai: missed {missed} events");
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                run.failed = true;
+                break;
+            }
+        };
+        if let session::Event::Approval { id, .. } = &event {
+            session.answer(permissions::Answer::Reject, Some(*id));
+        }
+        let over = run.event(
+            &event,
+            json,
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+        )?;
+        if over {
+            break;
+        }
+    }
+    Ok(!run.failed)
 }
 
 /// Drive the real agent loop without the TUI, rejecting every command. Checks auth,
@@ -1455,6 +1570,86 @@ mod tests {
             ..short
         };
         assert!(cache_check_prefix(&long, &tools).is_empty());
+    }
+
+    fn parsed(args: &[&str]) -> Result<Args> {
+        parse_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn exec_flags() {
+        let a = parsed(&["exec", "fix it", "--json", "--mode", "auto"]).unwrap();
+        assert_eq!(a.exec.as_deref(), Some("fix it"));
+        assert!(a.json);
+        assert_eq!(parsed(&["exec", "-"]).unwrap().exec.as_deref(), Some("-"));
+        assert!(parsed(&["exec"]).is_err());
+        assert!(parsed(&["--json"]).is_err());
+        assert!(parsed(&["exec", "x", "--serve", "--headless"]).is_err());
+        assert!(parsed(&["exec", "x", "--workflow", "w"]).is_err());
+    }
+
+    fn exec_run(events: &[session::Event], json: bool) -> (bool, String, String, bool) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut run = ExecRun::default();
+        let mut over = false;
+        for event in events {
+            over = run.event(event, json, &mut out, &mut err).unwrap();
+            if over {
+                break;
+            }
+        }
+        (
+            run.failed,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            over,
+        )
+    }
+
+    #[test]
+    fn exec_json_is_one_event_per_line_and_ends_at_the_turn() {
+        use session::Event;
+        let (failed, out, _, over) = exec_run(
+            &[
+                Event::Text("hi".to_string()),
+                Event::TurnEnd,
+                Event::Text("never".to_string()),
+            ],
+            true,
+        );
+        assert!(!failed && over);
+        assert_eq!(
+            out,
+            "{\"type\":\"text\",\"data\":\"hi\"}\n{\"type\":\"turn_end\"}\n"
+        );
+    }
+
+    #[test]
+    fn exec_text_keeps_stdout_to_the_answer() {
+        use session::Event;
+        let (failed, out, err, _) = exec_run(
+            &[
+                Event::ToolStart {
+                    tool: "bash".to_string(),
+                    summary: "ls".to_string(),
+                },
+                Event::Text("done".to_string()),
+                Event::TurnEnd,
+            ],
+            false,
+        );
+        assert!(!failed);
+        assert_eq!(out, "done\n");
+        assert_eq!(err, "$ ls\n");
+    }
+
+    #[test]
+    fn exec_fails_on_a_failed_or_interrupted_turn_but_not_a_notice() {
+        use session::Event;
+        let fails = |event| exec_run(&[event, Event::TurnEnd], true).0;
+        assert!(fails(Event::TurnFailed("401".to_string())));
+        assert!(fails(Event::Interrupted));
+        assert!(!fails(Event::Error("usage log: disk full".to_string())));
     }
 
     #[test]
