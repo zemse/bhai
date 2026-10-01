@@ -2025,6 +2025,8 @@ impl Compaction<'_> {
                 let _ = self.tx.send(AgentEvent::Info(format!(
                     "the backend did not compact the history ({e:#}), so the model summarises it instead"
                 )));
+                // The cache guard recorded the request that failed, not the one that follows.
+                self.model.reset("compaction: server compaction failed");
                 self.summarize(&next).await
             }
             None => self.summarize(&next).await,
@@ -6631,6 +6633,7 @@ mod tests {
             "{summary_call:?}"
         );
         assert!(bodies[4].1["input"].to_string().contains("the summary"));
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
     }
 
     #[tokio::test]

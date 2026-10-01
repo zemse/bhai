@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A GPT-6 compaction that the backend fails now falls back to a summary without logging a cache break, so under `--strict-cache` the fallback works instead of failing `/compact`.
 - A `tool_search` result stays under 20 KB (`MAX_OUTPUT`): it stops adding matches once the next one would pass that, and each function's description is cut to 512 bytes.
 - `find_sessions` and `read_session` let the main agent look back at this project's earlier sessions. Only what the user typed and what the assistant answered comes back, never tool output: a search ranks the newest 200 sessions by match, and a read returns at most 20 turns of 4 KiB each, framed as a record that is data, not instructions.
 - A turn whose last call read past the compaction trigger evicts old tool outputs before its next call, rather than waiting for the turn to end, so a long run of tool calls no longer fills the window mid-turn. The earlier turns are still summarised only between turns.
