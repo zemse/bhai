@@ -162,7 +162,7 @@ impl Entries {
             Event::TurnFailed(message) => self.push(Entry::Failed(message.clone())),
             Event::Interrupted => self.push(Entry::Info("interrupted".to_string())),
             Event::Done { seconds, at, verb } => self.push(Entry::Done(format!(
-                "{} {verb} \u{b7} {at} pe ho gaya",
+                "{} {verb} \u{b7} {at} khatam",
                 took(*seconds)
             ))),
             _ => {}
@@ -451,28 +451,11 @@ enum Stream {
 }
 
 /// What a finished turn is said to have done, one picked at random each time. It reads
-/// after the duration, as in `9m 54s jugaad kiya`.
+/// after the duration, as in `9m 54s chabaya`.
 pub const VERBS: &[&str] = &[
-    "jugaad kiya",
-    "dimaag lagaya",
-    "mehnat ki",
-    "setting ki",
-    "ghisai ki",
-    "kaarigari ki",
-    "hisaab lagaya",
-    "tadka lagaya",
-    "masala milaya",
-    "khichdi pakayi",
-    "chai pe socha",
-    "kaam nipataya",
-    "pasina bahaya",
-    "jhol suljhaya",
-    "gutthi suljhayi",
-    "pench kase",
-    "dhaaga piroya",
-    "thok-peet ki",
-    "jaadu chalaya",
-    "dhamaal machaya",
+    "chabaya", "pakaya", "pachaya", "ghisa", "ragda", "ghota", "peesa", "nichoda", "khoda",
+    "thoka", "ubala", "bhuna", "chhana", "maanja", "suljhaya", "joda", "bunaa", "tala", "kheecha",
+    "ghumaya",
 ];
 
 /// A word from `VERBS`, at random.
@@ -526,10 +509,10 @@ mod tests {
         entries.apply(&Event::Done {
             seconds: 594,
             at: "12:58 PM".to_string(),
-            verb: "jugaad kiya".to_string(),
+            verb: "chabaya".to_string(),
         });
         assert!(matches!(&entries.list[..],
-            [Entry::Done(t)] if t == "9m 54s jugaad kiya \u{b7} 12:58 PM pe ho gaya"));
+            [Entry::Done(t)] if t == "9m 54s chabaya \u{b7} 12:58 PM khatam"));
     }
 
     #[test]
