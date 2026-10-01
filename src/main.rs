@@ -804,6 +804,16 @@ fn start(
         });
     }
     let watch = tx_agent.clone();
+    // What is typed while a turn runs reaches it between steps. Weak, so the loop does
+    // not keep the session, and with it the loop's own channels, alive.
+    let inbox: agent::Inbox = {
+        let session = Arc::downgrade(&session);
+        Arc::new(move || {
+            session
+                .upgrade()
+                .map_or_else(Vec::new, |session| session.take_queued())
+        })
+    };
     let loop_task = tokio::spawn(agent::run(
         client,
         prompt,
@@ -811,6 +821,7 @@ fn start(
         judge,
         namer,
         rx_user,
+        Some(inbox),
         rx_control,
         tx_agent,
         cancel,
@@ -897,6 +908,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
         None,
         None,
         rx_user,
+        None,
         rx_control,
         tx_agent,
         Arc::clone(&cancel),
@@ -968,6 +980,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             }
             AgentEvent::Judging(Some(call)) => println!("[judging] {call}"),
             AgentEvent::Resumed(what) => println!("\n[resumed] {what}"),
+            AgentEvent::Steered(text) => println!("\n[user] {text}"),
             AgentEvent::Titled(name) => println!("[title] {name}"),
             // A probe prints what the model says, and the prompt behind it is a tui
             // readout: the size is already in the usage it prints when the call ends.

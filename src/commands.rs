@@ -263,6 +263,7 @@ pub fn help() -> String {
         "\n  enter send · alt+enter or ctrl+j newline · shift+tab permission mode",
         "\n  ctrl+c interrupt, then quit · ctrl+d quit on an empty prompt",
         "\n  up and down walk the prompt history · tab takes the grey completion",
+        "\n  up on an empty prompt takes the queued messages back to edit",
         "\n  wheel, pgup/pgdn or ctrl+up/down scroll · click a tool output to expand it",
         "\n  drag selects, past the edge to keep going · ctrl+a takes the whole transcript",
         "\n  ctrl+y copies · ctrl+v pastes · ctrl+t shows every badge",

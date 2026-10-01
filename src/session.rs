@@ -40,6 +40,8 @@ pub enum Event {
         position: usize,
         text: String,
     },
+    /// The front of the queue joined the running turn's history, between its steps.
+    Steered(String),
     Reasoning(String),
     Text(String),
     Approval {
@@ -441,6 +443,22 @@ impl Session {
         dropped
     }
 
+    /// Every prompt waiting, as what is sent and what is shown, for the agent to read
+    /// before its next model call. Nothing is handed over once the turn is interrupted,
+    /// so the queue outlives the interrupt.
+    pub fn take_queued(&self) -> Vec<(String, String)> {
+        let mut inner = self.lock();
+        if self.cancel.stopped() {
+            return Vec::new();
+        }
+        inner.queue.drain(..).map(|p| (p.text, p.shown)).collect()
+    }
+
+    /// Take every waiting prompt back out of the queue, as typed, to be edited.
+    pub fn unqueue(&self) -> Vec<String> {
+        self.lock().queue.drain(..).map(|p| p.shown).collect()
+    }
+
     /// Hand the next queued prompt to the agent, with the state locked. A prompt the
     /// agent will not take keeps its place rather than being lost.
     fn start_queued(&self, inner: &mut Inner) {
@@ -823,6 +841,7 @@ impl Session {
                 Event::Call(call)
             }
             AgentEvent::Item(index) => Event::Item(index),
+            AgentEvent::Steered(shown) => Event::Steered(shown),
             AgentEvent::CacheHit(hit) => Event::CacheHit(hit),
             AgentEvent::CacheStalled(misses) => Event::CacheStalled(misses),
             AgentEvent::RateLimits(limits) => {
@@ -1402,6 +1421,148 @@ mod tests {
         let entries = session.entries();
         let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
         assert_eq!(texts, ["/pdf", "/pdf"]);
+    }
+
+    #[test]
+    fn the_agent_takes_the_whole_queue_unless_interrupted() {
+        let (session, _rx_user) = session();
+        session.submit("a".to_string()).unwrap();
+        session.submit("b".to_string()).unwrap();
+        session
+            .submit(Prompt::shown_as(
+                "Use the `pdf` skill.".to_string(),
+                "/pdf".to_string(),
+            ))
+            .unwrap();
+        // An interrupted turn reads nothing more, so the queue waits for the next one.
+        session.interrupt();
+        assert!(session.take_queued().is_empty());
+        assert_eq!(session.queued(), ["b", "/pdf"]);
+
+        session.cancel.clear();
+        assert_eq!(
+            session.take_queued(),
+            [
+                ("b".to_string(), "b".to_string()),
+                ("Use the `pdf` skill.".to_string(), "/pdf".to_string()),
+            ]
+        );
+        assert!(session.queued().is_empty());
+    }
+
+    #[test]
+    fn unqueue_hands_back_what_was_typed() {
+        let (session, _rx_user) = session();
+        session.submit("a".to_string()).unwrap();
+        session.submit("b".to_string()).unwrap();
+        session
+            .submit(Prompt::shown_as(
+                "Use the `pdf` skill.".to_string(),
+                "/pdf".to_string(),
+            ))
+            .unwrap();
+        assert_eq!(session.unqueue(), ["b", "/pdf"]);
+        assert!(session.queued().is_empty());
+        // Nothing is left to start once the turn ends.
+        session.on_agent(AgentEvent::TurnEnd);
+        assert!(!session.state().working);
+    }
+
+    /// What is typed while the agent answers goes in before its next call, each as a
+    /// message of its own, rather than one turn apiece once the turn has ended.
+    #[tokio::test]
+    async fn what_is_queued_joins_the_running_turn() {
+        use crate::agent::fake::{Fake, say};
+
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx_agent, rx_agent) = mpsc::unbounded_channel();
+        let cancel = Arc::new(Cancel::default());
+        let policy = Arc::new(Policy::default());
+        let session = Session::new(
+            "fake".to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            Arc::clone(&cancel),
+            Arc::clone(&policy),
+            None,
+        );
+        tokio::spawn(pump(Arc::clone(&session), rx_agent));
+        let typing = Arc::clone(&session);
+        let fake = Fake::new(vec![vec![say("one")], vec![say("two")]]).during(move |call| {
+            if call == 0 {
+                typing.submit("b".to_string()).unwrap();
+                let skill = "Use the `pdf` skill.".to_string();
+                typing
+                    .submit(Prompt::shown_as(skill, "/pdf".to_string()))
+                    .unwrap();
+            }
+        });
+        let bodies = Arc::clone(&fake.bodies);
+        let inbox: crate::agent::Inbox = {
+            let session = Arc::clone(&session);
+            Arc::new(move || session.take_queued())
+        };
+        tokio::spawn(crate::agent::run_with(
+            Arc::new(fake),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            policy,
+            None,
+            None,
+            rx_user,
+            Some(inbox),
+            rx_control,
+            tx_agent,
+            cancel,
+            None,
+            None,
+            None,
+            crate::compact::Limits::default(),
+        ));
+
+        let mut events = session.subscribe();
+        session.submit("a".to_string()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while session.state().working {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the turn ends");
+
+        // One turn, two calls: the second reads both messages, apart.
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        let typed: Vec<_> = bodies[1].1["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["role"] == "user")
+            .map(|item| item["content"][0]["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(typed, ["a", "b", "Use the `pdf` skill."]);
+        // They show after the call they were typed during, as typed, and as messages
+        // of the same turn rather than turns of their own.
+        let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let at = |want: &Event| seen.iter().position(|e| e == want).unwrap();
+        let first_call = seen
+            .iter()
+            .position(|e| matches!(e, Event::Call(_)))
+            .unwrap();
+        assert!(
+            first_call < at(&Event::Steered("b".to_string())),
+            "{seen:?}"
+        );
+        assert!(at(&Event::Steered("b".to_string())) < at(&Event::Steered("/pdf".to_string())));
+        let turns = seen.iter().filter(|e| matches!(e, Event::User(_))).count();
+        assert_eq!(turns, 1, "{seen:?}");
+        let entries = session.entries();
+        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        assert_eq!(texts, ["a", "b", "/pdf"]);
+        assert!(session.queued().is_empty());
     }
 
     #[test]

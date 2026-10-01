@@ -6,6 +6,12 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A message typed while a turn runs joins that turn before its next model call, after
+  the tool results or the answer it was typed during, instead of waiting for the turn
+  to end. Everything waiting goes in together, each as its own message, and shows in
+  the transcript where the model reads it. An interrupt still keeps the queue.
+- Up on an empty prompt takes the queued messages back into the prompt box to edit,
+  one per line.
 - `/model-default` and `/effort-default` save the model and effort new sessions start
   on to `~/.config/bhai/config.toml`, leaving the running session where it is.
   `/model-default` opens the `/model` picker on the current default; with a name it

@@ -255,7 +255,9 @@ fn render_queued(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered()
         .border_style(dim)
         .title(Line::styled(" queued ", dim))
-        .title_bottom(Line::styled(" /queue clear drops them ", dim).right_aligned());
+        .title_bottom(
+            Line::styled(" ↑ edits them · /queue clear drops them ", dim).right_aligned(),
+        );
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);

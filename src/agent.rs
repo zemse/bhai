@@ -105,6 +105,8 @@ pub enum AgentEvent {
     Call(CallTokens),
     /// The user message or tool result just shown is history item `index`.
     Item(usize),
+    /// A message typed while the turn ran joined its history, shown as it was typed.
+    Steered(String),
     /// The request just sent broke the prompt cache, or `None` when it was clean.
     Cache(Option<CacheBreak>),
     /// How well the cache served a call that was judged; a child's only when it missed.
@@ -337,6 +339,19 @@ impl Drop for Mailbox {
     }
 }
 
+/// The session's queue, for the main agent: every prompt typed while it works, as what
+/// the model reads and what the transcript shows. Taken between steps, so nothing waits
+/// for the turn to end, and empty once the turn is interrupted.
+pub type Inbox = Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>;
+
+/// Where the messages typed into a running agent come from.
+enum Steer<'a> {
+    /// A child's pane.
+    Mailbox(&'a mut mpsc::UnboundedReceiver<String>),
+    /// The session's queue.
+    Inbox(&'a Inbox),
+}
+
 /// What a session needs to run child agents: the identities and how to build a
 /// child's system prompt.
 #[derive(Clone)]
@@ -478,6 +493,7 @@ pub async fn run(
     judge: Option<Arc<Judge>>,
     namer: Option<Arc<dyn Name>>,
     rx_user: mpsc::Receiver<String>,
+    inbox: Option<Inbox>,
     rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
     cancel: Arc<Cancel>,
@@ -489,7 +505,7 @@ pub async fn run(
     let session_id = client.session_id().to_string();
     let model: Arc<dyn Model> = Arc::new(client);
     run_with(
-        model, session_id, prompt, policy, judge, namer, rx_user, rx_control, tx, cancel,
+        model, session_id, prompt, policy, judge, namer, rx_user, inbox, rx_control, tx, cancel,
         usage_log, delegation, saved, limits,
     )
     .await;
@@ -505,6 +521,7 @@ pub(crate) async fn run_with(
     judge: Option<Arc<Judge>>,
     mut namer: Option<Arc<dyn Name>>,
     mut rx_user: mpsc::Receiver<String>,
+    inbox: Option<Inbox>,
     mut rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
     cancel: Arc<Cancel>,
@@ -821,7 +838,7 @@ pub(crate) async fn run_with(
                 &mut monitor,
                 usage_log.as_deref(),
                 &mut sink,
-                None,
+                inbox.as_ref().map(Steer::Inbox),
                 Some(&mut rx_results),
                 // The user is watching this one and can interrupt it.
                 None,
@@ -972,7 +989,7 @@ async fn turn(
     monitor: &mut CacheMonitor,
     usage_log: Option<&Path>,
     sink: &mut Sink<'_>,
-    mut steer: Option<&mut mpsc::UnboundedReceiver<String>>,
+    mut steer: Option<Steer<'_>>,
     // Reports of children detached earlier; they join the history between steps.
     mut results: Option<&mut mpsc::UnboundedReceiver<ChildResult>>,
     // Steps this turn may take, for one nobody is watching; `None` for no bound.
@@ -1011,12 +1028,9 @@ async fn turn(
                 record(sink, &history[from..], tx);
             }
         }
-        // Whatever was typed into this agent's pane joins the history before the call,
-        // so the next answer has it.
-        let typed = steered(steer.as_deref_mut());
-        if !typed.is_empty() {
-            let from = history.len();
-            history.extend(typed);
+        // Whatever was typed into this agent's pane, or queued for it, joins the history
+        // before the call, so the next answer has it.
+        if let Some(from) = steered(steer.as_mut(), history, tx) {
             record(sink, &history[from..], tx);
         }
         // A child detached earlier has finished: its report joins the history before the
@@ -1135,12 +1149,9 @@ async fn turn(
             record(sink, &history[sent..], tx);
             // A message typed while that answer was being written is not lost: it goes
             // in and the agent keeps going rather than ending on the answer before it.
-            let typed = steered(steer.as_deref_mut());
-            if typed.is_empty() {
+            let Some(from) = steered(steer.as_mut(), history, tx) else {
                 return Turn::ended(step, truncated);
-            }
-            let from = history.len();
-            history.extend(typed);
+            };
             record(sink, &history[from..], tx);
             continue;
         }
@@ -1234,20 +1245,37 @@ fn delivered(
     landed
 }
 
-/// The messages posted to an agent's mailbox since the last look, as history items.
-fn steered(steer: Option<&mut mpsc::UnboundedReceiver<String>>) -> Vec<Value> {
-    let Some(steer) = steer else {
-        return Vec::new();
-    };
-    let mut items = Vec::new();
-    while let Ok(text) = steer.try_recv() {
-        items.push(json!({
+/// Add the messages typed into an agent since the last look to its history, returning
+/// where they begin, or `None` when there were none. The queue's are announced as each
+/// joins, so the transcript shows it where the model reads it.
+fn steered(
+    steer: Option<&mut Steer<'_>>,
+    history: &mut Vec<Value>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) -> Option<usize> {
+    let from = history.len();
+    let message = |text: String| {
+        json!({
             "type": "message",
             "role": "user",
             "content": [{ "type": "input_text", "text": text }],
-        }));
+        })
+    };
+    match steer? {
+        Steer::Mailbox(rx) => {
+            while let Ok(text) = rx.try_recv() {
+                history.push(message(text));
+            }
+        }
+        Steer::Inbox(inbox) => {
+            for (text, shown) in inbox() {
+                let _ = tx.send(AgentEvent::Steered(shown));
+                history.push(message(text));
+                let _ = tx.send(AgentEvent::Item(history.len() - 1));
+            }
+        }
     }
-    items
+    (history.len() > from).then_some(from)
 }
 
 /// One compaction of a conversation's history.
@@ -1494,7 +1522,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             &mut monitor,
             None,
             &mut sink,
-            steer.as_mut(),
+            steer.as_mut().map(Steer::Mailbox),
             // A child has no `agent` tool, so it has no children to hear back from.
             None,
             Some(CHILD_STEPS),
@@ -1531,6 +1559,9 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::TurnEnd
                 // A child has no children, so it never resumes on one's report.
                 | AgentEvent::Resumed(_)
+                // What is typed into its pane comes by its mailbox, and shows there as
+                // it is posted.
+                | AgentEvent::Steered(_)
                 | AgentEvent::Call(_)
                 | AgentEvent::Item(_)
                 // The status bar says what the session is waiting on, and a child's
@@ -2319,6 +2350,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             cancel,
@@ -2442,6 +2474,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -2706,6 +2739,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::new(Cancel::default()),
@@ -3010,6 +3044,7 @@ mod tests {
             Some(Arc::clone(&judge)),
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -3179,6 +3214,7 @@ mod tests {
             None,
             Some(namer.clone()),
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -3481,6 +3517,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             cancel,
@@ -3613,6 +3650,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -3748,6 +3786,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -3834,6 +3873,7 @@ mod tests {
                 None,
                 None,
                 rx_user,
+                None,
                 rx_control,
                 tx,
                 Arc::clone(&cancel),
@@ -3918,6 +3958,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -4036,6 +4077,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -4073,6 +4115,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -4161,6 +4204,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -4219,6 +4263,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -4274,6 +4319,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -4330,6 +4376,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -4397,6 +4444,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -4546,6 +4594,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),
@@ -4633,6 +4682,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx,
             Arc::clone(&cancel),

@@ -84,7 +84,9 @@ impl Entries {
             // only joins it when the turn it belongs to starts. A prompt still waiting
             // in the queue is shown above the prompt box instead, where the eye that
             // typed it already is, and where it is plainly not part of the history yet.
-            Event::User(message) => self.push(Entry::User(message.clone())),
+            Event::User(message) | Event::Steered(message) => {
+                self.push(Entry::User(message.clone()))
+            }
             // Nothing was typed: the reports themselves follow, as the tool results
             // they are, so this only says why the agent started working again.
             Event::Resumed(what) => {

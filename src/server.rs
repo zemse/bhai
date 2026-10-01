@@ -623,6 +623,7 @@ mod tests {
             None,
             None,
             rx_user,
+            None,
             rx_control,
             tx_agent,
             cancel,

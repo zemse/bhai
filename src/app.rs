@@ -492,6 +492,11 @@ impl App {
             // themselves belong to the prompt.
             KeyCode::Up if ctrl => self.scroll_by(-1),
             KeyCode::Down if ctrl => self.scroll_by(1),
+            // Up on an empty prompt takes back what is still queued, to edit and send
+            // again, before it walks the history.
+            KeyCode::Up if !shift && self.input.is_empty() && !self.queued.is_empty() => {
+                return self.unqueue();
+            }
             // Inside a prompt of more than one row the arrows move between its rows; off
             // the top or bottom edge of it they walk the prompt history, as a shell does.
             KeyCode::Up | KeyCode::Down => {
@@ -516,6 +521,17 @@ impl App {
             self.input.insert(text);
             self.refresh_menu();
         }
+    }
+
+    /// Put every prompt still queued back in the prompt box, one per line, since what is
+    /// sent from there goes as one message. What the agent has already read stays sent.
+    fn unqueue(&mut self) {
+        let taken = self.session.unqueue();
+        self.queued.clear();
+        if !taken.is_empty() {
+            self.input.set(taken.join("\n"));
+        }
+        self.menu = None;
     }
 
     /// Walk the prompt history: back one entry, or forward one and then to the draft the
@@ -971,6 +987,13 @@ impl App {
                 // Nothing waits unless a turn runs, so a user message with a queue
                 // behind it is the front of that queue starting, and it has just
                 // joined the transcript as the entry the model will see.
+                if !self.queued.is_empty() {
+                    self.queued.remove(0);
+                }
+            }
+            // The same, between the steps of the turn already running.
+            Event::Steered(_) => {
+                self.follow = true;
                 if !self.queued.is_empty() {
                     self.queued.remove(0);
                 }
@@ -2483,6 +2506,28 @@ mod tests {
             (state.model.as_str(), state.effort.as_str()),
             ("gpt-5.5", "xhigh")
         );
+    }
+
+    #[test]
+    fn up_on_an_empty_prompt_takes_the_queue_back() {
+        let (mut app, _user, _control) = connected();
+        for text in ["a", "fix the test", "then ship it"] {
+            app.input.set(text.to_string());
+            app.submit();
+        }
+        app.queued = app.session.queued();
+        assert_eq!(app.queued.len(), 2);
+
+        // With something typed, up is the history's as before.
+        app.input.set("draft".to_string());
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.queued.len(), 2);
+
+        app.input.set(String::new());
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input.value(), "fix the test\nthen ship it");
+        assert!(app.queued.is_empty());
+        assert!(app.session.queued().is_empty());
     }
 
     #[test]
