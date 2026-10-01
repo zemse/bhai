@@ -954,10 +954,10 @@ fn usage_badge(usage: Usage) -> String {
 /// command, so only `bash` gets a shell prompt; yellow is for the tools that change the
 /// machine, cyan for the ones that only bring something in.
 fn tool_mark(tool: &str) -> (&'static str, Color) {
-    use crate::tools::{agent, bash, edit, read, skill, write};
+    use crate::tools::{agent, bash, edit, patch, read, skill, write};
     match tool {
         bash::NAME => ("$ ", Color::Yellow),
-        write::NAME | edit::NAME => ("✎ ", Color::Yellow),
+        write::NAME | edit::NAME | patch::NAME => ("✎ ", Color::Yellow),
         read::NAME => ("▸ ", Color::Cyan),
         skill::NAME => ("✦ ", Color::Magenta),
         agent::NAME => ("⇢ ", Color::Magenta),

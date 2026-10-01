@@ -80,6 +80,10 @@ impl Identity {
         if name == tools::mcp::TOOL_SEARCH {
             return self.allows_tool(tools::mcp::SEARCH);
         }
+        // The same change to files as `edit`, in the format Codex models write.
+        if name == tools::patch::NAME {
+            return self.allows_tool(tools::edit::NAME);
+        }
         let mcp = [tools::mcp::SEARCH, tools::mcp::CALL].contains(&name);
         self.tools
             .as_ref()
@@ -415,6 +419,7 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         assert_eq!(bhai.mcp, ["XcodeBuildMCP"]);
         assert_eq!(bhai.instructions, Some(vec![Source::Project]));
         assert_eq!(bhai.prompt, "Be Swift-y.");
+        assert!(bhai.allows_tool("apply_patch"), "it follows `edit`");
 
         let claude = identity(
             "---\nname: reviewer\ndescription: Reviews code\ntools: Read, Grep, Bash(git:*), Glob\n---\nReview.\n",
@@ -424,6 +429,7 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         assert!(claude.allows_skill("anything"));
         assert_eq!(claude.instructions, None);
         assert!(!claude.allows_tool("write"));
+        assert!(!claude.allows_tool("apply_patch"));
 
         let mcp = identity("---\nname: m\ntools: read, mcp, mcp_call, mcp__x__y\n---\n");
         assert_eq!(

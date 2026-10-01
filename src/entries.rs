@@ -240,7 +240,17 @@ impl Entries {
                         tool: name,
                     }
                 }
-                Some("function_call_output") => Entry::Output(
+                Some("custom_tool_call") => {
+                    let name = item["name"].as_str().unwrap_or_default();
+                    let input = item["input"].as_str().unwrap_or_default();
+                    Entry::Command {
+                        summary: crate::tools::patch::summarize(input)
+                            .filter(|_| name == crate::tools::patch::NAME)
+                            .unwrap_or_else(|| format!("{name} {input}")),
+                        tool: name.to_string(),
+                    }
+                }
+                Some("function_call_output" | "custom_tool_call_output") => Entry::Output(
                     item["output"]
                         .as_str()
                         .unwrap_or_default()

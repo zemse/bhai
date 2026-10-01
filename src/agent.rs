@@ -1718,7 +1718,7 @@ async fn turn(
             .filter(|item| {
                 matches!(
                     item.get("type").and_then(Value::as_str),
-                    Some("function_call" | "tool_search_call")
+                    Some("function_call" | "tool_search_call" | "custom_tool_call")
                 )
             })
             .collect();
@@ -1756,9 +1756,11 @@ async fn turn(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            // A `tool_search_call` runs as a call to `tool_search` and is answered in kind.
+            // A `tool_search_call` runs as a call to `tool_search`, and a `custom_tool_call`
+            // as a function call; each is answered in kind.
             let search = tools::mcp::search_call(call);
-            let run = search.as_ref().unwrap_or(call);
+            let custom = tools::custom_call(call);
+            let run = search.as_ref().or(custom.as_ref()).unwrap_or(call);
             let conversation = tools::Conversation {
                 id: model.conversation(),
                 model: model.name(),
@@ -1768,9 +1770,10 @@ async fn turn(
                 execute(registry, policy, judge, run, Some(conversation), tx, cancel).await;
             all_failed &= !ok;
             let _ = tx.send(AgentEvent::Item(sent + items.len() + index));
-            results.push(match search {
-                Some(_) => tools::mcp::search_output(&call_id, &output),
-                None => json!({
+            results.push(match (search, custom) {
+                (Some(_), _) => tools::mcp::search_output(&call_id, &output),
+                (None, Some(_)) => tools::custom_output(&call_id, &output),
+                (None, None) => json!({
                     "type": "function_call_output",
                     "call_id": call_id,
                     "output": output,
@@ -3358,6 +3361,78 @@ mod tests {
         assert!(labels.contains(&"tool: bash"));
         assert!(labels.contains(&"tool: edit"));
         assert!(profile.calibration.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_custom_apply_patch_call_runs_and_is_answered_in_kind() {
+        use fake::{Fake, say};
+
+        let dir = tools::temp_dir();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let input = format!(
+            "*** Begin Patch\n*** Update File: {}\n one\n-two\n+three\n*** End Patch",
+            file.display()
+        );
+        let fake = Fake::new(vec![
+            vec![
+                json!({"type": "custom_tool_call", "call_id": "p1", "name": "apply_patch",
+                        "input": input}),
+            ],
+            vec![say("done")],
+        ]);
+        let registry = Registry::new(Vec::new());
+        let schemas = registry.schemas();
+        assert!(schemas.iter().any(|t| t["type"] == "custom"));
+        let policy = Policy::new(
+            Mode::Bypass,
+            crate::permissions::Rules::default(),
+            None,
+            dir.clone(),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut history = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "patch it" }],
+        })];
+        let Turn { result, .. } = turn(
+            &fake,
+            &registry,
+            &policy,
+            None,
+            &schemas,
+            "",
+            &mut history,
+            &tx,
+            &Arc::new(AtomicBool::new(false)),
+            &mut Vec::new(),
+            &mut CacheMonitor::default(),
+            None,
+            &mut Sink::Discard,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        let kinds: Vec<&str> = history.iter().filter_map(|i| i["type"].as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "message",
+                "custom_tool_call",
+                "custom_tool_call_output",
+                "message"
+            ]
+        );
+        assert_eq!(history[2]["call_id"], "p1");
+        let output = history[2]["output"].as_str().unwrap();
+        assert!(output.starts_with("Applied: update "), "{output}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\nthree\n");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// What `tool_search` loads is called by its own name, and the rules decide that call

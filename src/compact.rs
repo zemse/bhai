@@ -138,7 +138,7 @@ pub fn evict(history: &mut [Value], excess: u64, tokenizer: &dyn Tokenizer) -> u
     let results: Vec<usize> = history
         .iter()
         .enumerate()
-        .filter(|(_, item)| is(item, "function_call_output"))
+        .filter(|(_, item)| is(item, "function_call_output") || is(item, "custom_tool_call_output"))
         .map(|(index, _)| index)
         .collect();
     let old = results.len().saturating_sub(KEEP_RESULTS);

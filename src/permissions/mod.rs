@@ -16,6 +16,7 @@ pub mod rules;
 pub mod settings;
 pub mod trust;
 
+use crate::tools::patch;
 use rules::Base;
 pub use rules::Rule;
 pub use trust::Trust;
@@ -417,6 +418,13 @@ impl Policy {
                     )
                 }
             }
+            (patch::NAME, _, _) => match self.written(tool, args).first() {
+                Some(path) if !rules::is_protected(path, base.home) => (
+                    rules::exact_path("edit", path, base),
+                    rules::dir_path(path, base),
+                ),
+                _ => (None, None),
+            },
             ("mcp_call", _, _) => match mcp_name(args) {
                 Some(name) => (
                     Rule::parse(&name).ok(),
@@ -638,6 +646,7 @@ pub fn written(tool: &str, args: &Value, cwd: &Path, home: Option<&Path>) -> Vec
         None => Some(cwd.join(target)),
     };
     match (tool, text("path"), text("command")) {
+        (patch::NAME, ..) => patch::paths(args, cwd).unwrap_or_default(),
         ("write" | "edit", Some(path), _) => resolve(cwd, path).into_iter().collect(),
         ("bash", _, Some(command)) => {
             let mut cwd = match text("workdir").filter(|w| !w.is_empty()) {
@@ -700,8 +709,35 @@ impl Checker<'_> {
                 Some(name) => self.check_other(&name, needs_approval),
                 None => Decision::Ask,
             },
+            patch::NAME => self.check_patch(args, needs_approval),
             _ => self.check_other(tool, needs_approval),
         }
+    }
+
+    /// Each file a patch touches is decided as a `write` to it, so `Edit` and `Write`
+    /// rules both reach it, and the strictest answer stands.
+    fn check_patch(&self, args: &Value, needs_approval: bool) -> Decision {
+        let Some(paths) = patch::paths(args, self.base.cwd) else {
+            return Decision::Ask;
+        };
+        let bare = |rules: &[Rule]| rules.iter().find(|r| r.applies_to(patch::NAME)).cloned();
+        if let Some(rule) = bare(&self.rules.deny) {
+            return denied(&rule);
+        }
+        let mut decisions: Vec<Decision> = paths
+            .iter()
+            .map(|path| self.check_path("write", path, needs_approval))
+            .collect();
+        if bare(&self.rules.ask).is_some() {
+            decisions.push(Decision::Ask);
+        }
+        if let Some(deny) = decisions.iter().find(|d| matches!(d, Decision::Deny(_))) {
+            return deny.clone();
+        }
+        if decisions.iter().any(|d| matches!(d, Decision::Ask)) {
+            return Decision::Ask;
+        }
+        decisions.into_iter().next().unwrap_or(Decision::Ask)
     }
 
     fn check_other(&self, tool: &str, needs_approval: bool) -> Decision {
@@ -956,6 +992,27 @@ impl Checker<'_> {
                 }
                 None => Err(Reserved::Protected("no path".to_string())),
             },
+            patch::NAME => {
+                let paths = patch::paths(args, self.base.cwd)
+                    .ok_or_else(|| Reserved::Protected("no path".to_string()))?;
+                if let Some(rule) = self.rules.ask.iter().find(|r| r.applies_to(patch::NAME)) {
+                    return Err(Reserved::Asked(rule.text.clone()));
+                }
+                paths.iter().try_for_each(|path| {
+                    if rules::is_protected(path, self.base.home) {
+                        return Err(Reserved::Protected(path.display().to_string()));
+                    }
+                    match self
+                        .rules
+                        .ask
+                        .iter()
+                        .find(|r| r.applies_to("write") && r.matches_path(path, self.base, true))
+                    {
+                        Some(rule) => Err(Reserved::Asked(rule.text.clone())),
+                        None => Ok(()),
+                    }
+                })
+            }
             // An MCP server the user has not approved is never connected, so an
             // `mcp_call` that gets this far names one they did approve.
             _ => match self.rules.ask.iter().find(|r| r.applies_to(tool)) {
@@ -1616,6 +1673,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_patch_is_decided_by_every_file_it_touches() {
+        let patch = |files: &[&str]| {
+            let hunks: String = files
+                .iter()
+                .map(|f| format!("*** Add File: {f}\n+x\n"))
+                .collect();
+            json!({ "input": format!("*** Begin Patch\n{hunks}*** End Patch") })
+        };
+        let check =
+            |policy: &Policy, files: &[&str]| policy.check("apply_patch", &patch(files), true);
+
+        let bypass = policy(Mode::Bypass, &[], &["Write(//etc/**)"], &[]);
+        assert_eq!(check(&bypass, &["a.txt"]), allowed("bypass mode"));
+        assert_eq!(
+            check(&bypass, &["a.txt", "/etc/hosts"]),
+            Decision::Deny("deny rule Write(//etc/**)".to_string())
+        );
+        let bare = policy(Mode::Bypass, &[], &["apply_patch"], &[]);
+        assert_eq!(
+            check(&bare, &["a.txt"]),
+            Decision::Deny("deny rule apply_patch".to_string())
+        );
+
+        let auto = policy(Mode::Auto, &["Edit(//home/u/repo/**)"], &[], &[]);
+        assert_eq!(
+            check(&auto, &["a.txt", "src/b.rs"]),
+            allowed("rule Edit(//home/u/repo/**)")
+        );
+        assert_eq!(check(&auto, &["a.txt", "/tmp/x"]), Decision::Ask);
+        let asked = policy(
+            Mode::Auto,
+            &["Edit(//home/u/repo/**)"],
+            &[],
+            &["Edit(/b.rs)"],
+        );
+        assert_eq!(check(&asked, &["a.txt", "b.rs"]), Decision::Ask);
+        assert_eq!(
+            asked.judgeable("apply_patch", &patch(&["a.txt", "b.rs"])),
+            Err(Reserved::Asked("Edit(/b.rs)".to_string()))
+        );
+
+        assert_eq!(
+            auto.written("apply_patch", &patch(&["a.txt", "../c.txt"])),
+            [
+                PathBuf::from("/home/u/repo/a.txt"),
+                PathBuf::from("/home/u/c.txt")
+            ]
+        );
+        let ask = policy(Mode::Ask, &[], &[], &[]);
+        assert!(
+            ask.offers("apply_patch", &patch(&["src/a.rs"]))
+                .exact
+                .is_some()
+        );
+        assert_eq!(
+            ask.offers("apply_patch", &patch(&["src/a.rs", "/tmp/b"]))
+                .exact,
+            None,
+            "one file's rule does not let the other through"
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod goal;
 pub mod history;
 pub mod mcp;
 pub mod models;
+pub mod patch;
 pub mod plan;
 pub mod read;
 pub mod skill;
@@ -43,7 +44,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
-    /// The Responses API function tool definition.
+    /// The Responses API tool definition: a function, or for `apply_patch` a custom tool.
     fn schema(&self) -> Value;
     fn needs_approval(&self) -> bool;
     /// Check the arguments and summarize the call in one line for the user.
@@ -99,6 +100,7 @@ impl Registry {
             Box::new(read::Read),
             Box::new(write::Write),
             Box::new(edit::Edit),
+            Box::new(patch::ApplyPatch),
         ];
         if !skills.is_empty() {
             tools.push(Box::new(skill::Skill { skills }));
@@ -233,6 +235,33 @@ impl Registry {
     }
 }
 
+/// A `custom_tool_call` as the `function_call` it is run as, its freeform input carried
+/// as the one argument `input`.
+pub fn custom_call(item: &Value) -> Option<Value> {
+    if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
+        return None;
+    }
+    let input = item
+        .get("input")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(serde_json::json!({
+        "type": "function_call",
+        "name": item.get("name").cloned().unwrap_or(Value::Null),
+        "call_id": item.get("call_id").cloned().unwrap_or(Value::Null),
+        "arguments": serde_json::json!({ "input": input }).to_string(),
+    }))
+}
+
+/// The `custom_tool_call_output` that answers `call_id`.
+pub fn custom_output(call_id: &str, output: &str) -> Value {
+    serde_json::json!({
+        "type": "custom_tool_call_output",
+        "call_id": call_id,
+        "output": output,
+    })
+}
+
 /// Parse a `function_call`'s JSON-string arguments into an object.
 pub fn parse_arguments(arguments: &str) -> Result<Value, String> {
     let parsed: Value = serde_json::from_str(arguments)
@@ -330,12 +359,14 @@ mod tests {
             .schemas()
             .iter()
             .map(|s| {
-                assert_eq!(s["type"], "function");
-                assert_eq!(s["parameters"]["type"], "object");
+                if s["name"] != patch::NAME {
+                    assert_eq!(s["type"], "function");
+                    assert_eq!(s["parameters"]["type"], "object");
+                }
                 s["name"].as_str().unwrap().to_string()
             })
             .collect();
-        assert_eq!(names, ["bash", "read", "write", "edit"]);
+        assert_eq!(names, ["bash", "read", "write", "edit", "apply_patch"]);
     }
 
     #[test]
@@ -347,8 +378,8 @@ mod tests {
             source: "~/.claude/skills".to_string(),
         };
         let registry = Registry::new(vec![skill]);
-        assert_eq!(registry.schemas().len(), 5);
-        for name in ["bash", "write", "edit"] {
+        assert_eq!(registry.schemas().len(), 6);
+        for name in ["bash", "write", "edit", "apply_patch"] {
             assert!(registry.get(name).unwrap().needs_approval(), "{name}");
         }
         assert!(!registry.get("read").unwrap().needs_approval());
@@ -363,6 +394,23 @@ mod tests {
         let out = registry.unknown("nope");
         assert!(out.contains("`nope`"), "{out}");
         assert!(out.contains("`bash`, `read`, `write`, `edit`"), "{out}");
+    }
+
+    #[test]
+    fn a_custom_tool_call_runs_as_a_function_call_and_is_answered_in_kind() {
+        let item = json!({"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch",
+            "input": "*** Begin Patch\n*** End Patch"});
+        let call = custom_call(&item).unwrap();
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["name"], "apply_patch");
+        assert_eq!(call["call_id"], "c1");
+        let args = parse_arguments(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["input"], "*** Begin Patch\n*** End Patch");
+        assert!(custom_call(&json!({"type": "function_call"})).is_none());
+        let output = custom_output("c1", "done");
+        assert_eq!(output["type"], "custom_tool_call_output");
+        assert_eq!(output["call_id"], "c1");
+        assert_eq!(output["output"], "done");
     }
 
     #[test]

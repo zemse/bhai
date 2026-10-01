@@ -94,7 +94,23 @@ pub fn messages(instructions: &str, input: &[Value]) -> Vec<Value> {
                     }}],
                 }));
             }
-            Some("function_call_output") => out.push(json!({
+            // A custom tool is the Responses API's own, so its call goes over as a function
+            // call with the freeform input as its one argument.
+            Some("custom_tool_call") => {
+                let name = Cow::Borrowed(field("name").unwrap_or_default());
+                if let Some(id) = field("call_id") {
+                    names.insert(id, name.clone());
+                }
+                out.push(json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{ "function": {
+                        "name": name,
+                        "arguments": { "input": field("input").unwrap_or_default() },
+                    }}],
+                }));
+            }
+            Some("function_call_output" | "custom_tool_call_output") => out.push(json!({
                 "role": "tool",
                 "tool_name": field("call_id")
                     .and_then(|id| names.get(id).cloned())
@@ -630,6 +646,28 @@ mod tests {
             "mcp__gh__get_issue"
         );
         assert_eq!(out[1]["tool_name"], "mcp__gh__get_issue");
+    }
+
+    #[test]
+    fn a_custom_tool_round_goes_over_as_a_function_call() {
+        let input = [
+            json!({"type": "custom_tool_call", "call_id": "p1", "name": "apply_patch",
+                   "input": "*** Begin Patch"}),
+            json!({"type": "custom_tool_call_output", "call_id": "p1", "output": "Applied"}),
+        ];
+        let out = messages("", &input);
+        assert_eq!(out.len(), 2, "{out:?}");
+        let function = &out[0]["tool_calls"][0]["function"];
+        assert_eq!(function["name"], "apply_patch");
+        assert_eq!(function["arguments"]["input"], "*** Begin Patch");
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[1]["tool_name"], "apply_patch");
+        assert_eq!(out[1]["content"], "Applied");
+        let custom = json!({"type": "custom", "name": "apply_patch"});
+        assert!(
+            tool_defs(&[custom]).is_empty(),
+            "Ollama has no custom tools"
+        );
     }
 
     #[test]

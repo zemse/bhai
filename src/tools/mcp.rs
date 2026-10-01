@@ -315,7 +315,7 @@ mod tests {
         let empty = Arc::new(Hub::offline(vec![("gh", Vec::new())]));
         let without = Registry::new(Vec::new()).with_mcp(Some(empty));
         assert!(without.get(SEARCH).is_none() && without.get(CALL).is_none());
-        assert_eq!(Registry::new(Vec::new()).with_mcp(None).schemas().len(), 4);
+        assert_eq!(Registry::new(Vec::new()).with_mcp(None).schemas().len(), 5);
     }
 
     #[test]

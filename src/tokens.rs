@@ -63,11 +63,18 @@ pub fn item_text(item: &Value) -> Option<String> {
             field("name").unwrap_or_default(),
             field("arguments").unwrap_or_default()
         )),
-        Some("function_call_output") => Some(match item.get("output") {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-            None => String::new(),
-        }),
+        Some("custom_tool_call") => Some(format!(
+            "{}{}",
+            field("name").unwrap_or_default(),
+            field("input").unwrap_or_default()
+        )),
+        Some("function_call_output" | "custom_tool_call_output") => {
+            Some(match item.get("output") {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            })
+        }
         _ => Some(item.to_string()),
     }
 }
@@ -115,6 +122,10 @@ mod tests {
         assert_eq!(item_text(&call).unwrap(), "bash{}");
         let output = json!({"type": "function_call_output", "output": "ok"});
         assert_eq!(item_text(&output).unwrap(), "ok");
+        let patch = json!({"type": "custom_tool_call", "name": "apply_patch", "input": "*** x"});
+        assert_eq!(item_text(&patch).unwrap(), "apply_patch*** x");
+        let patched = json!({"type": "custom_tool_call_output", "output": "done"});
+        assert_eq!(item_text(&patched).unwrap(), "done");
         let reasoning = json!({"type": "reasoning", "encrypted_content": "xyz"});
         assert_eq!(item_text(&reasoning), None);
     }

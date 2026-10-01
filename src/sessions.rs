@@ -447,7 +447,7 @@ pub fn load_child(path: &Path) -> Result<Vec<Value>> {
         .filter(|item| {
             matches!(
                 kind(item).as_deref(),
-                Some("function_call_output" | "tool_search_output")
+                Some("function_call_output" | "tool_search_output" | "custom_tool_call_output")
             )
         })
         .filter_map(call_id)
@@ -456,7 +456,7 @@ pub fn load_child(path: &Path) -> Result<Vec<Value>> {
     let mut dropping = false;
     for item in items.into_iter().rev() {
         match kind(&item).as_deref() {
-            Some("function_call" | "tool_search_call")
+            Some("function_call" | "tool_search_call" | "custom_tool_call")
                 if !call_id(&item).is_some_and(|id| answered.contains(&id)) =>
             {
                 dropping = true;
@@ -479,8 +479,8 @@ fn answered<'a>(items: impl Iterator<Item = &'a Value>) -> usize {
     for (index, item) in items.enumerate() {
         let call_id = || item.get("call_id").and_then(Value::as_str).unwrap_or("");
         match item.get("type").and_then(Value::as_str) {
-            Some("function_call" | "tool_search_call") => open.push(call_id()),
-            Some("function_call_output" | "tool_search_output") => {
+            Some("function_call" | "tool_search_call" | "custom_tool_call") => open.push(call_id()),
+            Some("function_call_output" | "tool_search_output" | "custom_tool_call_output") => {
                 open.retain(|id| *id != call_id())
             }
             _ => {}
@@ -1221,15 +1221,20 @@ mod tests {
         let output = json!({"type": "function_call_output", "call_id": "c1", "output": "ok"});
         let search = |id: &str| json!({"type": "tool_search_call", "call_id": id, "arguments": {}});
         let found = json!({"type": "tool_search_output", "call_id": "s1", "tools": []});
+        let patch = |id: &str| json!({"type": "custom_tool_call", "call_id": id, "name": "apply_patch", "input": ""});
+        let patched = json!({"type": "custom_tool_call_output", "call_id": "p1", "output": "ok"});
         let lines = [
             user("review"),
             call("c1"),
             output.clone(),
             search("s1"),
             found.clone(),
+            patch("p1"),
+            patched.clone(),
             reasoning,
             call("c2"),
             search("s2"),
+            patch("p2"),
             user("now fix it"),
         ];
         let mut text: String = lines.iter().map(|item| format!("{item}\n")).collect();
@@ -1244,6 +1249,8 @@ mod tests {
                 output,
                 search("s1"),
                 found,
+                patch("p1"),
+                patched,
                 user("now fix it")
             ]
         );

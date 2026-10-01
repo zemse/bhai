@@ -244,7 +244,12 @@ pub fn call_tokens(
 
     let is = |item: &Value, kind: &str| item.get("type").and_then(Value::as_str) == Some(kind);
     let mut weights = vec![items.iter().filter(|i| is(i, "message")).map(weight).sum()];
-    weights.extend(items.iter().filter(|i| is(i, "function_call")).map(weight));
+    weights.extend(
+        items
+            .iter()
+            .filter(|i| is(i, "function_call") || is(i, "custom_tool_call"))
+            .map(weight),
+    );
     let usage = call.usage;
     let parts = split(usage.output - usage.reasoning.min(usage.output), &weights);
     CallTokens {
@@ -721,8 +726,10 @@ fn classify(entry: &Value) -> (&'static str, Option<String>) {
         Some("message") if field("role") == Some("developer") => ("developer message", None),
         Some("message") => ("assistant message", None),
         Some("reasoning") => ("reasoning", None),
-        Some("function_call") => ("function_call", field("name").map(str::to_string)),
-        Some("function_call_output") => ("function_call_output", None),
+        Some("function_call" | "custom_tool_call") => {
+            ("function_call", field("name").map(str::to_string))
+        }
+        Some("function_call_output" | "custom_tool_call_output") => ("function_call_output", None),
         Some(other) => ("other", Some(other.to_string())),
         None => ("other", None),
     }

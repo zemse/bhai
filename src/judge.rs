@@ -731,6 +731,8 @@ pub fn target(tool: &str, args: &Value, summary: &str) -> (String, String) {
                 ),
             )
         }
+        // The summary names every file with its counts; the patch is what it does to them.
+        "apply_patch" => (summary.to_string(), text("input")),
         "edit" => (
             text("path"),
             format!(
