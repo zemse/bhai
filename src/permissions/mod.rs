@@ -941,6 +941,11 @@ impl Checker<'_> {
         if !self.relaxed() {
             return Err(Reserved::Untrusted);
         }
+        // As in `check`, `Read` rules and the protected paths decide it.
+        let tool = match tool {
+            view_image::NAME => "read",
+            _ => tool,
+        };
         let text = |key| args.get(key).and_then(Value::as_str);
         // An ask rule is the user saying they want to see this one. The judge waving it
         // through would leave the rule tightening nothing in the mode that needs it.
@@ -1690,10 +1695,12 @@ mod tests {
                     "{path} in {mode}"
                 );
                 // `auto` never prompts, so the judge must not be offered it either.
-                assert!(
-                    policy.judgeable("read", &json!({ "path": path })).is_err(),
-                    "{path} in {mode}"
-                );
+                for tool in ["read", "view_image"] {
+                    assert!(
+                        policy.judgeable(tool, &json!({ "path": path })).is_err(),
+                        "{tool} {path} in {mode}"
+                    );
+                }
             }
         }
     }
@@ -2052,6 +2059,7 @@ mod tests {
                     "Bash(git log -p:*)",
                     "Bash(cargo publish:*)",
                     "Write(gen/**)",
+                    "Read(private/**)",
                 ]),
                 ..Rules::default()
             },
@@ -2085,6 +2093,15 @@ mod tests {
         assert!(
             asking
                 .judgeable("write", &json!({"path": repo.join("src/x.rs")}))
+                .is_ok()
+        );
+        assert_eq!(
+            asking.judgeable("view_image", &json!({"path": repo.join("private/a.png")})),
+            asked("Read(private/**)")
+        );
+        assert!(
+            asking
+                .judgeable("view_image", &json!({"path": repo.join("docs/a.png")}))
                 .is_ok()
         );
 
