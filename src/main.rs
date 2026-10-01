@@ -26,6 +26,7 @@ mod markdown;
 mod mcp;
 mod mermaid;
 mod models;
+mod notify;
 mod ollama;
 mod palette;
 mod permissions;
@@ -52,9 +53,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as TermEvent, KeyEvent, KeyboardEnhancementFlags, MouseEvent,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event as TermEvent, KeyEvent, KeyboardEnhancementFlags,
+    MouseEvent, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::{execute, terminal};
 use tokio::net::TcpListener;
@@ -83,6 +84,8 @@ enum Event {
     /// Only a draw lets the terminal backend notice the new size and clear, and an idle
     /// tick does not draw.
     Resize,
+    /// Whether the terminal is in front, for notifications.
+    Focus(bool),
     Tick,
 }
 
@@ -431,6 +434,7 @@ allow it.",
     // click-drag, so terminals need shift (or option) held to select text while bhai runs.
     let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
     let paste = execute!(std::io::stdout(), EnableBracketedPaste).is_ok();
+    let focus = execute!(std::io::stdout(), EnableFocusChange).is_ok();
     // Disambiguated keys are how a terminal reports shift+enter; not all of them can.
     let keyboard = terminal::supports_keyboard_enhancement().unwrap_or(false)
         && execute!(
@@ -443,7 +447,7 @@ allow it.",
     let hook = std::panic::take_hook();
     let crashed = (dir.clone(), session_id.clone());
     std::panic::set_hook(Box::new(move |info| {
-        release_modes(mouse, paste, keyboard);
+        release_modes(mouse, paste, keyboard, focus);
         title::pop();
         hook(info);
         if let Some(hint) = sessions::exit_hint(&crashed.0, &crashed.1) {
@@ -474,7 +478,7 @@ allow it.",
         defaults,
     )
     .await;
-    release_modes(mouse, paste, keyboard);
+    release_modes(mouse, paste, keyboard, focus);
     title::pop();
     ratatui::restore();
     shutdown(hub).await;
@@ -495,7 +499,10 @@ fn set_capture(on: bool) -> bool {
 }
 
 /// Turn off the terminal modes the TUI turned on.
-fn release_modes(mouse: bool, paste: bool, keyboard: bool) {
+fn release_modes(mouse: bool, paste: bool, keyboard: bool, focus: bool) {
+    if focus {
+        let _ = execute!(std::io::stdout(), DisableFocusChange);
+    }
     if keyboard {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -1400,7 +1407,8 @@ async fn run(
                     Ok(TermEvent::Mouse(mouse)) => Event::Mouse(mouse),
                     Ok(TermEvent::Paste(text)) => Event::Paste(text),
                     Ok(TermEvent::Resize(..)) => Event::Resize,
-                    Ok(_) => Event::Tick,
+                    Ok(TermEvent::FocusGained) => Event::Focus(true),
+                    Ok(TermEvent::FocusLost) => Event::Focus(false),
                     Err(_) => break,
                 },
                 Ok(false) => Event::Tick,
@@ -1468,6 +1476,7 @@ async fn run(
     // Mouse motion arrives in floods, so it only redraws when the hover changes.
     let mut dirty = true;
     let mut captured = mouse;
+    let mut notifier = notify::Notifier::from_env();
     while !app.quit {
         if dirty {
             terminal.draw(|frame| ui::render(frame, &mut app))?;
@@ -1475,7 +1484,7 @@ async fn run(
         let Some(event) = rx_event.recv().await else {
             break;
         };
-        dirty = apply(&mut app, event, &root);
+        dirty = apply(&mut app, &mut notifier, event, &root);
         // Whatever else is already waiting is applied before the next draw. A streaming
         // turn sends an event per delta, and a frame per delta is a frame wasted:
         // rendering the transcript costs the same however little of it changed.
@@ -1483,7 +1492,7 @@ async fn run(
             let Ok(event) = rx_event.try_recv() else {
                 break;
             };
-            dirty |= apply(&mut app, event, &root);
+            dirty |= apply(&mut app, &mut notifier, event, &root);
         }
         // `/mouse` hands the pointer back to the terminal, and takes it again.
         if app.mouse != captured {
@@ -1499,7 +1508,12 @@ async fn run(
 }
 
 /// Apply one event to the view; returns whether it has to be drawn again.
-fn apply(app: &mut App, event: Event, root: &std::path::Path) -> bool {
+fn apply(
+    app: &mut App,
+    notifier: &mut notify::Notifier,
+    event: Event,
+    root: &std::path::Path,
+) -> bool {
     match event {
         Event::Key(key) => {
             app.on_key(key);
@@ -1516,6 +1530,9 @@ fn apply(app: &mut App, event: Event, root: &std::path::Path) -> bool {
             if let session::Event::Titled(name) = &event {
                 title::set(&title::compose(root, Some(name)));
             }
+            if let Some(message) = attention(&event, root) {
+                notifier.notify(&message);
+            }
             app.on_event(event);
             true
         }
@@ -1524,7 +1541,23 @@ fn apply(app: &mut App, event: Event, root: &std::path::Path) -> bool {
             true
         }
         Event::Resize => true,
+        Event::Focus(focused) => {
+            notifier.focus(focused);
+            false
+        }
         Event::Tick => app.tick(),
+    }
+}
+
+/// What to tell a user who is not looking, for the events that wait on them.
+fn attention(event: &session::Event, root: &std::path::Path) -> Option<String> {
+    let dir = title::compose(root, None);
+    match event {
+        session::Event::Approval { tool, .. } => {
+            Some(format!("bhai · {dir}: {tool} needs approval"))
+        }
+        session::Event::TurnEnd => Some(format!("bhai · {dir}: done")),
+        _ => None,
     }
 }
 
@@ -1537,6 +1570,7 @@ mod tests {
     #[test]
     fn a_batch_of_events_is_one_redraw() {
         let mut app = App::detached();
+        let mut notifier = notify::Notifier::from_env();
         let root = std::path::PathBuf::new();
         let batch = vec![
             Event::Session(session::Event::User("go".to_string())),
@@ -1546,7 +1580,7 @@ mod tests {
         ];
         let dirty = batch
             .into_iter()
-            .map(|event| apply(&mut app, event, &root))
+            .map(|event| apply(&mut app, &mut notifier, event, &root))
             .fold(false, |dirty, next| dirty | next);
         // One draw covers the batch, and every event in it has already been applied.
         assert!(dirty);
@@ -1556,9 +1590,34 @@ mod tests {
     #[test]
     fn a_resize_is_drawn_even_when_idle() {
         let mut app = App::detached();
+        let mut notifier = notify::Notifier::from_env();
         let root = std::path::PathBuf::new();
         app.tick();
-        assert!(apply(&mut app, Event::Resize, &root));
+        assert!(apply(&mut app, &mut notifier, Event::Resize, &root));
+    }
+
+    #[test]
+    fn an_approval_and_a_turn_end_are_worth_a_notification() {
+        let root = std::path::Path::new("/home/u/bhai");
+        let approval = session::Event::Approval {
+            id: 1,
+            tool: "bash".to_string(),
+            command: "rm -rf target".to_string(),
+            preview: None,
+            offers: Default::default(),
+        };
+        assert_eq!(
+            attention(&approval, root).as_deref(),
+            Some("bhai · bhai: bash needs approval")
+        );
+        assert_eq!(
+            attention(&session::Event::TurnEnd, root).as_deref(),
+            Some("bhai · bhai: done")
+        );
+        assert_eq!(
+            attention(&session::Event::Text("hi".to_string()), root),
+            None
+        );
     }
 
     fn parse(args: &[&str]) -> Result<(Option<u16>, bool)> {
