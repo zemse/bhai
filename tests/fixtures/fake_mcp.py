@@ -1,7 +1,8 @@
 """A tiny MCP stdio server for bhai's tests: initialize, two tools, and an echo call.
 
 `fake_mcp.py hang` never answers; `fake_mcp.py hangcall` answers everything but a call;
-`fake_mcp.py exit` quits at once; `fake_mcp.py http` serves the same tools over streamable
+`fake_mcp.py exit` quits at once; `fake_mcp.py grandchild` starts a `sleep` that outlives it
+and logs its pid to stderr, the way `npx` leaves the real server; `fake_mcp.py http` serves the same tools over streamable
 HTTP on a free port, printed as JSON on stdout.
 """
 
@@ -51,6 +52,16 @@ def send(message):
 
 def serve_stdio(mode):
     print("fake_mcp started", file=sys.stderr, flush=True)
+    if mode == "grandchild":
+        import subprocess
+
+        sleep = subprocess.Popen(
+            ["sleep", "300"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("grandchild", sleep.pid, file=sys.stderr, flush=True)
     for line in sys.stdin:
         if mode == "hang":
             time.sleep(60)

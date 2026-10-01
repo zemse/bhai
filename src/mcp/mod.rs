@@ -84,10 +84,23 @@ pub struct Status {
 
 type Service = RunningService<RoleClient, ()>;
 
+/// A stdio server's process group, killed when dropped. `npx`, `uvx` and `docker run`
+/// start the real server as a grandchild, which killing only the wrapper leaves running.
+struct Group(u32);
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        crate::tools::bash::kill_group(Some(self.0));
+    }
+}
+
+/// A connected server, and its process group when it is a stdio one.
+type Running = (Service, Option<Group>);
+
 /// What every view of a session's hub shares.
 struct Shared {
     /// Taken on shutdown; `None` after it.
-    services: Mutex<Option<Vec<Service>>>,
+    services: Mutex<Option<Vec<Running>>>,
     /// Servers started at launch, with all their tools.
     launched: Vec<Status>,
     /// Servers the launch identity did not allow, which a child may start.
@@ -162,7 +175,7 @@ impl Hub {
         let mut services = Vec::new();
         for (status, service) in futures_util::future::join_all(starts).await {
             if let Some(service) = service {
-                peers.push((status.name.clone(), service.peer().clone()));
+                peers.push((status.name.clone(), service.0.peer().clone()));
                 services.push(service);
             }
             launched.push(status);
@@ -277,7 +290,7 @@ impl Hub {
                     .unwrap_or_else(|e| e.into_inner());
                 match services.as_mut() {
                     Some(services) => {
-                        peer = Some(service.peer().clone());
+                        peer = Some(service.0.peer().clone());
                         services.push(service);
                     }
                     None => {
@@ -441,8 +454,9 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
         Some((tool, peer))
     }
 
-    /// Close every server; each is killed if it does not exit in a few seconds. Only the
-    /// session's hub does this.
+    /// Close every server; each is killed if it does not exit in a few seconds, and what a
+    /// stdio server left behind in its process group goes with it. Only the session's hub
+    /// does this.
     pub async fn shutdown(&self) {
         if !self.root {
             return;
@@ -454,7 +468,11 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .unwrap_or_default();
-        futures_util::future::join_all(services.into_iter().map(|s| s.cancel())).await;
+        futures_util::future::join_all(services.into_iter().map(|(service, group)| async move {
+            let _ = service.cancel().await;
+            drop(group);
+        }))
+        .await;
     }
 
     /// What `/mcp` prints.
@@ -585,15 +603,15 @@ async fn start_one(
     server: &Server,
     log_dir: &Path,
     timeout: Duration,
-) -> (Status, Option<Service>) {
+) -> (Status, Option<Running>) {
     let mut status = Status {
         state: State::Connected,
         ..skipped(server, String::new())
     };
     match tokio::time::timeout(timeout, spawn(server, log_dir)).await {
-        Ok(Ok((service, tools))) => {
+        Ok(Ok((service, group, tools))) => {
             status.tools = tools;
-            (status, Some(service))
+            (status, Some((service, group)))
         }
         Ok(Err(e)) => {
             status.state = State::Failed(format!("{e:#}"));
@@ -676,9 +694,9 @@ or a server name to list its tools.",
 }
 
 /// Connect, initialize and list tools.
-async fn spawn(server: &Server, log_dir: &Path) -> Result<(Service, Vec<ToolInfo>)> {
-    let service = match &server.url {
-        Some(url) => http(server, url).await?,
+async fn spawn(server: &Server, log_dir: &Path) -> Result<(Service, Option<Group>, Vec<ToolInfo>)> {
+    let (service, group) = match &server.url {
+        Some(url) => (http(server, url).await?, None),
         None => stdio(server, log_dir).await?,
     };
     let mut tools = service
@@ -695,11 +713,12 @@ async fn spawn(server: &Server, log_dir: &Path) -> Result<(Service, Vec<ToolInfo
         .collect::<Vec<_>>();
     // Sorted so the prompt's tool lines do not depend on the server's listing order.
     tools.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok((service, tools))
+    Ok((service, group, tools))
 }
 
-/// A stdio server as a child process. Its stderr goes to `<log_dir>/mcp-<name>.log`.
-async fn stdio(server: &Server, log_dir: &Path) -> Result<Service> {
+/// A stdio server as a child process leading its own group. Its stderr goes to
+/// `<log_dir>/mcp-<name>.log`.
+async fn stdio(server: &Server, log_dir: &Path) -> Result<(Service, Option<Group>)> {
     std::fs::create_dir_all(log_dir).with_context(|| format!("creating {}", log_dir.display()))?;
     let log_path = log_dir.join(format!("mcp-{}.log", file_safe(&server.name)));
     let log = std::fs::File::create(&log_path)
@@ -709,12 +728,15 @@ async fn stdio(server: &Server, log_dir: &Path) -> Result<Service> {
     command
         .args(&server.args)
         .envs(&server.env)
+        .process_group(0)
         .kill_on_drop(true);
     let (transport, _) = TokioChildProcess::builder(command)
         .stderr(Stdio::from(log))
         .spawn()
         .with_context(|| format!("starting `{}`", server.command))?;
-    ().serve(transport).await.context("initialize failed")
+    let group = transport.id().map(Group);
+    let service = ().serve(transport).await.context("initialize failed")?;
+    Ok((service, group))
 }
 
 /// A streamable HTTP server. Header values are never named in an error: they carry tokens.
@@ -854,6 +876,44 @@ mod tests {
         hub.shutdown().await;
         let (out, ok) = hub.call("mcp__fake__echo", serde_json::json!({})).await;
         assert!(!ok, "{out}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_kills_what_a_stdio_server_left_in_its_group() {
+        if !python() {
+            return;
+        }
+        let alive = |pid: &str| {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let dir = temp_dir();
+        let hub = Hub::connect(
+            vec![fake("fake", "grandchild")],
+            &Identity::default(),
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
+        let log = std::fs::read_to_string(dir.join("mcp-fake.log")).unwrap();
+        let pid = log
+            .lines()
+            .find_map(|l| l.strip_prefix("grandchild "))
+            .unwrap_or_else(|| panic!("{log}"))
+            .to_string();
+        assert!(alive(&pid));
+
+        hub.shutdown().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive(&pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive(&pid), "grandchild {pid} outlived shutdown");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
