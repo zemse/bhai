@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- Bash commands run with a fixed non-interactive environment (`TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0` and a UTF-8 `LANG`/`LC_ALL`), set after the credential scrub, so a pager or a git credential prompt can no longer hang a call and output carries no colour codes. Stdio MCP servers keep the inherited environment.
 - One running subagent can be stopped without stopping the turn or its siblings: ctrl+x inside its pane (the pane hint now says so), `POST /children/<id>/interrupt` (404 when no such child is running), or the model's `close_agent` tool, which comes with `agent`. A stopped child still reports, and its pane notes "stopped by you". Workflow steps share their run's flag, so they cannot be stopped one at a time.
 - The session file is fsynced when a turn ends (and after an explicit compaction), not only flushed to the OS, so a power loss no longer drops the tail of a turn that finished on screen. A failed sync is reported as a transcript error, and resume still drops an unanswered call.
 - A `--resume` of a session that ended while a child agent was running appends a report for that child saying it did not finish and was not restarted, in the history and in the session file, so the model no longer waits on a report that cannot come. A child that did report is left alone, and a second resume adds nothing.

@@ -54,6 +54,28 @@ pub fn scrub(command: &mut tokio::process::Command) {
     }
 }
 
+#[cfg(target_os = "macos")]
+const UTF8: &str = "en_US.UTF-8";
+#[cfg(not(target_os = "macos"))]
+const UTF8: &str = "C.UTF-8";
+
+/// Fixed for a bash child so nothing waits on a terminal that is not there: no pager, no
+/// git credential prompt, no colour codes in what the model reads.
+const FIXED: [(&str, &str); 7] = [
+    ("TERM", "dumb"),
+    ("NO_COLOR", "1"),
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("LANG", UTF8),
+    ("LC_ALL", UTF8),
+];
+
+/// Set the fixed non-interactive variables on `command`, over whatever bhai inherited.
+pub fn non_interactive(command: &mut tokio::process::Command) {
+    command.envs(FIXED);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

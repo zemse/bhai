@@ -149,6 +149,7 @@ fn parse_command(args: &Value) -> Result<String, String> {
 async fn run(command: &str, live: Live<'_>) -> String {
     let mut bash = Command::new("bash");
     crate::childenv::scrub(&mut bash);
+    crate::childenv::non_interactive(&mut bash);
     let child = bash
         .arg("-lc")
         .arg(command)
@@ -419,6 +420,18 @@ mod tests {
         assert!(out.contains("BHAI_TEST_PLAIN=kept-value"), "{out}");
         assert!(!out.contains("BHAI_TEST_API_TOKEN"), "{out}");
         assert!(!out.contains("withheld-value"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn the_command_runs_with_a_fixed_non_interactive_environment() {
+        let out = run(
+            "echo \"$TERM $NO_COLOR $PAGER $GIT_PAGER $GIT_TERMINAL_PROMPT\"",
+            quiet(),
+        )
+        .await;
+        assert!(out.contains("dumb 1 cat cat 0"), "{out}");
+        let out = run("echo \"$LANG $LC_ALL\"", quiet()).await;
+        assert!(out.contains("UTF-8"), "{out}");
     }
 
     #[tokio::test]
