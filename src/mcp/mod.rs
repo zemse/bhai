@@ -564,6 +564,7 @@ pub fn fake_server(name: &str, mode: &str) -> Option<Server> {
         skip: None,
         startup_timeout: None,
         tool_timeout: None,
+        pin: None,
     })
 }
 
@@ -630,6 +631,16 @@ async fn start_one(
     };
     match tokio::time::timeout(timeout, spawn(server, log_dir)).await {
         Ok(Ok((service, group, tools))) => {
+            if let Some(why) = server
+                .pin
+                .as_ref()
+                .and_then(|p| p.check(&server.name, &tools).err())
+            {
+                let _ = service.cancel().await;
+                drop(group);
+                status.state = State::Failed(why);
+                return (status, None);
+            }
             status.tools = tools;
             (status, Some((service, group)))
         }
@@ -1063,6 +1074,7 @@ mod tests {
             skip: None,
             startup_timeout: None,
             tool_timeout: None,
+            pin: None,
         };
         let Err(why) = http(&server, &url).await else {
             panic!("a cross-origin redirect was followed");
@@ -1233,6 +1245,52 @@ mod tests {
         );
         hub.shutdown().await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_server_whose_tools_changed_is_closed() {
+        if !python() {
+            return;
+        }
+        let dir = temp_dir();
+        let pin = servers::Pin::test(&dir.join("catalogs.json"));
+        let pinned = |mode: &str| Server {
+            pin: Some(pin.clone()),
+            ..fake("fake", mode)
+        };
+        let connect = |server: Server| {
+            let dir = dir.clone();
+            async move {
+                Hub::connect(
+                    vec![server],
+                    &Identity::default(),
+                    &dir,
+                    Duration::from_secs(10),
+                )
+                .await
+            }
+        };
+        // First sight pins the catalog, and the same one passes again.
+        for _ in 0..2 {
+            let hub = connect(pinned("")).await;
+            assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
+            hub.shutdown().await;
+        }
+        let hub = connect(pinned("drift")).await;
+        let State::Failed(why) = &hub.servers[0].state else {
+            panic!("{:?}", hub.servers);
+        };
+        assert!(
+            why.starts_with("its tools changed since it was approved"),
+            "{why}"
+        );
+        assert!(!hub.has_tools());
+        let (out, ok) = hub
+            .call("mcp__fake__echo", serde_json::json!({"message": "hi"}))
+            .await;
+        assert!(!ok, "{out}");
+        hub.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
