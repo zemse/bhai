@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `.config/nextest.toml` defines a `ci` profile for `cargo nextest run --profile ci` that does not stop at the first failure and kills a test still running after five minutes (60s slow-timeout, terminate after 5 periods); CI itself still runs `cargo test`.
 - A 401 from the Codex backend re-reads `auth.json` and takes the token there if another process rotated it, otherwise forces one refresh, then retries the call once. A token revoked before its `exp` no longer kills the turn, and a second 401 still fails with "Run `codex login`".
 - `.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on macOS and Linux for every push to main and every pull request, and `cargo deny check advisories` alongside. Actions are pinned by commit SHA and checkout does not persist credentials.
 - `deny.toml` sets the dependency policy for `cargo deny check`: yanked crates and wildcard versions are denied, only listed licences and the crates.io registry are allowed, and RUSTSEC-2025-0141 (bincode via syntect) is ignored with its reason.
