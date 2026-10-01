@@ -1188,7 +1188,7 @@ impl App {
             // A child's report opened a turn nobody typed. Deliberately not `follow`:
             // a landing report must not yank a scrolled-up reader to the bottom.
             Event::Resumed(_) => self.working = true,
-            Event::Judging(what) => self.judging = what.clone(),
+            Event::Judging(what) => self.judging = what,
             Event::TurnEnd => {
                 self.working = false;
                 self.judging = None;

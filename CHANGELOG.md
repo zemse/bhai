@@ -6,6 +6,9 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- The release binary is stripped and built with thin LTO, so it is about 12% smaller
+  (28.2 MB to 24.7 MB). The crate now denies unsafe code except for the one `killpg`
+  call, and clippy warns on redundant clones.
 - A token refresh writes `~/.codex/auth.json` readable only by the user: the temp file is
   created 0600 and synced before it is renamed over the old one, where it used to land
   0644.

@@ -258,7 +258,7 @@ mod tests {
         }
 
         // It stops once enough is freed, and never evicts twice.
-        let mut history = before.clone();
+        let mut history = before;
         assert_eq!(evict(&mut history, 1, &ByteEstimate), 89);
         assert_eq!(evict(&mut history, u64::MAX, &ByteEstimate), 3 * 89);
     }

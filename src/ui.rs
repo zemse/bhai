@@ -1655,8 +1655,7 @@ mod tests {
     #[test]
     fn an_entry_cut_off_at_the_bottom_keeps_its_badge_on_its_last_row() {
         let mut app = App::detached();
-        app.entries()
-            .push(Entry::Assistant("a line\n".repeat(40).to_string()));
+        app.entries().push(Entry::Assistant("a line\n".repeat(40)));
         app.entries().tokens.insert(
             1,
             Tokens {

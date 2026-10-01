@@ -300,6 +300,7 @@ fn flush(pending: &mut Vec<u8>, progress: &(dyn Fn(String) + Send + Sync)) {
     *pending = rest;
 }
 
+#[allow(unsafe_code)]
 fn kill_group(group: Option<u32>) {
     if let Some(pid) = group.and_then(|pid| i32::try_from(pid).ok()) {
         // SAFETY: `killpg` only sends a signal; the group is the child's own.

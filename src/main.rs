@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
             _ => bail!("usage: bhai mcp approve <server>"),
         };
         let cwd = std::env::current_dir()?;
-        let roots = instructions::Roots::from_env(cwd.clone());
+        let roots = instructions::Roots::from_env(cwd);
         let config = Config::load(roots.home.as_deref(), &roots.cwd)?;
         let server = mcp::servers::approve(&roots, &config.mcp_servers, name)?;
         let what = match &server.url {
