@@ -360,8 +360,7 @@ impl History {
 
     /// Record a submitted prompt and end any walk.
     pub fn push(&mut self, text: &str) -> Result<()> {
-        self.index = None;
-        self.draft.clear();
+        self.end_walk();
         if self.entries.last().is_some_and(|last| last == text) {
             return Ok(());
         }
@@ -375,6 +374,17 @@ impl History {
         let mut file = crate::sessions::private_append(path)?;
         writeln!(file, "{}", line(text)?)?;
         Ok(())
+    }
+
+    /// Every prompt kept, oldest first.
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+
+    /// Stop walking, so the next `prev` starts again from the newest.
+    pub fn end_walk(&mut self) {
+        self.index = None;
+        self.draft.clear();
     }
 
     /// The entry before the one shown; `current` is kept as the draft when a walk starts.

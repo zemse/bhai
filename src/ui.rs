@@ -19,6 +19,7 @@ use crate::markdown::{self, Origin};
 use crate::models::Picker;
 use crate::permissions::Mode;
 use crate::profile::{Method, Tokens};
+use crate::search::Search;
 use crate::session::{ChildRow, ChildState};
 use crate::wrap::{Join, joined, wrap};
 
@@ -111,8 +112,15 @@ fn draw(frame: &mut Frame, app: &mut App) {
         render_trust(frame, bottom_area, &gate);
         return;
     }
-    // The `/model` picker takes the prompt's place, sized to the list it is showing.
-    if let Some(height) = app.picker.as_ref().map(Picker::height) {
+    // The `/model` picker and the history search take the prompt's place, sized to the
+    // list they are showing. An approval that comes in meanwhile is drawn over them.
+    let search = app.search.as_ref().filter(|_| app.pending.is_none());
+    let overlay = app
+        .picker
+        .as_ref()
+        .map(Picker::height)
+        .or(search.map(Search::height));
+    if let Some(height) = overlay {
         let height = height.min(frame.area().height.saturating_sub(2));
         let [transcript_area, bottom_area, status_area] = Layout::vertical([
             Constraint::Min(1),
@@ -127,6 +135,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.child_rows.clear();
         if let Some(picker) = &mut app.picker {
             picker.render(frame, bottom_area);
+        } else if let Some(search) = &app.search {
+            search.render(frame, bottom_area);
         }
         return;
     }
@@ -3580,6 +3590,32 @@ mod tests {
         assert_eq!(buffer[(x + 4, y)].symbol(), "p");
         assert_eq!(buffer[(x + 4, y)].fg, Color::DarkGray);
         assert_eq!(buffer[(x + 7, y)].fg, Color::DarkGray);
+    }
+
+    #[test]
+    fn the_history_search_takes_the_prompt_and_lists_the_matches() {
+        let mut app = App::detached();
+        for text in ["fix the parser", "run the tests", "fix the\nlexer"] {
+            app.history.push(text).unwrap();
+        }
+        let mut search = crate::search::Search::new(app.history.entries());
+        search.insert("fix");
+        app.search = Some(search);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        for part in [
+            "history · 2 of 3",
+            "search: fix",
+            "fix the ↵ lexer",
+            "fix the parser",
+            "esc close",
+        ] {
+            assert!(shown.contains(part), "{part} missing from {shown}");
+        }
+        assert!(!shown.contains("run the tests"), "{shown}");
+        assert!(app.input_area.is_none());
     }
 
     #[test]

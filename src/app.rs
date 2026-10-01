@@ -29,6 +29,7 @@ use crate::markdown::{self, Origin};
 use crate::models::{Choice, Picker};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
+use crate::search::{Pick, Search};
 use crate::session::{Approval, ChildRow, Event, Prompt, Session, SubmitError};
 use crate::skills::Skill;
 use crate::speed::Speed;
@@ -288,6 +289,8 @@ pub struct App {
     pub child_rows: Vec<(Rect, String)>,
     /// The `/model` picker, shown instead of the prompt while open.
     pub picker: Option<Picker>,
+    /// The `ctrl+r` search over the prompt history, shown instead of the prompt while open.
+    pub search: Option<Search>,
     /// Where the Ollama server is, for asking it what it has pulled.
     pub ollama_url: String,
     /// The session's id, which names its file on disk; empty until main fills it in.
@@ -388,6 +391,7 @@ impl App {
             inside: None,
             child_rows: Vec::new(),
             picker: None,
+            search: None,
             ollama_url: crate::ollama::DEFAULT_URL.to_string(),
             session_id: String::new(),
             statusline: None,
@@ -474,6 +478,28 @@ impl App {
                         true => self.save_default(&model, Some(&effort)),
                         false => self.switch_model(model, effort, window),
                     }
+                }
+            }
+            return;
+        }
+
+        // The history search takes every key; ctrl+c closes it, and still stops a turn.
+        if let Some(search) = &mut self.search {
+            if ctrl && key.code == KeyCode::Char('c') {
+                self.search = None;
+                if self.busy() {
+                    self.interrupt();
+                }
+                return;
+            }
+            match search.on_key(key) {
+                Pick::Waiting => {}
+                Pick::Closed => self.search = None,
+                Pick::Picked(text) => {
+                    self.search = None;
+                    self.history.end_walk();
+                    self.input.set(text);
+                    self.menu = None;
                 }
             }
             return;
@@ -570,6 +596,10 @@ impl App {
             KeyCode::Enter if !key.modifiers.is_empty() => self.input.newline(),
             KeyCode::Char('j') if ctrl => self.input.newline(),
             KeyCode::Enter => self.submit(),
+            KeyCode::Char('r') if ctrl => {
+                self.search = Some(Search::new(self.history.entries()));
+                return;
+            }
             KeyCode::Char('p') if ctrl => return self.recall(-1),
             KeyCode::Char('n') if ctrl => return self.recall(1),
             KeyCode::PageUp => self.scroll_by(-(self.page as isize)),
@@ -603,6 +633,11 @@ impl App {
 
     /// Bracketed paste: the text goes into the input as typed, newlines and all.
     pub fn on_paste(&mut self, text: &str) {
+        if let Some(search) = &mut self.search
+            && self.pending.is_none()
+        {
+            return search.insert(text);
+        }
         if self.pending.is_none() && self.diff.is_none() {
             self.input.insert(text);
             self.refresh_menu();
@@ -3513,6 +3548,38 @@ mod tests {
         assert_eq!(app.input.value(), "/permissions");
         app.on_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert_eq!(app.input.value(), "draft");
+    }
+
+    #[test]
+    fn ctrl_r_searches_the_history_and_takes_the_pick_into_the_prompt() {
+        let mut app = App::detached();
+        for text in ["fix the parser", "run the tests", "fix the lexer"] {
+            app.history.push(text).unwrap();
+        }
+        type_text(&mut app, "draft");
+        app.on_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(app.search.is_some());
+        type_text(&mut app, "fix");
+        app.on_paste("\n");
+        assert_eq!(app.input.value(), "draft", "the search types into itself");
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.search.is_none());
+        assert_eq!(app.input.value(), "draft");
+
+        app.on_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        type_text(&mut app, "fix");
+        app.on_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.search.is_none());
+        assert_eq!(app.input.value(), "fix the parser");
+        // A walk after the pick starts again from the newest.
+        app.on_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.input.value(), "fix the lexer");
+
+        app.on_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.search.is_none());
+        assert_eq!(app.input.value(), "fix the lexer", "ctrl+c only closes it");
     }
 
     fn with_skill(name: &str) -> App {

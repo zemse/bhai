@@ -34,6 +34,7 @@ mod permissions;
 mod profile;
 mod prompt;
 mod redact;
+mod search;
 mod server;
 mod session;
 mod sessions;
