@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::agent::ChildUsage;
 use crate::cache::Hit;
-use crate::client::Usage;
+use crate::client::{Stalls, Usage};
 use crate::prompt::SystemPrompt;
 use crate::tokens::{self, Tokenizer};
 
@@ -682,8 +682,15 @@ pub fn export(profile: &Profile, dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Append one JSONL line for a finished model call.
-pub fn log_usage(path: &Path, usage: &Usage, hit: &Hit, items: usize) -> Result<()> {
+/// Append one JSONL line for a finished model call. `stalls` is `None` for a backend
+/// that does not time its stream.
+pub fn log_usage(
+    path: &Path,
+    usage: &Usage,
+    hit: &Hit,
+    items: usize,
+    stalls: Option<&Stalls>,
+) -> Result<()> {
     if let Some(dir) = path.parent() {
         crate::sessions::private_dir(dir)?;
     }
@@ -696,6 +703,7 @@ pub fn log_usage(path: &Path, usage: &Usage, hit: &Hit, items: usize) -> Result<
         "history_items": items,
         "expected_cached": hit.expected_cached,
         "hit_ratio": hit.hit_ratio,
+        "stalls": stalls,
     });
     let mut file = crate::sessions::private_append(path)
         .with_context(|| format!("could not open {}", path.display()))?;
@@ -1016,12 +1024,19 @@ mod tests {
             output: 3,
             reasoning: 1,
         };
-        log_usage(&log, &usage, &Hit::default(), 4).unwrap();
+        log_usage(&log, &usage, &Hit::default(), 4, None).unwrap();
         let hit = Hit {
             expected_cached: Some(8),
             hit_ratio: Some(1.0),
         };
-        log_usage(&log, &usage, &hit, 6).unwrap();
+        let stalls = Stalls {
+            first_ms: 900,
+            longest_ms: 300,
+            over_50ms: 3,
+            over_100ms: 2,
+            over_250ms: 1,
+        };
+        log_usage(&log, &usage, &hit, 6, Some(&stalls)).unwrap();
         let lines: Vec<Value> = std::fs::read_to_string(&log)
             .unwrap()
             .lines()
@@ -1033,6 +1048,9 @@ mod tests {
         assert!(lines[0]["expected_cached"].is_null());
         assert_eq!(lines[1]["expected_cached"], 8);
         assert_eq!(lines[1]["hit_ratio"], 1.0);
+        assert!(lines[0]["stalls"].is_null());
+        assert_eq!(lines[1]["stalls"]["over_250ms"], 1);
+        assert_eq!(lines[1]["stalls"]["longest_ms"], 300);
         let _ = std::fs::remove_dir_all(dir);
     }
 

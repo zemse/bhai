@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- Each line of `usage.jsonl` carries the call's stream stalls: the wait for the first event, the longest gap after it, and how many gaps passed 50, 100 and 250 ms. Keepalives do not count as events, so a stream that is pinging but stalled still shows up.
 - The tab title ends with what the session is doing, `working` while a turn runs and `approval?` while a tool call waits, so a user with many tabs or tmux panes can see which one needs them.
 - A turn the user interrupts ends on a constant `<turn_aborted>` message, so the next turn knows its plan did not finish and that a command it cut off may have partly run. A resumed session shows it as "interrupted".
 - The TUI sends a notification when an approval is waiting or a turn ends while the terminal is not in front. Ghostty, iTerm2, kitty, WezTerm and Warp get OSC 9 (passed through tmux) and other terminals get a bell. Nothing is sent until the terminal reports that it lost focus.

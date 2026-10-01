@@ -1491,6 +1491,7 @@ async fn turn(
         let sent = history.len();
         let mut finished = None;
         let mut continues = false;
+        let mut stalls = None;
         let mut on_delta = |delta: Delta| {
             let _ = tx.send(match delta {
                 Delta::Reasoning(s) => AgentEvent::Reasoning(s),
@@ -1498,6 +1499,10 @@ async fn turn(
                 Delta::Commentary(s) => AgentEvent::Commentary(s),
                 Delta::Continues => {
                     continues = true;
+                    return;
+                }
+                Delta::Stalls(found) => {
+                    stalls = Some(found);
                     return;
                 }
                 Delta::Usage(usage) => {
@@ -1509,7 +1514,8 @@ async fn turn(
                         false => cache::Hit::default(),
                     };
                     if let Some(path) = usage_log
-                        && let Err(e) = profile::log_usage(path, &usage, &hit, sent)
+                        && let Err(e) =
+                            profile::log_usage(path, &usage, &hit, sent, stalls.as_ref())
                     {
                         let _ = tx.send(AgentEvent::Error(format!("usage log: {e:#}")));
                     }

@@ -169,6 +169,8 @@ pub enum Delta {
     /// Text of a message in the `commentary` phase: a preamble the model writes before
     /// it carries on, not its answer.
     Commentary(String),
+    /// How the call's stream paced itself, sent just before its [`Delta::Usage`].
+    Stalls(Stalls),
     Usage(Usage),
     /// The request about to be sent breaks the prompt cache, or `None` when it is clean.
     Cache(Option<CacheBreak>),
@@ -227,6 +229,54 @@ impl Usage {
     /// Percent of the input that was a cache hit, when there was any input.
     pub fn cache_rate(&self) -> Option<f64> {
         (self.input > 0).then(|| self.cached as f64 * 100.0 / self.input as f64)
+    }
+}
+
+/// The silences between one parsed stream event and the next in a model call. Only
+/// events count, so a keepalive that rearms [`IDLE_TIMEOUT`] still shows as a stall.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Stalls {
+    /// From the response headers to the first event: the wait before the model starts.
+    pub first_ms: u64,
+    /// The longest gap after the first event.
+    pub longest_ms: u64,
+    pub over_50ms: u32,
+    pub over_100ms: u32,
+    pub over_250ms: u32,
+}
+
+/// Times the events of one attempt into [`Stalls`].
+pub(crate) struct Gaps {
+    last: std::time::Instant,
+    started: bool,
+    stalls: Stalls,
+}
+
+impl Gaps {
+    pub(crate) fn new(at: std::time::Instant) -> Self {
+        Self {
+            last: at,
+            started: false,
+            stalls: Stalls::default(),
+        }
+    }
+
+    pub(crate) fn event(&mut self, at: std::time::Instant) {
+        let gap = at.saturating_duration_since(self.last).as_millis() as u64;
+        self.last = at;
+        let s = &mut self.stalls;
+        if !std::mem::replace(&mut self.started, true) {
+            s.first_ms = gap;
+            return;
+        }
+        s.longest_ms = s.longest_ms.max(gap);
+        s.over_50ms += u32::from(gap >= 50);
+        s.over_100ms += u32::from(gap >= 100);
+        s.over_250ms += u32::from(gap >= 250);
+    }
+
+    pub(crate) fn stalls(&self) -> Stalls {
+        self.stalls
     }
 }
 
@@ -700,6 +750,7 @@ impl Client {
         // Ids of the messages in the `commentary` phase. The phase is on the item when it
         // is added, not on its text deltas.
         let mut commentary: Vec<String> = Vec::new();
+        let mut gaps = Gaps::new(std::time::Instant::now());
 
         loop {
             let chunk = match watched(stream.next(), cancel, "stream idle for too long").await? {
@@ -721,6 +772,7 @@ impl Client {
                 let Ok(event) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
+                gaps.event(std::time::Instant::now());
                 debug_log(data);
                 match event.get("type").and_then(Value::as_str).unwrap_or("") {
                     "response.output_item.added" => {
@@ -807,6 +859,7 @@ impl Client {
 
         if completed {
             if let Some(usage) = usage {
+                on_delta(Delta::Stalls(gaps.stalls()));
                 on_delta(Delta::Usage(usage));
             }
             if continues {
@@ -1131,6 +1184,26 @@ fn toml_string(line: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gaps_count_the_silences_after_the_first_event() {
+        let start = std::time::Instant::now();
+        let ms = |n| start + Duration::from_millis(n);
+        let mut gaps = Gaps::new(start);
+        for at in [700, 710, 770, 900, 1200, 1210] {
+            gaps.event(ms(at));
+        }
+        assert_eq!(
+            gaps.stalls(),
+            Stalls {
+                first_ms: 700,
+                longest_ms: 300,
+                over_50ms: 3,
+                over_100ms: 2,
+                over_250ms: 1,
+            }
+        );
+    }
 
     #[test]
     fn a_character_split_across_chunks_is_decoded_whole() {

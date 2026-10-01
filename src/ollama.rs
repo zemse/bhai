@@ -158,6 +158,7 @@ pub async fn attempt(
     // Held until the attempt succeeds, so a retry after the final event does not count
     // one call's usage twice.
     let mut counted = None;
+    let mut gaps = client::Gaps::new(std::time::Instant::now());
 
     loop {
         let chunk = match client::watched(stream.next(), cancel, "stream idle for too long").await?
@@ -176,6 +177,7 @@ pub async fn attempt(
             let Ok(event) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
+            gaps.event(std::time::Instant::now());
             if let Some(msg) = event.get("error").and_then(Value::as_str) {
                 return Err(Error::Fatal(anyhow!("{msg}")));
             }
@@ -217,6 +219,7 @@ pub async fn attempt(
         return Err(Error::Retryable(anyhow!("stream ended before done")));
     }
     if let Some(usage) = counted {
+        on_delta(Delta::Stalls(gaps.stalls()));
         on_delta(Delta::Usage(usage));
     }
     Ok(items(text, calls))
@@ -463,6 +466,60 @@ mod tests {
             .expect("the reply waited for a socket that never closed");
         assert!(result.is_err(), "the error after `done` ends the attempt");
         assert!(counted.is_empty(), "{counted:?}");
+    }
+
+    /// A silence before the final event is reported with the call, ahead of its usage.
+    #[tokio::test]
+    async fn a_pause_in_the_stream_is_reported_as_a_stall() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0u8; 4096]).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let lines = [
+                "{\"message\":{\"content\":\"a\"},\"done\":false}\n",
+                "{\"message\":{\"content\":\"b\"},\"done\":true}\n",
+            ];
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                let framed = format!("{:x}\r\n{line}\r\n", line.len());
+                socket.write_all(framed.as_bytes()).await.unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let mut seen = Vec::new();
+        let mut on_delta = |delta: Delta| match delta {
+            Delta::Stalls(stalls) => seen.push(Some(stalls)),
+            Delta::Usage(_) => seen.push(None),
+            _ => {}
+        };
+        let http = reqwest::Client::new();
+        let request = json!({});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let read = attempt(&http, &url, &request, &mut on_delta, &cancel);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .expect("the reply waited for a socket that never closed");
+        assert!(result.is_ok(), "the reply was refused");
+        let [Some(stalls), None] = seen[..] else {
+            panic!("{seen:?}");
+        };
+        assert!(stalls.longest_ms >= 250, "{stalls:?}");
+        assert_eq!((stalls.over_250ms, stalls.over_50ms), (1, 1));
     }
 
     #[tokio::test]
