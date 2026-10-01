@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A `--resume` of a session that ended while a child agent was running appends a report for that child saying it did not finish and was not restarted, in the history and in the session file, so the model no longer waits on a report that cannot come. A child that did report is left alone, and a second resume adds nothing.
 - A prompt starting with `!` runs that command in the shell yourself and shows the result as a note: it goes through the bash permission check (only a deny rule or a refusing mode stops it, since typing it is the approval), is written to `permissions.jsonl` with `by` set to `you`, and never reaches the model's history.
 - An edit or write approval shows the diff it would make, folded under the call in the transcript. The preview reads only a regular file of 1 MiB or less, so a path like /dev/zero or a fifo cannot hang the prompt.
 - `tests/fake_backend.rs` runs the real binary with `--serve --headless` against a local fake Responses backend and drives it over HTTP: a text answer, an approved bash call and a rejected one, checking the requests bhai sends, what `/events` and `/state` report, and the files on disk, with no quota spent. `BHAI_TEST_BASE_URL` points the ChatGPT backend root (responses, models, usage) at the fake, and only in a debug build.

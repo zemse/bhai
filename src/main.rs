@@ -277,10 +277,13 @@ async fn main() -> Result<()> {
                 client.effort_in_force()
             ));
             warnings.extend(loaded.warnings.iter().map(|w| format!("warning: {w}")));
-            Saved {
-                writer: sessions::Writer::resume(&dir, &loaded)?,
-                history: loaded.items,
+            let mut writer = sessions::Writer::resume(&dir, &loaded)?;
+            let mut history = loaded.items;
+            for report in agent::abandoned(&history) {
+                writer.append(&report)?;
+                history.push(report);
             }
+            Saved { writer, history }
         }
         None => {
             let header = sessions::Header::new(

@@ -405,6 +405,52 @@ pub const CHILD_RESULT: &str = "A child agent you started has finished.";
 const CHILD_RESULT_LATE: &str = " You have already answered the user, so say what this \
 adds or changes and leave the rest of your answer standing.";
 
+/// A report for every child the history says was started and never reported, which is
+/// what a session that ended mid-child holds: the call's "its report will reach you" with
+/// nothing after it. Nothing re-runs the child, so the model is told it is gone.
+pub fn abandoned(history: &[Value]) -> Vec<Value> {
+    let mut open: Vec<(&str, &str)> = Vec::new();
+    for item in history {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call_output") => {
+                let started = item
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .and_then(|output| output.strip_prefix("child "))
+                    .and_then(|rest| rest.split_once(" ("))
+                    .and_then(|(id, rest)| Some((id, rest.split_once(") started")?.0)));
+                open.extend(started);
+            }
+            Some("message") => {
+                let report = item
+                    .pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .and_then(|text| text.strip_prefix(CHILD_RESULT));
+                if let Some(report) = report {
+                    open.retain(|(id, _)| !report.contains(&format!("child {id} (")));
+                }
+            }
+            _ => {}
+        }
+    }
+    open.into_iter()
+        .map(|(id, name)| {
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!(
+                        "{CHILD_RESULT}\n\nchild {id} ({name}) did not finish: the session ended \
+while it was running, and it has not been restarted. Start a new child if the work is still \
+needed."
+                    ),
+                }],
+            })
+        })
+        .collect()
+}
+
 /// A detached child agent that has finished, on its way into the parent's history.
 #[derive(Debug)]
 pub struct ChildResult {
@@ -2480,6 +2526,44 @@ mod tests {
         drop(stop.child());
         let _running = stop.child();
         assert_eq!(stop.tracked(), 1, "the finished child was kept");
+    }
+
+    #[test]
+    fn a_child_that_never_reported_gets_a_report_that_it_did_not_finish() {
+        let started = |id: &str| {
+            json!({
+                "type": "function_call_output",
+                "call_id": id,
+                "output": format!("child {id} (worker) started. Its report will reach you as a message."),
+            })
+        };
+        let reported = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": format!("{CHILD_RESULT}\n\nchild aaaaaa (worker) finished in 1 steps\nfound it"),
+            }],
+        });
+        let refused = json!({
+            "type": "function_call_output",
+            "call_id": "c",
+            "output": "unknown identity `x`",
+        });
+        let history = [started("aaaaaa"), started("bbbbbb"), reported, refused];
+        let missing = abandoned(&history);
+        assert_eq!(missing.len(), 1);
+        let text = missing[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with(CHILD_RESULT), "{text}");
+        assert!(
+            text.contains("child bbbbbb (worker) did not finish"),
+            "{text}"
+        );
+        assert!(!text.contains("aaaaaa"), "{text}");
+        // The report closes it, so a second resume adds nothing.
+        let mut healed = history.to_vec();
+        healed.extend(missing);
+        assert!(abandoned(&healed).is_empty());
     }
     use super::*;
     use crate::permissions::Mode;
