@@ -733,6 +733,8 @@ pub(crate) async fn run_with(
     let mut monitor = CacheMonitor::default();
 
     let mut compact_next = false;
+    // The turn the backend refused as too long runs again on the compacted history, once.
+    let mut again = false;
     // What the user asked the next summary to keep, from `/compact <prompt>`.
     let mut asked: Option<String> = None;
     // The compacted copy `/compact-then` continues from, and the call whose cache the
@@ -764,10 +766,12 @@ pub(crate) async fn run_with(
                     .is_some_and(|c| c.usage.input >= compact::FORK_MIN)
             })
             .map(|sent| sent + cache::CACHE_TTL.saturating_sub(compact::FORK_LEAD));
+        let retried = std::mem::take(&mut again);
         let next = tokio::select! {
-            // Control first, so a `/model` switch is in force for the message typed
-            // right after it rather than one turn late.
+            // The retry is the same turn going on. Then control, so a `/model` switch is
+            // in force for the message typed right after it rather than one turn late.
             biased;
+            _ = std::future::ready(()), if retried => Next::Retry,
             Some(control) = rx_control.recv() => {
                 match control {
                     Control::Context(reply) => {
@@ -976,7 +980,7 @@ pub(crate) async fn run_with(
                 cancel: &cancel,
                 asked: asked.take(),
             };
-            if let Err(e) = pass.run(&mut history, None, &mut sink).await {
+            if let Err(e) = pass.run(&mut history, Trigger::Asked, &mut sink).await {
                 let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
             }
             (calls, monitor) = (Vec::new(), CacheMonitor::default());
@@ -1157,13 +1161,20 @@ pub(crate) async fn run_with(
                 }
             }
         };
+        // The backend is the authority on the window: a request it refused as too long
+        // compacts whatever the last call's usage said.
+        let overflowed = result
+            .result
+            .as_ref()
+            .is_err_and(crate::client::context_overflow);
         // A goal stops on an interrupt or a failure rather than carrying on past either,
-        // and on a turn of its own that cost nothing, which would otherwise loop.
+        // and on a turn of its own that cost nothing, which would otherwise loop. An
+        // overflow is a failure only once the retry is ruled out, below.
         {
             let total = children_spent(&children);
             if let Some(g) = lock_goal(&goal).as_mut() {
                 g.settle(total);
-                if result.result.is_err() {
+                if result.result.is_err() && !overflowed {
                     g.pause("the turn failed");
                 } else if cancel.load(Ordering::Relaxed) {
                     g.pause("interrupted");
@@ -1181,6 +1192,7 @@ pub(crate) async fn run_with(
             }));
             record(&mut sink, &history[at..], &tx);
         }
+        let mut failed = None;
         if let Err(e) = result.result {
             // A refused request that carried a new update may be refusing the update, and
             // one left in the history would go out with every request after it.
@@ -1214,12 +1226,20 @@ pub(crate) async fn run_with(
                 )));
                 let _ = tx.send(AgentEvent::Effort(back));
             }
-            let _ = tx.send(AgentEvent::TurnFailed(format!("{e:#}")));
+            match overflowed {
+                true => failed = Some(format!("{e:#}")),
+                false => {
+                    let _ = tx.send(AgentEvent::TurnFailed(format!("{e:#}")));
+                }
+            }
         }
         // Between turns the history holds every call's output, so it can be rewritten.
         // After an interrupt the summary call would be cut off, so the next turn does it.
         let size = calls.last().map(|call| call.usage.input);
-        let over = compact_next || size.is_some_and(|input| limits.over(model.name(), input));
+        let over = overflowed
+            || compact_next
+            || size.is_some_and(|input| limits.over(model.name(), input));
+        let mut compacted = false;
         if over && !cancel.load(Ordering::Relaxed) {
             let pass = Compaction {
                 model: model.as_ref(),
@@ -1230,12 +1250,33 @@ pub(crate) async fn run_with(
                 cancel: &cancel,
                 asked: asked.take(),
             };
-            let size = if compact_next { None } else { size };
-            if let Err(e) = pass.run(&mut history, size, &mut sink).await {
-                let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
+            let trigger = match size {
+                _ if overflowed => Trigger::Overflow,
+                Some(size) if !compact_next => Trigger::Size(size),
+                _ => Trigger::Asked,
+            };
+            match pass.run(&mut history, trigger, &mut sink).await {
+                Ok(changed) => compacted = changed,
+                Err(e) => {
+                    let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
+                }
             }
             // Earlier calls index the old history and read the old prefix.
             (calls, monitor, compact_next) = (Vec::new(), CacheMonitor::default(), false);
+        }
+        if let Some(failed) = failed {
+            // Not a turn end: the session stays at work and the user sees one turn.
+            if compacted && !retried {
+                let _ = tx.send(AgentEvent::Info(
+                    "the request was too long for the model's context window, so the turn runs again on the compacted history".to_string(),
+                ));
+                again = true;
+                continue;
+            }
+            if let Some(g) = lock_goal(&goal).as_mut() {
+                g.pause("the turn failed");
+            }
+            let _ = tx.send(AgentEvent::TurnFailed(failed));
         }
         announce(&goal, &mut shown, &tx);
         persist(&goal, writer.as_mut(), &tx);
@@ -1764,6 +1805,28 @@ struct Fork {
     summary: String,
 }
 
+/// What a compaction was started by.
+#[derive(Debug, Clone, Copy)]
+enum Trigger {
+    /// The last call read this many tokens, over the trigger.
+    Size(u64),
+    /// The user asked for one: a summary, whatever the size.
+    Asked,
+    /// The backend refused the last request as longer than the window.
+    Overflow,
+}
+
+/// What a compaction left in place of the history.
+enum Compacted {
+    /// The same history with its old tool outputs evicted.
+    Evicted,
+    /// The earlier turns folded into this summary.
+    Summarised(String),
+    /// The earlier turns folded away with no summary, since the summary call itself was
+    /// too long for the window.
+    Dropped,
+}
+
 /// One compaction of a conversation's history.
 struct Compaction<'a> {
     model: &'a dyn Model,
@@ -1778,33 +1841,41 @@ struct Compaction<'a> {
 
 impl Compaction<'_> {
     /// Bring `history` under the target: evict old tool outputs, then summarise if that
-    /// is not enough. `size` is the last call's input tokens; `None` forces a summary.
+    /// is not enough. Says whether `history` changed.
     async fn run(
         &self,
         history: &mut Vec<Value>,
-        size: Option<u64>,
+        trigger: Trigger,
         sink: &mut Sink<'_>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let name = self.model.name();
         let tokenizer = tokens::for_model(name);
         let before = compact::estimate(history, tokenizer);
         let mut next = history.clone();
-        if let Some(size) = size {
-            let excess = size.saturating_sub(self.limits.target(name));
-            if compact::evict(&mut next, excess, tokenizer) >= excess {
-                self.commit(before, before, next, None, history, sink);
-                return Ok(());
+        match trigger {
+            Trigger::Size(size) => {
+                let excess = size.saturating_sub(self.limits.target(name));
+                if compact::evict(&mut next, excess, tokenizer) >= excess {
+                    self.commit(before, before, next, Compacted::Evicted, history, sink);
+                    return Ok(true);
+                }
             }
+            // A refused request reports no size, and the window it overflowed may not be
+            // the one assumed, so every old output goes.
+            Trigger::Overflow => {
+                compact::evict(&mut next, u64::MAX, tokenizer);
+            }
+            Trigger::Asked => {}
         }
         if compact::fold(&next, "").is_none() {
             if next != *history {
-                self.commit(before, before, next, None, history, sink);
-            } else {
-                let _ = self.tx.send(AgentEvent::Info(
-                    "nothing to compact: there is no earlier turn to summarise".to_string(),
-                ));
+                self.commit(before, before, next, Compacted::Evicted, history, sink);
+                return Ok(true);
             }
-            return Ok(());
+            let _ = self.tx.send(AgentEvent::Info(
+                "nothing to compact: there is no earlier turn to summarise".to_string(),
+            ));
+            return Ok(false);
         }
         if next != *history {
             // The summary call already sends the evicted outputs.
@@ -1816,12 +1887,22 @@ impl Compaction<'_> {
         match self.summarize(&next).await {
             Ok(summary) => {
                 let folded = compact::fold(&next, &summary).expect("checked above");
-                self.commit(before, read, folded, Some(summary), history, sink);
-                Ok(())
+                let summary = Compacted::Summarised(summary);
+                self.commit(before, read, folded, summary, history, sink);
+                Ok(true)
+            }
+            // Left as it is, the history could never be sent again, so the earlier turns
+            // go without a summary. Only for an overflow: a transient failure keeps them.
+            Err(e) if crate::client::context_overflow(&e) => {
+                let mut folded =
+                    compact::fold(&next, compact::UNSUMMARISED).expect("checked above");
+                compact::evict(&mut folded, u64::MAX, tokenizer);
+                self.commit(before, read, folded, Compacted::Dropped, history, sink);
+                Ok(true)
             }
             Err(e) => {
                 if next != *history {
-                    self.commit(before, read, next, None, history, sink);
+                    self.commit(before, read, next, Compacted::Evicted, history, sink);
                 }
                 Err(e)
             }
@@ -1873,21 +1954,27 @@ impl Compaction<'_> {
     }
 
     /// Replace `history` with `next`, reset the cache guard, record it and say so.
-    /// `summary` is what the earlier turns were folded into; without one, `next` is the
-    /// same history with its old tool outputs evicted. `read` is the history the last
-    /// call read, so the status bar can take off what is gone from it.
+    /// `read` is the history the last call read, so the status bar can take off what is
+    /// gone from it.
     fn commit(
         &self,
         before: u64,
         read: u64,
         next: Vec<Value>,
-        summary: Option<String>,
+        how: Compacted,
         history: &mut Vec<Value>,
         sink: &mut Sink<'_>,
     ) {
-        let (stage, what) = match summary {
-            Some(_) => ("summary", "summarised earlier turns"),
-            None => ("evict", "evicted old tool outputs"),
+        let (stage, what, summary) = match how {
+            Compacted::Summarised(summary) => {
+                ("summary", "summarised earlier turns", Some(summary))
+            }
+            Compacted::Evicted => ("evict", "evicted old tool outputs", None),
+            Compacted::Dropped => (
+                "dropped",
+                "dropped earlier turns too long to summarise",
+                None,
+            ),
         };
         let after = compact::estimate(&next, tokens::for_model(self.model.name()));
         self.model.reset(&format!("compaction: {stage}"));
@@ -2609,6 +2696,8 @@ pub mod fake {
     pub const HANG: &str = "fake.hang";
     /// A script step the backend refuses as a bad request.
     pub const REFUSE: &str = "fake.refuse";
+    /// A script step the backend refuses as longer than the context window.
+    pub const OVERFLOW: &str = "fake.overflow";
     /// Leads a script step that ends on `end_turn: false`.
     pub const CONTINUES: &str = "fake.continues";
     /// Leads a script step whose call completes with no usage block.
@@ -2820,6 +2909,10 @@ pub mod fake {
                 }
                 match next.first().and_then(|item| item["type"].as_str()) {
                     Some(FAIL) => bail!("scripted failure"),
+                    Some(OVERFLOW) => {
+                        let refused = "400 Bad Request: input exceeds the context window";
+                        return Err(crate::client::ContextOverflow(refused.to_string()).into());
+                    }
                     Some(REFUSE) => {
                         let refused = "400 Bad Request: Invalid value".to_string();
                         return Err(crate::client::BadRequest(refused).into());
@@ -5396,6 +5489,191 @@ mod tests {
         let third = bodies[3].1["input"].as_array().unwrap();
         assert_eq!(third[..4], *bodies[1].1["input"].as_array().unwrap());
         assert_eq!(third.len(), 6);
+    }
+
+    /// A session on `fake` with the default limits, as `drive` wants it.
+    fn session_on(
+        fake: &fake::Fake,
+    ) -> (
+        mpsc::Sender<String>,
+        mpsc::UnboundedReceiver<AgentEvent>,
+        Arc<Cancel>,
+    ) {
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        (tx_user, rx, cancel)
+    }
+
+    fn inputs(fake: &fake::Fake) -> Vec<Vec<Value>> {
+        let bodies = fake.bodies.lock().unwrap();
+        bodies
+            .iter()
+            .map(|(_, body)| body["input"].as_array().unwrap().clone())
+            .collect()
+    }
+
+    fn failed(events: &[AgentEvent]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnFailed(_)))
+    }
+
+    #[tokio::test]
+    async fn an_overflow_compacts_and_runs_the_turn_again_once() {
+        use fake::{Fake, OVERFLOW, say, step};
+
+        let fake = Fake::new(vec![
+            vec![say("one")],
+            step(OVERFLOW),
+            vec![say("the summary")],
+            vec![say("two")],
+            step(OVERFLOW),
+            vec![say("summary two")],
+            step(OVERFLOW),
+            vec![say("summary three")],
+        ]);
+        let (tx_user, mut rx, cancel) = session_on(&fake);
+        drive(&tx_user, &mut rx, &cancel, "one", &[]).await;
+
+        // The usage said nothing was full; the refusal alone compacts, and the turn goes
+        // on as one, with no failure the user has to retry.
+        let events = drive(&tx_user, &mut rx, &cancel, "two", &[]).await;
+        assert!(!failed(&events), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Compacted { summary: Some(s), .. } if s == "the summary")));
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Info(m) if m.contains("runs again on the compacted history"))));
+        let sent = inputs(&fake);
+        assert_eq!(sent.len(), 4);
+        let summary = compact::user_message("Summary of earlier conversation:\nthe summary");
+        assert_eq!(
+            sent[3],
+            [
+                sent[0][0].clone(),
+                compact::user_message("one"),
+                summary,
+                compact::user_message("two")
+            ]
+        );
+
+        // A retry that overflows again compacts again but is not sent a third time.
+        let events = drive(&tx_user, &mut rx, &cancel, "three", &[]).await;
+        assert!(failed(&events), "{events:?}");
+        assert_eq!(inputs(&fake).len(), 8);
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn a_summary_call_that_overflows_drops_the_earlier_turns() {
+        use fake::{Fake, OVERFLOW, say, step};
+
+        let printf = || fake::call("bash", json!({"command": "printf '%0400d' 0"}));
+        let fake = Fake::new(vec![
+            (0..8).map(|_| printf()).collect(),
+            vec![say("one")],
+            step(OVERFLOW),
+            step(OVERFLOW),
+            vec![say("two")],
+        ]);
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let dir = tools::temp_dir();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::new(Mode::Bypass, Default::default(), None, dir)),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        drive(&tx_user, &mut rx, &cancel, "one", &[]).await;
+        let events = drive(&tx_user, &mut rx, &cancel, "two", &[]).await;
+        assert!(!failed(&events), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Compacted { notice, summary: None, .. }
+                if notice.contains("dropped earlier turns"))));
+        let sent = inputs(&fake);
+        assert_eq!(sent.len(), 5);
+        // The summary call was sent the history with every old output evicted already.
+        let evicted = |input: &[Value]| {
+            input
+                .iter()
+                .filter(|i| {
+                    i["output"]
+                        .as_str()
+                        .is_some_and(|o| o.starts_with("[output removed"))
+                })
+                .count()
+        };
+        assert_eq!(evicted(&sent[3]), 2);
+        let dropped = format!("{}\n{}", compact::SUMMARY_PREFIX, compact::UNSUMMARISED);
+        assert_eq!(
+            sent[4],
+            [
+                sent[0][0].clone(),
+                compact::user_message("one"),
+                compact::user_message(&dropped),
+                compact::user_message("two")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_summary_call_that_fails_otherwise_keeps_the_history() {
+        use fake::{FAIL, Fake, OVERFLOW, say, step};
+
+        let fake = Fake::new(vec![
+            vec![say("one")],
+            step(OVERFLOW),
+            step(FAIL),
+            vec![say("two")],
+        ]);
+        let (tx_user, mut rx, cancel) = session_on(&fake);
+        drive(&tx_user, &mut rx, &cancel, "one", &[]).await;
+        let events = drive(&tx_user, &mut rx, &cancel, "two", &[]).await;
+        assert!(failed(&events), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Error(m) if m.starts_with("compaction: scripted failure"))));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compacted { .. }))
+        );
+        // Nothing ran again on its own; the next message reads the whole history.
+        drive(&tx_user, &mut rx, &cancel, "three", &[]).await;
+        let sent = inputs(&fake);
+        assert_eq!(sent.len(), 4);
+        assert_eq!(sent[3][..sent[1].len()], sent[1][..]);
     }
 
     #[tokio::test]

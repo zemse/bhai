@@ -643,8 +643,52 @@ async fn a_context_overflow_is_not_sent_again() {
         failed["data"], "failed: context_length_exceeded",
         "{failed}"
     );
+    // A first turn has nothing earlier to fold, so there is nothing to send again.
     assert_eq!(fake.responses().len(), 1);
-    assert!(!events.kinds().contains(&"info"), "{:#?}", events.got);
+    let infos: Vec<&Value> = events.got.iter().filter(|e| e["type"] == "info").collect();
+    assert_eq!(infos.len(), 1, "{:#?}", events.got);
+    assert!(
+        infos[0]["data"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("nothing to compact")),
+        "{:#?}",
+        events.got
+    );
+}
+
+#[tokio::test]
+async fn a_context_overflow_compacts_and_the_turn_runs_again() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(says("one"));
+        replies.push_back(fails("context_length_exceeded"));
+        replies.push_back(says("the summary"));
+        replies.push_back(says("two"));
+    }
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+    bhai.post("/prompt", json!({ "text": "first" })).await;
+    events.until("turn_end").await;
+
+    bhai.post("/prompt", json!({ "text": "second" })).await;
+    events.until("turn_end").await;
+    assert!(
+        !events.kinds().contains(&"turn_failed"),
+        "{:#?}",
+        events.got
+    );
+    assert!(events.kinds().contains(&"compacted"), "{:#?}", events.got);
+    assert_eq!(events.text(), "onetwo");
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 4);
+    let retried = &sent[3].body;
+    assert!(mentions(
+        retried,
+        "Summary of earlier conversation:\\nthe summary"
+    ));
+    assert!(mentions(retried, "second"));
+    assert!(!mentions(retried, "\"one\""));
 }
 
 #[tokio::test]

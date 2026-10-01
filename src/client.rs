@@ -41,10 +41,11 @@ const BACKOFF: Duration = Duration::from_millis(500);
 /// The longest `Retry-After` slept inside a turn. Asked for more, the call fails and
 /// says so rather than holding the turn silent for minutes.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
-/// Error codes that fail the same way however often they are sent: the context is too
-/// long, the plan is out of quota, or a policy refused it.
-const TERMINAL_CODES: [&str; 7] = [
-    "context_length_exceeded",
+/// The error code for a request longer than the model's context window.
+const OVERFLOW_CODE: &str = "context_length_exceeded";
+/// Error codes that fail the same way however often they are sent: the plan is out of
+/// quota, or a policy refused it.
+const TERMINAL_CODES: [&str; 6] = [
     "insufficient_quota",
     "usage_not_included",
     "usage_limit_reached",
@@ -102,6 +103,24 @@ impl std::error::Error for BadRequest {}
 /// Whether `e` is the backend refusing the request itself.
 pub fn bad_request(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| cause.is::<BadRequest>())
+}
+
+/// A request the backend refused as longer than the model's context window: sent again
+/// it fails the same way, but a compacted history may fit.
+#[derive(Debug)]
+pub struct ContextOverflow(pub String);
+
+impl std::fmt::Display for ContextOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ContextOverflow {}
+
+/// Whether `e` is the backend refusing a request as too long for the context window.
+pub fn context_overflow(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<ContextOverflow>())
 }
 
 /// Whether `model` takes an effort change as a `configuration_update` input item, which
@@ -737,6 +756,7 @@ impl Client {
                     None => Error::Retryable(failed),
                 },
                 Class::BadRequest => Error::Fatal(BadRequest(format!("{status}: {msg}")).into()),
+                Class::Overflow => Error::Fatal(ContextOverflow(format!("{status}: {msg}")).into()),
                 Class::Fatal => Error::Fatal(failed),
             });
         }
@@ -1060,6 +1080,8 @@ pub(crate) enum Class {
     Fatal,
     /// The request itself was refused; see [`BadRequest`].
     BadRequest,
+    /// The request is longer than the context window; see [`ContextOverflow`].
+    Overflow,
     Unauthorized,
 }
 
@@ -1072,6 +1094,9 @@ pub(crate) fn classify(status: Option<u16>, error: &Value) -> Class {
     }
     let codes = ["code", "type"].map(|key| error.get(key).and_then(Value::as_str));
     let known = |table: &[&str]| codes.iter().flatten().any(|code| table.contains(code));
+    if known(&[OVERFLOW_CODE]) {
+        return Class::Overflow;
+    }
     if known(&TERMINAL_CODES) {
         return Class::Fatal;
     }
@@ -1099,6 +1124,7 @@ fn failed_in_band(error: &Value, fallback: &str) -> Error {
     match classify(None, error) {
         Class::Retry => Error::Retryable(anyhow!("{msg}")),
         Class::BadRequest => Error::Fatal(BadRequest(msg.to_string()).into()),
+        Class::Overflow => Error::Fatal(ContextOverflow(msg.to_string()).into()),
         Class::Fatal | Class::Unauthorized => Error::Fatal(anyhow!("{msg}")),
     }
 }
@@ -1398,7 +1424,7 @@ mod tests {
     fn a_failure_is_classified_by_its_code_before_its_status() {
         let code = |c: &str| json!({ "code": c, "message": "m" });
         let typed = |t: &str| json!({ "type": t, "message": "m" });
-        let cases: [(Option<u16>, Value, Class); 17] = [
+        let cases: [(Option<u16>, Value, Class); 18] = [
             (Some(401), code("server_error"), Class::Unauthorized),
             (Some(429), Value::Null, Class::Retry),
             (Some(429), typed("usage_limit_reached"), Class::Fatal),
@@ -1407,13 +1433,14 @@ mod tests {
             (Some(500), Value::Null, Class::Retry),
             (Some(503), code("server_is_overloaded"), Class::Retry),
             (Some(400), Value::Null, Class::BadRequest),
-            (Some(400), code("context_length_exceeded"), Class::Fatal),
+            (Some(400), code("context_length_exceeded"), Class::Overflow),
+            (Some(400), typed("context_length_exceeded"), Class::Overflow),
             (Some(400), code("invalid_prompt"), Class::BadRequest),
             (Some(403), Value::Null, Class::Fatal),
             (Some(404), code("anything"), Class::Fatal),
             (None, Value::Null, Class::Retry),
             (None, code("server_error"), Class::Retry),
-            (None, code("context_length_exceeded"), Class::Fatal),
+            (None, code("context_length_exceeded"), Class::Overflow),
             (None, code("cyber_policy"), Class::Fatal),
             (None, typed("usage_not_included"), Class::Fatal),
         ];
@@ -1430,6 +1457,9 @@ mod tests {
         };
         assert_eq!(e.to_string(), "too long");
         assert!(!bad_request(&e));
+        assert!(context_overflow(&e));
+        let quota = json!({ "code": "insufficient_quota", "message": "spent" });
+        assert!(matches!(failed_in_band(&quota, "x"), Error::Fatal(e) if !context_overflow(&e)));
         let refused = json!({ "code": "invalid_prompt", "message": "no" });
         assert!(matches!(failed_in_band(&refused, "x"), Error::Fatal(e) if bad_request(&e)));
         let overloaded = json!({ "type": "error", "code": "slow_down" });

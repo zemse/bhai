@@ -35,6 +35,9 @@ pub const FORK_MIN: u64 = 16_000;
 const KEEP_RESULTS: usize = 6;
 /// How the summary starts in the compacted history.
 pub const SUMMARY_PREFIX: &str = "Summary of earlier conversation:";
+/// What stands in for a summary the summary call could not fit in the window.
+pub const UNSUMMARISED: &str = "The earlier turns were dropped without a summary: the \
+conversation no longer fit in the context window to be summarised.";
 /// What the model is asked for when history is summarised.
 const REQUEST: &str = "Write a concise summary of the conversation so far, for yourself to \
 continue from once the older messages are gone: the user's goals, decisions made, files \
@@ -308,6 +311,9 @@ mod tests {
         let last = history.len() - 5;
         assert_eq!(folded[2], user_message("three"));
         assert_eq!(&folded[2..], &history[last..]);
+
+        let dropped = fold(&history, UNSUMMARISED).unwrap();
+        assert_eq!(&dropped[2..], &history[last..]);
 
         // A single turn has nothing earlier to fold.
         assert_eq!(fold(&history[..5], "s"), None);
