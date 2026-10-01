@@ -62,6 +62,9 @@ const TRANSIENT_CODES: [&str; 5] = [
 ];
 /// How long a finished call waits on a usage fetch still out, before leaving it.
 const USAGE_WAIT: Duration = Duration::from_secs(2);
+/// The backend's routing token: sent back, it brings a call to the backend that answered
+/// the turn's first call, where that call's prefix is cached.
+const TURN_STATE: &str = "x-codex-turn-state";
 
 /// The `reasoning.effort` values the Responses API takes. The models catalog also lists
 /// `ultra` for some models, which the API refuses.
@@ -246,6 +249,8 @@ pub struct Client {
     guard: Arc<Mutex<CacheGuard>>,
     /// `--profile`: where the rate-limit response headers are logged.
     header_log: Option<PathBuf>,
+    /// The turn's first [`TURN_STATE`]; shared by clones, fresh for each child.
+    turn_state: Arc<Mutex<Option<String>>>,
 }
 
 impl Client {
@@ -271,6 +276,7 @@ impl Client {
                 .unwrap_or_else(|| ollama::DEFAULT_URL.to_string()),
             window: None,
             header_log: None,
+            turn_state: Arc::default(),
         })
     }
 
@@ -422,7 +428,29 @@ impl Client {
             .strict();
         let id = uuid::Uuid::new_v4().simple().to_string();
         child.guard = guard(&format!("{}/{}", child.cache_key, &id[..6]), strict);
+        child.turn_state = Arc::default();
         child
+    }
+
+    /// Start a turn: its calls are routed afresh rather than after the last turn's.
+    pub fn begin_turn(&self) {
+        *self.turn_state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The routing token this turn's calls carry, once a call has been given one.
+    fn turn_state(&self) -> Option<String> {
+        self.turn_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Keep `found` unless the turn already has a token: the first one is replayed.
+    fn observe_turn_state(&self, found: Option<&str>) {
+        let mut held = self.turn_state.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            *held = found.filter(|s| !s.is_empty()).map(str::to_string);
+        }
     }
 
     /// Run one model call and return the assistant's output items verbatim,
@@ -461,7 +489,8 @@ impl Client {
         let mut backoff = BACKOFF;
         let mut attempt = 1;
         loop {
-            let (e, asked) = match self.attempt(self.provider(), &body, on_delta, cancel).await {
+            let sent = self.attempt(self.provider(), &body, true, on_delta, cancel);
+            let (e, asked) = match sent.await {
                 Ok(items) => return Ok(items),
                 Err(Error::Interrupted) => bail!("interrupted"),
                 Err(Error::Fatal(e)) => return Err(e),
@@ -540,6 +569,7 @@ impl Client {
             .attempt(
                 provider,
                 &body,
+                false,
                 &mut on_delta,
                 &Arc::new(AtomicBool::new(false)),
             )
@@ -581,11 +611,13 @@ impl Client {
     }
 
     /// One call. `provider` is passed rather than read off the client, since `aside`
-    /// may run its model on the other backend.
+    /// may run its model on the other backend. A `routed` call carries the turn's
+    /// routing token and keeps the one it is given; an aside is outside the turn.
     async fn attempt(
         &self,
         provider: Provider,
         body: &Value,
+        routed: bool,
         on_delta: &mut impl FnMut(Delta),
         cancel: &Arc<AtomicBool>,
     ) -> std::result::Result<Vec<Value>, Error> {
@@ -599,7 +631,9 @@ impl Client {
             .ok_or(Error::Interrupted)?
             .map_err(Error::Fatal)?;
 
-        let mut resp = self.send(&auth, body, cancel).await?;
+        let turn_state = routed.then(|| self.turn_state()).flatten();
+        let turn_state = turn_state.as_deref();
+        let mut resp = self.send(&auth, body, turn_state, cancel).await?;
         // A token revoked early or rotated by another process is not near expiry, so
         // `load` sent it. Once per call: a second 401 is a real refusal.
         if resp.status().as_u16() == 401 {
@@ -607,7 +641,7 @@ impl Client {
                 .await
                 .ok_or(Error::Interrupted)?
                 .map_err(Error::Fatal)?;
-            resp = self.send(&auth, body, cancel).await?;
+            resp = self.send(&auth, body, turn_state, cancel).await?;
         }
 
         // A debug aid only; a failed write must not fail the call or draw over the TUI.
@@ -639,6 +673,10 @@ impl Client {
                 Class::BadRequest => Error::Fatal(BadRequest(format!("{status}: {msg}")).into()),
                 Class::Fatal => Error::Fatal(failed),
             });
+        }
+        if routed {
+            let found = resp.headers().get(TURN_STATE).and_then(|v| v.to_str().ok());
+            self.observe_turn_state(found);
         }
 
         // The credit balance is only in `/wham/usage`, so now and then it is asked for
@@ -737,6 +775,10 @@ impl Client {
                         }
                         usage = Some(Usage::from_completed(&event));
                     }
+                    // The same token in band, as the WebSocket transport carries it.
+                    "response.metadata" if routed => {
+                        self.observe_turn_state(metadata_turn_state(&event));
+                    }
                     "codex.rate_limits" => {
                         let now = chrono::Utc::now().timestamp();
                         if let Some(found) = RateLimits::from_event(&event, now) {
@@ -788,14 +830,21 @@ impl Client {
         &self,
         auth: &Auth,
         body: &Value,
+        turn_state: Option<&str>,
         cancel: &Arc<AtomicBool>,
     ) -> std::result::Result<reqwest::Response, Error> {
-        watched(self.request(auth, body).send(), cancel, "request timed out")
+        let request = self.request(auth, body, turn_state).send();
+        watched(request, cancel, "request timed out")
             .await?
             .map_err(|e| Error::Retryable(anyhow!("request failed: {e}")))
     }
 
-    fn request(&self, auth: &Auth, body: &Value) -> reqwest::RequestBuilder {
+    fn request(
+        &self,
+        auth: &Auth,
+        body: &Value,
+        turn_state: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let mut req = self
             .http
             .post(format!("{}/responses", base_url()))
@@ -813,8 +862,21 @@ impl Client {
         if let Some(account_id) = &auth.account_id {
             req = req.header("ChatGPT-Account-ID", account_id);
         }
+        if let Some(turn_state) = turn_state {
+            req = req.header(TURN_STATE, turn_state);
+        }
         req
     }
+}
+
+/// The [`TURN_STATE`] a `response.metadata` event carries in its `headers`.
+fn metadata_turn_state(event: &Value) -> Option<&str> {
+    let headers = event.get("headers")?.as_object()?;
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(TURN_STATE))?
+        .1
+        .as_str()
 }
 
 /// Await `fut` unless the turn is cancelled first; `None` when it was. The flag is
@@ -1143,6 +1205,33 @@ mod tests {
             }
         );
         assert_eq!(usage.cache_rate(), Some(75.0));
+    }
+
+    #[test]
+    fn a_turn_keeps_its_first_routing_token_until_the_next_turn() {
+        let client = Client::new(&Choice::default()).unwrap();
+        let clone = client.clone();
+        client.observe_turn_state(None);
+        client.observe_turn_state(Some(""));
+        assert_eq!(client.turn_state(), None);
+        client.observe_turn_state(Some("first"));
+        clone.observe_turn_state(Some("second"));
+        assert_eq!(clone.turn_state().as_deref(), Some("first"));
+        let child = client.for_child(&crate::identity::Identity::default());
+        assert_eq!(child.turn_state(), None);
+        clone.begin_turn();
+        assert_eq!(client.turn_state(), None);
+    }
+
+    #[test]
+    fn the_routing_token_is_read_from_a_metadata_event() {
+        let event = json!({
+            "type": "response.metadata",
+            "headers": { "X-Codex-Turn-State": "sticky", "x-other": "no" }
+        });
+        assert_eq!(metadata_turn_state(&event), Some("sticky"));
+        let without = json!({ "type": "response.metadata", "headers": { "x-other": "no" } });
+        assert_eq!(metadata_turn_state(&without), None);
     }
 
     #[test]

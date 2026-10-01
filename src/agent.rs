@@ -281,6 +281,9 @@ pub trait Model: Send + Sync {
 
     /// Forget the last request, for an intended break such as a compaction.
     fn reset(&self, _reason: &str) {}
+
+    /// A turn starts, so the last turn's backend routing no longer applies.
+    fn begin_turn(&self) {}
 }
 
 impl Model for Client {
@@ -332,6 +335,10 @@ impl Model for Client {
 
     fn reset(&self, reason: &str) {
         self.reset_cache(reason);
+    }
+
+    fn begin_turn(&self) {
+        Client::begin_turn(self);
     }
 }
 
@@ -1396,6 +1403,7 @@ async fn turn(
     // The goal its calls are charged to, while one is active.
     budget: Option<&Budget<'_>>,
 ) -> Turn {
+    model.begin_turn();
     let mut error_rounds = 0usize;
     let mut truncated = false;
     let mut continued = 0usize;

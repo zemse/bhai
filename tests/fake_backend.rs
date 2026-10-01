@@ -40,6 +40,8 @@ struct Seen {
 #[derive(Default)]
 struct Fake {
     replies: Mutex<VecDeque<String>>,
+    /// The `x-codex-turn-state` each reply carries, in the same order; none past the end.
+    turn_states: Mutex<VecDeque<&'static str>>,
     seen: Mutex<Vec<Seen>>,
 }
 
@@ -61,10 +63,16 @@ async fn responses(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: Stri
         headers,
         body,
     });
+    let turn_state = fake.turn_states.lock().unwrap().pop_front();
     match fake.replies.lock().unwrap().pop_front() {
         Some(sse) => {
             let sse = sse.replace(CWD, &cwd);
-            ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+            let mut response = ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response();
+            if let Some(state) = turn_state.filter(|s| !s.is_empty()) {
+                let value = header::HeaderValue::from_static(state);
+                response.headers_mut().insert("x-codex-turn-state", value);
+            }
+            response
         }
         None => (StatusCode::BAD_REQUEST, "the fake has no reply queued").into_response(),
     }
@@ -530,6 +538,40 @@ async fn a_commentary_preamble_on_end_turn_false_does_not_end_the_turn() {
             .any(|m| m["phase"] == "commentary" && m.to_string().contains("looking first")),
         "{messages:?}"
     );
+}
+
+#[tokio::test]
+async fn a_turn_sends_back_its_first_routing_token_and_the_next_turn_starts_without() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(narrates("looking first"));
+        replies.push_back(says("here it is"));
+        replies.push_back(says("again"));
+        let mut states = fake.turn_states.lock().unwrap();
+        states.extend(["sticky-1", "sticky-other", "sticky-2"]);
+    }
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    bhai.post("/prompt", json!({ "text": "find it" })).await;
+    events.until("turn_end").await;
+    bhai.post("/prompt", json!({ "text": "once more" })).await;
+    events.until("turn_end").await;
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 3, "{sent:#?}");
+    let carried: Vec<Option<&str>> = sent
+        .iter()
+        .map(|s| {
+            s.headers
+                .get("x-codex-turn-state")
+                .map(|v| v.to_str().unwrap())
+        })
+        .collect();
+    assert_eq!(carried, [None, Some("sticky-1"), None]);
+    // A header, not a body field: the body is the cached prefix.
+    assert!(!sent[1].body.to_string().contains("sticky-1"));
 }
 
 /// A stream that fails in band with `code`.
