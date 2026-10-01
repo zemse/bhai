@@ -1,5 +1,6 @@
 //! The `/diff` pane: the working tree's changes against HEAD, a file list and the
 //! selected file's hunks. Git runs directly since these are the user's read-only views.
+//! Also the line diff an edit or write is previewed with, which needs no git.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,13 @@ const MAX_DIFF_LINES: u64 = 50_000;
 const TAB: &str = "    ";
 /// Width of the file list column.
 const LIST_WIDTH: u16 = 36;
+/// Lines of context around each change in a preview.
+const CONTEXT: usize = 3;
+/// A preview stops after this many lines and says how many more there were.
+pub const MAX_PREVIEW_LINES: usize = 200;
+/// Past this many cells of the changed region the preview stops looking for common
+/// lines inside it and shows it as removed then added.
+const MAX_LCS_CELLS: usize = 1 << 20;
 
 /// One changed file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,7 +279,7 @@ fn file_line(file: &FileChange, selected: bool) -> Line<'static> {
     }
 }
 
-fn style(kind: LineKind) -> Style {
+pub fn style(kind: LineKind) -> Style {
     match kind {
         LineKind::Header => Style::new().fg(Color::Yellow).bold(),
         LineKind::Hunk => Style::new().fg(Color::Cyan),
@@ -442,6 +450,132 @@ pub fn untracked_lines(bytes: &[u8]) -> Vec<(LineKind, String)> {
     lines
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Same,
+    Removed,
+    Added,
+}
+
+/// A unified diff of `old` to `new`, hunks only, cut at `MAX_PREVIEW_LINES`; `None` when
+/// no line differs. What an edit or write is about to do, for its approval and its entry.
+pub fn unified(old: &str, new: &str) -> Option<String> {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let ops = line_ops(&a, &b);
+    // Each op's line in the old and the new text.
+    let mut at = Vec::with_capacity(ops.len());
+    let (mut i, mut j) = (0, 0);
+    for op in &ops {
+        at.push((i, j));
+        match op {
+            Op::Same => (i, j) = (i + 1, j + 1),
+            Op::Removed => i += 1,
+            Op::Added => j += 1,
+        }
+    }
+    let mut out = Vec::new();
+    let mut done = 0;
+    while let Some(first) = (done..ops.len()).find(|&k| ops[k] != Op::Same) {
+        // Changes closer than twice the context share a hunk.
+        let mut end = first;
+        loop {
+            while end < ops.len() && ops[end] != Op::Same {
+                end += 1;
+            }
+            match (end..ops.len()).find(|&k| ops[k] != Op::Same) {
+                Some(next) if next - end <= 2 * CONTEXT => end = next,
+                _ => break,
+            }
+        }
+        let start = first.saturating_sub(CONTEXT).max(done);
+        let stop = (end + CONTEXT).min(ops.len());
+        let span = &ops[start..stop];
+        let removed = span.iter().filter(|op| **op != Op::Added).count();
+        let added = span.iter().filter(|op| **op != Op::Removed).count();
+        out.push(format!(
+            "@@ -{} +{} @@",
+            hunk_range(at[start].0, removed),
+            hunk_range(at[start].1, added)
+        ));
+        for k in start..stop {
+            let (i, j) = at[k];
+            out.push(match ops[k] {
+                Op::Same => format!(" {}", a[i]),
+                Op::Removed => format!("-{}", a[i]),
+                Op::Added => format!("+{}", b[j]),
+            });
+        }
+        done = stop;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    if out.len() > MAX_PREVIEW_LINES {
+        let more = out.len() - MAX_PREVIEW_LINES;
+        out.truncate(MAX_PREVIEW_LINES);
+        out.push(format!("[+{more} more lines]"));
+    }
+    Some(out.join("\n"))
+}
+
+/// A hunk header's `start,count`, where an empty range names the line before it.
+fn hunk_range(start: usize, count: usize) -> String {
+    match count {
+        0 => format!("{start},0"),
+        1 => format!("{}", start + 1),
+        _ => format!("{},{count}", start + 1),
+    }
+}
+
+/// The edit script from `a` to `b`: the common ends trimmed, then a longest common
+/// subsequence over what is left, removals before additions.
+fn line_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
+    let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let suf = a[pre..]
+        .iter()
+        .rev()
+        .zip(b[pre..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (x, y) = (&a[pre..a.len() - suf], &b[pre..b.len() - suf]);
+    let (n, m) = (x.len(), y.len());
+    let mut ops = vec![Op::Same; pre];
+    if n.saturating_mul(m) > MAX_LCS_CELLS {
+        ops.extend(std::iter::repeat_n(Op::Removed, n));
+        ops.extend(std::iter::repeat_n(Op::Added, m));
+    } else {
+        // `t[i][j]` is the common subsequence length of `x[i..]` and `y[j..]`.
+        let w = m + 1;
+        let mut t = vec![0u32; (n + 1) * w];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                t[i * w + j] = match x[i] == y[j] {
+                    true => t[(i + 1) * w + j + 1] + 1,
+                    false => t[(i + 1) * w + j].max(t[i * w + j + 1]),
+                };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < n && j < m {
+            if x[i] == y[j] {
+                ops.push(Op::Same);
+                (i, j) = (i + 1, j + 1);
+            } else if t[(i + 1) * w + j] >= t[i * w + j + 1] {
+                ops.push(Op::Removed);
+                i += 1;
+            } else {
+                ops.push(Op::Added);
+                j += 1;
+            }
+        }
+        ops.extend(std::iter::repeat_n(Op::Removed, n - i));
+        ops.extend(std::iter::repeat_n(Op::Added, m - j));
+    }
+    ops.extend(std::iter::repeat_n(Op::Same, suf));
+    ops
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +674,53 @@ mod tests {
         );
         file.added = Some(2);
         assert!(file_diff(&root, &file).is_err());
+    }
+
+    #[test]
+    fn a_preview_is_hunks_with_context() {
+        let old: String = (1..=20).map(|n| format!("l{n}\n")).collect();
+        let new = old.replace("l3\n", "three\n").replace("l18\n", "");
+        assert_eq!(
+            unified(&old, &new).unwrap(),
+            "@@ -1,6 +1,6 @@\n l1\n l2\n-l3\n+three\n l4\n l5\n l6\n\
+             @@ -15,6 +15,5 @@\n l15\n l16\n l17\n-l18\n l19\n l20"
+        );
+        // Changes within twice the context of each other share one hunk.
+        let near = old.replace("l3\n", "x\n").replace("l9\n", "y\n");
+        let hunks = unified(&old, &near).unwrap();
+        assert_eq!(hunks.matches("@@ -").count(), 1, "{hunks}");
+        assert!(hunks.starts_with("@@ -1,12 +1,12 @@"), "{hunks}");
+        assert_eq!(unified(&old, &old), None);
+    }
+
+    #[test]
+    fn a_preview_of_a_new_or_emptied_file() {
+        assert_eq!(unified("", "a\nb\n").unwrap(), "@@ -0,0 +1,2 @@\n+a\n+b");
+        assert_eq!(unified("a\n", "").unwrap(), "@@ -1 +0,0 @@\n-a");
+        // Removed lines come before the lines that replace them.
+        assert_eq!(
+            unified("a\nb\nc\n", "a\nx\ny\nc\n").unwrap(),
+            "@@ -1,3 +1,4 @@\n a\n-b\n+x\n+y\n c"
+        );
+    }
+
+    #[test]
+    fn a_long_preview_is_cut_and_says_how_much() {
+        let new: String = (0..MAX_PREVIEW_LINES + 10)
+            .map(|n| format!("{n}\n"))
+            .collect();
+        let preview = unified("", &new).unwrap();
+        let lines: Vec<&str> = preview.lines().collect();
+        assert_eq!(lines.len(), MAX_PREVIEW_LINES + 1);
+        assert_eq!(lines[MAX_PREVIEW_LINES], "[+11 more lines]");
+        // Too big a region to align still diffs, as everything out and everything in.
+        let a = vec!["a"; 2000].join("\n");
+        let b = vec!["b"; 2000].join("\n");
+        assert!(
+            unified(&a, &b)
+                .unwrap()
+                .starts_with("@@ -1,2000 +1,2000 @@")
+        );
     }
 
     fn view() -> DiffView {

@@ -44,7 +44,7 @@ pub fn width(text: &str) -> usize {
 
 /// The byte offset where `text` reaches `columns` on screen, never inside a character.
 /// A row can end a column short: a two-column character does not straddle the edge.
-fn split_at_width(text: &str, columns: usize) -> usize {
+pub fn split_at_width(text: &str, columns: usize) -> usize {
     let mut used = 0;
     for (at, c) in text.char_indices() {
         let next = used + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);

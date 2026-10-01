@@ -677,6 +677,7 @@ mod tests {
             let _ = tx_agent.send(AgentEvent::Approval {
                 tool: "bash".to_string(),
                 command: "ls".to_string(),
+                preview: Some("@@ -1 +1 @@\n-a\n+b".to_string()),
                 offers: Offers {
                     exact: Some("Bash(ls)".to_string()),
                     prefix: None,
@@ -802,6 +803,10 @@ mod tests {
             get_json(&http, format!("{base}/state")).await["pending"]["exact"],
             "Bash(ls)"
         );
+        assert_eq!(
+            get_json(&http, format!("{base}/state")).await["pending"]["preview"],
+            "@@ -1 +1 @@\n-a\n+b"
+        );
         // An id that is not the pending one answers nothing, however it is asked.
         for path in ["approve", "reject"] {
             assert_eq!(
@@ -859,7 +864,7 @@ mod tests {
         for want in [
             r#"{"type":"user","data":"go"}"#,
             r#"{"type":"text","data":"hi"}"#,
-            r#"{"type":"approval","data":{"id":1,"tool":"bash","command":"ls","exact":"Bash(ls)"}}"#,
+            r#"{"type":"approval","data":{"id":1,"tool":"bash","command":"ls","preview":"@@ -1 +1 @@\n-a\n+b","exact":"Bash(ls)"}}"#,
             r#"{"type":"resolved","data":{"id":1,"accepted":true,"remember":"exact"}}"#,
         ] {
             assert!(body.contains(want), "missing {want} in {body}");

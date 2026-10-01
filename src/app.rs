@@ -1177,12 +1177,14 @@ impl App {
                 id,
                 tool,
                 command,
+                preview,
                 offers,
             } => {
                 self.pending = Some(Approval {
                     id,
                     tool,
                     command,
+                    preview,
                     offers,
                 });
                 self.reset_approval_view();

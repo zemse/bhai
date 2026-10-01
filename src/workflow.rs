@@ -1175,6 +1175,7 @@ async fn confirm(tx: &mpsc::UnboundedSender<AgentEvent>, plan: String) -> bool {
     let sent = tx.send(AgentEvent::Approval {
         tool: TOOL.to_string(),
         command: plan,
+        preview: None,
         offers: Offers::default(),
         reply,
     });
@@ -1267,6 +1268,7 @@ async fn step(
             label(&step.id, item),
             identity.name
         ),
+        preview: None,
     });
     let model = run.model.child(identity);
     let (_mailbox, steer) = agent::Mailbox::open(&run.delegation.mailboxes, &id);
@@ -1349,6 +1351,7 @@ fn replay(run: &Run<'_>, step: &Step, identity: &Identity, item: Option<&str>, o
             label(&step.id, item),
             identity.name
         ),
+        preview: None,
     });
     let _ = run.tx.send(AgentEvent::ToolOutput(attributed(
         item,

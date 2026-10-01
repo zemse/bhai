@@ -43,6 +43,8 @@ pub enum AgentEvent {
         tool: String,
         /// The command, or a one-line summary of the call.
         command: String,
+        /// The diff an edit or write would make.
+        preview: Option<String>,
         offers: Offers,
         reply: oneshot::Sender<Answer>,
     },
@@ -51,6 +53,8 @@ pub enum AgentEvent {
     ToolStart {
         tool: String,
         summary: String,
+        /// The diff an edit or write is making.
+        preview: Option<String>,
     },
     /// Output of the running call so far, for the UI only.
     ToolProgress(String),
@@ -1169,7 +1173,7 @@ async fn turn(
                     "cache missed {} calls in a row; continue?",
                     cache::MAX_MISSES
                 );
-                if ask("cache", &prompt, &Offers::default(), policy, tx)
+                if ask("cache", &prompt, None, &Offers::default(), policy, tx)
                     .await
                     .is_some()
                 {
@@ -1321,6 +1325,7 @@ fn land(
     let _ = tx.send(AgentEvent::ToolStart {
         tool: tools::agent::NAME.to_string(),
         summary: format!("agent {}: {}", result.identity, result.description),
+        preview: None,
     });
 
     let _ = tx.send(AgentEvent::ToolOutput(result.text.clone()));
@@ -1712,11 +1717,13 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 AgentEvent::Approval {
                     tool,
                     command,
+                    preview,
                     offers,
                     reply,
                 } => AgentEvent::Approval {
                     tool,
                     command: format!("{tag} {command}"),
+                    preview,
                     offers,
                     reply,
                 },
@@ -2014,7 +2021,8 @@ as-is. Try a different approach, or ask the user."
                 }
                 Err(_) => {
                     let offers = policy.offers(name, &args);
-                    if let Some(result) = ask(name, &summary, &offers, policy, tx).await {
+                    let preview = tool.preview(&args);
+                    if let Some(result) = ask(name, &summary, preview, &offers, policy, tx).await {
                         audit("blocked", "you", "");
                         return result;
                     }
@@ -2032,9 +2040,11 @@ as-is. Try a different approach, or ask the user."
         }
     }
 
+    // Read again rather than kept from the approval, so it is the file as it is now.
     let _ = tx.send(AgentEvent::ToolStart {
         tool: name.to_string(),
         summary: summary.clone(),
+        preview: tool.preview(&args),
     });
     let progress = |chunk: String| {
         let _ = tx.send(AgentEvent::ToolProgress(chunk));
@@ -2077,6 +2087,7 @@ async fn judged(
 async fn ask(
     name: &str,
     summary: &str,
+    preview: Option<String>,
     offers: &Offers,
     policy: &Policy,
     tx: &mpsc::UnboundedSender<AgentEvent>,
@@ -2086,6 +2097,7 @@ async fn ask(
         .send(AgentEvent::Approval {
             tool: name.to_string(),
             command: summary.to_string(),
+            preview,
             offers: offers.clone(),
             reply,
         })
@@ -3624,6 +3636,48 @@ mod tests {
         assert!(!ok);
         assert_eq!(output, "Not executed: the user interrupted the turn.");
         assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A write is put to the user with the diff it makes, and the transcript gets the
+    /// same diff when it runs.
+    #[tokio::test]
+    async fn a_write_is_approved_and_shown_with_its_diff() {
+        let dir = tools::temp_dir();
+        let target = dir.join("notes.txt");
+        std::fs::write(&target, "a\nb\n").unwrap();
+        let cancel = Arc::new(Cancel::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let answering = tokio::spawn(async move {
+            let (mut asked, mut started) = (None, None);
+            while let Some(event) = rx.recv().await {
+                match event {
+                    AgentEvent::Approval { reply, preview, .. } => {
+                        asked = preview;
+                        let _ = reply.send(Answer::Accept(None));
+                    }
+                    AgentEvent::ToolStart { preview, .. } => started = preview,
+                    AgentEvent::ToolOutput(_) => break,
+                    _ => {}
+                }
+            }
+            (asked, started)
+        });
+        let (_, ok) = execute(
+            &Registry::new(Vec::new()),
+            &Policy::default(),
+            None,
+            &fake::call("write", json!({"path": target, "content": "a\nc\n"})),
+            &tx,
+            &cancel.flag(),
+        )
+        .await;
+        let (asked, started) = answering.await.unwrap();
+        assert!(ok);
+        let diff = "@@ -1,2 +1,2 @@\n a\n-b\n+c";
+        assert_eq!(asked.as_deref(), Some(diff));
+        assert_eq!(started.as_deref(), Some(diff));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\nc\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 

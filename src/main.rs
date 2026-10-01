@@ -1656,6 +1656,7 @@ mod tests {
                 Event::ToolStart {
                     tool: "bash".to_string(),
                     summary: "ls".to_string(),
+                    preview: None,
                 },
                 Event::Text("done".to_string()),
                 Event::TurnEnd,

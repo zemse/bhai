@@ -40,6 +40,10 @@ pub trait Tool: Send + Sync {
     fn needs_approval(&self) -> bool;
     /// Check the arguments and summarize the call in one line for the user.
     fn describe(&self, args: &Value) -> Result<String, String>;
+    /// A unified diff of what the call would change, for the files it writes.
+    fn preview(&self, _args: &Value) -> Option<String> {
+        None
+    }
     /// Run the call; returns the output and whether it counts as a success.
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)>;
     /// Run the call while reporting output as it arrives; only `bash` streams.

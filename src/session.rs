@@ -67,6 +67,8 @@ pub enum Event {
         id: u64,
         tool: String,
         command: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
         #[serde(flatten)]
         offers: Offers,
     },
@@ -81,6 +83,9 @@ pub enum Event {
     ToolStart {
         tool: String,
         summary: String,
+        /// The diff an edit or write is making.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
     },
     /// Output of the running call so far; never part of history.
     ToolProgress(String),
@@ -229,6 +234,9 @@ pub struct Approval {
     pub id: u64,
     pub tool: String,
     pub command: String,
+    /// The diff an edit or write would make, as a unified diff's hunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
     /// Rules the user may choose to remember.
     #[serde(flatten)]
     pub offers: Offers,
@@ -665,6 +673,7 @@ impl Session {
                 id: next.id,
                 tool: next.tool.clone(),
                 command: next.command.clone(),
+                preview: next.preview.clone(),
                 offers: next.offers.clone(),
             });
         }
@@ -938,6 +947,7 @@ impl Session {
             AgentEvent::Approval {
                 tool,
                 command,
+                preview,
                 offers,
                 reply,
             } => {
@@ -948,6 +958,7 @@ impl Session {
                         id,
                         tool: tool.clone(),
                         command: command.clone(),
+                        preview: preview.clone(),
                         offers: offers.clone(),
                     },
                     reply,
@@ -961,10 +972,19 @@ impl Session {
                     id,
                     tool,
                     command,
+                    preview,
                     offers,
                 }
             }
-            AgentEvent::ToolStart { tool, summary } => Event::ToolStart { tool, summary },
+            AgentEvent::ToolStart {
+                tool,
+                summary,
+                preview,
+            } => Event::ToolStart {
+                tool,
+                summary,
+                preview,
+            },
             AgentEvent::ToolProgress(s) => Event::ToolProgress(s),
             AgentEvent::ToolOutput(s) => Event::ToolOutput(s),
             AgentEvent::ToolRejected {
@@ -1272,7 +1292,15 @@ fn said(event: AgentEvent) -> Option<Event> {
     Some(match event {
         AgentEvent::Reasoning(s) => Event::Reasoning(s),
         AgentEvent::Text(s) => Event::Text(s),
-        AgentEvent::ToolStart { tool, summary } => Event::ToolStart { tool, summary },
+        AgentEvent::ToolStart {
+            tool,
+            summary,
+            preview,
+        } => Event::ToolStart {
+            tool,
+            summary,
+            preview,
+        },
         AgentEvent::ToolProgress(s) => Event::ToolProgress(s),
         AgentEvent::ToolOutput(s) => Event::ToolOutput(s),
         AgentEvent::ToolRejected {
@@ -1409,6 +1437,7 @@ mod tests {
         session.on_agent(AgentEvent::Approval {
             tool: "bash".to_string(),
             command: "ls".to_string(),
+            preview: None,
             offers: Offers {
                 exact: Some("Bash(ls)".to_string()),
                 prefix: None,
@@ -1438,6 +1467,7 @@ mod tests {
             event: Box::new(AgentEvent::ToolStart {
                 tool: "bash".to_string(),
                 summary: "ls".to_string(),
+                preview: None,
             }),
         });
         session.on_agent(AgentEvent::ChildEnded {
@@ -1961,6 +1991,7 @@ mod tests {
                 id: 1,
                 tool: "bash".to_string(),
                 command: "ls".to_string(),
+                preview: None,
                 offers: Offers {
                     exact: Some("Bash(ls)".to_string()),
                     prefix: None,

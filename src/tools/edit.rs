@@ -77,6 +77,13 @@ impl Tool for Edit {
         ))
     }
 
+    fn preview(&self, args: &Value) -> Option<String> {
+        let args = parse(args).ok()?;
+        let content = std::fs::read_to_string(args.path).ok()?;
+        let (updated, _) = apply(&content, args.old, args.new, args.replace_all).ok()?;
+        crate::diff::unified(&content, &updated)
+    }
+
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
         Box::pin(async move {
             match parse(args).and_then(|args| edit_file(&args)) {
@@ -253,6 +260,29 @@ mod tests {
         let args = parse(&args).unwrap();
         edit_file(&args).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello bhai\n");
+    }
+
+    #[test]
+    fn previews_the_edit_without_making_it() {
+        let path = super::super::temp_dir().join("p.rs");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let args = json!({
+            "path": path.to_str().unwrap(),
+            "old_string": "two",
+            "new_string": "2",
+        });
+        assert_eq!(
+            Edit.preview(&args).unwrap(),
+            "@@ -1,3 +1,3 @@\n one\n-two\n+2\n three"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
+        // An edit that would fail has nothing to show.
+        let missing = json!({
+            "path": path.to_str().unwrap(),
+            "old_string": "four",
+            "new_string": "4",
+        });
+        assert_eq!(Edit.preview(&missing), None);
     }
 
     #[test]

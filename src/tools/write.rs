@@ -60,6 +60,17 @@ impl Tool for Write {
         ))
     }
 
+    fn preview(&self, args: &Value) -> Option<String> {
+        let (path, content) = parse(args).ok()?;
+        // A file that is there but not text has nothing to diff against.
+        let old = match std::fs::read_to_string(path) {
+            Ok(old) => old,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return None,
+        };
+        crate::diff::unified(&old, content)
+    }
+
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
         Box::pin(async move {
             match parse(args).and_then(|(path, content)| write(path, content)) {
@@ -101,6 +112,17 @@ mod tests {
         let out = write(&path, "hello").unwrap();
         assert!(out.contains("5 bytes"), "{out}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn previews_a_new_file_and_an_overwrite() {
+        let path = super::super::temp_dir().join("p.txt");
+        let args = json!({"path": path, "content": "a\nb\n"});
+        assert_eq!(Write.preview(&args).unwrap(), "@@ -0,0 +1,2 @@\n+a\n+b");
+        std::fs::write(&path, "a\nc\n").unwrap();
+        assert_eq!(Write.preview(&args).unwrap(), "@@ -1,2 +1,2 @@\n a\n-c\n+b");
+        std::fs::write(&path, b"\xff\xfe").unwrap();
+        assert_eq!(Write.preview(&args), None, "not text, so nothing to diff");
     }
 
     #[test]

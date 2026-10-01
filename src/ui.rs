@@ -135,7 +135,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .as_ref()
         .map(|pending| {
             let width = frame.area().width.saturating_sub(4).max(10) as usize;
-            let lines = wrap(&pending.command, width).len() as u16;
+            let lines = (wrap(&pending.command, width).len()
+                + pending
+                    .preview
+                    .as_deref()
+                    .map_or(0, |diff| diff_rows(diff, width).len())) as u16;
             let offers = [&pending.offers.exact, &pending.offers.prefix]
                 .iter()
                 .filter(|o| o.is_some())
@@ -575,7 +579,15 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
             .list
             .get(index + 1)
             .and_then(|next| shell_result(entry, next));
-        let rows = entry_lines(entry, width, expanded, retryable, result);
+        let mut rows = entry_lines(entry, width, expanded, retryable, result);
+        // A diff hangs from the command that made it, with no separator between them.
+        let hangs = matches!(entries.list.get(index + 1), Some(Entry::Diff(_)));
+        if hangs {
+            rows.lines.pop();
+            rows.joins.pop();
+            rows.margins.pop();
+            rows.origins.pop();
+        }
         lines.extend(rows.lines);
         joins.extend(rows.joins);
         margins.extend(rows.margins);
@@ -594,7 +606,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
             folds.insert(index, owner);
         }
         // The blank separator line belongs to no entry.
-        spans.push((start..lines.len() - 1, index));
+        spans.push((start..lines.len() - usize::from(!hangs), index));
     }
     drop(entries);
     app.folds = folds;
@@ -870,6 +882,9 @@ fn entry_lines(
     retryable: bool,
     result: Option<&Entry>,
 ) -> Rows {
+    if let Entry::Diff(text) = entry {
+        return diff_entry(text, width, expanded);
+    }
     if let Entry::Assistant(text) = entry {
         let lead = MESSAGE_MARK.chars().count();
         let indent = " ".repeat(lead);
@@ -931,7 +946,7 @@ fn entry_lines(
             let (prefix, colour) = tool_mark(tool);
             (prefix, summary.as_str(), Style::new().fg(colour))
         }
-        Entry::Output(t) => ("", t, Style::new().fg(Color::Gray)),
+        Entry::Output(t) | Entry::Diff(t) => ("", t, Style::new().fg(Color::Gray)),
         Entry::Running { tail, .. } => ("", tail.trim_end(), Style::new().fg(Color::Gray)),
         Entry::Rejected { by, reason } => {
             rejected = match reason.is_empty() {
@@ -1056,6 +1071,81 @@ fn entry_lines(
         margins,
         copies: Vec::new(),
         folded: hidden > 0 || printed > 0,
+    }
+}
+
+/// The rows of a unified diff cut to `width`, each coloured as the line it came from.
+/// Cut rather than word wrapped, which would drop the indentation code is read by.
+fn diff_rows(text: &str, width: usize) -> Vec<(Line<'static>, Join)> {
+    let text = crate::wrap::readable(text);
+    let mut rows = Vec::new();
+    for (kind, line) in crate::diff::classify(&text) {
+        let style = crate::diff::style(kind);
+        let line = line.replace('\t', "    ");
+        let mut rest = line.as_str();
+        let mut join = Join::Newline;
+        loop {
+            let mut cut = crate::wrap::split_at_width(rest, width.max(1));
+            // A character wider than the row still has to go somewhere.
+            if cut == 0 {
+                cut = rest.chars().next().map_or(0, char::len_utf8);
+            }
+            rows.push((
+                Line::from(Span::styled(rest[..cut].to_string(), style)),
+                join,
+            ));
+            join = Join::Split;
+            rest = &rest[cut..];
+            if rest.is_empty() {
+                break;
+            }
+        }
+    }
+    rows
+}
+
+/// The diff an edit or write made, under its command: one row saying how much it changed
+/// until a click opens it.
+fn diff_entry(text: &str, width: usize, expanded: bool) -> Rows {
+    let indent = "  ";
+    let mut lines = Vec::new();
+    let mut joins = Vec::new();
+    if expanded {
+        for (mut line, join) in diff_rows(text, width.saturating_sub(indent.len()).max(4)) {
+            line.spans.insert(0, Span::raw(indent));
+            lines.push(line);
+            joins.push(join);
+        }
+    }
+    let mut margins = vec![indent.len(); lines.len()];
+    let count = |kind| {
+        crate::diff::classify(text)
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .count()
+    };
+    let note = match expanded {
+        true => "[collapse]".to_string(),
+        false => format!(
+            "[diff +{} -{}]",
+            count(crate::diff::LineKind::Added),
+            count(crate::diff::LineKind::Removed)
+        ),
+    };
+    lines.push(Line::from(Span::styled(
+        format!("{indent}{note}"),
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+    joins.extend([Join::Newline, Join::Newline]);
+    margins.resize(lines.len(), 0);
+    Rows {
+        origins: vec![None; lines.len()],
+        lines,
+        joins,
+        margins,
+        copies: Vec::new(),
+        folded: true,
     }
 }
 
@@ -1342,7 +1432,15 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
         ]));
     }
 
-    let all = wrap(&pending.command, inner.width.max(4) as usize);
+    let width = inner.width.max(4) as usize;
+    let mut all: Vec<Line> = wrap(&pending.command, width)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Yellow))))
+        .collect();
+    // Part of what is approved, so it scrolls with the command and `y` waits for its end.
+    if let Some(diff) = &pending.preview {
+        all.extend(diff_rows(diff, width).into_iter().map(|(line, _)| line));
+    }
     let room = inner.height.saturating_sub(2 + options.len() as u16) as usize;
     let (body, start) = match all.len() > room {
         // The marker takes a row of the room, so the body gives one up.
@@ -1352,10 +1450,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
     let start = start.min(all.len() - body);
     let end = start + body;
     let seen = end >= all.len();
-    let mut lines: Vec<Line> = all[start..end]
-        .iter()
-        .map(|l| Line::from(Span::styled(l.clone(), Style::new().fg(Color::Yellow))))
-        .collect();
+    let mut lines: Vec<Line> = all[start..end].to_vec();
     if body < all.len() {
         let mut note = Vec::new();
         if start > 0 {
@@ -2096,6 +2191,7 @@ mod tests {
             id: 7,
             tool: "bash".to_string(),
             command: "ls".to_string(),
+            preview: None,
             offers: Offers {
                 exact: exact.map(str::to_string),
                 prefix: None,
@@ -2200,6 +2296,7 @@ mod tests {
         app.entries().apply(&Event::ToolStart {
             tool: "bash".to_string(),
             summary: "seq 5".to_string(),
+            preview: None,
         });
         app.entries()
             .apply(&Event::ToolProgress("one\ntwo\nthree\n".to_string()));
@@ -2276,6 +2373,7 @@ mod tests {
             app.entries().apply(&Event::ToolStart {
                 tool: "bash".to_string(),
                 summary: summary.to_string(),
+                preview: None,
             });
             app.entries().apply(&Event::ToolOutput(output.to_string()));
         };
@@ -2485,6 +2583,73 @@ mod tests {
         assert!(click(&mut app, 2, rows.start));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(screen(&terminal).contains("  four\n  [collapse]\n"));
+    }
+
+    #[test]
+    fn an_edit_diff_is_folded_under_its_command_until_clicked() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Command {
+            tool: "edit".to_string(),
+            summary: "edit /f.rs".to_string(),
+        });
+        app.entries()
+            .push(Entry::Diff("@@ -1,2 +1,2 @@\n a\n-b\n+c".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("✎ edit /f.rs\n  [diff +1 -1]\n"), "{text}");
+        assert!(!text.contains("+c"), "{text}");
+
+        let (rows, _) = app.rows.iter().find(|(_, e)| *e == 2).cloned().unwrap();
+        assert!(click(&mut app, 2, rows.start));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("  @@ -1,2 +1,2 @@\n   a\n  -b\n  +c\n  [collapse]\n"),
+            "{text}"
+        );
+        let buffer = terminal.backend().buffer();
+        let (_, y) = (0..buffer.area.height)
+            .map(|y| (0, y))
+            .find(|&(_, y)| buffer[(2, y)].symbol() == "+" && buffer[(3, y)].symbol() == "c")
+            .unwrap();
+        assert_eq!(buffer[(2, y)].fg, Color::Green);
+        assert_eq!(buffer[(2, y - 1)].fg, Color::Red);
+    }
+
+    #[test]
+    fn an_approval_shows_the_diff_and_waits_for_its_end() {
+        let mut app = App::detached();
+        let mut edit = approval(None);
+        edit.tool = "edit".to_string();
+        edit.command = "edit /f.rs (1 lines -> 1 lines)".to_string();
+        edit.preview = Some("@@ -1 +1 @@\n-old\n+new".to_string());
+        app.pending = Some(edit.clone());
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("edit /f.rs (1 lines -> 1 lines)"), "{text}");
+        assert!(text.contains("-old"), "{text}");
+        assert!(text.contains("+new"), "{text}");
+        assert!(app.approval_seen);
+
+        // A long diff is part of what is approved, so `y` waits for its last line too.
+        edit.preview = Some(
+            std::iter::once("@@ -0,0 +1,40 @@".to_string())
+                .chain((1..=40).map(|n| format!("+line{n}")))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        app.pending = Some(edit);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("lines hidden"));
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.pending.is_some());
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("+line40"));
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.pending.is_none());
     }
 
     #[test]

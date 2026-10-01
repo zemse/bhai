@@ -32,6 +32,8 @@ pub enum Entry {
         lines: usize,
     },
     Output(String),
+    /// The diff an edit or write made, under its command; folded until opened.
+    Diff(String),
     /// A call that did not run, under the command it would have been. `reason` is empty
     /// when the user gave none.
     Rejected {
@@ -97,10 +99,19 @@ impl Entries {
             Event::Queued { .. } => {}
             Event::Text(delta) => self.append(delta, Stream::Assistant),
             Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
-            Event::ToolStart { tool, summary } => self.push(Entry::Command {
-                tool: tool.clone(),
-                summary: summary.clone(),
-            }),
+            Event::ToolStart {
+                tool,
+                summary,
+                preview,
+            } => {
+                self.push(Entry::Command {
+                    tool: tool.clone(),
+                    summary: summary.clone(),
+                });
+                if let Some(diff) = preview {
+                    self.push(Entry::Diff(diff.clone()));
+                }
+            }
             Event::ToolProgress(chunk) => self.progress(chunk),
             Event::ToolOutput(output) => {
                 let entry = Entry::Output(output.trim_end().to_string());
@@ -395,6 +406,7 @@ impl Entry {
             | Entry::Command { summary: t, .. }
             | Entry::Running { tail: t, .. }
             | Entry::Output(t)
+            | Entry::Diff(t)
             | Entry::Rejected { reason: t, .. }
             | Entry::Error(t)
             | Entry::Failed(t)
@@ -412,6 +424,7 @@ impl Entry {
             Entry::Command { .. } => "command",
             Entry::Running { .. } => "running",
             Entry::Output(_) => "output",
+            Entry::Diff(_) => "diff",
             Entry::Rejected { .. } => "rejected",
             Entry::Error(_) => "error",
             Entry::Failed(_) => "failed",
@@ -542,6 +555,7 @@ mod tests {
         Event::ToolStart {
             tool: tool.to_string(),
             summary: summary.to_string(),
+            preview: None,
         }
     }
 
@@ -714,6 +728,33 @@ mod tests {
         assert_eq!(app.list[3].text(), "exit code: 0");
         assert_eq!(app.attribution.items[&2], 3);
         assert_eq!(app.tokens[&2].output, Some(3));
+    }
+
+    #[test]
+    fn an_edit_shows_its_diff_between_the_command_and_its_result() {
+        let mut app = intro();
+        app.apply(&Event::User("hi".to_string()));
+        app.apply(&Event::Item(0));
+        app.apply(&Event::Call(CallTokens {
+            usage: usage(10, 0, 3, 0),
+            sent: 1,
+            outputs: 1,
+            inputs: vec![1],
+            calls: vec![3],
+            ..CallTokens::default()
+        }));
+        app.apply(&Event::ToolStart {
+            tool: "edit".to_string(),
+            summary: "edit /f".to_string(),
+            preview: Some("@@ -1 +1 @@\n-a\n+b".to_string()),
+        });
+        app.apply(&Event::ToolOutput("Edited /f: 1 exact match.".to_string()));
+        app.apply(&Event::Item(2));
+        assert!(matches!(&app.list[3], Entry::Diff(d) if d.ends_with("+b")));
+        assert_eq!(app.list[3].kind(), "diff");
+        // The call and its result are still tied to the command and the output.
+        assert_eq!(app.tokens[&2].output, Some(3));
+        assert_eq!(app.attribution.items[&2], 4);
     }
 
     #[test]
