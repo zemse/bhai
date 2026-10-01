@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A long approval no longer cuts its command off silently: the box shows `[+N lines hidden]` and scrolls with up/down, j/k, PageUp/PageDown and Home/End. `y`, `a` and `p` (and clicks on them) do nothing until the last line of the command has been on screen; `n`, `r` and esc always answer.
 - `Auth` no longer derives `Debug`: its impl prints the access token as `<redacted>` and keeps the account id, so a `{:?}` of an `Auth` or a struct holding one cannot leak the bearer token.
 - `.config/nextest.toml` defines a `ci` profile for `cargo nextest run --profile ci` that does not stop at the first failure and kills a test still running after five minutes (60s slow-timeout, terminate after 5 periods); CI itself still runs `cargo test`.
 - A 401 from the Codex backend re-reads `auth.json` and takes the token there if another process rotated it, otherwise forces one refresh, then retries the call once. A token revoked before its `exp` no longer kills the turn, and a second 401 still fails with "Run `codex login`".

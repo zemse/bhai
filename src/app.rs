@@ -234,6 +234,14 @@ pub struct App {
     pub judging: Option<String>,
     /// The tool call waiting for approval.
     pub pending: Option<Approval>,
+    /// How far the approval's command is scrolled, in wrapped lines. The renderer clamps
+    /// it, and sets the other two from what it drew.
+    pub approval_scroll: usize,
+    /// Whether the last line of the pending command has been on screen. `y`, `a` and `p`
+    /// do nothing until it has.
+    pub approval_seen: bool,
+    /// Lines of the command the box shows at once, for paging.
+    pub approval_page: usize,
     /// The trust question, until it is answered.
     pub trust_gate: Option<TrustGate>,
     pub scroll: usize,
@@ -333,6 +341,9 @@ impl App {
             queued: Vec::new(),
             judging: None,
             pending: None,
+            approval_scroll: 0,
+            approval_seen: false,
+            approval_page: 1,
             trust_gate: None,
             scroll: 0,
             max_scroll: 0,
@@ -393,7 +404,16 @@ impl App {
 
         // An approval is modal: nothing else happens until it is answered.
         if self.pending.is_some() {
+            let page = self.approval_page.max(1);
             match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_approval(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_approval(1),
+                KeyCode::PageUp => self.scroll_approval(-(page as isize)),
+                KeyCode::PageDown => self.scroll_approval(page as isize),
+                KeyCode::Home => self.approval_scroll = 0,
+                KeyCode::End => self.approval_scroll = usize::MAX,
+                // Approving what has not been read is how a hidden tail gets through.
+                KeyCode::Char('y' | 'a' | 'p') if !self.approval_seen => {}
                 KeyCode::Char('y') => self.answer(Answer::Accept(None)),
                 KeyCode::Char('a') => self.answer(Answer::Accept(Some(Remember::Exact))),
                 KeyCode::Char('p') => self.answer(Answer::Accept(Some(Remember::Prefix))),
@@ -1139,6 +1159,7 @@ impl App {
                     command,
                     offers,
                 });
+                self.reset_approval_view();
             }
             Event::Resolved { id, .. } if self.pending.as_ref().is_some_and(|p| p.id == id) => {
                 self.pending = None;
@@ -1208,6 +1229,7 @@ impl App {
         self.working = state.working;
         self.queued = state.queued;
         self.pending = state.pending;
+        self.reset_approval_view();
         self.mode = state.mode;
         self.model = state.model;
         self.effort = state.effort;
@@ -1979,6 +2001,16 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             Ok(text) => self.note(Entry::Info(text)),
             Err(e) => self.note(Entry::Error(format!("{e:#}"))),
         }
+    }
+
+    fn scroll_approval(&mut self, by: isize) {
+        self.approval_scroll = self.approval_scroll.saturating_add_signed(by);
+    }
+
+    /// A new approval starts at the top, and nothing of it has been read yet.
+    fn reset_approval_view(&mut self) {
+        self.approval_scroll = 0;
+        self.approval_seen = false;
     }
 
     /// A remember key does nothing unless the prompt offers that rule.

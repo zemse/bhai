@@ -1304,6 +1304,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(pending) = &app.pending else {
         return;
     };
+    let scroll = app.approval_scroll;
     let title = if pending.tool == "bash" {
         " run this command? ".to_string()
     } else {
@@ -1341,11 +1342,37 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
         ]));
     }
 
-    let mut lines: Vec<Line> = wrap(&pending.command, inner.width.max(4) as usize)
-        .into_iter()
-        .map(|l| Line::from(Span::styled(l, Style::new().fg(Color::Yellow))))
+    let all = wrap(&pending.command, inner.width.max(4) as usize);
+    let room = inner.height.saturating_sub(2 + options.len() as u16) as usize;
+    let (body, start) = match all.len() > room {
+        // The marker takes a row of the room, so the body gives one up.
+        true => (room.saturating_sub(1).max(1), scroll),
+        false => (all.len(), 0),
+    };
+    let start = start.min(all.len() - body);
+    let end = start + body;
+    let seen = end >= all.len();
+    let mut lines: Vec<Line> = all[start..end]
+        .iter()
+        .map(|l| Line::from(Span::styled(l.clone(), Style::new().fg(Color::Yellow))))
         .collect();
-    lines.truncate(inner.height.saturating_sub(2 + options.len() as u16) as usize);
+    if body < all.len() {
+        let mut note = Vec::new();
+        if start > 0 {
+            note.push(format!("{start} above"));
+        }
+        if !seen {
+            note.push(format!("+{} lines hidden", all.len() - end));
+        }
+        let hint = match seen {
+            true => "up scrolls back",
+            false => "down scrolls, y waits for the end",
+        };
+        lines.push(Line::styled(
+            format!("[{}] {hint}", note.join(", ")),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
     lines.push(Line::from(""));
     let row = inner.y + lines.len() as u16;
     let mut buttons = vec![
@@ -1356,13 +1383,16 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
         buttons.push((Rect::new(inner.x, row + 1 + i as u16, inner.width, 1), k));
     }
     lines.push(Line::from(vec![
-        key("[y]", Color::Green),
+        key("[y]", if seen { Color::Green } else { Color::DarkGray }),
         Span::raw("es   "),
         key("[n]", Color::Red),
         Span::raw("o"),
     ]));
     lines.extend(options);
     frame.render_widget(Paragraph::new(lines), inner);
+    app.approval_scroll = start;
+    app.approval_seen = seen;
+    app.approval_page = body;
     app.buttons = buttons
         .into_iter()
         .map(|(spot, k)| (spot.intersection(inner), KeyCode::Char(k)))
@@ -1426,7 +1456,9 @@ mod tests {
     use crate::session::{Approval, Event};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::crossterm::event::{
+        KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::style::Modifier;
     use std::time::Instant;
 
@@ -2116,6 +2148,50 @@ mod tests {
         assert!(app.buttons.is_empty());
         app.on_mouse(down(always.x, always.y));
         assert_eq!(app.input.value(), "", "a stale button types nothing");
+    }
+
+    #[test]
+    fn a_long_command_cannot_be_approved_until_its_end_has_been_shown() {
+        let mut app = App::detached();
+        let mut long = approval(Some("seq"));
+        long.command = (1..=40).map(|n| format!("line{n}\n")).collect();
+        app.pending = Some(long);
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("lines hidden"));
+        assert!(!shown.contains("line40"));
+        for code in ['y', 'a', 'p'] {
+            app.on_key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE));
+        }
+        let &(yes, _) = app
+            .buttons
+            .iter()
+            .find(|(_, k)| *k == KeyCode::Char('y'))
+            .unwrap();
+        app.on_mouse(down(yes.x + 1, yes.y));
+        assert!(app.pending.is_some(), "nothing approves what is unread");
+
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.pending.is_some());
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("line40"));
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn rejecting_needs_no_reading() {
+        let mut app = App::detached();
+        let mut long = approval(None);
+        long.command = (1..=40).map(|n| format!("line{n}\n")).collect();
+        app.pending = Some(long);
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.pending.is_none());
     }
 
     #[test]
