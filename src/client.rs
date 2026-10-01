@@ -24,7 +24,10 @@ use crate::compact;
 use crate::limits::{self, RateLimits};
 use crate::ollama;
 
-pub(crate) const BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+/// The ChatGPT backend, which the Codex endpoints and the usage endpoint hang off.
+const BACKEND: &str = "https://chatgpt.com/backend-api";
+/// Stands in for [`BACKEND`] in a debug build; how `tests/` run the binary on a fake.
+const TEST_BASE_URL: &str = "BHAI_TEST_BASE_URL";
 pub(crate) const ORIGINATOR: &str = "codex_cli_rs";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const DEFAULT_EFFORT: &str = "medium";
@@ -39,6 +42,23 @@ const USAGE_WAIT: Duration = Duration::from_secs(2);
 /// The `reasoning.effort` values the Responses API takes. The models catalog also lists
 /// `ultra` for some models, which the API refuses.
 pub const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// [`BACKEND`], or [`TEST_BASE_URL`] where a debug build has it set. A release build never
+/// reads it, so the environment cannot send the subscription's token anywhere else.
+pub(crate) fn backend() -> String {
+    if cfg!(debug_assertions)
+        && let Ok(url) = std::env::var(TEST_BASE_URL)
+        && !url.trim().is_empty()
+    {
+        return url.trim().trim_end_matches('/').to_string();
+    }
+    BACKEND.to_string()
+}
+
+/// The Codex endpoints, under [`backend`].
+pub(crate) fn base_url() -> String {
+    format!("{}/codex", backend())
+}
 
 /// A request the backend refused as malformed: sent again, it fails the same way.
 #[derive(Debug)]
@@ -702,7 +722,7 @@ impl Client {
     fn request(&self, auth: &Auth, body: &Value) -> reqwest::RequestBuilder {
         let mut req = self
             .http
-            .post(format!("{BASE_URL}/responses"))
+            .post(format!("{}/responses", base_url()))
             .header("Authorization", format!("Bearer {}", auth.access_token))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")

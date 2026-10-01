@@ -1,0 +1,435 @@
+//! The real binary, `--serve --headless`, on a fake Responses backend: what a turn sends
+//! and what `/events` fans out, with no model call and no quota.
+//!
+//! `BHAI_TEST_BASE_URL` only moves the backend in a debug build, so these only run there.
+#![cfg(debug_assertions)]
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::time::timeout;
+
+const WAIT: Duration = Duration::from_secs(20);
+/// A JWT whose `exp` is 2100-01-01, so auth never tries to refresh it.
+const ACCESS_TOKEN: &str = "e30.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln";
+const ACCOUNT: &str = "acct-fake";
+
+/// One request the fake answered.
+#[derive(Debug, Clone)]
+struct Seen {
+    path: &'static str,
+    headers: HeaderMap,
+    body: Value,
+}
+
+/// The fake: replies to `/codex/responses` in the order queued, and keeps every request.
+#[derive(Default)]
+struct Fake {
+    replies: Mutex<VecDeque<String>>,
+    seen: Mutex<Vec<Seen>>,
+}
+
+impl Fake {
+    fn responses(&self) -> Vec<Seen> {
+        let seen = self.seen.lock().unwrap();
+        seen.iter()
+            .filter(|s| s.path == "/codex/responses")
+            .cloned()
+            .collect()
+    }
+}
+
+async fn responses(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: String) -> Response {
+    let body = serde_json::from_str(&body).unwrap_or(Value::Null);
+    fake.seen.lock().unwrap().push(Seen {
+        path: "/codex/responses",
+        headers,
+        body,
+    });
+    match fake.replies.lock().unwrap().pop_front() {
+        Some(sse) => ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response(),
+        None => (StatusCode::BAD_REQUEST, "the fake has no reply queued").into_response(),
+    }
+}
+
+async fn usage(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
+    fake.seen.lock().unwrap().push(Seen {
+        path: "/wham/usage",
+        headers,
+        body: Value::Null,
+    });
+    axum::Json(json!({})).into_response()
+}
+
+async fn serve_fake(fake: Arc<Fake>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/codex/responses", post(responses))
+        .route("/wham/usage", get(usage))
+        .with_state(fake);
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    format!("http://{addr}")
+}
+
+/// A Responses stream of `events`, each framed the way the backend frames it.
+fn sse(events: &[Value]) -> String {
+    events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect()
+}
+
+fn completed() -> Value {
+    json!({
+        "type": "response.completed",
+        "response": { "output": [], "usage": { "input_tokens": 120, "output_tokens": 7 } }
+    })
+}
+
+/// The model saying `text`, in two deltas.
+fn says(text: &str) -> String {
+    let (head, tail) = text.split_at(text.len() / 2);
+    sse(&[
+        json!({ "type": "response.output_text.delta", "delta": head }),
+        json!({ "type": "response.output_text.delta", "delta": tail }),
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": text }]
+            }
+        }),
+        completed(),
+    ])
+}
+
+/// The model asking for `command` in bash.
+fn runs(call_id: &str, command: &str) -> String {
+    sse(&[
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "bash",
+                "call_id": call_id,
+                "arguments": json!({ "command": command }).to_string()
+            }
+        }),
+        completed(),
+    ])
+}
+
+/// A bhai `--serve 0 --headless` in a scratch home and project, killed on drop.
+struct Bhai {
+    child: Child,
+    base: String,
+    token: String,
+    http: reqwest::Client,
+    dir: PathBuf,
+}
+
+impl Drop for Bhai {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Bhai {
+    async fn start(backend: &str) -> Bhai {
+        let dir = std::env::temp_dir().join(format!("bhai-fake-{}", uuid::Uuid::new_v4()));
+        let (home, codex, project) = (dir.join("home"), dir.join("codex"), dir.join("project"));
+        for d in [&home, &codex, &project] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let auth = json!({ "tokens": { "access_token": ACCESS_TOKEN, "account_id": ACCOUNT } });
+        std::fs::write(codex.join("auth.json"), auth.to_string()).unwrap();
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bhai"))
+            .args(["--serve", "0", "--headless"])
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("CODEX_HOME", &codex)
+            .env("BHAI_TEST_BASE_URL", backend)
+            .env_remove("BHAI_MODEL")
+            .env_remove("BHAI_MODE")
+            .env_remove("BHAI_EFFORT")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+        let mut said = String::new();
+        let found = timeout(WAIT, async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if let Some(rest) = line.strip_prefix("bhai: debug server on ") {
+                    return Some(rest.to_string());
+                }
+                said.push_str(&line);
+                said.push('\n');
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(rest) = found else {
+            panic!("bhai did not start its server:\n{said}");
+        };
+        // `http://127.0.0.1:PORT (x-bhai-token: TOKEN)`
+        let (base, token) = rest.split_once(" (x-bhai-token: ").unwrap();
+        let token = token.trim_end_matches(')').to_string();
+        // The rest of stderr is drained so a full pipe cannot block the binary.
+        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+
+        Bhai {
+            child,
+            base: base.to_string(),
+            token,
+            http: reqwest::Client::new(),
+            dir,
+        }
+    }
+
+    fn project(&self) -> PathBuf {
+        self.dir.join("project")
+    }
+
+    async fn post(&self, path: &str, body: Value) -> (StatusCode, Value) {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .header("x-bhai-token", &self.token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        (status, response.json().await.unwrap_or(Value::Null))
+    }
+
+    async fn state(&self) -> Value {
+        self.http
+            .get(format!("{}/state", self.base))
+            .header("x-bhai-token", &self.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    /// `/events` from the first event on.
+    async fn events(&self) -> Events {
+        let response = self
+            .http
+            .get(format!("{}/events", self.base))
+            .header("x-bhai-token", &self.token)
+            .header("last-event-id", "0")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+        Events {
+            stream: response.bytes_stream().boxed(),
+            buf: String::new(),
+            got: Vec::new(),
+        }
+    }
+}
+
+/// What `/events` sent, read as far as asked.
+struct Events {
+    stream: BoxStream<'static, reqwest::Result<Bytes>>,
+    buf: String,
+    got: Vec<Value>,
+}
+
+impl Events {
+    /// Read up to and including the first event of type `kind`, and return it.
+    async fn until(&mut self, kind: &str) -> Value {
+        let read = timeout(WAIT, async {
+            loop {
+                while let Some(end) = self.buf.find("\n\n") {
+                    let frame: String = self.buf.drain(..end + 2).collect();
+                    let Some(data) = frame.lines().find_map(|l| l.strip_prefix("data: ")) else {
+                        continue;
+                    };
+                    let event: Value = serde_json::from_str(data).unwrap();
+                    self.got.push(event.clone());
+                    if event["type"] == kind {
+                        return event;
+                    }
+                }
+                let chunk = self.stream.next().await.expect("/events ended").unwrap();
+                self.buf.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await;
+        match read {
+            Ok(event) => event,
+            Err(_) => panic!("no {kind} event; got {:#?}", self.got),
+        }
+    }
+
+    fn kinds(&self) -> Vec<&str> {
+        self.got.iter().filter_map(|e| e["type"].as_str()).collect()
+    }
+
+    fn text(&self) -> String {
+        self.got
+            .iter()
+            .filter(|e| e["type"] == "text")
+            .filter_map(|e| e["data"].as_str())
+            .collect()
+    }
+}
+
+/// The input items of a request that are `kind`.
+fn items<'a>(body: &'a Value, kind: &str) -> Vec<&'a Value> {
+    body["input"]
+        .as_array()
+        .map(|input| input.iter().filter(|i| i["type"] == kind).collect())
+        .unwrap_or_default()
+}
+
+fn mentions(body: &Value, text: &str) -> bool {
+    body["input"].to_string().contains(text)
+}
+
+#[tokio::test]
+async fn a_prompt_reaches_the_backend_and_its_answer_reaches_events() {
+    let fake = Arc::new(Fake::default());
+    fake.replies
+        .lock()
+        .unwrap()
+        .push_back(says("ok from the fake"));
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    let (status, answer) = bhai.post("/prompt", json!({ "text": "say ok" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let user = events.until("user").await;
+    assert_eq!(user["data"], "say ok");
+    events.until("turn_end").await;
+    assert_eq!(events.text(), "ok from the fake");
+    let kinds = events.kinds();
+    for kind in ["streaming", "usage", "done"] {
+        assert!(kinds.contains(&kind), "no {kind} in {kinds:?}");
+    }
+    let usage = events.got.iter().find(|e| e["type"] == "usage").unwrap();
+    assert_eq!(usage["data"]["input"], 120, "{usage}");
+    assert_eq!(usage["data"]["output"], 7, "{usage}");
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 1, "{sent:#?}");
+    let request = &sent[0];
+    assert_eq!(
+        request.headers["authorization"],
+        format!("Bearer {ACCESS_TOKEN}").as_str()
+    );
+    assert_eq!(request.headers["chatgpt-account-id"], ACCOUNT);
+    assert_eq!(request.body["stream"], true);
+    assert!(mentions(&request.body, "say ok"), "{}", request.body);
+
+    let state = bhai.state().await;
+    assert_eq!(state["calls"], 1, "{state}");
+    assert_eq!(state["input_tokens"], 120, "{state}");
+    assert_eq!(state["output_tokens"], 7, "{state}");
+}
+
+#[tokio::test]
+async fn a_tool_call_waits_for_approve_runs_and_its_output_goes_back() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(runs("call_1", "touch made-by-the-fake"));
+        replies.push_back(says("made it"));
+    }
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    let (status, answer) = bhai.post("/prompt", json!({ "text": "make a file" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let approval = events.until("approval").await;
+    assert_eq!(approval["data"]["tool"], "bash", "{approval}");
+    assert!(!bhai.project().join("made-by-the-fake").exists());
+    let id = approval["data"]["id"].clone();
+    let (status, answer) = bhai.post("/approve", json!({ "id": id })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let resolved = events.until("resolved").await;
+    assert_eq!(resolved["data"]["accepted"], true, "{resolved}");
+    events.until("tool_output").await;
+    events.until("turn_end").await;
+    assert_eq!(events.text(), "made it");
+    assert!(bhai.project().join("made-by-the-fake").exists());
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    let calls = items(&sent[1].body, "function_call");
+    assert!(calls.iter().any(|c| c["call_id"] == "call_1"), "{calls:?}");
+    let outputs = items(&sent[1].body, "function_call_output");
+    assert!(
+        outputs.iter().any(|o| o["call_id"] == "call_1"),
+        "{outputs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_call_sends_the_refusal_back_and_runs_nothing() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(runs("call_9", "touch never-made"));
+        replies.push_back(says("understood"));
+    }
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    bhai.post("/prompt", json!({ "text": "make a file" })).await;
+    let approval = events.until("approval").await;
+    let (status, answer) = bhai
+        .post("/reject", json!({ "id": approval["data"]["id"] }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    events.until("tool_rejected").await;
+    events.until("turn_end").await;
+    assert!(!bhai.project().join("never-made").exists());
+    assert!(
+        !events.kinds().contains(&"tool_start"),
+        "{:?}",
+        events.kinds()
+    );
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    let outputs = items(&sent[1].body, "function_call_output");
+    assert!(
+        outputs.iter().any(|o| o["call_id"] == "call_9"),
+        "{outputs:?}"
+    );
+}

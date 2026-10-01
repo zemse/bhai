@@ -216,7 +216,7 @@ async fn fetch(http: &reqwest::Client, cached: &Option<Value>) -> Result<Value> 
     let mut req = http
         .get(format!(
             "{}/models?client_version={version}",
-            client::BASE_URL
+            client::base_url()
         ))
         .bearer_auth(&auth.access_token)
         .header("originator", client::ORIGINATOR);

@@ -21,9 +21,9 @@ pub const WARN: f64 = 75.0;
 /// Percent used at which a window turns red.
 pub const ALERT: f64 = 90.0;
 
-/// Rate limits and credits, as openai/codex reads them. Not under `/backend-api/codex`:
-/// that copy of the path answers 403.
-const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// Rate limits and credits, as openai/codex reads them, under the backend root. Not under
+/// `/backend-api/codex`: that copy of the path answers 403.
+const USAGE_PATH: &str = "/wham/usage";
 /// Seconds between usage fetches, whether a session is idle or a call brings one.
 const REFRESH_SECS: i64 = 60;
 /// How often an idle session asks whether a fetch is due.
@@ -314,7 +314,7 @@ pub fn due(now: i64) -> bool {
 /// is read here and never logged.
 pub async fn fetch(http: &reqwest::Client, auth: &Auth) -> Result<Value> {
     let mut req = http
-        .get(USAGE_URL)
+        .get(format!("{}{USAGE_PATH}", crate::client::backend()))
         .timeout(FETCH_TIMEOUT)
         .bearer_auth(&auth.access_token)
         .header("Accept", "application/json")
