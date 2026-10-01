@@ -1065,7 +1065,7 @@ pub fn request_body(
         "input": input,
         "tools": tools,
         "tool_choice": "auto",
-        "parallel_tool_calls": false,
+        "parallel_tool_calls": true,
         "reasoning": { "effort": effort, "summary": "auto" },
         "store": false,
         "stream": true,

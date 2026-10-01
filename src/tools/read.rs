@@ -56,6 +56,10 @@ impl Tool for Read {
         false
     }
 
+    fn parallel(&self) -> bool {
+        true
+    }
+
     fn describe(&self, args: &Value) -> Result<String, String> {
         let path = path_arg(args)?;
         let (offset, limit) = range(args)?;

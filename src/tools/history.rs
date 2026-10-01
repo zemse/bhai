@@ -82,6 +82,10 @@ impl Tool for FindSessions {
         false
     }
 
+    fn parallel(&self) -> bool {
+        true
+    }
+
     fn describe(&self, args: &Value) -> Result<String, String> {
         limit(args)?;
         Ok(match query(args) {
@@ -145,6 +149,10 @@ impl Tool for ReadSession {
 
     fn needs_approval(&self) -> bool {
         false
+    }
+
+    fn parallel(&self) -> bool {
+        true
     }
 
     fn describe(&self, args: &Value) -> Result<String, String> {

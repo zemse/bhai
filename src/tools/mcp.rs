@@ -64,6 +64,10 @@ impl Tool for Search {
         false
     }
 
+    fn parallel(&self) -> bool {
+        true
+    }
+
     fn describe(&self, args: &Value) -> Result<String, String> {
         query(args).map(|q| format!("mcp_search {q}"))
     }

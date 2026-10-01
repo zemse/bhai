@@ -47,6 +47,11 @@ pub trait Tool: Send + Sync {
     /// The Responses API tool definition: a function, or for `apply_patch` a custom tool.
     fn schema(&self) -> Value;
     fn needs_approval(&self) -> bool;
+    /// Whether its calls may run alongside the others of one response: it changes
+    /// nothing another call could read.
+    fn parallel(&self) -> bool {
+        false
+    }
     /// Check the arguments and summarize the call in one line for the user.
     fn describe(&self, args: &Value) -> Result<String, String>;
     /// A unified diff of what the call would change, for the files it writes.
@@ -182,6 +187,13 @@ impl Registry {
         self
     }
 
+    /// Any tool, for a test that needs one the session never offers.
+    #[cfg(test)]
+    pub fn with_tool(mut self, tool: Box<dyn Tool>) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
     /// The built-in tools and `skill`, narrowed to an identity's tools.
     pub fn for_identity(
         skills: Vec<crate::skills::Skill>,
@@ -219,6 +231,17 @@ impl Registry {
             .iter()
             .find(|t| t.name() == name)
             .map(|t| t.as_ref())
+    }
+
+    /// Whether `call` may run alongside the others of its response. A call to a function
+    /// `tool_search` loaded is an `mcp_call`, which may change anything.
+    pub fn parallel(&self, call: &Value) -> bool {
+        call.get("type").and_then(Value::as_str) == Some("function_call")
+            && call
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(|name| self.get(name))
+                .is_some_and(|tool| tool.parallel())
     }
 
     /// The output for a call to a tool that does not exist.

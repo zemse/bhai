@@ -1767,37 +1767,62 @@ async fn turn(
         }
         continued = 0;
 
+        let conversation = tools::Conversation {
+            id: model.conversation(),
+            model: model.name(),
+            history: history.as_slice(),
+        };
+        // The history index of the first call's result.
+        let first = sent + items.len();
         let mut results = Vec::with_capacity(calls.len());
         let mut all_failed = true;
-        for (index, call) in calls.iter().enumerate() {
-            let call_id = call
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            // A `tool_search_call` runs as a call to `tool_search`, and a `custom_tool_call`
-            // as a function call; each is answered in kind.
-            let search = tools::mcp::search_call(call);
-            let custom = tools::custom_call(call);
-            let run = search.as_ref().or(custom.as_ref()).unwrap_or(call);
-            let conversation = tools::Conversation {
-                id: model.conversation(),
-                model: model.name(),
-                history: history.as_slice(),
-            };
-            let (output, ok) =
-                execute(registry, policy, judge, run, Some(conversation), tx, cancel).await;
-            all_failed &= !ok;
-            let _ = tx.send(AgentEvent::Item(sent + items.len() + index));
-            results.push(match (search, custom) {
-                (Some(_), _) => tools::mcp::search_output(&call_id, &output),
-                (None, Some(_)) => tools::custom_output(&call_id, &output),
-                (None, None) => json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": output,
-                }),
-            });
+        for batch in batches(registry, &calls) {
+            let (runs, events): (Vec<_>, Vec<_>) = batch
+                .map(|index| {
+                    let (events, rx) = mpsc::unbounded_channel();
+                    let call = calls[index];
+                    let run = async move {
+                        let call_id = call
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        // A `tool_search_call` runs as a call to `tool_search`, and a
+                        // `custom_tool_call` as a function call; each is answered in kind.
+                        let search = tools::mcp::search_call(call);
+                        let custom = tools::custom_call(call);
+                        let run = search.as_ref().or(custom.as_ref()).unwrap_or(call);
+                        let (output, ok) = execute(
+                            registry,
+                            policy,
+                            judge,
+                            run,
+                            Some(conversation),
+                            &events,
+                            cancel,
+                        )
+                        .await;
+                        let _ = events.send(AgentEvent::Item(first + index));
+                        let result = match (search, custom) {
+                            (Some(_), _) => tools::mcp::search_output(&call_id, &output),
+                            (None, Some(_)) => tools::custom_output(&call_id, &output),
+                            (None, None) => json!({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": output,
+                            }),
+                        };
+                        (result, ok)
+                    };
+                    (run, rx)
+                })
+                .unzip();
+            let (outcomes, ()) =
+                tokio::join!(futures_util::future::join_all(runs), in_turn(events, tx));
+            for (result, ok) in outcomes {
+                all_failed &= !ok;
+                results.push(result);
+            }
         }
 
         // Append the assistant items and every matching result together.
@@ -1815,6 +1840,35 @@ async fn turn(
                 "stopped: the last few tool calls all failed".to_string(),
             ));
             return Turn::ended(step, truncated);
+        }
+    }
+}
+
+/// The calls of one response split into what runs together: each run of calls to tools
+/// that may overlap is one batch, and any other call is a batch of its own, in order.
+fn batches(registry: &Registry, calls: &[&Value]) -> Vec<std::ops::Range<usize>> {
+    let mut batches: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut joinable = false;
+    for (index, call) in calls.iter().enumerate() {
+        let parallel = registry.parallel(call);
+        match batches.last_mut() {
+            Some(last) if parallel && joinable => last.end = index + 1,
+            _ => batches.push(index..index + 1),
+        }
+        joinable = parallel;
+    }
+    batches
+}
+
+/// Pass on each call's events once every call before it has finished, so a batch reads
+/// as calls made one after another and its approvals are still asked one at a time.
+async fn in_turn(
+    events: Vec<mpsc::UnboundedReceiver<AgentEvent>>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    for mut rx in events {
+        while let Some(event) = rx.recv().await {
+            let _ = tx.send(event);
         }
     }
 }
@@ -3546,6 +3600,176 @@ mod tests {
         assert!(output.starts_with("Applied: update "), "{output}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\nthree\n");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Waits on `b` when called as `a`, so two `a`/`b` calls only finish if they overlap.
+    struct Rendezvous {
+        parallel: bool,
+        met: Arc<tokio::sync::Notify>,
+    }
+
+    impl tools::Tool for Rendezvous {
+        fn name(&self) -> &str {
+            "rendezvous"
+        }
+
+        fn schema(&self) -> Value {
+            json!({"type": "function", "name": "rendezvous"})
+        }
+
+        fn needs_approval(&self) -> bool {
+            false
+        }
+
+        fn parallel(&self) -> bool {
+            self.parallel
+        }
+
+        fn describe(&self, args: &Value) -> Result<String, String> {
+            Ok(args["side"].as_str().unwrap_or_default().to_string())
+        }
+
+        fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
+            Box::pin(async move {
+                match args["side"].as_str() {
+                    Some("a") => self.met.notified().await,
+                    _ => self.met.notify_one(),
+                }
+                (
+                    format!("{} done", args["side"].as_str().unwrap_or_default()),
+                    true,
+                )
+            })
+        }
+    }
+
+    /// One turn of `fake` in ask mode with no judge, as a main agent runs it.
+    async fn meet(
+        fake: &fake::Fake,
+        registry: &Registry,
+        history: &mut Vec<Value>,
+        tx: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Turn {
+        let policy = Policy::new(
+            Mode::Ask,
+            crate::permissions::Rules::default(),
+            None,
+            tools::temp_dir(),
+        );
+        turn(
+            fake,
+            registry,
+            &policy,
+            None,
+            &registry.schemas(),
+            "",
+            history,
+            tx,
+            &Arc::new(AtomicBool::new(false)),
+            &mut Vec::new(),
+            &mut CacheMonitor::default(),
+            None,
+            &mut Sink::Discard,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    fn rendezvous(side: &str, id: &str) -> Value {
+        json!({"type": "function_call", "call_id": id, "name": "rendezvous",
+                "arguments": json!({"side": side}).to_string()})
+    }
+
+    #[test]
+    fn calls_to_tools_that_may_overlap_are_batched_and_the_rest_run_alone() {
+        let registry = Registry::new(Vec::new());
+        let call = |name: &str| json!({"type": "function_call", "name": name, "arguments": "{}"});
+        let (read, bash) = (call("read"), call("bash"));
+        let custom = json!({"type": "custom_tool_call", "name": "read", "input": ""});
+        let calls = [&read, &read, &bash, &read, &custom, &read, &read];
+        assert_eq!(batches(&registry, &calls), [0..2, 2..3, 3..4, 4..5, 5..7]);
+        assert!(batches(&registry, &[]).is_empty());
+    }
+
+    /// Two calls that can only finish together do, and the transcript still shows the
+    /// first one's start and output before the second's, though the second ended first.
+    #[tokio::test]
+    async fn calls_that_may_overlap_run_together_and_are_shown_in_turn() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![
+            vec![rendezvous("a", "c1"), rendezvous("b", "c2")],
+            vec![say("done")],
+        ]);
+        let registry = Registry::new(Vec::new()).with_tool(Box::new(Rendezvous {
+            parallel: true,
+            met: Arc::new(tokio::sync::Notify::new()),
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut history = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "meet" }],
+        })];
+        let ran = meet(&fake, &registry, &mut history, &tx);
+        let Turn { result, .. } = tokio::time::timeout(std::time::Duration::from_secs(5), ran)
+            .await
+            .expect("the two calls never overlapped");
+        assert!(result.is_ok());
+        let outputs: Vec<(&str, &str)> = history
+            .iter()
+            .filter(|i| i["type"] == "function_call_output")
+            .map(|i| {
+                (
+                    i["call_id"].as_str().unwrap(),
+                    i["output"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(outputs, [("c1", "a done"), ("c2", "b done")]);
+        drop(tx);
+        let mut shown = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::ToolStart { summary, .. } => shown.push(format!("start {summary}")),
+                AgentEvent::ToolOutput(output) => shown.push(output),
+                AgentEvent::Item(index) => shown.push(format!("item {index}")),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            shown,
+            ["start a", "a done", "item 3", "start b", "b done", "item 4"]
+        );
+    }
+
+    /// A call to a tool that may change things waits for the calls before it, even when
+    /// the tool around it could overlap.
+    #[tokio::test]
+    async fn a_call_that_may_not_overlap_runs_alone() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![
+            vec![rendezvous("a", "c1"), rendezvous("b", "c2")],
+            vec![say("done")],
+        ]);
+        let registry = Registry::new(Vec::new()).with_tool(Box::new(Rendezvous {
+            parallel: false,
+            met: Arc::new(tokio::sync::Notify::new()),
+        }));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut history = Vec::new();
+        let ran = meet(&fake, &registry, &mut history, &tx);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), ran)
+                .await
+                .is_err(),
+            "the second call ran before the first had finished"
+        );
     }
 
     /// What `tool_search` loads is called by its own name, and the rules decide that call

@@ -138,6 +138,10 @@ impl Tool for WebSearch {
         false
     }
 
+    fn parallel(&self) -> bool {
+        true
+    }
+
     fn describe(&self, args: &Value) -> Result<String, String> {
         let commands = commands(args)?;
         Ok(summary(&commands))
