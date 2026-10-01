@@ -154,6 +154,8 @@ pub enum AgentEvent {
     Resumed(String),
     /// The goal as it now stands, credits included; `None` once there is none.
     Goal(Option<Goal>),
+    /// The plan `update_plan` set, as it now stands; `None` once there is none.
+    Plan(Option<crate::plan::Plan>),
     /// The agent is done with this turn and is waiting for input.
     TurnEnd,
 }
@@ -666,6 +668,7 @@ pub(crate) async fn run_with(
     // hand the session a second set of slots while the first set is still running.
     let slots = Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING));
     let goal: goal::Shared = Arc::default();
+    let plan: crate::plan::Shared = Arc::default();
     // Built again when `/model` switches, so a child starts on the model its parent is
     // on. What tools there are does not depend on the model, so the schemas hold.
     let build = |model: &Arc<dyn Model>| {
@@ -689,9 +692,14 @@ pub(crate) async fn run_with(
                 current: Arc::clone(model),
             });
         }
-        registry.with_goal(tools::goal::Goal {
-            goal: Arc::clone(&goal),
-        })
+        registry
+            .with_goal(tools::goal::Goal {
+                goal: Arc::clone(&goal),
+            })
+            .with_plan(tools::plan::UpdatePlan {
+                plan: Arc::clone(&plan),
+                tx: tx.clone(),
+            })
     };
     let mut registry = build(&model);
     let tools = registry.schemas();
@@ -729,6 +737,11 @@ pub(crate) async fn run_with(
         was
     });
     let mut shown: Option<Goal> = None;
+    // The checklist carries on as it was: unlike a goal, it never starts anything.
+    *lock_plan(&plan) = writer.as_ref().and_then(|w| w.plan.clone());
+    if let Some(was) = lock_plan(&plan).clone() {
+        let _ = tx.send(AgentEvent::Plan(Some(was)));
+    }
     let mut calls: Vec<Call> = Vec::new();
     let mut monitor = CacheMonitor::default();
 
@@ -784,6 +797,11 @@ pub(crate) async fn run_with(
                         let before = compact::estimate(&history, tokenizer);
                         history.clear();
                         drop_fork(&mut fork, &tx);
+                        // The plan was for the conversation that is gone.
+                        if lock_plan(&plan).take().is_some() {
+                            let _ = tx.send(AgentEvent::Plan(None));
+                        }
+                        persist_plan(&plan, writer.as_mut(), &tx);
                         (calls, monitor) = (Vec::new(), CacheMonitor::default());
                         model.reset("cleared");
                         if let Some(writer) = &mut writer
@@ -913,6 +931,7 @@ pub(crate) async fn run_with(
                 tx: &tx,
                 cancel: &cancel,
                 asked: None,
+                plan: lock_plan(&plan).clone(),
             };
             match pass.fork(&history).await {
                 Ok(Some(made)) => {
@@ -979,6 +998,7 @@ pub(crate) async fn run_with(
                 tx: &tx,
                 cancel: &cancel,
                 asked: asked.take(),
+                plan: lock_plan(&plan).clone(),
             };
             if let Err(e) = pass.run(&mut history, Trigger::Asked, &mut sink).await {
                 let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
@@ -1250,6 +1270,7 @@ pub(crate) async fn run_with(
                 tx: &tx,
                 cancel: &cancel,
                 asked: asked.take(),
+                plan: lock_plan(&plan).clone(),
             };
             let trigger = match size {
                 _ if overflowed => Trigger::Overflow,
@@ -1281,6 +1302,7 @@ pub(crate) async fn run_with(
         }
         announce(&goal, &mut shown, &tx);
         persist(&goal, writer.as_mut(), &tx);
+        persist_plan(&plan, writer.as_mut(), &tx);
         sync(writer.as_ref(), &tx);
         let _ = tx.send(AgentEvent::TurnEnd);
     }
@@ -1288,6 +1310,24 @@ pub(crate) async fn run_with(
 
 fn lock_goal(goal: &goal::Shared) -> std::sync::MutexGuard<'_, Option<Goal>> {
     goal.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_plan(plan: &crate::plan::Shared) -> std::sync::MutexGuard<'_, Option<crate::plan::Plan>> {
+    plan.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Record the plan in the session file, so a resume shows it again.
+fn persist_plan(
+    plan: &crate::plan::Shared,
+    writer: Option<&mut Writer>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    let now = lock_plan(plan).clone();
+    if let Some(writer) = writer
+        && let Err(e) = writer.plan(&now)
+    {
+        let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+    }
 }
 
 /// What every child of the session has cost so far, as a goal counts it.
@@ -1838,6 +1878,8 @@ struct Compaction<'a> {
     cancel: &'a Arc<AtomicBool>,
     /// What the user asked this summary to keep, from `/compact <prompt>`.
     asked: Option<String>,
+    /// The plan the summary restates, since the call that set it may be folded away.
+    plan: Option<crate::plan::Plan>,
 }
 
 impl Compaction<'_> {
@@ -1887,7 +1929,9 @@ impl Compaction<'_> {
             + compact::estimate(&[compact::request(self.asked.as_deref())], tokenizer);
         match self.summarize(&next).await {
             Ok(summary) => {
-                let folded = compact::fold(&next, &summary).expect("checked above");
+                let folded =
+                    compact::fold(&next, &crate::plan::restated(&summary, self.plan.as_ref()))
+                        .expect("checked above");
                 let summary = Compacted::Summarised(summary);
                 self.commit(before, read, folded, summary, history, sink);
                 Ok(true)
@@ -1895,8 +1939,8 @@ impl Compaction<'_> {
             // Left as it is, the history could never be sent again, so the earlier turns
             // go without a summary. Only for an overflow: a transient failure keeps them.
             Err(e) if crate::client::context_overflow(&e) => {
-                let mut folded =
-                    compact::fold(&next, compact::UNSUMMARISED).expect("checked above");
+                let unsummarised = crate::plan::restated(compact::UNSUMMARISED, self.plan.as_ref());
+                let mut folded = compact::fold(&next, &unsummarised).expect("checked above");
                 compact::evict(&mut folded, u64::MAX, tokenizer);
                 self.commit(before, read, folded, Compacted::Dropped, history, sink);
                 Ok(true)
@@ -1917,7 +1961,11 @@ impl Compaction<'_> {
             return Ok(None);
         }
         let summary = self.summarize(history).await?;
-        let folded = compact::fold(history, &summary).expect("checked above");
+        let folded = compact::fold(
+            history,
+            &crate::plan::restated(&summary, self.plan.as_ref()),
+        )
+        .expect("checked above");
         Ok(Some(Fork {
             history: folded,
             summary,
@@ -2172,8 +2220,9 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::TurnEnd
                 // A child has no children, so it never resumes on one's report.
                 | AgentEvent::Resumed(_)
-                // Nor a goal, which is the session's.
+                // Nor a goal or a plan, which are the session's.
                 | AgentEvent::Goal(_)
+                | AgentEvent::Plan(_)
                 // What is typed into its pane comes by its mailbox, and shows there as
                 // it is posted.
                 | AgentEvent::Steered(_)
@@ -5789,6 +5838,82 @@ mod tests {
         assert!(
             text.ends_with("keep this in particular: the file paths"),
             "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_plan_runs_unasked_outlives_a_compaction_and_goes_with_a_clear() {
+        use fake::{Fake, call, say};
+
+        let fake = Fake::new(vec![
+            vec![call(
+                tools::plan::NAME,
+                json!({"plan": [
+                    {"step": "read", "status": "completed"},
+                    {"step": "fix", "status": "in_progress"},
+                ]}),
+            )],
+            vec![say("one")],
+            vec![say("two")],
+            vec![say("short")],
+            vec![say("three")],
+        ]);
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        // No approval is answered, so the call ran without asking.
+        let events = drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::Plan(Some(plan)) if plan.line() == "plan 1/2 done: fix")
+            ),
+            "{events:?}"
+        );
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        tx_control.send(Control::Compact(None)).await.unwrap();
+        settle(&mut rx).await;
+        drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+        {
+            let bodies = fake.bodies.lock().unwrap();
+            let input = bodies[4].1["input"].as_array().unwrap();
+            let summary = input[2]["content"][0]["text"].as_str().unwrap();
+            assert!(summary.starts_with("Summary of earlier conversation:\nshort\n\n"));
+            assert!(summary.ends_with("[x] read\n[>] fix"), "{summary}");
+            // The call that set it was folded away; only the summary carries it now.
+            assert!(!input.iter().any(|i| i["name"] == tools::plan::NAME));
+        }
+        assert!(fake.offered.lock().unwrap()[0].contains(&tools::plan::NAME.to_string()));
+
+        tx_control.send(Control::Clear).await.unwrap();
+        let mut cleared = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let done = matches!(event, AgentEvent::Cleared);
+            cleared.push(event);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            cleared.iter().any(|e| matches!(e, AgentEvent::Plan(None))),
+            "{cleared:?}"
         );
     }
 

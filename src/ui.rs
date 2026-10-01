@@ -36,6 +36,8 @@ const JUDGING_CLIP: usize = 48;
 const MAX_CHILD_ROWS: usize = 4;
 /// Rows the queue panel shows before it says how many more are behind them.
 const MAX_QUEUED_ROWS: usize = 3;
+/// Steps the plan panel shows before it scrolls to the one in progress.
+const MAX_PLAN_ROWS: usize = 6;
 
 /// How long the note about a drag's copy stays on screen.
 const COPIED_FOR: Duration = Duration::from_secs(3);
@@ -226,8 +228,16 @@ fn draw(frame: &mut Frame, app: &mut App) {
         rows => rows.min(MAX_QUEUED_ROWS) as u16 + 2,
     };
 
+    // The plan sits above the subagents. A finished one stays while the turn that
+    // finished it runs, then goes: a checklist with nothing left on it is not news.
+    let plan = app.plan().filter(|plan| app.working || !plan.done());
+    let plan_height = plan
+        .as_ref()
+        .map_or(0, |plan| plan.steps.len().min(MAX_PLAN_ROWS) as u16 + 2);
+
     let [
         transcript_area,
+        plan_area,
         children_area,
         queued_area,
         menu_area,
@@ -236,6 +246,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         status_area,
     ] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(plan_height),
         Constraint::Length(children_height),
         Constraint::Length(queued_height),
         Constraint::Length(menu_height),
@@ -260,6 +271,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.scrollbar = None;
         app.input_area = None;
         // The pane covered those rows, so they go back on top.
+        render_plan(frame, plan_area, plan.as_ref());
         render_children(frame, children_area, app, &children);
         render_queued(frame, queued_area, app);
         render_working(frame, working_area, app);
@@ -269,6 +281,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
     render_transcript(frame, transcript_area, app);
+    render_plan(frame, plan_area, plan.as_ref());
     render_children(frame, children_area, app, &children);
     render_queued(frame, queued_area, app);
     if menu_height > 0 {
@@ -282,6 +295,64 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.buttons.clear();
         render_input(frame, bottom_area, app);
     }
+}
+
+/// The checklist the model keeps with `update_plan`, with the step in progress kept in
+/// view when there are more steps than rows.
+fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>) {
+    use crate::plan::Status;
+    let Some(plan) = plan.filter(|_| area.height > 0) else {
+        return;
+    };
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut block = Block::bordered().border_style(dim).title(Line::styled(
+        format!(" plan {}/{} ", plan.completed(), plan.steps.len()),
+        dim,
+    ));
+    let room = area.width.saturating_sub(6) as usize;
+    if !plan.explanation.is_empty() && room > 0 {
+        block = block.title_bottom(
+            Line::styled(format!(" {} ", clip(&plan.explanation, room)), dim).right_aligned(),
+        );
+    }
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let rows = inner.height as usize;
+    let width = inner.width as usize;
+    // The step to keep in view: the one in progress, else the first still to do.
+    let focus = plan
+        .current()
+        .or_else(|| {
+            plan.steps
+                .iter()
+                .position(|s| s.status != Status::Completed)
+        })
+        .unwrap_or(0);
+    let top = focus
+        .saturating_sub(1)
+        .min(plan.steps.len().saturating_sub(rows));
+    let lines: Vec<Line> = plan
+        .steps
+        .iter()
+        .skip(top)
+        .take(rows)
+        .map(|step| {
+            let (mark, mark_style, text_style) = match step.status {
+                Status::Completed => ("✓", Style::new().fg(Color::Green), dim),
+                Status::InProgress => ("▸", Style::new().fg(Color::Yellow), Style::new().bold()),
+                Status::Pending => ("○", dim, Style::new()),
+            };
+            let head = format!(" {mark} ");
+            let room = width.saturating_sub(head.chars().count()).max(1);
+            Line::from(vec![
+                Span::styled(head, mark_style),
+                Span::styled(clip(&step.step, room), text_style),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The prompts waiting on the running turn. They are shown here rather than in the
@@ -3510,6 +3581,57 @@ mod tests {
         session.on_agent(crate::agent::AgentEvent::Goal(None));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!status(&terminal).contains("goal"), "{}", status(&terminal));
+    }
+
+    #[test]
+    fn the_plan_panel_keeps_the_step_in_progress_in_view_and_goes_once_done() {
+        let (tx_user, _) = tokio::sync::mpsc::channel(1);
+        let (tx_control, _) = tokio::sync::mpsc::channel(1);
+        let session = crate::session::Session::new(
+            "m".to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+            None,
+        );
+        let mut app = App::new(std::sync::Arc::clone(&session));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let plan = |at: usize, of: usize| {
+            let steps: Vec<serde_json::Value> = (0..of)
+                .map(|i| {
+                    let status = match i.cmp(&at) {
+                        std::cmp::Ordering::Less => "completed",
+                        std::cmp::Ordering::Equal => "in_progress",
+                        std::cmp::Ordering::Greater => "pending",
+                    };
+                    serde_json::json!({"step": format!("step {i}"), "status": status})
+                })
+                .collect();
+            crate::plan::Plan::parse(&serde_json::json!({"plan": steps, "explanation": "why"}))
+                .unwrap()
+        };
+        session.on_agent(crate::agent::AgentEvent::Plan(plan(8, 10)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains(" plan 8/10 "), "{text}");
+        assert!(text.contains("▸ step 8"), "{text}");
+        assert!(text.contains("○ step 9"), "{text}");
+        assert!(text.contains("✓ step 7"), "{text}");
+        assert!(!text.contains("step 0"), "{text}");
+        assert!(text.contains(" why "), "{text}");
+        assert_eq!(session.state().plan, plan(8, 10));
+
+        // Every step done and the session idle: nothing left to watch.
+        session.on_agent(crate::agent::AgentEvent::Plan(plan(10, 10)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            !screen(&terminal).contains(" plan "),
+            "{}",
+            screen(&terminal)
+        );
     }
 
     #[test]

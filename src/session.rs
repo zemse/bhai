@@ -165,6 +165,8 @@ pub enum Event {
     Fork(Option<u64>),
     /// The goal as it now stands, credits included; `None` once there is none.
     Goal(Option<crate::goal::Goal>),
+    /// The plan `update_plan` set, as it now stands; `None` once there is none.
+    Plan(Option<crate::plan::Plan>),
     /// The permission mode changed.
     Mode(Mode),
     /// `/model` switched the session to this model and reasoning effort.
@@ -282,6 +284,8 @@ pub struct State {
     pub rate_limits: Option<RateLimits>,
     /// What `/goal` set, and what it has spent.
     pub goal: Option<crate::goal::Goal>,
+    /// The checklist the model keeps with `update_plan`.
+    pub plan: Option<crate::plan::Plan>,
     pub pending: Option<Approval>,
     /// Transcript entries with token attribution, as the hover badges show them.
     pub entries: Vec<EntryTokens>,
@@ -411,6 +415,7 @@ struct Inner {
     /// The tokens a call on the compacted copy would read, while there is one.
     fork: Option<u64>,
     goal: Option<crate::goal::Goal>,
+    plan: Option<crate::plan::Plan>,
     next_id: u64,
     /// Calls waiting on the user, oldest first. Parallel workflow steps each park one,
     /// so there can be several; only the front is on screen.
@@ -547,6 +552,7 @@ impl Session {
             last_cache_break: inner.last_cache_break.clone(),
             rate_limits: inner.rate_limits,
             goal: inner.goal.clone(),
+            plan: inner.plan.clone(),
             pending: inner.pending.front().map(|(approval, _)| approval.clone()),
             entries: self.entries().attributed(),
             seq,
@@ -600,6 +606,11 @@ impl Session {
     /// The goal `/goal` set, as the agent last reported it.
     pub fn goal(&self) -> Option<crate::goal::Goal> {
         self.lock().goal.clone()
+    }
+
+    /// The plan `update_plan` set, as the agent last reported it.
+    pub fn plan(&self) -> Option<crate::plan::Plan> {
+        self.lock().plan.clone()
     }
 
     /// `/goal` with what followed it. The agent takes it even mid-turn, and opens a turn on
@@ -1143,6 +1154,10 @@ impl Session {
             AgentEvent::Goal(goal) => {
                 inner.goal = goal.clone();
                 Event::Goal(goal)
+            }
+            AgentEvent::Plan(plan) => {
+                inner.plan = plan.clone();
+                Event::Plan(plan)
             }
             AgentEvent::Fork(tokens) => {
                 inner.fork = tokens;

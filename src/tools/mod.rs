@@ -14,6 +14,7 @@ pub mod edit;
 pub mod goal;
 pub mod mcp;
 pub mod models;
+pub mod plan;
 pub mod read;
 pub mod skill;
 pub mod submit;
@@ -116,6 +117,13 @@ impl Registry {
     /// a goal can only end on its budget.
     pub fn with_goal(mut self, goal: goal::Goal) -> Self {
         self.tools.push(Box::new(goal));
+        self
+    }
+
+    /// `update_plan`, for the main agent, past the identity's narrowing like `goal`: it
+    /// touches nothing but the checklist.
+    pub fn with_plan(mut self, plan: plan::UpdatePlan) -> Self {
+        self.tools.push(Box::new(plan));
         self
     }
 

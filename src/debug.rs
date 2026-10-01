@@ -387,6 +387,7 @@ mod tests {
                 last_cache_break: None,
                 rate_limits: None,
                 goal: None,
+                plan: None,
                 pending: None,
                 entries: Vec::new(),
                 seq: 0,

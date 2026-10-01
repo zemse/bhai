@@ -33,6 +33,7 @@ mod notify;
 mod ollama;
 mod palette;
 mod permissions;
+mod plan;
 mod profile;
 mod prompt;
 mod redact;
@@ -1270,6 +1271,8 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             AgentEvent::Resumed(what) => println!("\n[resumed] {what}"),
             AgentEvent::Goal(Some(goal)) => println!("[goal] {}", goal.line()),
             AgentEvent::Goal(None) => {}
+            AgentEvent::Plan(Some(plan)) => println!("[plan] {}", plan.line()),
+            AgentEvent::Plan(None) => println!("[plan] cleared"),
             AgentEvent::Steered(text) => println!("\n[user] {text}"),
             AgentEvent::Titled(name) => println!("[title] {name}"),
             // A probe prints what the model says, and the prompt behind it is a tui

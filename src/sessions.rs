@@ -120,6 +120,8 @@ pub struct Writer {
     file: Option<std::fs::File>,
     /// The `/goal` as last recorded, which a resume picks up.
     pub goal: Option<crate::goal::Goal>,
+    /// The `update_plan` checklist as last recorded, which a resume shows again.
+    pub plan: Option<crate::plan::Plan>,
 }
 
 impl Writer {
@@ -131,6 +133,7 @@ impl Writer {
             last: None,
             file: None,
             goal: None,
+            plan: None,
         }
     }
 
@@ -155,6 +158,7 @@ impl Writer {
             last: loaded.last.clone(),
             file: Some(file),
             goal: loaded.goal.clone(),
+            plan: loaded.plan.clone(),
         })
     }
 
@@ -192,6 +196,16 @@ impl Writer {
         }
         self.write(json!({ "type": "goal", "goal": goal }))?;
         self.goal = goal.clone();
+        Ok(())
+    }
+
+    /// Record the plan, when it is not what was last recorded.
+    pub fn plan(&mut self, plan: &Option<crate::plan::Plan>) -> Result<()> {
+        if self.plan == *plan {
+            return Ok(());
+        }
+        self.write(json!({ "type": "plan", "plan": plan }))?;
+        self.plan = plan.clone();
         Ok(())
     }
 
@@ -295,6 +309,8 @@ pub struct Loaded {
     pub items: Vec<Value>,
     /// The goal as last recorded.
     pub goal: Option<crate::goal::Goal>,
+    /// The plan as last recorded.
+    pub plan: Option<crate::plan::Plan>,
     /// The id of the last record kept.
     pub last: Option<String>,
     /// Bytes of the file that hold the header and the records kept.
@@ -320,6 +336,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
     // The model the session ends on, which a `/model` record later in the file moves.
     let (mut model, mut effort) = (header.model.clone(), header.effort.clone());
     let mut goal = None;
+    let mut plan = None;
     while let Some(line) = lines.next() {
         let record = serde_json::from_str::<Value>(line)
             .ok()
@@ -366,6 +383,9 @@ pub fn load(path: &Path) -> Result<Loaded> {
         } else if kind == Some("goal") {
             goal = serde_json::from_value(record.get("goal").cloned().unwrap_or_default())
                 .with_context(|| format!("{}: goal record {id} is not a goal", path.display()))?;
+        } else if kind == Some("plan") {
+            plan = serde_json::from_value(record.get("plan").cloned().unwrap_or_default())
+                .with_context(|| format!("{}: plan record {id} is not a plan", path.display()))?;
         } else {
             let Some(item) = record.get("item") else {
                 bail!("{}: record {id} has no item", path.display());
@@ -393,6 +413,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
         last: records.last().map(|(id, _)| id.clone()),
         items: items.into_iter().map(|(item, _)| item).collect(),
         goal,
+        plan,
         len,
         warnings,
     })
@@ -868,6 +889,31 @@ mod tests {
         let mut writer = Writer::resume(&dir, &loaded).unwrap();
         writer.goal(&None).unwrap();
         assert_eq!(load(&path).unwrap().goal, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_plan_last_recorded_is_what_a_resume_reads() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+        let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
+        let plan = crate::plan::Plan::parse(&json!({"plan": [
+            {"step": "fix", "status": "in_progress"},
+        ]}))
+        .unwrap();
+        writer.plan(&plan).unwrap();
+        // The same plan again writes nothing.
+        writer.plan(&plan).unwrap();
+        drop(writer);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.plan, plan);
+        assert_eq!(loaded.items.len(), items().len());
+        let records = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(records.matches(r#""type":"plan""#).count(), 1);
+
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        writer.plan(&None).unwrap();
+        assert_eq!(load(&path).unwrap().plan, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

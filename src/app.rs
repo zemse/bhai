@@ -1862,6 +1862,11 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         self.session.goal()
     }
 
+    /// The checklist `update_plan` set, for its panel.
+    pub fn plan(&self) -> Option<crate::plan::Plan> {
+        self.session.plan()
+    }
+
     /// What the working row says the turn is doing.
     pub fn verb(&self) -> &'static str {
         self.session.verb().unwrap_or("working")
