@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A turn whose last call read past the compaction trigger evicts old tool outputs before its next call, rather than waiting for the turn to end, so a long run of tool calls no longer fills the window mid-turn. The earlier turns are still summarised only between turns.
 - The model can keep a checklist with `update_plan`, which needs no approval and allows at most one step `in_progress`; a panel above the prompt shows it (hidden once every step is done and the session is idle), `/state` reports it as `plan`, a resume brings it back, a compaction summary restates it, and `/clear` drops it.
 - A request the backend refuses as too long for the context window compacts the history and runs the turn again once. A goal turn that overflows keeps the goal active through that retry and is paused only if the retry is ruled out.
 - `BHAI_STARTUP_TIMING=1` prints one JSON line per startup stage to stderr as it ends (`resume`, `config`, `mcp`, `prompt`, `client`, `preflight`, `session`, `start`), each with its own `ms` and the running `total_ms`, so a slow start can be pinned on MCP servers or the backend preflight. The lines carry no config content, and they stop before the TUI takes the terminal.

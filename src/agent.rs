@@ -1135,6 +1135,7 @@ pub(crate) async fn run_with(
                 // The user is watching this one and can interrupt it.
                 None,
                 charged.then_some(&budget),
+                Some(limits),
             );
             tokio::pin!(turn);
             loop {
@@ -1503,6 +1504,8 @@ async fn turn(
     limit: Option<usize>,
     // The goal its calls are charged to, while one is active.
     budget: Option<&Budget<'_>>,
+    // When old tool outputs are evicted between steps; `None` for never.
+    limits: Option<Limits>,
 ) -> Turn {
     model.begin_turn();
     let mut error_rounds = 0usize;
@@ -1573,6 +1576,9 @@ async fn turn(
                 let _ = tx.send(AgentEvent::CacheStalled(cache::MAX_MISSES));
             }
             monitor.resume();
+        }
+        if let Some(limits) = limits {
+            evict_between_steps(model, limits, history, ledger, monitor, sink, tx);
         }
         let sent = history.len();
         let mut finished = None;
@@ -1743,6 +1749,49 @@ async fn turn(
             return Turn::ended(step, truncated);
         }
     }
+}
+
+/// Evict old tool outputs in place when the last call read past the trigger, so a long
+/// turn does not reach the window before it ends. Every call in `history` has its output
+/// here, and only outputs change, so no pair is split; folding waits for the turn's end.
+fn evict_between_steps(
+    model: &dyn Model,
+    limits: Limits,
+    history: &mut [Value],
+    ledger: &mut Vec<Call>,
+    monitor: &mut CacheMonitor,
+    sink: &mut Sink<'_>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    let Some(size) = ledger.last().map(|call| call.usage.input) else {
+        return;
+    };
+    if !limits.over(model.name(), size) {
+        return;
+    }
+    let tokenizer = tokens::for_model(model.name());
+    let before = compact::estimate(history, tokenizer);
+    let excess = size.saturating_sub(limits.target(model.name()));
+    if compact::evict(history, excess, tokenizer) == 0 {
+        return;
+    }
+    let after = compact::estimate(history, tokenizer);
+    model.reset("compaction: evict mid-turn");
+    // Earlier calls read the old prefix, and the turn's end reads the next call's size.
+    ledger.clear();
+    *monitor = CacheMonitor::default();
+    if let Sink::Session(writer) = sink
+        && let Err(e) = writer.compact("evict", before, after, history)
+    {
+        let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+    }
+    let _ = tx.send(AgentEvent::Compacted {
+        notice: format!(
+            "compacted history mid-turn (evicted old tool outputs): ~{before} -> ~{after} tokens"
+        ),
+        summary: None,
+        freed: before.saturating_sub(after),
+    });
 }
 
 /// What a bounded turn is told on its last step.
@@ -2186,6 +2235,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             // A child has no `agent` tool, so it has no children to hear back from.
             None,
             Some(CHILD_STEPS),
+            None,
             None,
         )
         .await;
@@ -3190,6 +3240,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_turn_over_the_trigger_with_nothing_old_to_evict_never_folds_mid_turn() {
+        use fake::{Fake, call, say};
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let read = || vec![call("read", json!({"path": "/etc/hosts"}))];
+        let fake = Fake::new(vec![read(), read(), read(), vec![say("done")]]).with_usage(Usage {
+            input: 850,
+            ..fake::USAGE
+        });
+        let limits = Limits {
+            window: Some(1000),
+            ..Limits::default()
+        };
+        let registry = Registry::for_prompt(&SystemPrompt::default());
+        let mut history = vec![
+            compact::user_message("one"),
+            say("ok"),
+            compact::user_message("two"),
+        ];
+        let Turn { steps, result, .. } = turn(
+            &fake,
+            &registry,
+            &Policy::default(),
+            None,
+            &[],
+            "",
+            &mut history,
+            &tx,
+            &Arc::new(AtomicBool::new(false)),
+            &mut Vec::new(),
+            &mut CacheMonitor::default(),
+            None,
+            &mut Sink::Discard,
+            None,
+            None,
+            None,
+            None,
+            Some(limits),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(steps, 4);
+        // Three results are all among the last six, and the earlier turn is never folded
+        // while the turn runs: no summary call, no reset, the history only appended to.
+        assert_eq!(fake.bodies.lock().unwrap().len(), 4);
+        assert_eq!(*fake.resets.lock().unwrap(), []);
+        assert_eq!(history[0], compact::user_message("one"));
+        drop(tx);
+        while let Some(event) = rx.recv().await {
+            assert!(!matches!(event, AgentEvent::Compacted { .. }));
+        }
+    }
+
+    #[tokio::test]
     async fn a_report_that_lands_while_the_turn_runs_joins_it_rather_than_waiting() {
         use fake::{Fake, call, say};
 
@@ -3234,6 +3338,7 @@ mod tests {
             &mut Sink::Discard,
             None,
             Some(&mut results),
+            None,
             None,
             None,
         )
@@ -5304,7 +5409,8 @@ mod tests {
         };
 
         // Evicting the three oldest of nine results is enough, and evicting says nothing
-        // about the conversation, so it carries no summary.
+        // about the conversation, so it carries no summary. The call that asked for them
+        // read past the trigger, so it happens before the turn's next call, not after it.
         let events = drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
         let notices = compacted(&events);
         assert_eq!(notices.len(), 1);
@@ -5316,9 +5422,17 @@ mod tests {
         assert!(
             notices[0]
                 .0
-                .starts_with("compacted history (evicted old tool outputs): ~")
+                .starts_with("compacted history mid-turn (evicted old tool outputs): ~")
         );
         assert_eq!(notices[0].1, None);
+        assert_eq!(
+            fake.resets.lock().unwrap()[..],
+            [(
+                "parent".to_string(),
+                1,
+                "compaction: evict mid-turn".to_string()
+            )]
+        );
         // Nothing left to evict, so the earlier turn is summarised, and the summary the
         // history now carries comes with the notice.
         let events = drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
@@ -5336,6 +5450,18 @@ mod tests {
             .map(|(_, body)| body["input"].clone())
             .collect();
         assert_eq!(bodies.len(), 6);
+        let evicted = |body: &Value| -> Vec<bool> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .filter(|i| i["type"] == "function_call_output")
+                .map(|i| i["output"].as_str().unwrap().starts_with("[output removed"))
+                .collect()
+        };
+        assert_eq!(
+            evicted(&bodies[1]),
+            [[true; 3], [false; 3], [false; 3]].concat()
+        );
         let input = bodies[2].as_array().unwrap();
         let outputs: Vec<&str> = input
             .iter()
