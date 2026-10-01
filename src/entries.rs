@@ -161,8 +161,8 @@ impl Entries {
             Event::Error(message) => self.push(Entry::Error(message.clone())),
             Event::TurnFailed(message) => self.push(Entry::Failed(message.clone())),
             Event::Interrupted => self.push(Entry::Info("interrupted".to_string())),
-            Event::Done { seconds, at } => self.push(Entry::Done(format!(
-                "Crunched for {} \u{b7} done {at}",
+            Event::Done { seconds, at, verb } => self.push(Entry::Done(format!(
+                "{} {verb} \u{b7} {at} pe ho gaya",
                 took(*seconds)
             ))),
             _ => {}
@@ -450,6 +450,36 @@ enum Stream {
     Reasoning,
 }
 
+/// What a finished turn is said to have done, one picked at random each time. It reads
+/// after the duration, as in `9m 54s jugaad kiya`.
+pub const VERBS: &[&str] = &[
+    "jugaad kiya",
+    "dimaag lagaya",
+    "mehnat ki",
+    "setting ki",
+    "ghisai ki",
+    "kaarigari ki",
+    "hisaab lagaya",
+    "tadka lagaya",
+    "masala milaya",
+    "khichdi pakayi",
+    "chai pe socha",
+    "kaam nipataya",
+    "pasina bahaya",
+    "jhol suljhaya",
+    "gutthi suljhayi",
+    "pench kase",
+    "dhaaga piroya",
+    "thok-peet ki",
+    "jaadu chalaya",
+    "dhamaal machaya",
+];
+
+/// A word from `VERBS`, at random.
+pub fn verb() -> &'static str {
+    VERBS[(uuid::Uuid::new_v4().as_u128() % VERBS.len() as u128) as usize]
+}
+
 /// A turn's length as `54s`, `9m 54s` or `1h 3m`.
 fn took(seconds: u64) -> String {
     match seconds {
@@ -496,9 +526,10 @@ mod tests {
         entries.apply(&Event::Done {
             seconds: 594,
             at: "12:58 PM".to_string(),
+            verb: "jugaad kiya".to_string(),
         });
         assert!(matches!(&entries.list[..],
-            [Entry::Done(t)] if t == "Crunched for 9m 54s \u{b7} done 12:58 PM"));
+            [Entry::Done(t)] if t == "9m 54s jugaad kiya \u{b7} 12:58 PM pe ho gaya"));
     }
 
     #[test]

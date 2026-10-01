@@ -140,10 +140,12 @@ pub enum Event {
     /// run the same turn again without the user retyping anything.
     TurnFailed(String),
     Interrupted,
-    /// The turn about to end ran this many seconds, and ended at this local time.
+    /// The turn about to end ran this many seconds, and ended at this local time;
+    /// `verb` is the word the transcript says it with, picked afresh for each turn.
     Done {
         seconds: u64,
         at: String,
+        verb: String,
     },
     TurnEnd,
 }
@@ -957,6 +959,7 @@ impl Session {
                     self.publish(Event::Done {
                         seconds: started.elapsed().as_secs(),
                         at: chrono::Local::now().format("%-I:%M %p").to_string(),
+                        verb: crate::entries::verb().to_string(),
                     });
                 }
                 // The session keeps working while queued prompts wait behind the turn.
@@ -1966,10 +1969,11 @@ mod tests {
         let done = std::iter::from_fn(|| events.try_recv().ok())
             .find(|e| matches!(e, Event::Done { .. }))
             .expect("a done event");
-        let Event::Done { seconds, at } = done else {
+        let Event::Done { seconds, at, verb } = done else {
             unreachable!()
         };
         assert_eq!(seconds, 0);
+        assert!(crate::entries::VERBS.contains(&verb.as_str()), "{verb}");
         assert!(at.ends_with("AM") || at.ends_with("PM"), "{at}");
     }
 
