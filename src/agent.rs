@@ -425,7 +425,8 @@ pub struct Delegation {
     pub prompt: Arc<dyn Fn(&Identity) -> SystemPrompt + Send + Sync>,
     /// Child transcripts go to `<sessions>/<session id>/child-<id>.jsonl`.
     pub sessions: PathBuf,
-    /// `<project>/.bhai`, which a caching workflow keeps its step results under.
+    /// `<project>/.bhai`, which a caching workflow keeps its step results under and the
+    /// main agent's `remember` writes `MEMORY.md` in.
     pub cache_root: PathBuf,
     /// Shared with the session, so what is typed into a pane reaches that child.
     pub mailboxes: Mailboxes,
@@ -724,6 +725,11 @@ pub(crate) async fn run_with(
             && prompt.identity.allows_tool(tools::history::FIND)
         {
             registry = registry.with_history(delegation.sessions.clone(), own.clone());
+        }
+        if let Some(delegation) = &delegation
+            && prompt.identity.allows_tool(tools::memory::NAME)
+        {
+            registry = registry.with_memory(crate::memory::path(&delegation.cache_root));
         }
         registry
             .with_goal(tools::goal::Goal {
@@ -4476,8 +4482,12 @@ mod tests {
         assert_eq!(narrowed.len(), 2, "{offered:?}");
         assert!(narrowed.iter().all(|names| *names == &["bash", "read"]));
         assert_eq!(full.len(), 3, "{offered:?}");
-        // The parent can look back at earlier sessions; a child cannot.
-        for name in [tools::history::FIND, tools::history::READ] {
+        // The parent can look back at earlier sessions and save a note; a child cannot.
+        for name in [
+            tools::history::FIND,
+            tools::history::READ,
+            tools::memory::NAME,
+        ] {
             assert!(full.iter().all(|names| names.contains(&name.to_string())));
         }
 

@@ -291,8 +291,9 @@ pub fn build(
     let appended: usize = prompt.sources.iter().map(|s| s.bytes).sum::<usize>()
         + prompt.skills_bytes
         + prompt.agents_bytes
-        + prompt.mcp_bytes;
-    // The prompt is laid out as base, sources, skills, agents, mcp.
+        + prompt.mcp_bytes
+        + prompt.memory_bytes;
+    // The prompt is laid out as base, sources, skills, agents, mcp, memory.
     let mut at = text.len() - appended;
     let base = text.get(..at).unwrap_or_default();
     let mut next = |bytes: usize| {
@@ -324,6 +325,10 @@ pub fn build(
             hub.servers.iter().filter(|s| !s.tools.is_empty()).count()
         });
         items.push(row(format!("mcp servers listing ({servers})"), "mcp", mcp));
+    }
+    let memory = next(prompt.memory_bytes);
+    if !memory.is_empty() {
+        items.push(row("memory notes".to_string(), "memory", memory));
     }
     for tool in tools {
         let name = tool.get("name").and_then(Value::as_str).unwrap_or("?");
@@ -855,6 +860,22 @@ mod tests {
         assert_eq!(profile.items[2].label, "skills listing (1)");
         assert_eq!(profile.items[2].category, "skills");
         assert_eq!(profile.items[2].bytes, prompt.skills_bytes);
+        assert_eq!(profile.total_bytes, prompt.text.len());
+    }
+
+    #[test]
+    fn memory_notes_are_an_item_of_their_own() {
+        let memory = crate::memory::Memory {
+            label: "./.bhai/MEMORY.md".to_string(),
+            content: "- note".to_string(),
+            cut: 0,
+        };
+        let prompt = crate::prompt::system_prompt(&[], Vec::new()).with_memory(Some(memory));
+        let profile = build(&prompt, &[], &[], &[], &ByteEstimate);
+        assert_eq!(profile.items.len(), 2);
+        assert_eq!(profile.items[1].label, "memory notes");
+        assert_eq!(profile.items[1].category, "memory");
+        assert_eq!(profile.items[1].bytes, prompt.memory_bytes);
         assert_eq!(profile.total_bytes, prompt.text.len());
     }
 

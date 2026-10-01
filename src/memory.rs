@@ -1,0 +1,183 @@
+//! `.bhai/MEMORY.md`: notes the main agent saves with `remember`, one per line, read into
+//! the system prompt once when a session starts. A note saved mid-session waits for the
+//! next one, so the cached prefix never moves.
+
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+/// The file, in the project's `.bhai` directory.
+pub const FILE: &str = "MEMORY.md";
+
+/// The most of the file the prompt carries, the newest lines kept.
+const MAX_LOAD: usize = 4 * 1024;
+
+/// The most one note may be.
+pub const MAX_NOTE: usize = 1024;
+
+/// Where the memory file of the `.bhai` directory `bhai` is.
+pub fn path(bhai: &Path) -> PathBuf {
+    bhai.join(FILE)
+}
+
+/// What the prompt carries of the file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Memory {
+    /// The path as shown to the user.
+    pub label: String,
+    /// The newest whole lines within `MAX_LOAD`.
+    pub content: String,
+    /// Bytes of older lines left out.
+    pub cut: usize,
+}
+
+/// The file's last `MAX_LOAD` bytes of whole lines; `None` when it is missing, empty or
+/// not text.
+pub fn load(path: &Path, label: String) -> Option<Memory> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim_end();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let mut start = 0;
+    if text.len() > MAX_LOAD {
+        let mut from = text.len() - MAX_LOAD;
+        while !text.is_char_boundary(from) {
+            from += 1;
+        }
+        // From the first line that starts inside the budget; a last line longer than the
+        // budget leaves nothing, which is said rather than cut mid-line.
+        start = match text.as_bytes()[from - 1] {
+            b'\n' => from,
+            _ => text[from..]
+                .find('\n')
+                .map_or(text.len(), |at| from + at + 1),
+        };
+    }
+    Some(Memory {
+        label,
+        content: text[start..].to_string(),
+        cut: start,
+    })
+}
+
+/// A note as the line it is saved as: dated, and on one line however it was written.
+pub fn entry(note: &str, date: &str) -> Result<String, String> {
+    let note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+    if note.is_empty() {
+        return Err("`note` is empty.".to_string());
+    }
+    if note.len() > MAX_NOTE {
+        return Err(format!(
+            "`note` is {} bytes; keep it under {MAX_NOTE}. Save the fact, not the story.",
+            note.len()
+        ));
+    }
+    Ok(format!("- {date}: {note}"))
+}
+
+/// Append `line` to the file, creating it and its directory, on a line of its own.
+pub fn append(path: &Path, line: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)?;
+    let mut last = [0u8; 1];
+    let len = file.metadata()?.len();
+    let mut text = String::new();
+    if len > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            text.push('\n');
+        }
+    }
+    text.push_str(line);
+    text.push('\n');
+    file.write_all(text.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_or_blank_file_loads_nothing() {
+        let dir = crate::tools::temp_dir();
+        let file = path(&dir);
+        assert_eq!(load(&file, "m".to_string()), None);
+        std::fs::write(&file, "\n  \n").unwrap();
+        assert_eq!(load(&file, "m".to_string()), None);
+        std::fs::write(&file, b"\xff\xfe").unwrap();
+        assert_eq!(load(&file, "m".to_string()), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_small_file_loads_whole() {
+        let dir = crate::tools::temp_dir();
+        let file = path(&dir);
+        std::fs::write(&file, "- a\n- b\n\n").unwrap();
+        let memory = load(&file, "./.bhai/MEMORY.md".to_string()).unwrap();
+        assert_eq!(memory.content, "- a\n- b");
+        assert_eq!(memory.cut, 0);
+        assert_eq!(memory.label, "./.bhai/MEMORY.md");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The file only grows, so what is kept is the newest notes, in whole lines.
+    #[test]
+    fn a_large_file_keeps_its_newest_whole_lines() {
+        let dir = crate::tools::temp_dir();
+        let file = path(&dir);
+        let lines: Vec<String> = (0..1000).map(|i| format!("- note {i:04}")).collect();
+        std::fs::write(&file, lines.join("\n")).unwrap();
+        let memory = load(&file, "m".to_string()).unwrap();
+        assert!(memory.content.len() <= MAX_LOAD);
+        assert!(
+            memory.content.starts_with("- note "),
+            "{}",
+            &memory.content[..20]
+        );
+        assert!(memory.content.ends_with("- note 0999"));
+        let whole = lines.join("\n");
+        assert_eq!(&whole[memory.cut..], memory.content);
+        assert_eq!(whole.as_bytes()[memory.cut - 1], b'\n');
+
+        // One line past the budget leaves nothing to keep, never half a line.
+        std::fs::write(&file, "é".repeat(MAX_LOAD)).unwrap();
+        let memory = load(&file, "m".to_string()).unwrap();
+        assert_eq!(memory.content, "");
+        assert_eq!(memory.cut, MAX_LOAD * 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_note_is_one_dated_line_under_the_cap() {
+        assert_eq!(
+            entry("  uses   pnpm,\nnot npm ", "2026-10-02").unwrap(),
+            "- 2026-10-02: uses pnpm, not npm"
+        );
+        assert!(entry(" \n ", "d").unwrap_err().contains("empty"));
+        let err = entry(&"x".repeat(MAX_NOTE + 1), "d").unwrap_err();
+        assert!(err.contains("1025 bytes"), "{err}");
+        assert!(entry(&"x".repeat(MAX_NOTE), "d").is_ok());
+    }
+
+    #[test]
+    fn append_creates_the_file_and_keeps_each_note_on_its_own_line() {
+        let dir = crate::tools::temp_dir();
+        let file = path(&dir.join(".bhai"));
+        append(&file, "- one").unwrap();
+        append(&file, "- two").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "- one\n- two\n");
+        // A file the user edited without a final newline.
+        std::fs::write(&file, "- mine").unwrap();
+        append(&file, "- three").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "- mine\n- three\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

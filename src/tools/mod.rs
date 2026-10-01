@@ -14,6 +14,7 @@ pub mod edit;
 pub mod goal;
 pub mod history;
 pub mod mcp;
+pub mod memory;
 pub mod models;
 pub mod patch;
 pub mod plan;
@@ -24,7 +25,7 @@ pub mod web;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 10] = [
+pub const NAMES: [&str; 11] = [
     bash::NAME,
     read::NAME,
     write::NAME,
@@ -34,6 +35,7 @@ pub const NAMES: [&str; 10] = [
     models::NAME,
     history::FIND,
     history::READ,
+    memory::NAME,
     web::NAME,
 ];
 
@@ -177,6 +179,12 @@ impl Registry {
             current,
         }));
         self.tools.push(Box::new(history::ReadSession { dir }));
+        self
+    }
+
+    /// `remember`, appending to the memory file at `path`, for the main agent.
+    pub fn with_memory(mut self, path: std::path::PathBuf) -> Self {
+        self.tools.push(Box::new(memory::Remember { path }));
         self
     }
 

@@ -27,6 +27,7 @@ mod limits;
 mod links;
 mod markdown;
 mod mcp;
+mod memory;
 mod mermaid;
 mod models;
 mod notify;
@@ -684,8 +685,12 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     startup::mark("config");
     let hub = mcp::start(&config, &roots, &identity).await;
     startup::mark("mcp");
-    let mut prompt = identity::build(&config, &roots, &identity, &identities).with_mcp(hub.clone());
     let bhai = roots.cwd.join(".bhai");
+    let notes = memory::path(&bhai);
+    // Children are built without it: they neither see the notes nor save one.
+    let mut prompt = identity::build(&config, &roots, &identity, &identities)
+        .with_mcp(hub.clone())
+        .with_memory(memory::load(&notes, instructions::label(&notes, &roots)));
     let delegation = Delegation {
         identities,
         sessions: bhai.join("sessions"),
