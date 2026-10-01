@@ -700,10 +700,17 @@ pub fn target(tool: &str, args: &Value, summary: &str) -> (String, String) {
             let command = text("command");
             // The checker hands over a command it could not take apart rather than
             // denying it outright, so the judge is told that is what it is looking at.
-            let detail = match crate::permissions::bash::parse(&command) {
+            let mut detail = match crate::permissions::bash::parse(&command) {
                 Some(_) => String::new(),
                 None => UNREADABLE.to_string(),
             };
+            let dir = text("workdir");
+            if !dir.is_empty() {
+                if !detail.is_empty() {
+                    detail.push('\n');
+                }
+                detail.push_str(&format!("runs in {dir}"));
+            }
             (command, detail)
         }
         "write" => {
@@ -1708,6 +1715,11 @@ regression test for it in src/tools/write.rs"
         assert_eq!(
             target("bash", &args, "cargo test"),
             ("cargo test".to_string(), String::new())
+        );
+        let args = json!({"command": "cargo test", "workdir": "/p/sub"});
+        assert_eq!(
+            target("bash", &args, "cargo test"),
+            ("cargo test".to_string(), "runs in /p/sub".to_string())
         );
     }
 }

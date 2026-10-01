@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- Bash takes an optional `workdir`, so the model passes the directory instead of writing `cd dir && ...`: the approval line reads `command  (in dir)`, the judge is told "runs in dir", and the rules see the bare command, so `Bash(cargo test:*)` matches. A workdir inside the project is followed the way a leading `cd` is; one outside it asks, and one that is not a directory is refused before approval.
 - A bash result ends with a trailer line `[output: N lines, X.Ys]` giving the lines the command printed in all (trimmed ones included) and its wall time, after the output so the first-line exit status that the transcript and `outcome()` read is unchanged; a timed-out command gets it too.
 - Bash commands run with a fixed non-interactive environment (`TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0` and a UTF-8 `LANG`/`LC_ALL`), set after the credential scrub, so a pager or a git credential prompt can no longer hang a call and output carries no colour codes. Stdio MCP servers keep the inherited environment.
 - One running subagent can be stopped without stopping the turn or its siblings: ctrl+x inside its pane (the pane hint now says so), `POST /children/<id>/interrupt` (404 when no such child is running), or the model's `close_agent` tool, which comes with `agent`. A stopped child still reports, and its pane notes "stopped by you". Workflow steps share their run's flag, so they cannot be stopped one at a time.

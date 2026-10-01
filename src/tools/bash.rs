@@ -91,7 +91,11 @@ impl Tool for Bash {
     }
 
     fn describe(&self, args: &Value) -> Result<String, String> {
-        parse_command(args)
+        let command = parse_command(args)?;
+        Ok(match parse_workdir(args)? {
+            Some(dir) => format!("{command}  (in {dir})"),
+            None => command,
+        })
     }
 
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
@@ -109,8 +113,8 @@ impl Tool for Bash {
         live: Live<'a>,
     ) -> BoxFuture<'a, (String, bool)> {
         Box::pin(async move {
-            match parse_command(args) {
-                Ok(command) => (run(&command, live).await, true),
+            match parse_command(args).and_then(|c| Ok((c, parse_workdir(args)?))) {
+                Ok((command, dir)) => (run(&command, dir, live).await, true),
                 Err(e) => (e, false),
             }
         })
@@ -121,8 +125,8 @@ fn tool_schema() -> Value {
     json!({
         "type": "function",
         "name": NAME,
-        "description": "Run a shell command with `bash -lc` in the current working directory and \
-    return its combined stdout and stderr plus the exit code. The user approves every command \
+        "description": "Run a shell command with `bash -lc` in the current working directory, or in \
+    `workdir` when given, and return its combined stdout and stderr plus the exit code. The user approves every command \
     before it runs; a rejected command does not execute. Use absolute paths. Commands time out \
     after 120 seconds, so avoid anything interactive or long-running. A job sent to the \
     background must redirect its output to a file, since it inherits this command's own.",
@@ -133,6 +137,11 @@ fn tool_schema() -> Value {
                 "command": {
                     "type": "string",
                     "description": "The shell command to run."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Directory to run the command in, instead of `cd dir && ...`. \
+    A relative path is taken from the current working directory."
                 }
             },
             "required": ["command"],
@@ -149,11 +158,31 @@ fn parse_command(args: &Value) -> Result<String, String> {
         .ok_or_else(|| "missing required string field `command`.".to_string())
 }
 
-async fn run(command: &str, live: Live<'_>) -> String {
+/// The directory the call asks to run in: `None` when it names none, an error when it
+/// names something that is not a directory.
+fn parse_workdir(args: &Value) -> Result<Option<&str>, String> {
+    let dir = match args.get("workdir") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(dir)) => dir.as_str(),
+        Some(_) => return Err("`workdir` must be a string.".to_string()),
+    };
+    if dir.is_empty() {
+        return Ok(None);
+    }
+    match std::path::Path::new(dir).is_dir() {
+        true => Ok(Some(dir)),
+        false => Err(format!("`workdir` {dir} is not a directory.")),
+    }
+}
+
+async fn run(command: &str, workdir: Option<&str>, live: Live<'_>) -> String {
     let started = Instant::now();
     let mut bash = Command::new("bash");
     crate::childenv::scrub(&mut bash);
     crate::childenv::non_interactive(&mut bash);
+    if let Some(dir) = workdir {
+        bash.current_dir(dir);
+    }
     let child = bash
         .arg("-lc")
         .arg(command)
@@ -409,6 +438,34 @@ mod tests {
         assert_eq!(parse_command(&args).unwrap(), "ls -la");
     }
 
+    #[tokio::test]
+    async fn a_workdir_is_where_the_command_runs_and_shows_in_the_summary() {
+        let dir = std::env::temp_dir().join(format!("bhai-workdir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.canonicalize().unwrap();
+        let args = json!({"command": "pwd", "workdir": path.to_str().unwrap()});
+        assert_eq!(
+            Bash.describe(&args).unwrap(),
+            format!("pwd  (in {})", path.display())
+        );
+        let (out, ran) = Bash.execute(&args).await;
+        assert!(ran && out.contains(path.to_str().unwrap()), "{out}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_workdir_must_be_a_directory() {
+        assert_eq!(parse_workdir(&json!({"command": "ls"})), Ok(None));
+        assert_eq!(parse_workdir(&json!({"workdir": ""})), Ok(None));
+        assert!(parse_workdir(&json!({"workdir": 1})).is_err());
+        let args = json!({"command": "ls", "workdir": "/no/such/dir/bhai"});
+        assert!(
+            Bash.describe(&args)
+                .unwrap_err()
+                .contains("not a directory")
+        );
+    }
+
     #[test]
     fn rejects_a_missing_or_empty_command() {
         assert!(parse_command(&json!({})).is_err());
@@ -418,7 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_a_command_and_reports_the_exit_code() {
-        let out = run("echo hi; exit 3", quiet()).await;
+        let out = run("echo hi; exit 3", None, quiet()).await;
         assert!(out.starts_with("exit code: 3"), "{out}");
         assert!(out.contains("hi"), "{out}");
     }
@@ -445,7 +502,7 @@ mod tests {
             return;
         }
         crate::childenv::set_pass(&[]);
-        let out = run("env", quiet()).await;
+        let out = run("env", None, quiet()).await;
         assert!(out.contains("BHAI_TEST_PLAIN=kept-value"), "{out}");
         assert!(!out.contains("BHAI_TEST_API_TOKEN"), "{out}");
         assert!(!out.contains("withheld-value"), "{out}");
@@ -455,17 +512,18 @@ mod tests {
     async fn the_command_runs_with_a_fixed_non_interactive_environment() {
         let out = run(
             "echo \"$TERM $NO_COLOR $PAGER $GIT_PAGER $GIT_TERMINAL_PROMPT\"",
+            None,
             quiet(),
         )
         .await;
         assert!(out.contains("dumb 1 cat cat 0"), "{out}");
-        let out = run("echo \"$LANG $LC_ALL\"", quiet()).await;
+        let out = run("echo \"$LANG $LC_ALL\"", None, quiet()).await;
         assert!(out.contains("UTF-8"), "{out}");
     }
 
     #[tokio::test]
     async fn merges_stderr_into_the_output() {
-        let out = run("echo oops >&2", quiet()).await;
+        let out = run("echo oops >&2", None, quiet()).await;
         assert!(out.contains("oops"), "{out}");
     }
 
@@ -480,7 +538,7 @@ mod tests {
             progress: &progress,
             cancel: &cancel,
         };
-        let out = run(command, live).await;
+        let out = run(command, None, live).await;
         let total = start.elapsed();
 
         let chunks = chunks.into_inner().unwrap();
@@ -531,7 +589,7 @@ mod tests {
             cancel: &cancel,
         };
         let start = Instant::now();
-        let out = run(&command, live).await;
+        let out = run(&command, None, live).await;
         assert!(start.elapsed() < Duration::from_secs(1), "{out}");
         assert!(
             out.starts_with("exit code: killed by signal\na\n\n[output: 1 line, "),
@@ -550,7 +608,12 @@ mod tests {
     #[tokio::test]
     async fn a_backgrounded_job_does_not_hold_the_command_open() {
         let start = Instant::now();
-        let out = run("printf 'quick\\n'; (sleep 3; printf 'late\\n') &", quiet()).await;
+        let out = run(
+            "printf 'quick\\n'; (sleep 3; printf 'late\\n') &",
+            None,
+            quiet(),
+        )
+        .await;
         assert!(start.elapsed() < Duration::from_secs(2), "{out}");
         assert!(out.starts_with("exit code: 0\nquick\n"), "{out}");
     }
@@ -576,7 +639,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_result_ends_with_the_line_count_and_wall_time() {
-        let out = run("seq 1 5", quiet()).await;
+        let out = run("seq 1 5", None, quiet()).await;
         assert!(out.starts_with("exit code: 0\n1\n2\n3\n4\n5\n"), "{out}");
         let last = out.lines().last().unwrap();
         assert!(
@@ -585,21 +648,21 @@ mod tests {
         );
         assert_eq!(outcome(&out), Some(Outcome::Succeeded));
 
-        let out = run("sleep 0.3", quiet()).await;
+        let out = run("sleep 0.3", None, quiet()).await;
         assert!(
             out.contains("(no output)\n[output: 0 lines, 0.3s]"),
             "{out}"
         );
 
         // A last line without its newline counts, and so does stderr.
-        let out = run("printf 'a\\nb'; echo e >&2; exit 2", quiet()).await;
+        let out = run("printf 'a\\nb'; echo e >&2; exit 2", None, quiet()).await;
         assert!(out.contains("[output: 3 lines, "), "{out}");
         assert_eq!(outcome(&out), Some(Outcome::Failed(2)));
     }
 
     #[tokio::test]
     async fn the_line_count_includes_trimmed_output() {
-        let out = run("yes | head -n 200000", quiet()).await;
+        let out = run("yes | head -n 200000", None, quiet()).await;
         assert!(out.contains("bytes trimmed"), "{out}");
         assert!(out.contains("\n[output: 200000 lines, "), "{out}");
     }

@@ -640,7 +640,10 @@ pub fn written(tool: &str, args: &Value, cwd: &Path, home: Option<&Path>) -> Vec
     match (tool, text("path"), text("command")) {
         ("write" | "edit", Some(path), _) => resolve(cwd, path).into_iter().collect(),
         ("bash", _, Some(command)) => {
-            let mut cwd = cwd.to_path_buf();
+            let mut cwd = match text("workdir").filter(|w| !w.is_empty()) {
+                Some(dir) => cwd.join(dir),
+                None => cwd.to_path_buf(),
+            };
             let mut paths = Vec::new();
             for c in bash::parse(command).unwrap_or_default() {
                 if !c.piped
@@ -685,7 +688,10 @@ impl Checker<'_> {
     fn check(&self, tool: &str, args: &Value, needs_approval: bool) -> Decision {
         let text = |key| args.get(key).and_then(Value::as_str);
         match tool {
-            "bash" => self.check_bash(text("command").unwrap_or_default()),
+            "bash" => self.check_bash(
+                text("command").unwrap_or_default(),
+                text("workdir").filter(|w| !w.is_empty()),
+            ),
             "read" | "write" | "edit" => match text("path") {
                 Some(path) => self.check_path(tool, Path::new(path), needs_approval),
                 None => Decision::Ask,
@@ -742,7 +748,7 @@ impl Checker<'_> {
         self.fallback(allowed)
     }
 
-    fn check_bash(&self, command: &str) -> Decision {
+    fn check_bash(&self, command: &str, workdir: Option<&str>) -> Decision {
         let any = |rules: &[Rule]| {
             rules
                 .iter()
@@ -789,9 +795,19 @@ impl Checker<'_> {
         }
 
         let mut reasons: Vec<String> = Vec::new();
+        // A `workdir` is a `cd` before the first command: inside the project it is
+        // followed, and anywhere else it is the `cd` this cannot name, so nothing runs
+        // on a rule that was written for the project.
+        let start = match workdir {
+            None => self.base.cwd.to_path_buf(),
+            Some(dir) => match self.cd_into(self.base.cwd, dir) {
+                Some(dir) => dir,
+                None => return self.fallback(None),
+            },
+        };
         // The rest of the chain runs wherever its `cd`s have left it, or nowhere this can
         // name once a `cd` it cannot follow has moved it.
-        let mut cwd: Option<PathBuf> = Some(self.base.cwd.to_path_buf());
+        let mut cwd: Option<PathBuf> = Some(start);
         for c in &commands {
             // A `cd` in a pipeline moves only its own subshell, so it says nothing
             // about where the rest of the chain runs.
@@ -1956,6 +1972,40 @@ mod tests {
             p.set_mode(mode);
             assert_eq!(command("cargo clippy"), Err(Reserved::Untrusted), "{mode}");
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_workdir_decides_a_command_as_a_cd_would() {
+        let dir = std::env::temp_dir().join(format!("bhai-workdir-{}", uuid::Uuid::new_v4()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        let p = Policy::new(Mode::Auto, Rules::default(), None, repo.clone())
+            .with_trust(Trust::new(&dir.join("config"), &repo));
+        p.trust().unwrap();
+        let in_dir = |command: &str, workdir: &str| {
+            p.check(
+                "bash",
+                &json!({ "command": command, "workdir": workdir }),
+                true,
+            )
+        };
+        let project = allowed("auto, inside the project");
+        assert_eq!(in_dir("cargo test", "sub"), project);
+        assert_eq!(
+            in_dir("cargo test", &repo.join("sub").display().to_string()),
+            project
+        );
+        // Resolved against the workdir, the redirect lands outside the project.
+        assert_eq!(in_dir("cargo test > ../../x", "sub"), Decision::Ask);
+        assert_eq!(in_dir("cargo test", "../outside"), Decision::Ask);
+        assert_eq!(
+            in_dir("cargo test", &dir.join("outside").display().to_string()),
+            Decision::Ask
+        );
+        let args = json!({ "command": "echo a > x", "workdir": "sub" });
+        assert_eq!(p.written("bash", &args), [repo.join("sub").join("x")]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
