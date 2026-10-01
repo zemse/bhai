@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- ctrl+l expands every folded tool output, diff and thinking block in the transcript at once. When all of them are already open, it collapses them all.
 - Over ssh (`SSH_CONNECTION` or `SSH_TTY` set) a copy goes out as OSC 52 first, so it lands on the local clipboard rather than the remote machine's; the platform command is used only when there is no tty to write to. OSC 52 text is cut at 100 KB on a char boundary, and the copy note says "copied N of M chars" when it was.
 - An approved `.mcp.json` server's tool catalog (each tool's name, description and input schema) is pinned the first time it starts, in `~/.config/bhai/mcp-catalogs.json`. If the catalog later changes, the server is closed and shows as failed, so a changed tool description never reaches the model. `bhai mcp approve <name>` accepts the catalog as it is now.
 - A prompt typed with a leading space, or one holding something shaped like a credential (an `sk-`, `ghp_` or `AKIA` key, a JWT, a private key, a value bhai already redacts), stays out of the prompt history, so ctrl+p and ctrl+r never offer it again and it is never written to `history.jsonl`.

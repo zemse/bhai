@@ -1966,6 +1966,42 @@ mod tests {
         assert!(matches!(&app.entries().list[1], Entry::Assistant(t) if t == raw));
     }
 
+    #[test]
+    fn ctrl_l_expands_every_fold_then_collapses_them_all() {
+        let mut app = App::detached();
+        let first = app.entries().list.len();
+        app.entries()
+            .push(Entry::Output("a\nb\nc\nd\ne".to_string()));
+        app.entries().push(Entry::User("hi".to_string()));
+        app.entries()
+            .push(Entry::Output("1\n2\n3\n4\n5".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(40, 40)).unwrap();
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("[collapse]"));
+
+        app.on_key(ctrl_l);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.expanded,
+            std::collections::HashSet::from([first, first + 2])
+        );
+        assert_eq!(screen(&terminal).matches("[collapse]").count(), 2);
+
+        // With one closed again by hand, the key opens the rest rather than closing.
+        app.expanded.remove(&first);
+        app.on_key(ctrl_l);
+        assert_eq!(
+            app.expanded,
+            std::collections::HashSet::from([first, first + 2])
+        );
+
+        app.on_key(ctrl_l);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.expanded.is_empty());
+        assert!(!screen(&terminal).contains("[collapse]"));
+    }
+
     /// A long session of markdown with code in it, the kind that is slow to lay out.
     fn long_session(messages: usize) -> App {
         let app = App::detached();

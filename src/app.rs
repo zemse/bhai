@@ -581,6 +581,7 @@ impl App {
             KeyCode::Esc if self.busy() => self.confirm_interrupt(),
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
+            KeyCode::Char('l') if ctrl => self.toggle_folds(),
             KeyCode::Char('y') if ctrl => self.copy(),
             KeyCode::Char('v') if ctrl => self.paste(),
             KeyCode::Char('g') if ctrl => self.editing = true,
@@ -883,6 +884,16 @@ impl App {
             set.insert(entry);
         }
         true
+    }
+
+    /// Every entry with rows folded away opens, or, when all of them already are, closes.
+    fn toggle_folds(&mut self) {
+        let owners: HashSet<usize> = self.folds.values().copied().collect();
+        if owners.is_subset(&self.expanded) {
+            self.expanded.retain(|entry| !owners.contains(entry));
+        } else {
+            self.expanded.extend(owners);
+        }
     }
 
     /// The wrapped transcript line and column under a screen cell, clamped to the last

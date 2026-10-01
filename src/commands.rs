@@ -282,7 +282,8 @@ pub fn help() -> String {
         "\n  !<command> runs a shell command yourself, shown here and not told to the model",
         "\n  up and down walk the prompt history · ctrl+r searches it · tab takes the grey completion",
         "\n  up on an empty prompt takes the queued messages back to edit",
-        "\n  wheel, pgup/pgdn or ctrl+up/down scroll · click a tool output to expand it",
+        "\n  wheel, pgup/pgdn or ctrl+up/down scroll",
+        "\n  click a tool output to expand it · ctrl+l expands or collapses them all",
         "\n  drag selects, past the edge to keep going · ctrl+a takes the whole transcript",
         "\n  ctrl+y copies · ctrl+v pastes · ctrl+g edits the draft in $EDITOR · ctrl+t shows every badge",
     ));
