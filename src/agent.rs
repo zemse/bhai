@@ -1169,7 +1169,8 @@ pub(crate) async fn run_with(
             .is_err_and(crate::client::context_overflow);
         // A goal stops on an interrupt or a failure rather than carrying on past either,
         // and on a turn of its own that cost nothing, which would otherwise loop. An
-        // overflow is a failure only once the retry is ruled out, below.
+        // overflow is a failure only once the retry is ruled out, below, and its refused
+        // call charged nothing, so it says nothing of what the turn costs.
         {
             let total = children_spent(&children);
             if let Some(g) = lock_goal(&goal).as_mut() {
@@ -1178,7 +1179,7 @@ pub(crate) async fn run_with(
                     g.pause("the turn failed");
                 } else if cancel.load(Ordering::Relaxed) {
                     g.pause("interrupted");
-                } else if on_goal.as_ref().is_some_and(|on| on.spent == g.spent) {
+                } else if !overflowed && on_goal.as_ref().is_some_and(|on| on.spent == g.spent) {
                     g.pause("its last turn spent no tokens");
                 }
             }
@@ -5646,6 +5647,43 @@ mod tests {
                 compact::user_message("two")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_goal_turn_that_overflows_keeps_the_goal_through_the_retry() {
+        use fake::{Fake, OVERFLOW, call, say, step};
+
+        let fake = Fake::new(vec![
+            vec![say("one")],
+            step(OVERFLOW),
+            vec![say("the summary")],
+            vec![say("retried")],
+            vec![call(
+                "goal",
+                json!({"status": "complete", "reason": "retried"}),
+            )],
+            vec![say("done")],
+        ]);
+        let (mut rx, user, control, _cancel) = goal_session(&fake, Vec::new());
+        user.send("one".to_string()).await.unwrap();
+        settle(&mut rx).await;
+        control.send(set_goal("g")).await.unwrap();
+        let mut events = settle(&mut rx).await;
+        // A paused goal would open no next turn to wait for.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), settle(&mut rx));
+        events.extend(next.await.unwrap_or_default());
+        let notices = info(&events);
+        // The refused call charged nothing, which is not a turn that cost nothing.
+        assert!(
+            !notices.iter().any(|i| i.starts_with("goal paused")),
+            "{events:?}"
+        );
+        assert!(!failed(&events), "{events:?}");
+        assert!(
+            notices.iter().any(|i| i.starts_with("goal complete: g")),
+            "{events:?}"
+        );
+        assert_eq!(parent_calls(&fake).len(), 6);
     }
 
     #[tokio::test]

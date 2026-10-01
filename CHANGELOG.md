@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A request the backend refuses as too long for the context window compacts the history and runs the turn again once. A goal turn that overflows keeps the goal active through that retry and is paused only if the retry is ruled out.
 - `BHAI_STARTUP_TIMING=1` prints one JSON line per startup stage to stderr as it ends (`resume`, `config`, `mcp`, `prompt`, `client`, `preflight`, `session`, `start`), each with its own `ms` and the running `total_ms`, so a slow start can be pinned on MCP servers or the backend preflight. The lines carry no config content, and they stop before the TUI takes the terminal.
 - `/mcp reload` of a server says a restart is needed when no MCP server had tools at launch, since the model then has no `mcp_search` or `mcp_call` to reach it.
 - URLs and file paths in the transcript are OSC 8 hyperlinks, so a terminal that supports them opens one on click. A URL wrapped over rows is one link. A path links only when it exists (relative to the working directory or `~`, with any `:line:col` kept on the link) and not over ssh. Control characters never reach the escape.
