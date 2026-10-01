@@ -332,9 +332,18 @@ impl Hub {
 restart bhai to use it"
             ));
         }
+        let deferred = self.shared.deferred.iter().any(|s| s.name == name);
+        // `mcp_search` and `mcp_call` are registered at launch only when there was a tool;
+        // a deferred server counts for the children that may start it.
+        if !deferred && !self.has_tools() {
+            return Err(format!(
+                "mcp: no server had tools when bhai started, so the model has no MCP tools \
+to reach `{name}` with; restart bhai to use it"
+            ));
+        }
         let _reloading = self.shared.reloading.lock().await;
         // A deferred server lives in `late`, held across the restart as on a first start.
-        let mut late = match self.shared.deferred.iter().any(|s| s.name == name) {
+        let mut late = match deferred {
             true => Some(self.shared.late.lock().await),
             false => None,
         };
@@ -1743,6 +1752,32 @@ mod tests {
         let late = hub.reload_from("added", added).await.unwrap_err();
         assert!(late.contains("restart bhai"), "{late}");
         assert_eq!(hub.prompt_section(), section);
+        hub.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reload_with_no_mcp_tools_at_launch_asks_for_a_restart() {
+        if !python() {
+            return;
+        }
+        let dir = temp_dir();
+        let hub = Hub::connect(
+            vec![fake("flaky", "exit")],
+            &Identity::default(),
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(matches!(hub.servers[0].state, State::Failed(_)));
+        assert!(!hub.has_tools());
+        let err = hub
+            .reload_from("flaky", vec![fake("flaky", "")])
+            .await
+            .unwrap_err();
+        assert!(err.contains("restart bhai"), "{err}");
+        assert!(hub.shared.reloaded.lock().unwrap().is_empty());
+        assert!(matches!(hub.live()[0].state, State::Failed(_)));
         hub.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
     }

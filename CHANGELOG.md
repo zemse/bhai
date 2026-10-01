@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `/mcp reload` of a server says a restart is needed when no MCP server had tools at launch, since the model then has no `mcp_search` or `mcp_call` to reach it.
 - URLs and file paths in the transcript are OSC 8 hyperlinks, so a terminal that supports them opens one on click. A URL wrapped over rows is one link. A path links only when it exists (relative to the working directory or `~`, with any `:line:col` kept on the link) and not over ssh. Control characters never reach the escape.
 - ctrl+l expands every folded tool output, diff and thinking block in the transcript at once. When all of them are already open, it collapses them all.
 - Over ssh (`SSH_CONNECTION` or `SSH_TTY` set) a copy goes out as OSC 52 first, so it lands on the local clipboard rather than the remote machine's; the platform command is used only when there is no tty to write to. OSC 52 text is cut at 100 KB on a char boundary, and the copy note says "copied N of M chars" when it was.
