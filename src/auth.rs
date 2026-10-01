@@ -88,6 +88,24 @@ fn read_doc(path: &Path) -> Result<Value> {
 /// [`REFRESHING`], and the file is re-read inside the lock so a caller that queued
 /// behind another's refresh takes its result instead of spending the token again.
 async fn refresh(http: &reqwest::Client, path: &Path) -> Result<Value> {
+    refresh_with(path, |token| exchange(http, token)).await
+}
+
+/// What the token endpoint answered, when it answered at all.
+enum Exchange {
+    Tokens(Value),
+    Refused { status: u16, body: String },
+}
+
+/// [`refresh`] with the call to the token endpoint passed in. The lock is per process,
+/// so the `codex` CLI or another bhai can spend the refresh token between our read and
+/// the server's answer; a refusal then finds a different refresh token in the file, and
+/// that file is the rotation to adopt.
+async fn refresh_with<F, Fut>(path: &Path, exchange: F) -> Result<Value>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Exchange>>,
+{
     let _held = REFRESHING
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
@@ -99,10 +117,38 @@ async fn refresh(http: &reqwest::Client, path: &Path) -> Result<Value> {
     }
     let refresh_token = str_at(&doc, &["tokens", "refresh_token"])
         .ok_or_else(|| anyhow!("access token expired and no refresh_token is present"))?;
-    refresh_tokens(http, &refresh_token, &mut doc).await?;
+    let refreshed = match exchange(refresh_token.clone()).await? {
+        Exchange::Tokens(refreshed) => refreshed,
+        Exchange::Refused { status, body } => {
+            if let Ok(now) = read_doc(path)
+                && str_at(&now, &["tokens", "refresh_token"]).is_some_and(|t| t != refresh_token)
+            {
+                return Ok(now);
+            }
+            if refusal_code(&body).as_deref() == Some("refresh_token_reused") {
+                bail!(
+                    "token refresh failed ({status}): the refresh token was already spent, \
+                     and {} still holds it. Try `codex login` again.",
+                    path.display()
+                );
+            }
+            bail!("token refresh failed ({status}): {body}. Try `codex login` again.");
+        }
+    };
+    apply_refreshed(&mut doc, &refreshed)?;
     write_atomically(path, &serde_json::to_string_pretty(&doc)?)
         .with_context(|| format!("could not write refreshed tokens to {}", path.display()))?;
     Ok(doc)
+}
+
+/// The error code of a refusal: `{"error": "<code>"}` or `{"error": {"code": "<code>"}}`.
+fn refusal_code(body: &str) -> Option<String> {
+    let body: Value = serde_json::from_str(body).ok()?;
+    let error = body.get("error")?;
+    error
+        .as_str()
+        .or_else(|| error.get("code").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 /// Write through a neighbouring temp file and rename, so a concurrent reader sees either
@@ -127,11 +173,7 @@ fn write_atomically(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-async fn refresh_tokens(
-    http: &reqwest::Client,
-    refresh_token: &str,
-    doc: &mut Value,
-) -> Result<()> {
+async fn exchange(http: &reqwest::Client, refresh_token: String) -> Result<Exchange> {
     let sent = http
         .post(TOKEN_URL)
         .header("Content-Type", "application/json")
@@ -149,11 +191,16 @@ async fn refresh_tokens(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("token refresh failed ({status}): {body}. Try `codex login` again.");
+        return Ok(Exchange::Refused {
+            status: status.as_u16(),
+            body,
+        });
     }
-    let refreshed: Value =
-        serde_json::from_str(&body).context("token refresh returned non-JSON")?;
+    let refreshed = serde_json::from_str(&body).context("token refresh returned non-JSON")?;
+    Ok(Exchange::Tokens(refreshed))
+}
 
+fn apply_refreshed(doc: &mut Value, refreshed: &Value) -> Result<()> {
     let tokens = doc
         .get_mut("tokens")
         .ok_or_else(|| anyhow!("auth.json has no `tokens` object"))?;
@@ -266,5 +313,127 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An unsigned JWT whose `exp` is `secs` from now.
+    fn jwt_expiring_in(secs: i64) -> String {
+        fn b64url(bytes: &[u8]) -> String {
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let n = chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |acc, (i, b)| acc | u32::from(*b) << (16 - 8 * i));
+                for i in 0..=chunk.len() {
+                    out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+                }
+            }
+            out
+        }
+        let exp = chrono::Utc::now().timestamp() + secs;
+        let claims = json!({ "exp": exp }).to_string();
+        format!("e30.{}.sig", b64url(claims.as_bytes()))
+    }
+
+    fn auth_file(access: &str, refresh: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("bhai-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let doc = json!({ "tokens": { "access_token": access, "refresh_token": refresh } });
+        std::fs::write(&path, doc.to_string()).unwrap();
+        (dir, path)
+    }
+
+    fn token(doc: &Value, key: &str) -> Option<String> {
+        str_at(doc, &["tokens", key])
+    }
+
+    #[test]
+    fn the_test_jwt_carries_its_expiry() {
+        assert!(expires_within(&jwt_expiring_in(-60), REFRESH_SLACK_SECS));
+        assert!(!expires_within(&jwt_expiring_in(3600), REFRESH_SLACK_SECS));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_writes_the_new_tokens() {
+        let (dir, path) = auth_file(&jwt_expiring_in(-60), "rt-old");
+        let fresh = jwt_expiring_in(3600);
+
+        let doc = refresh_with(&path, |sent| {
+            assert_eq!(sent, "rt-old");
+            let fresh = fresh.clone();
+            async move {
+                Ok(Exchange::Tokens(
+                    json!({ "access_token": fresh, "refresh_token": "rt-new" }),
+                ))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(token(&doc, "access_token"), Some(fresh));
+        let on_disk = read_doc(&path).unwrap();
+        assert_eq!(token(&on_disk, "refresh_token").as_deref(), Some("rt-new"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reused_token_adopts_the_rotation_another_process_wrote() {
+        let (dir, path) = auth_file(&jwt_expiring_in(-60), "rt-old");
+        let theirs = jwt_expiring_in(3600);
+        let rotated = json!({ "tokens": { "access_token": theirs, "refresh_token": "rt-theirs" } })
+            .to_string();
+
+        // The `codex` CLI spends the token and writes its rotation while ours is in flight.
+        let doc = refresh_with(&path, |_| {
+            std::fs::write(&path, &rotated).unwrap();
+            async {
+                Ok(Exchange::Refused {
+                    status: 401,
+                    body: r#"{"error":{"code":"refresh_token_reused"}}"#.to_string(),
+                })
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(token(&doc, "access_token"), Some(theirs));
+        assert_eq!(token(&doc, "refresh_token").as_deref(), Some("rt-theirs"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), rotated);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reused_token_with_nothing_newer_on_disk_is_an_error() {
+        let (dir, path) = auth_file(&jwt_expiring_in(-60), "rt-old");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = refresh_with(&path, |_| async {
+            Ok(Exchange::Refused {
+                status: 401,
+                body: r#"{"error":"refresh_token_reused"}"#.to_string(),
+            })
+        })
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("already spent"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_code_is_read_from_either_shape() {
+        assert_eq!(
+            refusal_code(r#"{"error":"refresh_token_reused"}"#).as_deref(),
+            Some("refresh_token_reused")
+        );
+        assert_eq!(
+            refusal_code(r#"{"error":{"code":"refresh_token_expired","message":"x"}}"#).as_deref(),
+            Some("refresh_token_expired")
+        );
+        assert_eq!(refusal_code("bad gateway"), None);
     }
 }

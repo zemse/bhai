@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A token refresh that the server refuses, because the `codex` CLI or another bhai spent the same refresh token first, adopts the tokens that process wrote to `~/.codex/auth.json` instead of failing the turn. A `refresh_token_reused` refusal with nothing newer on disk says the token was already spent.
 - The release binary is stripped and built with thin LTO, so it is about 12% smaller
   (28.2 MB to 24.7 MB). The crate now denies unsafe code except for the one `killpg`
   call, and clippy warns on redundant clones.
