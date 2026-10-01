@@ -9,6 +9,8 @@ use crate::tokens::{self, Tokenizer};
 
 /// The context window of the gpt-5 family, in tokens.
 pub const GPT5_WINDOW: u64 = 272_000;
+/// The window the Codex CLI gives the gpt-6 family by default, in tokens.
+pub const GPT6_WINDOW: u64 = 272_000;
 /// What Ollama is asked to hold, and what compaction assumes it holds. Its own default
 /// is 4096, which the system prompt and the tool schemas overflow between them, and it
 /// truncates from the front with nothing but a line in the server's log to say so.
@@ -45,6 +47,8 @@ pub struct Limits {
     /// to hold when nothing reports one.
     pub window: Option<u64>,
     pub compact_at: f64,
+    /// The model's window as its backend's list reports it, under a configured one.
+    pub reported: Option<u64>,
 }
 
 impl Default for Limits {
@@ -52,14 +56,18 @@ impl Default for Limits {
         Self {
             window: None,
             compact_at: COMPACT_AT,
+            reported: None,
         }
     }
 }
 
 impl Limits {
-    /// The window for `model`: the configured one, else what it is assumed to hold.
+    /// The window for `model`: the configured one, else the reported one, else what it
+    /// is assumed to hold.
     pub fn window(&self, model: &str) -> u64 {
-        self.window.unwrap_or_else(|| default_window(model))
+        self.window
+            .or(self.reported)
+            .unwrap_or_else(|| default_window(model))
     }
 
     /// Whether a call that read `input` tokens filled the window past `compact_at`.
@@ -79,6 +87,8 @@ impl Limits {
 pub fn default_window(model: &str) -> u64 {
     if model.starts_with("gpt-5") {
         GPT5_WINDOW
+    } else if model.starts_with("gpt-6") {
+        GPT6_WINDOW
     } else if model.starts_with(crate::ollama::PREFIX) {
         OLLAMA_WINDOW
     } else {
@@ -195,6 +205,7 @@ mod tests {
     fn limits_know_the_gpt5_window() {
         let limits = Limits::default();
         assert_eq!(limits.window("gpt-5.1-codex"), GPT5_WINDOW);
+        assert_eq!(limits.window("gpt-6-astra"), GPT6_WINDOW);
         assert!(limits.over("gpt-5", 220_000));
         assert!(!limits.over("gpt-5", 210_000));
         // A model nothing reports a window for still compacts, on an assumed one.
@@ -205,6 +216,7 @@ mod tests {
         let set = Limits {
             window: Some(1000),
             compact_at: 0.7,
+            reported: None,
         };
         assert!(set.over("other", 701));
         assert_eq!(set.target("other"), 525);
@@ -223,6 +235,21 @@ mod tests {
                 "target at compact_at {compact_at}"
             );
         }
+    }
+
+    #[test]
+    fn a_reported_window_sits_between_the_configured_and_the_assumed_one() {
+        let reported = Limits {
+            reported: Some(400_000),
+            ..Limits::default()
+        };
+        assert_eq!(reported.window("gpt-6-astra"), 400_000);
+        assert!(!reported.over("gpt-6-astra", 300_000));
+        let configured = Limits {
+            window: Some(100_000),
+            ..reported
+        };
+        assert_eq!(configured.window("gpt-6-astra"), 100_000);
     }
 
     #[test]

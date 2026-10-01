@@ -267,6 +267,11 @@ async fn main() -> Result<()> {
         eprintln!("bhai: {e:#}");
         std::process::exit(1);
     }
+    // Otherwise the backend's list is read for a window only on a `/model` switch.
+    let limits = Limits {
+        reported: models::cached_window(client.model()),
+        ..limits
+    };
     let saved = match resumed {
         Some(loaded) => {
             // Only `--model` can put a resumed session on another model now, so this is

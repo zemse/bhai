@@ -697,7 +697,6 @@ pub(crate) async fn run_with(
     let tools = registry.schemas();
     // Both follow the model, so a switch takes them with it. A window the config asked
     // for still wins over the one the new model's backend reports.
-    let configured_window = limits.window;
     let mut tokenizer = tokens::for_model(model.name());
     let report = |history: &[Value], calls: &[Call], tokenizer| {
         let mut profile = profile::build(&prompt, &tools, history, calls, tokenizer);
@@ -839,7 +838,7 @@ pub(crate) async fn run_with(
                                 }
                                 if !same {
                                     tokenizer = tokens::for_model(model.name());
-                                    limits.window = configured_window.or(window);
+                                    limits.reported = window;
                                     history.retain(|item| {
                                         !matches!(
                                             item.get("type").and_then(Value::as_str),
@@ -5111,7 +5110,7 @@ mod tests {
         // 850 is over 0.8 of 1000, so every turn compacts towards 600.
         let limits = Limits {
             window: Some(1000),
-            compact_at: 0.8,
+            ..Limits::default()
         };
         let policy = Policy::new(Mode::Bypass, Default::default(), None, dir.clone());
         let saved = Saved {

@@ -871,7 +871,8 @@ compact_at = 0.9
             limits,
             Limits {
                 window: Some(100_000),
-                compact_at: 0.7
+                compact_at: 0.7,
+                reported: None,
             }
         );
         write(

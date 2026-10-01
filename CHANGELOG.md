@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A session now starts on its model's context window as the Codex CLI's cached model list (`~/.codex/models_cache.json`) reports it, not only after a `/model` switch. A model the list does not cover falls back to 272k for `gpt-6*`, so a gpt-6 session no longer compacts at around 102k. A configured `context_window` still wins, and the status bar's ctx uses the same window after a switch.
 - An MCP HTTP server can now redirect within its own origin (HTTPS, or plain HTTP on loopback), for example `/mcp` to `/mcp/`. rmcp's default client refused every redirect. Redirects to another origin are still refused, so a token header from `.mcp.json` stays on the configured server.
 - A call's usage now includes the `cache_write_tokens` the backend reports, summed into the session totals (`cache_write_tokens` in `/state`) and written to `usage.jsonl`. A call that completes with no usage block counts as unknown instead of free: its `usage.jsonl` line has null counts, and the totals and the last call's context fill are left as they were.
 - `ctrl+g` opens the prompt draft in `$VISUAL`, then `$EDITOR`, then `vi`, and the draft becomes whatever the editor saved, minus the newline the editor adds at the end. While it runs, the TUI gives the editor the whole terminal, then takes it back. An editor that exits with an error leaves the draft unchanged and shows the error.

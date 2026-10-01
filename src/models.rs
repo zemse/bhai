@@ -238,6 +238,22 @@ fn cache() -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
+/// `id`'s context window as the Codex CLI's cached list reports it. Read from disk, so a
+/// session starts on the right window without waiting for the backend's list.
+pub fn cached_window(id: &str) -> Option<u64> {
+    window_of(&cache()?, id)
+}
+
+/// `id`'s context window in a `{"models": [...]}` body, hidden models included.
+fn window_of(body: &Value, id: &str) -> Option<u64> {
+    body.get("models")?
+        .as_array()?
+        .iter()
+        .find(|m| m.get("slug").and_then(Value::as_str) == Some(id))?
+        .get("context_window")
+        .and_then(Value::as_u64)
+}
+
 /// The models of a `{"models": [...]}` body, listable ones only, most capable first.
 pub fn codex_models(body: &Value) -> Vec<Model> {
     let mut models: Vec<(i64, Model)> = body
@@ -673,6 +689,15 @@ mod tests {
             {"slug": "gpt-reserve", "visibility": "hide", "priority": 3},
             {"slug": "not-in-api", "visibility": "list", "supported_in_api": false},
         ]})
+    }
+
+    #[test]
+    fn a_window_is_read_off_the_list_by_slug() {
+        let body = codex_body();
+        assert_eq!(window_of(&body, "gpt-5.5"), Some(272_000));
+        assert_eq!(window_of(&body, "gpt-6-astra"), None);
+        assert_eq!(window_of(&body, "missing"), None);
+        assert_eq!(window_of(&json!({}), "gpt-5.5"), None);
     }
 
     #[test]

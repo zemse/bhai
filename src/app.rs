@@ -1821,8 +1821,15 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             },
             false => model_notice(&model, &effort),
         };
+        let switched = model != self.model;
         match self.session.set_model(model, effort, window) {
-            Ok(()) => self.note(Entry::Info(notice)),
+            Ok(()) => {
+                // The loop takes the same window, so the status bar's ctx agrees with it.
+                if switched {
+                    self.limits.reported = window;
+                }
+                self.note(Entry::Info(notice))
+            }
             Err(e) => self.note(Entry::Error(format!("cannot switch: {e}"))),
         }
     }
@@ -2917,6 +2924,19 @@ mod tests {
             (state.model.as_str(), state.effort.as_str()),
             ("gpt-5.5", "xhigh")
         );
+    }
+
+    #[test]
+    fn a_switch_takes_the_new_models_reported_window() {
+        let (mut app, _user, _control) = connected();
+        app.model = "gpt-5.5".to_string();
+        app.limits.reported = Some(272_000);
+        app.switch_model("gpt-6-astra".to_string(), "low".to_string(), Some(400_000));
+        assert_eq!(app.limits.reported, Some(400_000));
+        // Named by hand, the old model's window does not carry over to the new one.
+        app.model = "gpt-6-astra".to_string();
+        app.switch_model("gpt-5.5".to_string(), "low".to_string(), None);
+        assert_eq!(app.limits.reported, None);
     }
 
     #[test]
