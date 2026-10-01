@@ -54,6 +54,11 @@ const MAX_NATIVE_RESULTS: usize = 16;
 const NATIVE_NAME: usize = 64;
 /// A schema past this is left out of a `tool_search` result rather than loaded.
 const NATIVE_SCHEMA: usize = crate::tools::MAX_OUTPUT / 2;
+/// Longest description a `tool_search` result gives one function, in bytes.
+const NATIVE_DESCRIPTION: usize = 512;
+/// Most a `tool_search` result holds once serialized. It must stay valid JSON, so it is
+/// not cut like other tool output, and `compact::evict` never shrinks it afterwards.
+const NATIVE_TOTAL: usize = crate::tools::MAX_OUTPUT;
 /// Bounds on one server's `tools/list`. The server picks the cursors, so one that keeps
 /// handing out a next page would be followed until the startup timeout, with all it sent
 /// held in memory and searched.
@@ -524,14 +529,24 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n"
     }
 
     /// The best matches for `query` as a `tool_search_output`'s `tools`: one namespace per
-    /// server, holding its matches as deferred functions.
+    /// server, holding its matches as deferred functions. Matches stop at the first one that
+    /// would take the serialized result past `NATIVE_TOTAL`.
     pub async fn search_native(&self, query: &str, limit: Option<usize>) -> Vec<Value> {
         let limit = limit.unwrap_or(SEARCH_RESULTS).clamp(1, MAX_NATIVE_RESULTS);
         let tools = self.all_tools().await;
         let mut namespaces: Vec<(String, Vec<Value>)> = Vec::new();
+        // The outer `[]`; each item after the first also adds a comma.
+        let mut total = 2;
         for tool in ranked(&tools, query).into_iter().take(limit) {
             let (namespace, function) = native_names(tool);
-            let mut description = first_line(&tool.description).to_string();
+            let line = first_line(&tool.description);
+            let mut description = match line.len() > NATIVE_DESCRIPTION {
+                true => format!(
+                    "{}...",
+                    &line[..line.floor_char_boundary(NATIVE_DESCRIPTION)]
+                ),
+                false => line.to_string(),
+            };
             let size = tool.schema.to_string().len();
             let parameters = match tool.schema.is_object() && size <= NATIVE_SCHEMA {
                 true => tool.schema.clone(),
@@ -550,25 +565,27 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n"
                 "defer_loading": true,
                 "parameters": parameters,
             });
-            match namespaces.iter_mut().find(|(name, _)| *name == namespace) {
-                Some((_, functions)) => functions.push(function),
+            let size = function.to_string().len();
+            let found = namespaces.iter().position(|(name, _)| *name == namespace);
+            let added = match found {
+                Some(_) => size + 1,
+                None => {
+                    let comma = usize::from(!namespaces.is_empty());
+                    comma + native_namespace(&namespace, Vec::new()).to_string().len() + size
+                }
+            };
+            if total + added > NATIVE_TOTAL {
+                break;
+            }
+            total += added;
+            match found {
+                Some(i) => namespaces[i].1.push(function),
                 None => namespaces.push((namespace, vec![function])),
             }
         }
         namespaces
             .into_iter()
-            .map(|(name, tools)| {
-                let server = name
-                    .strip_prefix("mcp__")
-                    .and_then(|s| s.strip_suffix("__"))
-                    .unwrap_or(&name);
-                serde_json::json!({
-                    "type": "namespace",
-                    "name": name,
-                    "description": format!("Tools of the MCP server {}.", listed(server)),
-                    "tools": tools,
-                })
-            })
+            .map(|(name, tools)| native_namespace(&name, tools))
             .collect()
     }
 
@@ -920,7 +937,20 @@ async fn start_one(
     }
 }
 
-/// The server and tool of `mcp__server__tool`.
+/// A `tool_search` namespace holding `tools`, the functions of one server.
+fn native_namespace(name: &str, tools: Vec<Value>) -> Value {
+    let server = name
+        .strip_prefix("mcp__")
+        .and_then(|s| s.strip_suffix("__"))
+        .unwrap_or(name);
+    serde_json::json!({
+        "type": "namespace",
+        "name": name,
+        "description": format!("Tools of the MCP server {}.", listed(server)),
+        "tools": tools,
+    })
+}
+
 /// A name as the listing shows it: one line, printable, and no longer than a name needs to
 /// be. What a server calls itself and its tools is the server's to decide, and this is the
 /// one place it lands in the prompt.
@@ -936,6 +966,7 @@ fn listed(name: &str) -> String {
     }
 }
 
+/// The server and tool of `mcp__server__tool`.
 fn split(full_name: &str) -> Option<(&str, &str)> {
     full_name.strip_prefix("mcp__")?.split_once("__")
 }
@@ -2094,6 +2125,34 @@ mod tests {
         );
         assert_eq!(hub.resolve_native("mcp__fs__", function).await, None);
         assert!(hub.prompt_section().contains("`tool_search`"));
+    }
+
+    #[tokio::test]
+    async fn a_native_search_stays_under_the_output_cap() {
+        let tools: Vec<ToolInfo> = (0..16)
+            .map(|i| ToolInfo {
+                schema: serde_json::json!({"type": "object", "pad": "x".repeat(8_000)}),
+                ..ToolInfo::test(
+                    if i % 2 == 0 { "a" } else { "b" },
+                    &format!("issue_{i}"),
+                    &"long ".repeat(1_000),
+                )
+            })
+            .collect();
+        let (a, b): (Vec<_>, Vec<_>) = tools.into_iter().partition(|t| t.server == "a");
+        let hub = Hub::offline(vec![("a", a), ("b", b)]).with_tool_search();
+        let found = hub.search_native("issue", Some(16)).await;
+        let text = Value::Array(found.clone()).to_string();
+        assert!(text.len() <= NATIVE_TOTAL, "{}", text.len());
+        let functions: Vec<&Value> = found
+            .iter()
+            .flat_map(|n| n["tools"].as_array().unwrap())
+            .collect();
+        assert_eq!(functions.len(), 2);
+        assert!(functions.iter().all(|f| {
+            let d = f["description"].as_str().unwrap();
+            d.len() <= NATIVE_DESCRIPTION + 3 && d.ends_with("...")
+        }));
     }
 
     #[test]
