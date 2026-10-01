@@ -6,6 +6,9 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- Every turn ends with a dim `✻ Crunched for 9m 54s · done 12:58 PM` line in the
+  transcript: how long it ran from start to its end, and the local time it ended. A
+  queued prompt that follows is timed as its own turn. `/events` carries it as `done`.
 - An idle conversation whose cache is about to lapse gets a compacted copy, summarised
   three minutes before the cache's expected 30 while the history still reads from it.
   A normal message carries on with the full history; `/compact-then <prompt>` runs the

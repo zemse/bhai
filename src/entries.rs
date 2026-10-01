@@ -43,6 +43,8 @@ pub enum Entry {
     /// stands behind it, so the transcript offers to run the turn again.
     Failed(String),
     Info(String),
+    /// How long the turn above it ran and when it ended.
+    Done(String),
     /// The summary a compaction folded the earlier turns into. It is the context the
     /// conversation carries from here, so the transcript shows it where it happened.
     Summary(String),
@@ -159,6 +161,10 @@ impl Entries {
             Event::Error(message) => self.push(Entry::Error(message.clone())),
             Event::TurnFailed(message) => self.push(Entry::Failed(message.clone())),
             Event::Interrupted => self.push(Entry::Info("interrupted".to_string())),
+            Event::Done { seconds, at } => self.push(Entry::Done(format!(
+                "Crunched for {} \u{b7} done {at}",
+                took(*seconds)
+            ))),
             _ => {}
         }
     }
@@ -391,6 +397,7 @@ impl Entry {
             | Entry::Error(t)
             | Entry::Failed(t)
             | Entry::Info(t)
+            | Entry::Done(t)
             | Entry::Summary(t) => t,
         }
     }
@@ -407,6 +414,7 @@ impl Entry {
             Entry::Error(_) => "error",
             Entry::Failed(_) => "failed",
             Entry::Info(_) => "info",
+            Entry::Done(_) => "done",
             Entry::Summary(_) => "summary",
         }
     }
@@ -442,6 +450,15 @@ enum Stream {
     Reasoning,
 }
 
+/// A turn's length as `54s`, `9m 54s` or `1h 3m`.
+fn took(seconds: u64) -> String {
+    match seconds {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m {}s", s / 60, s % 60),
+        s => format!("{}h {}m", s / 3600, s % 3600 / 60),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +485,20 @@ mod tests {
         let mut entries = Entries::default();
         entries.push(Entry::Info("intro".to_string()));
         entries
+    }
+
+    #[test]
+    fn a_finished_turn_shows_how_long_it_took_and_when() {
+        assert_eq!(took(54), "54s");
+        assert_eq!(took(594), "9m 54s");
+        assert_eq!(took(3780), "1h 3m");
+        let mut entries = Entries::default();
+        entries.apply(&Event::Done {
+            seconds: 594,
+            at: "12:58 PM".to_string(),
+        });
+        assert!(matches!(&entries.list[..],
+            [Entry::Done(t)] if t == "Crunched for 9m 54s \u{b7} done 12:58 PM"));
     }
 
     #[test]

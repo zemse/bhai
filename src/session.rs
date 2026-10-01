@@ -140,6 +140,11 @@ pub enum Event {
     /// run the same turn again without the user retyping anything.
     TurnFailed(String),
     Interrupted,
+    /// The turn about to end ran this many seconds, and ended at this local time.
+    Done {
+        seconds: u64,
+        at: String,
+    },
     TurnEnd,
 }
 
@@ -323,6 +328,8 @@ struct Inner {
     last_call: Option<Instant>,
     /// When the call in flight was sent.
     sending: Option<Instant>,
+    /// When the running turn started.
+    started: Option<Instant>,
     last_cache_break: Option<CacheBreak>,
     rate_limits: Option<RateLimits>,
     /// The tokens a call on the compacted copy would read, while there is one.
@@ -331,6 +338,14 @@ struct Inner {
     /// Calls waiting on the user, oldest first. Parallel workflow steps each park one,
     /// so there can be several; only the front is on screen.
     pending: VecDeque<(Approval, oneshot::Sender<Answer>)>,
+}
+
+impl Inner {
+    /// A turn runs from now.
+    fn start(&mut self) {
+        self.working = true;
+        self.started = Some(Instant::now());
+    }
 }
 
 pub struct Session {
@@ -434,7 +449,7 @@ impl Session {
         self.tx_user
             .try_send(prompt.text)
             .map_err(|_| SubmitError::Closed)?;
-        inner.working = true;
+        inner.start();
         self.publish(Event::User(prompt.shown));
         Ok(Submitted::Started)
     }
@@ -455,7 +470,7 @@ impl Session {
         self.tx_control
             .try_send(Control::Forked(prompt.text))
             .map_err(|_| SubmitError::Closed)?;
-        inner.working = true;
+        inner.start();
         self.publish(Event::User(prompt.shown));
         Ok(())
     }
@@ -509,7 +524,7 @@ impl Session {
             inner.working = false;
             return;
         }
-        inner.working = true;
+        inner.start();
         self.publish(Event::User(prompt.shown));
     }
 
@@ -732,7 +747,7 @@ impl Session {
         self.tx_control
             .try_send(Control::Compact(asked))
             .map_err(|_| SubmitError::Closed)?;
-        inner.working = true;
+        inner.start();
         self.publish(Event::Info(notice));
         Ok(())
     }
@@ -748,7 +763,7 @@ impl Session {
         self.tx_control
             .try_send(Control::Retry)
             .map_err(|_| SubmitError::Closed)?;
-        inner.working = true;
+        inner.start();
         self.publish(Event::Info("retrying".to_string()));
         Ok(())
     }
@@ -777,7 +792,7 @@ impl Session {
         self.tx_control
             .try_send(Control::Workflow { workflow, input })
             .map_err(|_| SubmitError::Closed)?;
-        inner.working = true;
+        inner.start();
         Ok(())
     }
 
@@ -934,10 +949,16 @@ impl Session {
             // session says so: what the user sends now queues behind it, as it would
             // behind any other turn.
             AgentEvent::Resumed(what) => {
-                inner.working = true;
+                inner.start();
                 Event::Resumed(what)
             }
             AgentEvent::TurnEnd => {
+                if let Some(started) = inner.started.take() {
+                    self.publish(Event::Done {
+                        seconds: started.elapsed().as_secs(),
+                        at: chrono::Local::now().format("%-I:%M %p").to_string(),
+                    });
+                }
                 // The session keeps working while queued prompts wait behind the turn.
                 inner.working = !inner.queue.is_empty();
                 Event::TurnEnd
@@ -1396,7 +1417,9 @@ mod tests {
         assert!(!session.state().working);
         assert!(session.state().queued.is_empty());
 
-        let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| !matches!(e, Event::Done { .. }))
+            .collect();
         assert_eq!(
             seen,
             [
@@ -1418,9 +1441,19 @@ mod tests {
         );
         // The queued entries became the user entries, with nothing left over.
         let entries = session.entries();
-        let kinds: Vec<_> = entries.list.iter().map(Entry::kind).collect();
+        let kinds: Vec<_> = entries
+            .list
+            .iter()
+            .map(Entry::kind)
+            .filter(|k| *k != "done")
+            .collect();
         assert_eq!(kinds, ["user", "user", "user"]);
-        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        let texts: Vec<_> = entries
+            .list
+            .iter()
+            .filter(|e| e.kind() != "done")
+            .map(Entry::text)
+            .collect();
         assert_eq!(texts, ["a", "b", "c"]);
     }
 
@@ -1437,14 +1470,24 @@ mod tests {
         session.on_agent(AgentEvent::Text("answer".to_string()));
         {
             let entries = session.entries();
-            let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+            let texts: Vec<_> = entries
+                .list
+                .iter()
+                .filter(|e| e.kind() != "done")
+                .map(Entry::text)
+                .collect();
             assert_eq!(texts, ["a", "half an answer"]);
         }
 
         session.on_agent(AgentEvent::TurnEnd);
         assert_eq!(rx_user.try_recv().unwrap(), "b");
         let entries = session.entries();
-        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        let texts: Vec<_> = entries
+            .list
+            .iter()
+            .filter(|e| e.kind() != "done")
+            .map(Entry::text)
+            .collect();
         assert_eq!(texts, ["a", "half an answer", "b"]);
     }
 
@@ -1463,10 +1506,17 @@ mod tests {
         assert_eq!(session.state().queued, ["/pdf"]);
         session.on_agent(AgentEvent::TurnEnd);
         assert_eq!(rx_user.try_recv().unwrap(), "Use the `pdf` skill.");
-        let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| !matches!(e, Event::Done { .. }))
+            .collect();
         assert!(seen.contains(&Event::User("/pdf".to_string())), "{seen:?}");
         let entries = session.entries();
-        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        let texts: Vec<_> = entries
+            .list
+            .iter()
+            .filter(|e| e.kind() != "done")
+            .map(Entry::text)
+            .collect();
         assert_eq!(texts, ["/pdf", "/pdf"]);
     }
 
@@ -1593,7 +1643,9 @@ mod tests {
         assert_eq!(typed, ["a", "b", "Use the `pdf` skill."]);
         // They show after the call they were typed during, as typed, and as messages
         // of the same turn rather than turns of their own.
-        let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| !matches!(e, Event::Done { .. }))
+            .collect();
         let at = |want: &Event| seen.iter().position(|e| e == want).unwrap();
         let first_call = seen
             .iter()
@@ -1607,7 +1659,12 @@ mod tests {
         let turns = seen.iter().filter(|e| matches!(e, Event::User(_))).count();
         assert_eq!(turns, 1, "{seen:?}");
         let entries = session.entries();
-        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        let texts: Vec<_> = entries
+            .list
+            .iter()
+            .filter(|e| e.kind() != "done")
+            .map(Entry::text)
+            .collect();
         assert_eq!(texts, ["a", "b", "/pdf"]);
         assert!(session.queued().is_empty());
     }
@@ -1635,7 +1692,12 @@ mod tests {
         session.on_agent(AgentEvent::TurnEnd);
         assert!(!session.state().working);
         let entries = session.entries();
-        let texts: Vec<_> = entries.list.iter().map(Entry::text).collect();
+        let texts: Vec<_> = entries
+            .list
+            .iter()
+            .filter(|e| e.kind() != "done")
+            .map(Entry::text)
+            .collect();
         assert_eq!(texts, ["a", "interrupted", "b", "c"]);
     }
 
@@ -1890,6 +1952,25 @@ mod tests {
             input,
             ..Usage::default()
         }));
+    }
+
+    #[test]
+    fn a_turn_says_how_long_it_ran_as_it_ends() {
+        let (session, _control) = on("gpt-5.5");
+        let mut events = session.subscribe();
+        // Nothing was running, so there is nothing to time.
+        session.on_agent(AgentEvent::TurnEnd);
+        assert_eq!(events.try_recv().unwrap(), Event::TurnEnd);
+        session.compact(None).unwrap();
+        session.on_agent(AgentEvent::TurnEnd);
+        let done = std::iter::from_fn(|| events.try_recv().ok())
+            .find(|e| matches!(e, Event::Done { .. }))
+            .expect("a done event");
+        let Event::Done { seconds, at } = done else {
+            unreachable!()
+        };
+        assert_eq!(seconds, 0);
+        assert!(at.ends_with("AM") || at.ends_with("PM"), "{at}");
     }
 
     #[test]

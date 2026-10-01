@@ -3678,7 +3678,12 @@ mod tests {
 
         // The queued prompt became a user entry where it was typed, not a second one.
         let entries = session.entries();
-        let shown: Vec<(&str, &str)> = entries.list.iter().map(|e| (e.kind(), e.text())).collect();
+        let shown: Vec<(&str, &str)> = entries
+            .list
+            .iter()
+            .filter(|e| e.kind() != "done")
+            .map(|e| (e.kind(), e.text()))
+            .collect();
         // The fake streams no text, so the transcript is the two prompts alone.
         assert_eq!(shown, [("user", "first"), ("user", "second")]);
         drop(entries);

@@ -896,6 +896,7 @@ fn entry_lines(
         }
         Entry::Error(t) | Entry::Failed(t) => ("! ", t, Style::new().fg(Color::Red).bold()),
         Entry::Info(t) => ("", t, Style::new().fg(Color::DarkGray)),
+        Entry::Done(t) => ("\u{273b} ", t, Style::new().fg(Color::DarkGray)),
         Entry::Summary(t) => ("≡ ", t, Style::new().fg(Color::DarkGray)),
     };
 
