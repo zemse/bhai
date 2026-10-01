@@ -24,6 +24,7 @@ mod input;
 mod instructions;
 mod judge;
 mod limits;
+mod links;
 mod markdown;
 mod mcp;
 mod mermaid;

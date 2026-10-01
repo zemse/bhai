@@ -68,8 +68,7 @@ pub fn said(copied: usize, of: usize) -> String {
 }
 
 /// Whether bhai runs in an ssh session, by the variables sshd sets.
-#[cfg_attr(test, allow(dead_code))]
-fn over_ssh(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+pub fn over_ssh(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
     ["SSH_CONNECTION", "SSH_TTY"]
         .iter()
         .any(|name| var(name).is_some_and(|value| !value.is_empty()))

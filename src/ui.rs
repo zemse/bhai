@@ -59,6 +59,32 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     draw(frame, app);
     // Last, so it sits over whatever the drag was made on.
     render_copied(frame, app);
+    // After everything, so a link never runs under an overlay drawn over the transcript.
+    render_links(frame, app);
+}
+
+/// The URLs and file paths in the transcript rows in view, as OSC 8 links.
+fn render_links(frame: &mut Frame, app: &App) {
+    let Some(area) = app.transcript_area else {
+        return;
+    };
+    let view = app.scroll..(app.scroll + area.height as usize).min(app.lines.len());
+    let root = std::env::current_dir().unwrap_or_default();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let places = crate::links::Places {
+        root: &root,
+        home: home.as_deref(),
+        files: !crate::clipboard::over_ssh(|name| std::env::var_os(name)),
+    };
+    crate::links::stamp(
+        frame.buffer_mut(),
+        area,
+        view,
+        &app.lines,
+        &app.joins,
+        &app.margins,
+        &places,
+    );
 }
 
 /// What a drag's copy leaves behind, beside where the drag ended so the eye is already
@@ -3744,5 +3770,33 @@ mod tests {
         let shown = screen(&narrow);
         assert!(shown.contains("ship."), "{shown}");
         assert!(shown.contains("[y] trust"), "{shown}");
+    }
+
+    #[test]
+    fn a_url_in_a_message_is_drawn_as_an_osc_8_link() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Assistant(
+            "read [the docs](https://example.com/d) first".to_string(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let linked: String = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol().contains("\x1b]8;id="))
+            .map(|cell| {
+                assert!(cell.symbol().contains(";https://example.com/d\x1b\\"));
+                assert!(cell.symbol().ends_with("\x1b]8;;\x1b\\"));
+                cell.symbol()
+                    .split('\\')
+                    .nth(1)
+                    .unwrap()
+                    .chars()
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(linked, "https://example.com/d");
     }
 }
