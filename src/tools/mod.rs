@@ -95,8 +95,11 @@ impl Registry {
         self
     }
 
-    /// The `agent` tool, for a parent session only.
+    /// The `agent` tool and its `close_agent`, for a parent session only.
     pub fn with_agent(mut self, agent: agent::Agent) -> Self {
+        self.tools.push(Box::new(agent::Close {
+            cancel: Arc::clone(&agent.cancel),
+        }));
         self.tools.push(Box::new(agent));
         self
     }

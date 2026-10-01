@@ -474,7 +474,7 @@ pub type Results = mpsc::UnboundedSender<ChildResult>;
 #[derive(Default)]
 pub struct Cancel {
     turn: Arc<AtomicBool>,
-    children: Mutex<Vec<Arc<AtomicBool>>>,
+    children: Mutex<Vec<(String, Arc<AtomicBool>)>>,
 }
 
 impl Cancel {
@@ -490,8 +490,24 @@ impl Cancel {
     /// Stop the turn and every child still running under it.
     pub fn stop(&self) {
         self.turn.store(true, Ordering::Relaxed);
-        for child in self.lock().iter() {
+        for (_, child) in self.lock().iter() {
             child.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Stop child `id` alone, leaving the turn and its siblings running. False when no
+    /// child of that id is still running.
+    pub fn stop_child(&self, id: &str) -> bool {
+        let children = self.lock();
+        match children
+            .iter()
+            .find(|(own, flag)| own == id && Arc::strong_count(flag) > 1)
+        {
+            Some((_, flag)) => {
+                flag.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
         }
     }
 
@@ -503,15 +519,15 @@ impl Cancel {
     /// A flag for a child about to start: already set if the turn is, and latched by any
     /// later `stop`. The one the finished children left behind are dropped here, since a
     /// flag only the list still holds belongs to a task that has ended.
-    pub fn child(&self) -> Arc<AtomicBool> {
+    pub fn child(&self, id: &str) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(self.stopped()));
         let mut children = self.lock();
-        children.retain(|c| Arc::strong_count(c) > 1);
-        children.push(Arc::clone(&flag));
+        children.retain(|(_, c)| Arc::strong_count(c) > 1);
+        children.push((id.to_string(), Arc::clone(&flag)));
         flag
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Arc<AtomicBool>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(String, Arc<AtomicBool>)>> {
         self.children.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -2509,7 +2525,7 @@ mod tests {
     #[test]
     fn an_interrupt_latches_on_a_child_that_outlives_the_turn() {
         let stop = Cancel::default();
-        let child = stop.child();
+        let child = stop.child("a");
         stop.stop();
         assert!(stop.stopped());
         assert!(child.load(Ordering::Relaxed));
@@ -2524,16 +2540,29 @@ mod tests {
         let stop = Cancel::default();
         stop.stop();
         assert!(
-            stop.child().load(Ordering::Relaxed),
+            stop.child("a").load(Ordering::Relaxed),
             "a child queued behind a slot must not start after an interrupt"
         );
     }
 
     #[test]
+    fn one_child_can_be_stopped_alone() {
+        let stop = Cancel::default();
+        let (a, b) = (stop.child("a"), stop.child("b"));
+        assert!(stop.stop_child("a"));
+        assert!(a.load(Ordering::Relaxed));
+        assert!(!b.load(Ordering::Relaxed), "a sibling was stopped too");
+        assert!(!stop.stopped(), "the turn was stopped");
+        assert!(!stop.stop_child("c"), "no such child");
+        drop(b);
+        assert!(!stop.stop_child("b"), "a finished child is not running");
+    }
+
+    #[test]
     fn a_finished_child_is_dropped_from_the_list() {
         let stop = Cancel::default();
-        drop(stop.child());
-        let _running = stop.child();
+        drop(stop.child("a"));
+        let _running = stop.child("b");
         assert_eq!(stop.tracked(), 1, "the finished child was kept");
     }
 

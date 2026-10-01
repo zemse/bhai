@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{self, KeepAlive, Sse};
@@ -62,6 +62,7 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/untrust", post(untrust))
         .route("/children", get(children))
         .route("/steer", post(steer))
+        .route("/children/{id}/interrupt", post(interrupt_child))
         .layer(middleware::from_fn(move |request, next| {
             let token = token.clone();
             async move { local_only(&token, request, next).await }
@@ -257,6 +258,17 @@ async fn children(State(session): State<Arc<Session>>) -> Response {
         })
         .collect();
     Json(json!({ "children": children })).into_response()
+}
+
+/// Stop one running child agent, as ctrl+x in its pane does.
+async fn interrupt_child(State(session): State<Arc<Session>>, Path(id): Path<String>) -> Response {
+    match session.interrupt_child(&id) {
+        true => ok(),
+        false => error(
+            StatusCode::NOT_FOUND,
+            "no child agent of that id is running",
+        ),
+    }
 }
 
 /// Post a message to a running child agent, as typing into its pane does.
@@ -1092,5 +1104,37 @@ mod tests {
             post(&http, format!("{base}/interrupt"), json!({})).await,
             StatusCode::CONFLICT
         );
+    }
+
+    #[tokio::test]
+    async fn one_child_is_interrupted_over_http() {
+        let cancel = Arc::new(crate::agent::Cancel::default());
+        let (tx_user, _) = mpsc::channel(1);
+        let (tx_control, _) = mpsc::channel(1);
+        let session = Session::new(
+            "test-model".to_string(),
+            "medium".to_string(),
+            "router".to_string(),
+            tx_user,
+            tx_control,
+            Arc::clone(&cancel),
+            Arc::new(Policy::default()),
+            None,
+        );
+        let listener = bind(0).await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(serve(listener, Arc::clone(&session), TOKEN.to_string()));
+        let flag = cancel.child("a1");
+        let http = reqwest::Client::new();
+        let url = |id: &str| format!("{base}/children/{id}/interrupt");
+
+        assert_eq!(
+            post(&http, url("zzzzzz"), json!({})).await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(post(&http, url("a1"), json!({})).await, StatusCode::OK);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!cancel.stopped(), "the turn was not interrupted");
     }
 }

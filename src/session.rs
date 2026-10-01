@@ -1254,6 +1254,19 @@ impl Session {
         Ok(())
     }
 
+    /// Stop child agent `id` alone, as ctrl+x in its pane does. False when no child of
+    /// that id is running, which includes a workflow step: it shares its run's flag.
+    pub fn interrupt_child(&self, id: &str) -> bool {
+        if !self.cancel.stop_child(id) {
+            return false;
+        }
+        self.publish(Event::Child {
+            id: id.to_string(),
+            event: Box::new(Event::Info("stopped by you".to_string())),
+        });
+        true
+    }
+
     /// Whether any child agent is still running, detached from the turn that started it.
     pub fn child_running(&self) -> bool {
         self.panes()
@@ -1558,6 +1571,25 @@ mod tests {
             ok: false,
         });
         assert!(!session.interrupt());
+    }
+
+    #[test]
+    fn one_child_is_interrupted_and_the_rest_keep_running() {
+        let (session, _rx) = session();
+        child(&session, "a1", "count the files");
+        child(&session, "b2", "read the docs");
+        let (a, b) = (session.cancel.child("a1"), session.cancel.child("b2"));
+        assert!(session.interrupt_child("a1"));
+        assert!(a.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!b.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!session.cancel.stopped());
+        let pane = session.child_entries("a1").unwrap();
+        let pane = pane.lock().unwrap();
+        assert!(matches!(pane.list.last(), Some(Entry::Info(t)) if t == "stopped by you"));
+        drop(pane);
+        assert!(!session.interrupt_child("nobody"));
+        drop(b);
+        assert!(!session.interrupt_child("b2"), "it has ended");
     }
 
     #[test]

@@ -1177,7 +1177,7 @@ fn render_children(frame: &mut Frame, area: Rect, app: &mut App, children: &[Chi
     let dim = Style::new().fg(Color::DarkGray);
     let open = app.inside.as_ref().map(|inside| inside.id.as_str());
     let hint = match open {
-        Some(_) => " ctrl+o next · esc close ",
+        Some(_) => " ctrl+o next · ctrl+x stop · esc close ",
         None => " ctrl+o opens one · click to read ",
     };
     let block = Block::bordered()

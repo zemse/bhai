@@ -16,6 +16,7 @@ use crate::judge::Judge;
 use crate::permissions::Policy;
 
 pub const NAME: &str = "agent";
+pub const CLOSE: &str = "close_agent";
 
 /// Children of one parent running at once. A call past that is still accepted; the
 /// child waits for a slot rather than the parent waiting for the call.
@@ -151,6 +152,62 @@ message when it finishes; nothing else is needed to collect it."
     }
 }
 
+/// Stop one running child, for the model that started it. The child's report still
+/// arrives, saying how far it got.
+pub struct Close {
+    pub cancel: Arc<Cancel>,
+}
+
+impl Tool for Close {
+    fn name(&self) -> &str {
+        CLOSE
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "function",
+            "name": CLOSE,
+            "description": "Stop a child agent that is still running, by the id `agent` \
+        returned. Use it for a child that is off track or no longer needed; the other children \
+        carry on. Its report still arrives, with what it had done.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The child's id."
+                    }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    fn needs_approval(&self) -> bool {
+        false
+    }
+
+    fn describe(&self, args: &Value) -> Result<String, String> {
+        let id = string_arg(args, "id").ok_or("missing required string field `id`.")?;
+        Ok(format!("close agent {id}"))
+    }
+
+    fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
+        Box::pin(async move {
+            let id = match string_arg(args, "id") {
+                Some(id) => id.trim(),
+                None => return ("missing required string field `id`.".to_string(), false),
+            };
+            match self.cancel.stop_child(id) {
+                true => (format!("child {id} is stopping."), true),
+                false => (format!("no child {id} is running."), false),
+            }
+        })
+    }
+}
+
 impl Agent {
     /// Run the child detached, so the turn that asked for it carries on. It holds a
     /// slot for as long as it runs and posts its report when it ends; the parent reads
@@ -167,7 +224,7 @@ impl Agent {
         );
         // Taken here, not inside the task: a child queued behind the running ones must
         // still be stopped by an interrupt that lands before it gets a slot.
-        let (tx, cancel) = (self.tx.clone(), self.cancel.child());
+        let (tx, cancel) = (self.tx.clone(), self.cancel.child(&id));
         let (children, slots) = (Arc::clone(&self.children), Arc::clone(&self.slots));
         let results = self.results.clone();
         // Forked now, so the child starts from what the session had done when it asked.
@@ -395,6 +452,29 @@ mod tests {
             _events: rx,
             results,
         }
+    }
+
+    #[test]
+    fn close_agent_stops_the_named_child_alone() {
+        let harness = tool(&Fake::default(), false);
+        let cancel = Arc::clone(&harness.agent.cancel);
+        let close = Close {
+            cancel: Arc::clone(&cancel),
+        };
+        let (a, b) = (cancel.child("a1"), cancel.child("b2"));
+        let out = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(close.execute(&json!({"id": "a1"})));
+        assert_eq!(out, ("child a1 is stopping.".to_string(), true));
+        assert!(a.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!b.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(close.describe(&json!({})).is_err());
+        assert_eq!(
+            close.describe(&json!({"id": "a1"})).unwrap(),
+            "close agent a1"
+        );
+        assert!(!close.needs_approval());
     }
 
     #[test]

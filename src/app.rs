@@ -523,6 +523,16 @@ impl App {
             }
             // The panel's rows, in order, and then back out to the transcript.
             KeyCode::Char('o') if ctrl => self.cycle_child(),
+            // Inside a pane, the child alone; ctrl+c still stops everything.
+            KeyCode::Char('x') if ctrl && self.inside.is_some() => {
+                let id = self.inside.as_ref().map(|inside| inside.id.clone());
+                if let Some(id) = id
+                    && !self.session.interrupt_child(&id)
+                {
+                    self.entries()
+                        .push(Entry::Error("that subagent has finished".to_string()));
+                }
+            }
             KeyCode::Esc if self.inside.is_some() => self.leave_child(),
             KeyCode::Esc if self.busy() => self.confirm_interrupt(),
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
@@ -2418,6 +2428,49 @@ mod tests {
         app.on_key(ctrl_o());
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.inside.is_none());
+    }
+
+    #[test]
+    fn ctrl_x_inside_a_pane_stops_that_child_only() {
+        let cancel = Arc::new(crate::agent::Cancel::default());
+        let (tx_user, _) = tokio::sync::mpsc::channel(1);
+        let (tx_control, _) = tokio::sync::mpsc::channel(1);
+        let mut app = App::new(Session::new(
+            "m".to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            Arc::clone(&cancel),
+            Arc::default(),
+            None,
+        ));
+        for id in ["a1", "b2"] {
+            app.session().publish(Event::ChildStarted {
+                id: id.to_string(),
+                identity: "worker".to_string(),
+                description: "read the docs".to_string(),
+                task: "go".to_string(),
+            });
+        }
+        let (a, b) = (cancel.child("a1"), cancel.child("b2"));
+        let ctrl_x = || key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+        // Outside a pane the key means nothing.
+        app.on_key(ctrl_x());
+        assert!(!a.load(std::sync::atomic::Ordering::Relaxed));
+
+        app.open_child("a1");
+        app.on_key(ctrl_x());
+        assert!(a.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!b.load(std::sync::atomic::Ordering::Relaxed));
+
+        drop(a);
+        app.on_key(ctrl_x());
+        assert!(matches!(
+            app.entries().list.last(),
+            Some(Entry::Error(t)) if t == "that subagent has finished"
+        ));
     }
 
     #[test]
