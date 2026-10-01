@@ -19,6 +19,8 @@ const LIVE_BYTES: usize = 16_000;
 pub enum Entry {
     User(String),
     Assistant(String),
+    /// What the model said before carrying on, as opposed to its answer.
+    Commentary(String),
     Reasoning(String),
     /// A tool call, kept with the tool that ran it so the transcript can draw a shell
     /// command as one and everything else as what it is.
@@ -96,6 +98,7 @@ impl Entries {
             Event::Resumed(what) => self.push(Entry::Info(format!("resumed {what}"))),
             Event::Queued { .. } => {}
             Event::Text(delta) => self.append(delta, Stream::Assistant),
+            Event::Commentary(delta) => self.append(delta, Stream::Commentary),
             Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
             Event::ToolStart {
                 tool,
@@ -207,6 +210,9 @@ impl Entries {
                         None => Entry::User(text("content")),
                     },
                 },
+                Some("message") if crate::client::is_commentary(item) => {
+                    Entry::Commentary(text("content"))
+                }
                 Some("message") => Entry::Assistant(text("content")),
                 Some("reasoning") if !text("summary").is_empty() => {
                     Entry::Reasoning(text("summary"))
@@ -284,7 +290,7 @@ impl Entries {
         let of = |want: fn(&Entry) -> bool| -> Vec<usize> {
             fresh.clone().filter(|&i| want(&self.list[i])).collect()
         };
-        let text = of(|e| matches!(e, Entry::Assistant(_)));
+        let text = of(|e| matches!(e, Entry::Assistant(_) | Entry::Commentary(_)));
         let thinking = of(|e| matches!(e, Entry::Reasoning(_)));
         self.share(&text, call.text, |tokens, part| tokens.output = Some(part));
         self.share(&thinking, call.usage.reasoning, |tokens, part| {
@@ -381,6 +387,7 @@ impl Entries {
         let open = self.list.len() > self.attribution.mark;
         match (self.list.last_mut().filter(|_| open), kind) {
             (Some(Entry::Assistant(text)), Stream::Assistant)
+            | (Some(Entry::Commentary(text)), Stream::Commentary)
             | (Some(Entry::Reasoning(text)), Stream::Reasoning) => {
                 text.push_str(delta);
                 return;
@@ -394,6 +401,7 @@ impl Entries {
         }
         self.list.push(match kind {
             Stream::Assistant => Entry::Assistant(text),
+            Stream::Commentary => Entry::Commentary(text),
             Stream::Reasoning => Entry::Reasoning(text),
         });
     }
@@ -404,6 +412,7 @@ impl Entry {
         match self {
             Entry::User(t)
             | Entry::Assistant(t)
+            | Entry::Commentary(t)
             | Entry::Reasoning(t)
             | Entry::Command { summary: t, .. }
             | Entry::Running { tail: t, .. }
@@ -422,6 +431,7 @@ impl Entry {
         match self {
             Entry::User(_) => "user",
             Entry::Assistant(_) => "assistant",
+            Entry::Commentary(_) => "commentary",
             Entry::Reasoning(_) => "thinking",
             Entry::Command { .. } => "command",
             Entry::Running { .. } => "running",
@@ -464,6 +474,7 @@ fn summarised(text: &str) -> Option<String> {
 #[derive(Clone, Copy)]
 enum Stream {
     Assistant,
+    Commentary,
     Reasoning,
 }
 
@@ -774,6 +785,25 @@ mod tests {
         assert_eq!(kinds, ["user", "command", "output", "assistant"]);
         assert_eq!(app.list[3].text(), "ok");
         assert_eq!(app.attribution.items.get(&3), Some(&3));
+    }
+
+    #[test]
+    fn commentary_is_kept_apart_from_the_answer_it_leads_to() {
+        let mut app = intro();
+        app.apply(&Event::Commentary("checking ".to_string()));
+        app.apply(&Event::Commentary("first".to_string()));
+        app.apply(&Event::Text("found it".to_string()));
+        let kinds: Vec<_> = app.list[1..].iter().map(Entry::kind).collect();
+        assert_eq!(kinds, ["commentary", "assistant"]);
+        assert_eq!(app.list[1].text(), "checking first");
+
+        let mut restored = intro();
+        let message = |text: &str| serde_json::json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]});
+        let mut preamble = message("checking first");
+        preamble["phase"] = serde_json::json!("commentary");
+        restored.restore(&[preamble, message("found it")]);
+        let kinds: Vec<_> = restored.list[1..].iter().map(Entry::kind).collect();
+        assert_eq!(kinds, ["commentary", "assistant"]);
     }
 
     #[test]

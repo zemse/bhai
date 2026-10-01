@@ -1008,7 +1008,7 @@ impl App {
             return None;
         }
         let entries = self.entries();
-        let Some(Entry::Assistant(text)) = entries.list.get(entry) else {
+        let Some(Entry::Assistant(text) | Entry::Commentary(text)) = entries.list.get(entry) else {
             return None;
         };
         let text = crate::wrap::readable(text);
@@ -1220,7 +1220,7 @@ impl App {
                 true => self.speed.start(Instant::now()),
                 false => self.speed.end(Instant::now()),
             },
-            Event::Reasoning(ref text) | Event::Text(ref text) => {
+            Event::Reasoning(ref text) | Event::Text(ref text) | Event::Commentary(ref text) => {
                 let tokens = crate::tokens::for_model(&self.model).count(text);
                 self.speed.streamed(Instant::now(), tokens as u64);
             }

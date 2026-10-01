@@ -139,6 +139,9 @@ pub struct Choice {
 pub enum Delta {
     Reasoning(String),
     Text(String),
+    /// Text of a message in the `commentary` phase: a preamble the model writes before
+    /// it carries on, not its answer.
+    Commentary(String),
     Usage(Usage),
     /// The request about to be sent breaks the prompt cache, or `None` when it is clean.
     Cache(Option<CacheBreak>),
@@ -147,6 +150,9 @@ pub enum Delta {
     /// The backend stopped the model at its output cap: what streamed is the whole
     /// answer, and there is no more of it to ask for.
     Truncated,
+    /// The backend said the turn is not over (`end_turn: false`), so an answer with no
+    /// tool call is not the last word and the model is sampled again.
+    Continues,
 }
 
 /// Token counts for one model call, as `response.completed` reports them.
@@ -597,10 +603,14 @@ impl Client {
         // turn is assembled from the per-item `done` events instead.
         let mut items: Vec<Value> = Vec::new();
         let mut completed = false;
+        let mut continues = false;
         // Held until the attempt succeeds: an error after the terminal event retries the
         // whole call, and usage reported for an attempt that was sent again is counted
         // twice.
         let mut usage: Option<Usage> = None;
+        // Ids of the messages in the `commentary` phase. The phase is on the item when it
+        // is added, not on its text deltas.
+        let mut commentary: Vec<String> = Vec::new();
 
         loop {
             let chunk = match watched(stream.next(), cancel, "stream idle for too long").await? {
@@ -624,9 +634,23 @@ impl Client {
                 };
                 debug_log(data);
                 match event.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "response.output_item.added" => {
+                        if let Some(item) = event.get("item")
+                            && is_commentary(item)
+                            && let Some(id) = item.get("id").and_then(Value::as_str)
+                        {
+                            commentary.push(id.to_string());
+                        }
+                    }
                     "response.output_text.delta" => {
                         if let Some(d) = event.get("delta").and_then(Value::as_str) {
-                            on_delta(Delta::Text(d.to_string()));
+                            let id = event.get("item_id").and_then(Value::as_str);
+                            on_delta(
+                                match id.is_some_and(|id| commentary.iter().any(|c| c == id)) {
+                                    true => Delta::Commentary(d.to_string()),
+                                    false => Delta::Text(d.to_string()),
+                                },
+                            );
                         }
                     }
                     "response.reasoning_summary_text.delta" => {
@@ -649,6 +673,8 @@ impl Client {
                         if event.get("type").and_then(Value::as_str) == Some("response.incomplete")
                         {
                             on_delta(Delta::Truncated);
+                        } else {
+                            continues = event.pointer("/response/end_turn") == Some(&json!(false));
                         }
                         // Some deployments do populate it; prefer their copy when present.
                         if let Some(output) = event
@@ -693,6 +719,9 @@ impl Client {
         if completed {
             if let Some(usage) = usage {
                 on_delta(Delta::Usage(usage));
+            }
+            if continues {
+                on_delta(Delta::Continues);
             }
             if let Some(task) = usage_fetch
                 && let Ok(Ok(Ok(body))) = tokio::time::timeout(USAGE_WAIT, task).await
@@ -819,6 +848,12 @@ pub fn request_body(
         "include": ["reasoning.encrypted_content"],
         "prompt_cache_key": cache_key,
     })
+}
+
+/// Whether `item` is a message the model wrote in the `commentary` phase.
+pub(crate) fn is_commentary(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("message")
+        && item.get("phase").and_then(Value::as_str) == Some("commentary")
 }
 
 /// The assistant's text across the output items of one call.

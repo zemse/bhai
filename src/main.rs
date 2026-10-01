@@ -973,6 +973,8 @@ impl ExecRun {
         } else {
             match event {
                 Event::Text(delta) => write!(out, "{delta}")?,
+                // Narration on the way to the answer; stdout keeps the answer alone.
+                Event::Commentary(delta) => write!(err, "{delta}")?,
                 Event::ToolStart { summary, .. } => writeln!(err, "$ {summary}")?,
                 Event::ToolRejected {
                     summary, reason, ..
@@ -1074,6 +1076,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             AgentEvent::Reasoning(_) => {}
+            AgentEvent::Commentary(delta) => print!("{delta}"),
             AgentEvent::Approval { command, reply, .. } => {
                 println!("\n[would run] {command}\n[probe rejects it]");
                 let _ = reply.send(permissions::Answer::Reject);

@@ -906,7 +906,12 @@ fn entry_lines(
     if let Entry::Diff(text) = entry {
         return diff_entry(text, width, expanded);
     }
-    if let Entry::Assistant(text) = entry {
+    if let Entry::Assistant(text) | Entry::Commentary(text) = entry {
+        // Commentary is narration on the way to the answer, so it sits back from it.
+        let tone = match entry {
+            Entry::Commentary(_) => Style::new().fg(Color::DarkGray),
+            _ => Style::new(),
+        };
         let lead = MESSAGE_MARK.chars().count();
         let indent = " ".repeat(lead);
         let rendered = markdown::render(text, width.saturating_sub(lead).max(4));
@@ -934,7 +939,7 @@ fn entry_lines(
                         _ => Span::raw(indent.clone()),
                     },
                 );
-                line
+                line.patch_style(tone)
             })
             .collect();
         // A message that has only started still gets its mark, so the eye has somewhere
@@ -961,7 +966,7 @@ fn entry_lines(
     let rejected: String;
     let (prefix, text, style): (&str, &str, Style) = match entry {
         Entry::User(t) => ("› ", t, Style::new().bg(USER_BG)),
-        Entry::Assistant(t) => ("", t, Style::new()),
+        Entry::Assistant(t) | Entry::Commentary(t) => ("", t, Style::new()),
         Entry::Reasoning(t) => ("✻ ", t, Style::new().fg(Color::DarkGray).italic()),
         Entry::Command { tool, summary } => {
             let (prefix, colour) = tool_mark(tool);
@@ -2494,6 +2499,21 @@ mod tests {
         assert!(app.on_mouse(up(4, rows.start)));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(screen(&terminal).contains("[+2 lines]"), "still collapsed");
+    }
+
+    #[test]
+    fn commentary_is_drawn_dimmer_than_the_answer() {
+        let fg = |entry: Entry| {
+            let rows = entry_lines(&entry, 40, false, false, None);
+            let line = &rows.lines[0];
+            let span = line.spans.last().unwrap();
+            line.style.patch(span.style).fg
+        };
+        assert_eq!(
+            fg(Entry::Commentary("checking first".to_string())),
+            Some(Color::DarkGray)
+        );
+        assert_eq!(fg(Entry::Assistant("found it".to_string())), None);
     }
 
     #[test]

@@ -33,6 +33,9 @@ use crate::workflow::{self, Workflow};
 /// is otherwise unbounded: a long task keeps going until it is done, interrupted, or
 /// stuck on failing calls.
 const MAX_ERROR_ROUNDS: usize = 3;
+/// Calls in a row a turn makes on `end_turn: false` with no tool call between them,
+/// before it ends anyway.
+const MAX_CONTINUES: usize = 8;
 
 /// How long an idle session with a goal active waits before opening a turn on it.
 const GOAL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
@@ -42,6 +45,8 @@ const GOAL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 pub enum AgentEvent {
     Reasoning(String),
     Text(String),
+    /// Text the model writes before carrying on, rather than as its answer.
+    Commentary(String),
     /// The agent wants to run a tool call; `reply` carries the user's decision back.
     Approval {
         tool: String,
@@ -1390,6 +1395,7 @@ async fn turn(
 ) -> Turn {
     let mut error_rounds = 0usize;
     let mut truncated = false;
+    let mut continued = 0usize;
 
     let mut step = 0usize;
     loop {
@@ -1458,10 +1464,16 @@ async fn turn(
         }
         let sent = history.len();
         let mut finished = None;
+        let mut continues = false;
         let mut on_delta = |delta: Delta| {
             let _ = tx.send(match delta {
                 Delta::Reasoning(s) => AgentEvent::Reasoning(s),
                 Delta::Text(s) => AgentEvent::Text(s),
+                Delta::Commentary(s) => AgentEvent::Commentary(s),
+                Delta::Continues => {
+                    continues = true;
+                    return;
+                }
                 Delta::Usage(usage) => {
                     finished = Some(usage);
                     // A backend that never reports a cached count would look like an
@@ -1540,12 +1552,25 @@ async fn turn(
             record(sink, &history[sent..], tx);
             // A message typed while that answer was being written is not lost: it goes
             // in and the agent keeps going rather than ending on the answer before it.
-            let Some(from) = steered(steer.as_mut(), history, tx) else {
+            if let Some(from) = steered(steer.as_mut(), history, tx) {
+                record(sink, &history[from..], tx);
+                continue;
+            }
+            // A preamble on `end_turn: false` is the model narrating before it carries on;
+            // ending there leaves the work undone.
+            if !continues {
                 return Turn::ended(step, truncated);
-            };
-            record(sink, &history[from..], tx);
+            }
+            continued += 1;
+            if continued > MAX_CONTINUES {
+                let _ = tx.send(AgentEvent::Info(format!(
+                    "stopped: the model asked to carry on {MAX_CONTINUES} times without acting"
+                )));
+                return Turn::ended(step, truncated);
+            }
             continue;
         }
+        continued = 0;
 
         let mut results = Vec::with_capacity(calls.len());
         let mut all_failed = true;
@@ -2061,6 +2086,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 // Everything the child says goes to its own pane.
                 said @ (AgentEvent::Reasoning(_)
                 | AgentEvent::Text(_)
+                | AgentEvent::Commentary(_)
                 | AgentEvent::ToolStart { .. }
                 | AgentEvent::ToolProgress(_)
                 | AgentEvent::ToolOutput(_)
@@ -2192,6 +2218,13 @@ fn final_text(history: &[Value]) -> Option<String> {
     if answer.is_empty() {
         return None;
     }
+    // The preambles before an answer are narration; they stand only when nothing else does.
+    let spoken: Vec<&Value> = answer
+        .iter()
+        .copied()
+        .filter(|m| !crate::client::is_commentary(m))
+        .collect();
+    let answer = if spoken.is_empty() { answer } else { spoken };
     let text: Vec<&str> = answer
         .iter()
         .rev()
@@ -2528,6 +2561,8 @@ pub mod fake {
     pub const HANG: &str = "fake.hang";
     /// A script step the backend refuses as a bad request.
     pub const REFUSE: &str = "fake.refuse";
+    /// Leads a script step that ends on `end_turn: false`.
+    pub const CONTINUES: &str = "fake.continues";
 
     /// Answers each call with the next scripted output and remembers the tool names
     /// every call was offered. Each call's request body is built and checked as the
@@ -2654,6 +2689,13 @@ pub mod fake {
         })
     }
 
+    /// A commentary-phase message on `end_turn: false`: narration before the model carries on.
+    pub fn preamble(text: &str) -> Vec<Value> {
+        let mut said = say(text);
+        said["phase"] = json!("commentary");
+        vec![json!({ "type": CONTINUES }), said]
+    }
+
     /// A script step of the given kind, such as `FAIL`.
     pub fn step(kind: &str) -> Vec<Value> {
         vec![json!({ "type": kind })]
@@ -2707,7 +2749,19 @@ pub mod fake {
                     }
                     false => self.script.lock().unwrap().pop_front(),
                 };
-                let next = next.ok_or_else(|| anyhow!("the script ran out"))?;
+                let mut next = next.ok_or_else(|| anyhow!("the script ran out"))?;
+                let continues =
+                    next.first().and_then(|item| item["type"].as_str()) == Some(CONTINUES);
+                if continues {
+                    next.remove(0);
+                    for item in next
+                        .iter()
+                        .filter(|item| crate::client::is_commentary(item))
+                    {
+                        let text = item["content"][0]["text"].as_str().unwrap_or_default();
+                        on_delta(Delta::Commentary(text.to_string()));
+                    }
+                }
                 match next.first().and_then(|item| item["type"].as_str()) {
                     Some(FAIL) => bail!("scripted failure"),
                     Some(REFUSE) => {
@@ -2724,6 +2778,9 @@ pub mod fake {
                     _ => {}
                 }
                 on_delta(Delta::Usage(self.usage));
+                if continues {
+                    on_delta(Delta::Continues);
+                }
                 Ok(next)
             })
         }
@@ -3194,6 +3251,86 @@ mod tests {
         let bodies = fake.bodies.lock().unwrap().clone();
         let input = bodies.last().unwrap().1["input"].to_string();
         assert!(input.contains("look again"), "{input}");
+    }
+
+    #[tokio::test]
+    async fn a_preamble_on_end_turn_false_carries_the_turn_on_to_the_answer() {
+        use fake::{Fake, preamble, say};
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fake = Fake::new(vec![preamble("checking first"), vec![say("found it")]]);
+        let policy = Policy::default();
+        let finished = run_child(Child {
+            id: "c1",
+            description: "look around",
+            task: "go",
+            prompt: crate::prompt::system_prompt(&[], Vec::new()),
+            model: &fake,
+            policy: &policy,
+            tx: &tx,
+            cancel: &Arc::new(AtomicBool::new(false)),
+            transcript: None,
+            children: &Children::default(),
+            steer: None,
+            judge: None,
+            contract: None,
+            history: Vec::new(),
+        })
+        .await;
+
+        assert_eq!(finished.steps, 2);
+        // The narration is not the answer the parent is handed.
+        assert_eq!(finished.result.unwrap(), "found it");
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let input = bodies.last().unwrap().1["input"].to_string();
+        assert!(input.contains("checking first"), "{input}");
+        drop(tx);
+        let mut commentary = String::new();
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Child { event, .. } = event
+                && let AgentEvent::Commentary(text) = &*event
+            {
+                commentary.push_str(text);
+            }
+        }
+        assert_eq!(commentary, "checking first");
+    }
+
+    #[tokio::test]
+    async fn a_model_that_only_ever_carries_on_is_stopped() {
+        use fake::{Fake, preamble};
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let script = (0..=MAX_CONTINUES + 1)
+            .map(|n| preamble(&format!("still going {n}")))
+            .collect();
+        let fake = Fake::new(script);
+        let policy = Policy::default();
+        let finished = run_child(Child {
+            id: "c1",
+            description: "look around",
+            task: "go",
+            prompt: crate::prompt::system_prompt(&[], Vec::new()),
+            model: &fake,
+            policy: &policy,
+            tx: &tx,
+            cancel: &Arc::new(AtomicBool::new(false)),
+            transcript: None,
+            children: &Children::default(),
+            steer: None,
+            judge: None,
+            contract: None,
+            history: Vec::new(),
+        })
+        .await;
+
+        assert_eq!(finished.steps, MAX_CONTINUES + 1);
+        // With nothing but narration, the narration is all there is to report.
+        let report = finished.result.unwrap();
+        assert!(
+            report.ends_with(&format!("still going {MAX_CONTINUES}")),
+            "{report}"
+        );
     }
 
     /// A child that cannot write its transcript still says why it ended. The disk is the

@@ -66,6 +66,8 @@ pub enum Event {
     Steered(String),
     Reasoning(String),
     Text(String),
+    /// Text the model writes before carrying on, rather than as its answer.
+    Commentary(String),
     Approval {
         id: u64,
         tool: String,
@@ -997,6 +999,7 @@ impl Session {
         let event = match event {
             AgentEvent::Reasoning(s) => Event::Reasoning(s),
             AgentEvent::Text(s) => Event::Text(s),
+            AgentEvent::Commentary(s) => Event::Commentary(s),
             AgentEvent::Approval {
                 tool,
                 command,
@@ -1386,6 +1389,7 @@ fn said(event: AgentEvent) -> Option<Event> {
     Some(match event {
         AgentEvent::Reasoning(s) => Event::Reasoning(s),
         AgentEvent::Text(s) => Event::Text(s),
+        AgentEvent::Commentary(s) => Event::Commentary(s),
         AgentEvent::ToolStart {
             tool,
             summary,

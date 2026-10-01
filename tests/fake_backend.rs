@@ -119,6 +119,27 @@ fn says(text: &str) -> String {
     ])
 }
 
+/// The model narrating `text` in the commentary phase, then saying the turn is not over.
+fn narrates(text: &str) -> String {
+    let item = json!({
+        "type": "message",
+        "id": "msg_pre",
+        "role": "assistant",
+        "phase": "commentary",
+        "content": [{ "type": "output_text", "text": text }]
+    });
+    let mut added = item.clone();
+    added["content"] = json!([]);
+    let mut done = completed();
+    done["response"]["end_turn"] = json!(false);
+    sse(&[
+        json!({ "type": "response.output_item.added", "item": added }),
+        json!({ "type": "response.output_text.delta", "item_id": "msg_pre", "delta": text }),
+        json!({ "type": "response.output_item.done", "item": item }),
+        done,
+    ])
+}
+
 /// The model asking for `command` in bash.
 fn runs(call_id: &str, command: &str) -> String {
     sse(&[
@@ -431,5 +452,41 @@ async fn a_rejected_call_sends_the_refusal_back_and_runs_nothing() {
     assert!(
         outputs.iter().any(|o| o["call_id"] == "call_9"),
         "{outputs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_commentary_preamble_on_end_turn_false_does_not_end_the_turn() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(narrates("looking first"));
+        replies.push_back(says("here it is"));
+    }
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    let (status, answer) = bhai.post("/prompt", json!({ "text": "find it" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    events.until("turn_end").await;
+    assert_eq!(events.text(), "here it is");
+    let commentary: String = events
+        .got
+        .iter()
+        .filter(|e| e["type"] == "commentary")
+        .filter_map(|e| e["data"].as_str())
+        .collect();
+    assert_eq!(commentary, "looking first");
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    // The preamble goes back as it came, phase and all.
+    let messages = items(&sent[1].body, "message");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m["phase"] == "commentary" && m.to_string().contains("looking first")),
+        "{messages:?}"
     );
 }
