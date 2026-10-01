@@ -24,6 +24,9 @@ const EVENT_BUFFER: usize = 4096;
 /// Events kept for a `/events` client that reconnects to replay.
 pub const EVENT_LOG: usize = 4096;
 
+/// The longest message `steer` posts to a child, in bytes.
+pub const STEER_MAX: usize = 2048;
+
 /// The recent events, each with its `seq`: 1 for the first of the run, then one more for
 /// each, so a gap in what a reader holds is a gap in what it saw.
 #[derive(Default)]
@@ -344,6 +347,8 @@ pub enum SubmitError {
     UnknownEffort(String),
     /// `/compact-then` with no compacted copy to continue from.
     NoFork,
+    /// A message to a child over [`STEER_MAX`] bytes.
+    TooLong(usize),
 }
 
 impl fmt::Display for SubmitError {
@@ -359,6 +364,10 @@ impl fmt::Display for SubmitError {
             ),
             SubmitError::NoFork => f.write_str(
                 "there is no compacted copy yet: one is made while the conversation is idle, just before its cache lapses",
+            ),
+            SubmitError::TooLong(len) => write!(
+                f,
+                "a message to a subagent is at most {STEER_MAX} bytes, this one is {len}"
             ),
             SubmitError::UnknownEffort(effort) => write!(
                 f,
@@ -1237,6 +1246,9 @@ impl Session {
     /// Post `text` to a running child agent. It joins that child's history before its
     /// next model call, and shows in its pane straight away.
     pub fn steer(&self, id: &str, text: String) -> Result<(), SubmitError> {
+        if text.len() > STEER_MAX {
+            return Err(SubmitError::TooLong(text.len()));
+        }
         let posted = self
             .mailboxes
             .lock()
@@ -1603,8 +1615,15 @@ mod tests {
         session.steer("a1", "and the tests".to_string()).unwrap();
         assert_eq!(rx.try_recv().unwrap(), "and the tests");
         let pane = session.child_entries("a1").unwrap();
-        let pane = pane.lock().unwrap();
-        assert!(matches!(&pane.list[1], Entry::User(t) if t == "and the tests"));
+        assert!(matches!(&pane.lock().unwrap().list[1], Entry::User(t) if t == "and the tests"));
+
+        let long = "x".repeat(STEER_MAX + 1);
+        assert!(matches!(
+            session.steer("a1", long),
+            Err(SubmitError::TooLong(n)) if n == STEER_MAX + 1
+        ));
+        assert!(rx.try_recv().is_err(), "a refused message is not posted");
+        session.steer("a1", "x".repeat(STEER_MAX)).unwrap();
 
         drop(_mailbox);
         assert!(

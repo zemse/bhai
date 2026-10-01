@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use crate::permissions::{Answer, Mode, Remember};
-use crate::session::{self, Session, Submitted};
+use crate::session::{self, Session, SubmitError, Submitted};
 
 /// Port `--serve` listens on when none is given.
 pub const DEFAULT_PORT: u16 = 7878;
@@ -279,6 +279,7 @@ async fn steer(State(session): State<Arc<Session>>, Json(body): Json<Steer>) -> 
     }
     match session.steer(&body.id, text) {
         Ok(()) => ok(),
+        Err(e @ SubmitError::TooLong(_)) => error(StatusCode::PAYLOAD_TOO_LARGE, &e.to_string()),
         Err(_) => error(
             StatusCode::NOT_FOUND,
             "no child agent of that id is running",

@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A message to a running subagent is limited to 2048 bytes: typing a longer one into its pane shows an error instead of sending it, and `POST /steer` answers 413 with the limit. Nothing over it reaches the child's mailbox.
 - Bash takes an optional `workdir`, so the model passes the directory instead of writing `cd dir && ...`: the approval line reads `command  (in dir)`, the judge is told "runs in dir", and the rules see the bare command, so `Bash(cargo test:*)` matches. A workdir inside the project is followed the way a leading `cd` is; one outside it asks, and one that is not a directory is refused before approval.
 - A bash result ends with a trailer line `[output: N lines, X.Ys]` giving the lines the command printed in all (trimmed ones included) and its wall time, after the output so the first-line exit status that the transcript and `outcome()` read is unchanged; a timed-out command gets it too.
 - Bash commands run with a fixed non-interactive environment (`TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0` and a UTF-8 `LANG`/`LC_ALL`), set after the credential scrub, so a pager or a git credential prompt can no longer hang a call and output carries no colour codes. Stdio MCP servers keep the inherited environment.

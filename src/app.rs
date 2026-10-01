@@ -29,7 +29,7 @@ use crate::markdown::{self, Origin};
 use crate::models::{Choice, Picker};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
-use crate::session::{Approval, ChildRow, Event, Prompt, Session};
+use crate::session::{Approval, ChildRow, Event, Prompt, Session, SubmitError};
 use crate::skills::Skill;
 use crate::speed::Speed;
 use crate::statusline;
@@ -1316,10 +1316,14 @@ impl App {
         // none of the commands below apply.
         if let Some(id) = self.inside.as_ref().map(|inside| inside.id.clone()) {
             self.follow = true;
-            if self.session.steer(&id, message).is_err() {
-                self.entries().push(Entry::Error(
+            match self.session.steer(&id, message) {
+                Ok(()) => {}
+                Err(e @ SubmitError::TooLong(_)) => {
+                    self.entries().push(Entry::Error(e.to_string()))
+                }
+                Err(_) => self.entries().push(Entry::Error(
                     "that subagent has finished, so there is nothing to tell it".to_string(),
-                ));
+                )),
             }
             return;
         }
