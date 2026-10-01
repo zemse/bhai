@@ -147,7 +147,9 @@ fn parse_command(args: &Value) -> Result<String, String> {
 }
 
 async fn run(command: &str, live: Live<'_>) -> String {
-    let child = Command::new("bash")
+    let mut bash = Command::new("bash");
+    crate::childenv::scrub(&mut bash);
+    let child = bash
         .arg("-lc")
         .arg(command)
         .stdin(Stdio::null())
@@ -389,6 +391,34 @@ mod tests {
         let out = run("echo hi; exit 3", quiet()).await;
         assert!(out.starts_with("exit code: 3"), "{out}");
         assert!(out.contains("hi"), "{out}");
+    }
+
+    /// Runs itself as a child with credential-named variables set, since a test cannot
+    /// set the environment of its own process.
+    #[tokio::test]
+    async fn credential_variables_do_not_reach_the_command() {
+        const NAME: &str = "tools::bash::tests::credential_variables_do_not_reach_the_command";
+        if std::env::var_os("BHAI_TEST_CHILD").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("BHAI_TEST_CHILD", "1")
+                .env("BHAI_TEST_API_TOKEN", "withheld-value")
+                .env("BHAI_TEST_PLAIN", "kept-value")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        crate::childenv::set_pass(&[]);
+        let out = run("env", quiet()).await;
+        assert!(out.contains("BHAI_TEST_PLAIN=kept-value"), "{out}");
+        assert!(!out.contains("BHAI_TEST_API_TOKEN"), "{out}");
+        assert!(!out.contains("withheld-value"), "{out}");
     }
 
     #[tokio::test]

@@ -705,6 +705,7 @@ async fn stdio(server: &Server, log_dir: &Path) -> Result<Service> {
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("creating {}", log_path.display()))?;
     let mut command = tokio::process::Command::new(&server.command);
+    crate::childenv::scrub(&mut command);
     command
         .args(&server.args)
         .envs(&server.env)

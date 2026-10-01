@@ -8,6 +8,7 @@
 //! `sources` list are ignored in a project file, since a clone that switched them would be
 //! dropping the user's standing instructions or widening what it can put in the prompt.
 //! `statusline` is read from the global file only, and `/statusline` writes it there.
+//! So is `[bash] pass_env`, the credential-looking variables children may still inherit.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -54,6 +55,9 @@ pub struct Config {
     /// `statusline`: the status bar's template, or `None` for the built-in bar. Not
     /// checked here: a bar that does not parse is no reason to refuse to start.
     pub statusline: Option<String>,
+    /// `[bash] pass_env`: credential-looking variable names that bash and stdio MCP
+    /// children still inherit.
+    pub pass_env: Vec<String>,
 }
 
 impl Default for Config {
@@ -77,6 +81,7 @@ impl Default for Config {
             limits: Limits::default(),
             choice: crate::client::Choice::default(),
             statusline: None,
+            pass_env: Vec::new(),
         }
     }
 }
@@ -157,7 +162,16 @@ struct Layer {
     compact_at: Option<f64>,
     statusline: Option<String>,
     #[serde(default)]
+    bash: BashLayer,
+    #[serde(default)]
     permissions: RulesLayer,
+}
+
+/// `[bash]`.
+#[derive(Debug, Default, Deserialize)]
+struct BashLayer {
+    #[serde(default)]
+    pass_env: Vec<String>,
 }
 
 /// `skills = false`, or a `[skills]` table.
@@ -307,6 +321,8 @@ impl Config {
         }
         // Where inference runs is the user's call, never a cloned repo's.
         if trusted {
+            // What a child may see of the environment is the user's call, never a cloned repo's.
+            self.pass_env.extend(layer.bash.pass_env.iter().cloned());
             if layer.statusline.is_some() {
                 self.statusline = layer.statusline.clone();
             }
@@ -562,6 +578,23 @@ mod tests {
         write(&global_path(&home), "statusline = \"$branch\"\n");
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert_eq!(config.statusline.as_deref(), Some("$branch"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pass_env_is_the_global_files_alone() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[bash]\npass_env = [\"GITHUB_TOKEN\"]\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(config.pass_env.is_empty());
+
+        write(&global_path(&home), "[bash]\npass_env = [\"NPM_TOKEN\"]\n");
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert_eq!(config.pass_env, ["NPM_TOKEN"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

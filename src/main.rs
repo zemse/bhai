@@ -6,6 +6,7 @@ mod app;
 mod auth;
 mod branch;
 mod cache;
+mod childenv;
 mod client;
 mod clipboard;
 mod commands;
@@ -559,6 +560,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
+    childenv::set_pass(&config.pass_env);
     // Named once for the process: code already on screen is not repainted.
     if let Some(theme) = &config.code_theme {
         syntax::set_theme(theme);
