@@ -3,7 +3,8 @@
 `fake_mcp.py hang` never answers; `fake_mcp.py hangcall` answers everything but a call;
 `fake_mcp.py exit` quits at once; `fake_mcp.py grandchild` starts a `sleep` that outlives it
 and logs its pid to stderr, the way `npx` leaves the real server; `fake_mcp.py http` serves the same tools over streamable
-HTTP on a free port, printed as JSON on stdout, and redirects a POST to any other path there.
+HTTP on a free port, printed as JSON on stdout, and redirects a POST to any other path there;
+`fake_mcp.py paged` lists one tool per page; `fake_mcp.py endless` always has a next page.
 """
 
 import json
@@ -36,6 +37,12 @@ def result(msg):
             "serverInfo": {"name": "fake", "version": "0.0.1"},
         }
     if method == "tools/list":
+        if MODE == "paged":
+            page = int(params.get("cursor") or 0)
+            more = {"nextCursor": str(page + 1)} if page + 1 < len(TOOLS) else {}
+            return {"tools": TOOLS[page : page + 1], **more}
+        if MODE == "endless":
+            return {"tools": TOOLS[:1], "nextCursor": "again"}
         return {"tools": TOOLS}
     if method == "tools/call":
         args = params.get("arguments") or {}
@@ -125,8 +132,11 @@ def serve_http():
     server.serve_forever()
 
 
+MODE = sys.argv[1] if len(sys.argv) > 1 else ""
+
+
 def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    mode = MODE
     if mode == "exit":
         sys.exit(1)
     if mode == "http":

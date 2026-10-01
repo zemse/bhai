@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
-use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, PaginatedRequestParams};
 use rmcp::service::{Peer, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
@@ -42,6 +42,12 @@ const PROMPT_TOOLS: usize = 3;
 const PROMPT_NAME: usize = 64;
 /// Results `mcp_search` returns.
 const SEARCH_RESULTS: usize = 5;
+/// Bounds on one server's `tools/list`. The server picks the cursors, so one that keeps
+/// handing out a next page would be followed until the startup timeout, with all it sent
+/// held in memory and searched.
+const MAX_TOOL_PAGES: usize = 100;
+const MAX_TOOLS: usize = 2048;
+const MAX_CURSOR: usize = 64 * 1024;
 
 /// One MCP tool, as `mcp_search` shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -713,21 +719,54 @@ async fn spawn(server: &Server, log_dir: &Path) -> Result<(Service, Option<Group
         Some(url) => (http(server, url).await?, None),
         None => stdio(server, log_dir).await?,
     };
-    let mut tools = service
-        .list_all_tools()
-        .await
-        .context("tools/list failed")?
-        .into_iter()
-        .map(|t| ToolInfo {
-            server: server.name.clone(),
-            name: t.name.to_string(),
-            description: t.description.as_deref().unwrap_or_default().to_string(),
-            schema: Value::Object((*t.input_schema).clone()),
-        })
-        .collect::<Vec<_>>();
+    let mut tools = paged(|cursor| {
+        let params = PaginatedRequestParams::default().with_cursor(cursor);
+        let service = &service;
+        async move {
+            let page = service.list_tools(Some(params)).await?;
+            Ok((page.tools, page.next_cursor))
+        }
+    })
+    .await
+    .context("tools/list failed")?
+    .into_iter()
+    .map(|t| ToolInfo {
+        server: server.name.clone(),
+        name: t.name.to_string(),
+        description: t.description.as_deref().unwrap_or_default().to_string(),
+        schema: Value::Object((*t.input_schema).clone()),
+    })
+    .collect::<Vec<_>>();
     // Sorted so the prompt's tool lines do not depend on the server's listing order.
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((service, group, tools))
+}
+
+/// Every item of a paginated listing, within `MAX_TOOL_PAGES`, `MAX_TOOLS` and
+/// `MAX_CURSOR`. Past a bound the listing fails rather than keeping a prefix: a server
+/// that never ends its listing is broken, and part of its catalog would pass for all of it.
+async fn paged<T, F, Fut>(mut page: F) -> Result<Vec<T>>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<(Vec<T>, Option<String>)>>,
+{
+    let mut items = Vec::new();
+    let mut cursor = None;
+    for _ in 0..MAX_TOOL_PAGES {
+        let (more, next) = page(cursor).await?;
+        items.extend(more);
+        if items.len() > MAX_TOOLS {
+            anyhow::bail!("more than {MAX_TOOLS} tools");
+        }
+        match next {
+            None => return Ok(items),
+            Some(next) if next.len() > MAX_CURSOR => {
+                anyhow::bail!("a cursor of {} bytes, over {MAX_CURSOR}", next.len())
+            }
+            Some(next) => cursor = Some(next),
+        }
+    }
+    anyhow::bail!("more than {MAX_TOOL_PAGES} pages")
 }
 
 /// A stdio server as a child process leading its own group. Its stderr goes to
@@ -1191,6 +1230,62 @@ mod tests {
         assert_eq!(
             hub.servers[0].state,
             State::Failed("timed out after 0.3s".to_string())
+        );
+        hub.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_listing_follows_its_cursors_within_the_bounds() {
+        let pages = |count: usize, per: usize| {
+            move |cursor: Option<String>| {
+                let at: usize = cursor.map_or(0, |c| c.parse().unwrap());
+                let next = (at + 1 < count).then(|| (at + 1).to_string());
+                async move { Ok((vec![at; per], next)) }
+            }
+        };
+        assert_eq!(paged(pages(3, 1)).await.unwrap(), [0, 1, 2]);
+        let all = paged(pages(MAX_TOOL_PAGES, 1)).await.unwrap();
+        assert_eq!(all.len(), MAX_TOOL_PAGES);
+
+        let why = paged(pages(MAX_TOOL_PAGES + 1, 1)).await.unwrap_err();
+        assert_eq!(
+            format!("{why}"),
+            format!("more than {MAX_TOOL_PAGES} pages")
+        );
+        let why = paged(pages(3, MAX_TOOLS)).await.unwrap_err();
+        assert_eq!(format!("{why}"), format!("more than {MAX_TOOLS} tools"));
+        let huge = "x".repeat(MAX_CURSOR + 1);
+        let why = paged(|_| {
+            let huge = huge.clone();
+            async move { Ok((vec![0], Some(huge))) }
+        })
+        .await
+        .unwrap_err();
+        assert!(format!("{why}").starts_with("a cursor of"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_paged_listing_is_collected_and_an_endless_one_fails() {
+        if !python() {
+            return;
+        }
+        let dir = temp_dir();
+        let hub = Hub::connect(
+            vec![fake("paged", "paged"), fake("endless", "endless")],
+            &Identity::default(),
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
+        let names: Vec<_> = hub.tools().map(ToolInfo::full_name).collect();
+        assert_eq!(names, ["mcp__paged__echo", "mcp__paged__fail"]);
+        assert_eq!(
+            hub.servers[1].state,
+            State::Failed(format!(
+                "tools/list failed: more than {MAX_TOOL_PAGES} pages"
+            ))
         );
         hub.shutdown().await;
         let _ = std::fs::remove_dir_all(dir);

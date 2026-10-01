@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- An MCP server's `tools/list` is paged within 100 pages, 2048 tools and 64 KiB cursors. A server that keeps handing out a next page now fails with the bound it crossed, where before it was followed until the startup timeout.
 - ctrl+r opens a search over the prompt history: type to filter (every word must match, case ignored, newest first, each prompt once), and enter takes the pick into the prompt to edit and send. Esc or ctrl+c closes it and leaves the draft as it was.
 - An MCP server entry (in `~/.claude.json`, `.mcp.json` or `[mcp.servers.<name>]`) can set `startup_timeout_sec` and `tool_timeout_sec`, in seconds, so a slow `npx` cold start or a long-running tool gets its own limit in place of the default 10 s start and 600 s call. A value that is not a positive number leaves the default.
 - A session now starts on its model's context window as the Codex CLI's cached model list (`~/.codex/models_cache.json`) reports it, not only after a `/model` switch. A model the list does not cover falls back to 272k for `gpt-6*`, so a gpt-6 session no longer compacts at around 102k. A configured `context_window` still wins, and the status bar's ctx uses the same window after a switch.
