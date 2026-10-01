@@ -215,6 +215,8 @@ struct Bhai {
     token: String,
     http: reqwest::Client,
     dir: PathBuf,
+    /// What it wrote to stderr before the server line.
+    said: String,
 }
 
 impl Drop for Bhai {
@@ -226,6 +228,10 @@ impl Drop for Bhai {
 
 impl Bhai {
     async fn start(backend: &str) -> Bhai {
+        Self::start_with(backend, &[]).await
+    }
+
+    async fn start_with(backend: &str, env: &[(&str, &str)]) -> Bhai {
         let dir = std::env::temp_dir().join(format!("bhai-fake-{}", uuid::Uuid::new_v4()));
         let (home, codex) = logged_in(&dir);
         let project = dir.join("project");
@@ -240,6 +246,8 @@ impl Bhai {
             .env_remove("BHAI_MODEL")
             .env_remove("BHAI_MODE")
             .env_remove("BHAI_EFFORT")
+            .env_remove("BHAI_STARTUP_TIMING")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -277,6 +285,7 @@ impl Bhai {
             token,
             http: reqwest::Client::new(),
             dir,
+            said,
         }
     }
 
@@ -427,6 +436,40 @@ async fn a_prompt_reaches_the_backend_and_its_answer_reaches_events() {
     assert_eq!(state["calls"], 1, "{state}");
     assert_eq!(state["input_tokens"], 120, "{state}");
     assert_eq!(state["output_tokens"], 7, "{state}");
+}
+
+#[tokio::test]
+async fn startup_timing_names_each_stage_in_order_before_the_server_line() {
+    let fake = Arc::new(Fake::default());
+    let backend = serve_fake(fake).await;
+    let bhai = Bhai::start_with(&backend, &[("BHAI_STARTUP_TIMING", "1")]).await;
+    let stages: Vec<Value> = bhai
+        .said
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let names: Vec<&str> = stages.iter().filter_map(|s| s["stage"].as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "resume",
+            "config",
+            "mcp",
+            "prompt",
+            "client",
+            "preflight",
+            "session",
+            "start"
+        ],
+        "{}",
+        bhai.said
+    );
+    let total = |s: &Value| s["total_ms"].as_f64().unwrap();
+    assert!(stages.windows(2).all(|w| total(&w[0]) <= total(&w[1])));
+    assert!(stages.iter().all(|s| s["ms"].as_f64().unwrap() >= 0.0));
+
+    let quiet = Bhai::start(&backend).await;
+    assert!(!quiet.said.contains("\"stage\""), "{}", quiet.said);
 }
 
 #[tokio::test]

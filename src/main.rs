@@ -42,6 +42,7 @@ mod session;
 mod sessions;
 mod skills;
 mod speed;
+mod startup;
 mod statusline;
 mod syntax;
 mod title;
@@ -98,6 +99,7 @@ enum Event {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    startup::begin();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "identities") {
         return identities();
@@ -212,6 +214,7 @@ async fn main() -> Result<()> {
         Some(id) => Some(sessions::find(&dir, id.as_deref())?),
         None => None,
     };
+    startup::mark("resume");
     let mut warnings = Vec::new();
     let name = match &resumed {
         Some(loaded) => resumed_identity(&loaded.header, &cwd, &mut warnings),
@@ -271,12 +274,14 @@ async fn main() -> Result<()> {
             args.profile
                 .then(|| profile::debug_dir().join("headers.jsonl")),
         );
+    startup::mark("client");
     // Fail before taking over the terminal if the backend cannot serve the model.
     if let Err(e) = client.preflight().await {
         shutdown(hub.clone()).await;
         eprintln!("bhai: {e:#}");
         std::process::exit(1);
     }
+    startup::mark("preflight");
     // Otherwise the backend's list is read for a window only on a `/model` switch.
     let limits = Limits {
         reported: models::cached_window(client.model()),
@@ -369,6 +374,7 @@ allow it.",
     let skills = prompt.skills.clone();
     let workflows = workflow::discover(&instructions::Roots::from_env(cwd.clone()));
     notices.extend(workflows.errors.iter().cloned());
+    startup::mark("session");
 
     // Bind before taking over the terminal so a busy port is a plain error.
     let listener = match args.serve {
@@ -405,6 +411,7 @@ allow it.",
         saved,
         limits,
     );
+    startup::end("start");
     // `--workflow` is a run of its own: no TUI, no turn, just the steps and their report.
     if let Some((name, input)) = args.workflow.clone() {
         for notice in &notices {
@@ -670,7 +677,9 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     }
     let identities = identity::discover(&roots);
     let identity = identity::find(&identities, name)?;
+    startup::mark("config");
     let hub = mcp::start(&config, &roots, &identity).await;
+    startup::mark("mcp");
     let mut prompt = identity::build(&config, &roots, &identity, &identities).with_mcp(hub.clone());
     let bhai = roots.cwd.join(".bhai");
     let delegation = Delegation {
@@ -695,6 +704,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let statusline = config.statusline.clone();
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
+    startup::mark("prompt");
     Ok(Setup {
         prompt,
         policy,
