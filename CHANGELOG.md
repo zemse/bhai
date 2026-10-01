@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- The transcript keeps each entry's laid-out rows between frames and lays out again only the entries that changed. An idle tick no longer redraws, but a terminal resize still redraws at once.
 - A Codex call sends back the `x-codex-turn-state` routing token that the turn's first call was given (read from the response header or a `response.metadata` event), on every later call and retry of the same turn. The tool-loop calls of a turn then go to the backend that cached their prefix. The token is dropped when the next turn starts. Side calls (the namer and the judge) and children do not share it.
 - A model call that is retried drops the text and reasoning its failed attempt had already streamed, so the transcript shows the retry notice and then a single answer. Before, a leftover fragment stayed in the transcript above the retried answer. The `/events` stream now sends this as a `retrying` event, not `info`.
 - `evals/run.py` runs the checked-in tasks (in nanocodex's shape: `instruction.md`, `task.toml`, hidden `tests/test.sh` writing a reward) against `bhai exec --json --mode auto --trust`, `codex exec --json` or the reference solution, in a fresh temp dir per trial, and records reward, wall time and tokens to `evals/results/`. The trust entry for each trial's workspace is removed from `~/.config/bhai/trust.json` once bhai exits, and a trial past its timeout has every process it started killed.

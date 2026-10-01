@@ -80,6 +80,9 @@ enum Event {
     /// The forwarder fell behind and the channel dropped events, so what the stream sets
     /// is read from the session instead.
     Resync,
+    /// Only a draw lets the terminal backend notice the new size and clear, and an idle
+    /// tick does not draw.
+    Resize,
     Tick,
 }
 
@@ -1396,6 +1399,7 @@ async fn run(
                     Ok(TermEvent::Key(key)) => Event::Key(key),
                     Ok(TermEvent::Mouse(mouse)) => Event::Mouse(mouse),
                     Ok(TermEvent::Paste(text)) => Event::Paste(text),
+                    Ok(TermEvent::Resize(..)) => Event::Resize,
                     Ok(_) => Event::Tick,
                     Err(_) => break,
                 },
@@ -1519,6 +1523,7 @@ fn apply(app: &mut App, event: Event, root: &std::path::Path) -> bool {
             app.resync();
             true
         }
+        Event::Resize => true,
         Event::Tick => app.tick(),
     }
 }
@@ -1546,6 +1551,14 @@ mod tests {
         // One draw covers the batch, and every event in it has already been applied.
         assert!(dirty);
         assert!(!app.working);
+    }
+
+    #[test]
+    fn a_resize_is_drawn_even_when_idle() {
+        let mut app = App::detached();
+        let root = std::path::PathBuf::new();
+        app.tick();
+        assert!(apply(&mut app, Event::Resize, &root));
     }
 
     fn parse(args: &[&str]) -> Result<(Option<u16>, bool)> {
