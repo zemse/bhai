@@ -1471,20 +1471,22 @@ async fn run(
         tokio::spawn(server::serve(listener, session, token));
     }
     // The tab says where the session is running until the model says what it is doing.
-    let root = std::env::current_dir().unwrap_or_default();
-    title::set(&title::compose(&root, None));
+    let mut tab = title::Tab::new(std::env::current_dir().unwrap_or_default());
     // Mouse motion arrives in floods, so it only redraws when the hover changes.
     let mut dirty = true;
     let mut captured = mouse;
     let mut notifier = notify::Notifier::from_env();
     while !app.quit {
+        if let Some(text) = tab.refresh(tab_state(&app)) {
+            title::set(&text);
+        }
         if dirty {
             terminal.draw(|frame| ui::render(frame, &mut app))?;
         }
         let Some(event) = rx_event.recv().await else {
             break;
         };
-        dirty = apply(&mut app, &mut notifier, event, &root);
+        dirty = apply(&mut app, &mut notifier, event, &mut tab);
         // Whatever else is already waiting is applied before the next draw. A streaming
         // turn sends an event per delta, and a frame per delta is a frame wasted:
         // rendering the transcript costs the same however little of it changed.
@@ -1492,7 +1494,7 @@ async fn run(
             let Ok(event) = rx_event.try_recv() else {
                 break;
             };
-            dirty |= apply(&mut app, &mut notifier, event, &root);
+            dirty |= apply(&mut app, &mut notifier, event, &mut tab);
         }
         // `/mouse` hands the pointer back to the terminal, and takes it again.
         if app.mouse != captured {
@@ -1512,7 +1514,7 @@ fn apply(
     app: &mut App,
     notifier: &mut notify::Notifier,
     event: Event,
-    root: &std::path::Path,
+    tab: &mut title::Tab,
 ) -> bool {
     match event {
         Event::Key(key) => {
@@ -1528,9 +1530,9 @@ fn apply(
             // The terminal is written to from the thread that draws it, never from the
             // task that named the session.
             if let session::Event::Titled(name) = &event {
-                title::set(&title::compose(root, Some(name)));
+                tab.named(name);
             }
-            if let Some(message) = attention(&event, root) {
+            if let Some(message) = attention(&event, tab.root()) {
                 notifier.notify(&message);
             }
             app.on_event(event);
@@ -1546,6 +1548,17 @@ fn apply(
             false
         }
         Event::Tick => app.tick(),
+    }
+}
+
+/// What the tab says the session is doing.
+fn tab_state(app: &App) -> title::State {
+    if app.pending.is_some() {
+        title::State::Approval
+    } else if app.working {
+        title::State::Working
+    } else {
+        title::State::Idle
     }
 }
 
@@ -1571,7 +1584,7 @@ mod tests {
     fn a_batch_of_events_is_one_redraw() {
         let mut app = App::detached();
         let mut notifier = notify::Notifier::from_env();
-        let root = std::path::PathBuf::new();
+        let mut tab = title::Tab::new(std::path::PathBuf::new());
         let batch = vec![
             Event::Session(session::Event::User("go".to_string())),
             Event::Session(session::Event::Text("hi".to_string())),
@@ -1580,7 +1593,7 @@ mod tests {
         ];
         let dirty = batch
             .into_iter()
-            .map(|event| apply(&mut app, &mut notifier, event, &root))
+            .map(|event| apply(&mut app, &mut notifier, event, &mut tab))
             .fold(false, |dirty, next| dirty | next);
         // One draw covers the batch, and every event in it has already been applied.
         assert!(dirty);
@@ -1591,9 +1604,54 @@ mod tests {
     fn a_resize_is_drawn_even_when_idle() {
         let mut app = App::detached();
         let mut notifier = notify::Notifier::from_env();
-        let root = std::path::PathBuf::new();
+        let mut tab = title::Tab::new(std::path::PathBuf::new());
         app.tick();
-        assert!(apply(&mut app, &mut notifier, Event::Resize, &root));
+        assert!(apply(&mut app, &mut notifier, Event::Resize, &mut tab));
+    }
+
+    #[test]
+    fn the_tab_follows_the_turn_and_its_approval() {
+        let mut app = App::detached();
+        let mut notifier = notify::Notifier::from_env();
+        let mut tab = title::Tab::new(std::path::PathBuf::from("/home/u/bhai"));
+        let mut step = |app: &mut App, event| {
+            apply(app, &mut notifier, Event::Session(event), &mut tab);
+            tab.refresh(tab_state(app))
+        };
+        assert_eq!(
+            step(&mut app, session::Event::User("go".to_string())).as_deref(),
+            Some("bhai · working")
+        );
+        assert_eq!(
+            step(&mut app, session::Event::Titled("fix cache".to_string())).as_deref(),
+            Some("bhai · fix cache · working")
+        );
+        let approval = session::Event::Approval {
+            id: 1,
+            tool: "bash".to_string(),
+            command: "rm -rf target".to_string(),
+            preview: None,
+            offers: Default::default(),
+        };
+        assert_eq!(
+            step(&mut app, approval).as_deref(),
+            Some("bhai · fix cache · approval?")
+        );
+        // Text streaming while the approval waits leaves the title alone.
+        assert_eq!(step(&mut app, session::Event::Text("hi".to_string())), None);
+        let resolved = session::Event::Resolved {
+            id: 1,
+            accepted: true,
+            remember: None,
+        };
+        assert_eq!(
+            step(&mut app, resolved).as_deref(),
+            Some("bhai · fix cache · working")
+        );
+        assert_eq!(
+            step(&mut app, session::Event::TurnEnd).as_deref(),
+            Some("bhai · fix cache")
+        );
     }
 
     #[test]

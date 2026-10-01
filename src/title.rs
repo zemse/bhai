@@ -7,7 +7,7 @@
 //! rather than being worth reporting.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::client::{Client, Usage};
 use crate::tools::BoxFuture;
@@ -69,6 +69,55 @@ pub fn compose(root: &Path, work: Option<&str>) -> String {
     match work {
         Some(work) if !work.trim().is_empty() => format!("{dir} · {}", tidy(work)),
         _ => dir,
+    }
+}
+
+/// What the session is doing, said at the end of the title where a cut tab still shows
+/// it, so a user with many panes can see which one is waiting on them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Idle,
+    Working,
+    Approval,
+}
+
+/// The title as last written, so a state that has not changed is not written again.
+pub struct Tab {
+    root: PathBuf,
+    work: Option<String>,
+    shown: Option<String>,
+}
+
+impl Tab {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            work: None,
+            shown: None,
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn named(&mut self, work: &str) {
+        self.work = Some(work.to_string());
+    }
+
+    /// The title for `state`, or `None` when it is the one already showing.
+    pub fn refresh(&mut self, state: State) -> Option<String> {
+        let title = compose(&self.root, self.work.as_deref());
+        let title = match state {
+            State::Idle => title,
+            State::Working => format!("{title} · working"),
+            State::Approval => format!("{title} · approval?"),
+        };
+        if self.shown.as_deref() == Some(title.as_str()) {
+            return None;
+        }
+        self.shown = Some(title.clone());
+        Some(title)
     }
 }
 
@@ -181,6 +230,31 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "\x1b]0;bhai · fixthe cache\x07"
+        );
+    }
+
+    #[test]
+    fn the_state_goes_last_and_is_written_only_when_it_changes() {
+        let mut tab = Tab::new(PathBuf::from("/home/u/bhai"));
+        assert_eq!(tab.refresh(State::Idle).as_deref(), Some("bhai"));
+        assert_eq!(tab.refresh(State::Idle), None);
+        assert_eq!(
+            tab.refresh(State::Working).as_deref(),
+            Some("bhai · working")
+        );
+        tab.named("fix cache");
+        assert_eq!(
+            tab.refresh(State::Working).as_deref(),
+            Some("bhai · fix cache · working")
+        );
+        assert_eq!(
+            tab.refresh(State::Approval).as_deref(),
+            Some("bhai · fix cache · approval?")
+        );
+        assert_eq!(tab.refresh(State::Approval), None);
+        assert_eq!(
+            tab.refresh(State::Idle).as_deref(),
+            Some("bhai · fix cache")
         );
     }
 
