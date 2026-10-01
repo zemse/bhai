@@ -1552,6 +1552,11 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         crate::session::compact_then(self.input.value()).and(self.session.fork())
     }
 
+    /// What the working row says the turn is doing.
+    pub fn verb(&self) -> &'static str {
+        self.session.verb().unwrap_or("working")
+    }
+
     /// Tokens the next message would re-read now that the cache has likely lapsed.
     pub fn cold_tokens(&self) -> Option<u64> {
         self.session.cold_tokens()

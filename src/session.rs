@@ -332,6 +332,8 @@ struct Inner {
     sending: Option<Instant>,
     /// When the running turn started.
     started: Option<Instant>,
+    /// What the running turn is said to be doing, and to have done once it ends.
+    verb: Option<(&'static str, &'static str)>,
     last_cache_break: Option<CacheBreak>,
     rate_limits: Option<RateLimits>,
     /// The tokens a call on the compacted copy would read, while there is one.
@@ -347,6 +349,7 @@ impl Inner {
     fn start(&mut self) {
         self.working = true;
         self.started = Some(Instant::now());
+        self.verb = Some(crate::entries::verb());
     }
 }
 
@@ -400,6 +403,15 @@ impl Session {
             policy,
             judge,
         })
+    }
+
+    /// What the running turn is said to be doing, as in `chabārau`.
+    pub fn verb(&self) -> Option<&'static str> {
+        let inner = self.lock();
+        inner
+            .verb
+            .filter(|_| inner.working)
+            .map(|(working, _)| working)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -956,10 +968,11 @@ impl Session {
             }
             AgentEvent::TurnEnd => {
                 if let Some(started) = inner.started.take() {
+                    let (_, done) = inner.verb.unwrap_or_else(crate::entries::verb);
                     self.publish(Event::Done {
                         seconds: started.elapsed().as_secs(),
                         at: chrono::Local::now().format("%-I:%M %p").to_string(),
-                        verb: crate::entries::verb().to_string(),
+                        verb: done.to_string(),
                     });
                 }
                 // The session keeps working while queued prompts wait behind the turn.
@@ -1964,8 +1977,11 @@ mod tests {
         // Nothing was running, so there is nothing to time.
         session.on_agent(AgentEvent::TurnEnd);
         assert_eq!(events.try_recv().unwrap(), Event::TurnEnd);
+        assert_eq!(session.verb(), None);
         session.compact(None).unwrap();
+        let working = session.verb().expect("a running turn has a verb");
         session.on_agent(AgentEvent::TurnEnd);
+        assert_eq!(session.verb(), None);
         let done = std::iter::from_fn(|| events.try_recv().ok())
             .find(|e| matches!(e, Event::Done { .. }))
             .expect("a done event");
@@ -1973,7 +1989,11 @@ mod tests {
             unreachable!()
         };
         assert_eq!(seconds, 0);
-        assert!(crate::entries::VERBS.contains(&verb.as_str()), "{verb}");
+        // What it said it was doing is what it says it did.
+        assert!(
+            crate::entries::VERBS.contains(&(working, verb.as_str())),
+            "{verb}"
+        );
         assert!(at.ends_with("AM") || at.ends_with("PM"), "{at}");
     }
 

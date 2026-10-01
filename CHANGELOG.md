@@ -6,9 +6,10 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
-- Every turn ends with a dim `✻ 9m 54s chabaya · 12:58 PM khatam` line in the
-  transcript: how long it ran from start to its end, and the local time it ended. The
-  verb is picked at random from 20 Hindi ones for each turn. A queued prompt that
+- Every turn ends with a dim `✻ 9m 54s chabāyā · 12:58 PM khatam` line in the
+  transcript: how long it ran from start to its end, and the local time it ended. Each
+  turn picks one of 52 Hinglish pairs, Delhi and Mumbai slang among them: the working
+  row says `chabārau...` while it runs and the done line `chabāyā` once it ends. A queued prompt that
   follows is timed as its own turn. `/events` carries it as `done`.
 - An idle conversation whose cache is about to lapse gets a compacted copy, summarised
   three minutes before the cache's expected 30 while the history still reads from it.

@@ -427,7 +427,11 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let mut spans = vec![Span::styled(
-        format!(" {} working", SPINNER[app.spinner % SPINNER.len()]),
+        format!(
+            " {} {}...",
+            SPINNER[app.spinner % SPINNER.len()],
+            app.verb()
+        ),
         Style::new().fg(Color::Yellow),
     )];
     let dim = Style::new().fg(Color::DarkGray);
@@ -1950,7 +1954,7 @@ mod tests {
         let shown = screen(&terminal);
         let rate = 25.0 / crate::speed::PERIOD.as_secs_f64();
         assert!(
-            shown.contains(&format!("working · {rate:.0} tok/s")),
+            shown.contains(&format!("working... · {rate:.0} tok/s")),
             "{shown}"
         );
 

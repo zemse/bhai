@@ -450,16 +450,66 @@ enum Stream {
     Reasoning,
 }
 
-/// What a finished turn is said to have done, one picked at random each time. It reads
-/// after the duration, as in `9m 54s chabaya`.
-pub const VERBS: &[&str] = &[
-    "chabaya", "pakaya", "pachaya", "ghisa", "ragda", "ghota", "peesa", "nichoda", "khoda",
-    "thoka", "ubala", "bhuna", "chhana", "maanja", "suljhaya", "joda", "bunaa", "tala", "kheecha",
-    "ghumaya",
+/// What a running turn is said to be doing and what it is said to have done once it
+/// ends, one pair picked at random for each turn. The second reads after the duration,
+/// as in `9m 54s chabāyā`.
+pub const VERBS: &[(&str, &str)] = &[
+    ("chabārau", "chabāyā"),
+    ("pakārau", "pakāyā"),
+    ("pachārau", "pachāyā"),
+    ("ghisārau", "ghisā"),
+    ("ragḍārau", "ragḍā"),
+    ("pīsārau", "pīsā"),
+    ("nichoḍārau", "nichoḍā"),
+    ("khodārau", "khodā"),
+    ("ṭhokārau", "ṭhokā"),
+    ("ubālārau", "ubālā"),
+    ("bhūnārau", "bhūnā"),
+    ("chhānārau", "chhānā"),
+    ("mānjārau", "mānjā"),
+    ("suljhārau", "suljhāyā"),
+    ("joḍārau", "joḍā"),
+    ("khīnchārau", "khīnchā"),
+    ("machudārau", "machudāyā"),
+    ("gāṇḍ marārau", "gāṇḍ marāī"),
+    ("pelārau", "pelā"),
+    ("kūṭārau", "kūṭā"),
+    ("phoḍārau", "phoḍā"),
+    ("bajārau", "bajāyā"),
+    ("chhīlārau", "chhīlā"),
+    ("jhāḍārau", "jhāḍā"),
+    ("nipṭārau", "nipṭāyā"),
+    ("pheṇṭārau", "pheṇṭā"),
+    ("ghumārau", "ghumāyā"),
+    ("jhelārau", "jhelā"),
+    ("ukhāḍārau", "ukhāḍā"),
+    ("fāḍārau", "fāḍā"),
+    ("talārau", "talā"),
+    ("bunārau", "bunā"),
+    ("tapkārau", "tapkāyā"),
+    ("uḍārau", "uḍāyā"),
+    ("chepārau", "chepā"),
+    ("patārau", "patāyā"),
+    ("ghusārau", "ghusāyā"),
+    ("vāṭ lagārau", "vāṭ lagā dī"),
+    ("jugāḍ lagārau", "jugāḍ lagāyā"),
+    ("setting baiṭhārau", "setting baiṭhāī"),
+    ("bawāl machārau", "bawāl machā diyā"),
+    ("katl-e-ām machārau", "katl-e-ām machā diyā"),
+    ("gadar machārau", "gadar machā diyā"),
+    ("lankā lagārau", "lankā lagā dī"),
+    ("dhuāṃ uḍārau", "dhuāṃ uḍā diyā"),
+    ("tabāhī machārau", "tabāhī machā dī"),
+    ("bhasaḍ machārau", "bhasaḍ machā dī"),
+    ("kāṇḍ kar rau", "kāṇḍ kar diyā"),
+    ("lafḍā suljhārau", "lafḍā suljhāyā"),
+    ("rāḍā kar rau", "rāḍā kiyā"),
+    ("phaṭkā mārārau", "phaṭkā mārā"),
+    ("chālu kar rau", "chālu kiyā"),
 ];
 
-/// A word from `VERBS`, at random.
-pub fn verb() -> &'static str {
+/// A pair from `VERBS`, at random.
+pub fn verb() -> (&'static str, &'static str) {
     VERBS[(uuid::Uuid::new_v4().as_u128() % VERBS.len() as u128) as usize]
 }
 
@@ -509,10 +559,10 @@ mod tests {
         entries.apply(&Event::Done {
             seconds: 594,
             at: "12:58 PM".to_string(),
-            verb: "chabaya".to_string(),
+            verb: "chabāyā".to_string(),
         });
         assert!(matches!(&entries.list[..],
-            [Entry::Done(t)] if t == "9m 54s chabaya \u{b7} 12:58 PM khatam"));
+            [Entry::Done(t)] if t == "9m 54s chabāyā \u{b7} 12:58 PM khatam"));
     }
 
     #[test]
