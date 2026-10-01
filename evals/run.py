@@ -68,9 +68,58 @@ def load_task(path):
     return task
 
 
+def descendants(root):
+    """Map each live descendant pid of `root`, and `root` itself, to its process group."""
+    ps = subprocess.run(
+        ["ps", "-A", "-o", "pid=,ppid=,pgid="], capture_output=True, text=True, check=True
+    )
+    children, pgid = {}, {}
+    for line in ps.stdout.splitlines():
+        pid, ppid, group = map(int, line.split())
+        children.setdefault(ppid, []).append(pid)
+        pgid[pid] = group
+    found, stack = {}, [root]
+    while stack:
+        pid = stack.pop()
+        if pid in pgid and pid not in found:
+            found[pid] = pgid[pid]
+            stack.extend(children.get(pid, []))
+    return found
+
+
+def kill_tree(root):
+    """SIGKILL `root`, every process below it and every group they lead. bhai starts each
+    bash tool command in its own process group, so killing the agent's group alone leaves
+    a hung command running, and a dead parent's children are reparented out of reach. So
+    the tree is stopped first, until a walk finds nothing new, and only then killed."""
+    seen = {}
+    while True:
+        found = descendants(root)
+        fresh = {pid: g for pid, g in found.items() if pid not in seen}
+        if not fresh:
+            break
+        for pid in fresh:
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except ProcessLookupError:
+                pass
+        seen.update(fresh)
+    own = os.getpgrp()
+    for group in set(seen.values()) - {own, 0, 1}:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    for pid in seen:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def run(cmd, cwd, timeout, stdin=None, stdout=None, stderr=None, env=None):
-    """Run `cmd` in its own process group, killing the whole group on timeout. Returns
-    (exit code, timed out)."""
+    """Run `cmd` in its own process group, killing it and everything it started on
+    timeout. Returns (exit code, timed out)."""
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -85,7 +134,7 @@ def run(cmd, cwd, timeout, stdin=None, stdout=None, stderr=None, env=None):
         proc.communicate(stdin, timeout=timeout)
         return proc.returncode, False
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
+        kill_tree(proc.pid)
         proc.wait()
         return proc.returncode, True
 

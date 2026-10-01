@@ -174,11 +174,18 @@ echo '{"type":"turn.completed","usage":{"input_tokens":5,"cached_input_tokens":0
 #[test]
 fn an_agent_past_its_timeout_is_killed_and_scores_zero() {
     let Some(s) = scratch() else { return };
-    // The child outlives a kill of the script alone, so the group has to go.
+    // The hung command sits in its own process group, as bhai's bash tool puts it, so a
+    // kill of the agent's group alone leaves it running.
+    let pid_file = s.dir.join("command.pid");
     let bhai = fake(
         &s.dir,
         "bhai",
-        "echo 'Hello, world!' > hello.txt\nsleep 30 &\nwait\n",
+        &format!(
+            "echo 'Hello, world!' > hello.txt\n\
+python3 -c 'import os, time; os.setpgid(0, 0); open(\"{}\", \"w\").write(str(os.getpid())); time.sleep(30)' &\n\
+wait\n",
+            pid_file.display()
+        ),
     );
     let start = std::time::Instant::now();
     let results = eval(
@@ -192,4 +199,22 @@ fn an_agent_past_its_timeout_is_killed_and_scores_zero() {
     assert_eq!(r["timed_out"], true);
     // A timed out agent gets no credit for work it left on disk.
     assert_eq!(r["reward"], 0.0);
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    // Reaping the orphan is init's job, so give it a moment.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if alive() {
+        let _ = Command::new("kill").args(["-9", pid.trim()]).status();
+        panic!("the command {} outlived the trial", pid.trim());
+    }
 }
