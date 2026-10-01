@@ -414,6 +414,56 @@ impl History {
     }
 }
 
+/// Token prefixes of well-known credentials, with the shortest token that counts.
+const SECRET_PREFIXES: &[(&str, usize)] = &[
+    ("sk-", 20),
+    ("ghp_", 20),
+    ("gho_", 20),
+    ("ghu_", 20),
+    ("ghs_", 20),
+    ("ghr_", 20),
+    ("github_pat_", 30),
+    ("glpat-", 20),
+    ("xoxb-", 15),
+    ("xoxp-", 15),
+    ("xoxa-", 15),
+    ("xoxs-", 15),
+    ("npm_", 30),
+    ("AIza", 35),
+];
+
+/// Whether a submitted prompt stays out of the history: one typed with a leading space,
+/// as shells do with `ignorespace`, or one holding something shaped like a credential.
+/// `raw` is the prompt before trimming.
+pub fn kept_out(raw: &str) -> bool {
+    raw.starts_with(' ') || looks_secret(raw)
+}
+
+fn looks_secret(text: &str) -> bool {
+    if text.contains("PRIVATE KEY-----") || crate::redact::apply(text) != text {
+        return true;
+    }
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .any(|token| {
+            let token = token.trim_end_matches('.');
+            SECRET_PREFIXES
+                .iter()
+                .any(|(prefix, min)| token.starts_with(prefix) && token.len() >= *min)
+                || aws_key_id(token)
+                || (token.starts_with("eyJ")
+                    && token.matches('.').count() == 2
+                    && token.len() >= 30)
+        })
+}
+
+fn aws_key_id(token: &str) -> bool {
+    token.len() == 20
+        && (token.starts_with("AKIA") || token.starts_with("ASIA"))
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
 fn line(text: &str) -> Result<String> {
     Ok(serde_json::to_string(&Record {
         text: text.to_string(),
@@ -622,5 +672,29 @@ mod tests {
         let kept = std::fs::read_to_string(&path).unwrap();
         assert_eq!(kept.lines().count(), MAX_HISTORY);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn credentials_and_a_leading_space_keep_a_prompt_out() {
+        for kept in [
+            " run the tests",
+            "use OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwx",
+            "token is ghp_0123456789abcdefghijklmnopqrstuv.",
+            "\"AKIAIOSFODNN7EXAMPLE\"",
+            "auth eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nabc",
+            "key AIzaSyA1234567890abcdefghijklmnopqrstu",
+        ] {
+            assert!(kept_out(kept), "{kept}");
+        }
+        for recorded in [
+            "run the tests ",
+            "sk-learn and scikit-learn",
+            "fix the task-runner for risk-assessment-module-v2",
+            "AKIA is the AWS key prefix",
+            "\n indented on the second line",
+        ] {
+            assert!(!kept_out(recorded), "{recorded}");
+        }
     }
 }

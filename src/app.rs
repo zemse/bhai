@@ -23,7 +23,7 @@ use crate::debug;
 use crate::diff::DiffView;
 use crate::entries::Entries;
 pub use crate::entries::Entry;
-use crate::input::{Editor, History};
+use crate::input::{Editor, History, kept_out};
 use crate::limits::{self, RateLimits};
 use crate::markdown::{self, Origin};
 use crate::models::{Choice, Picker};
@@ -1384,10 +1384,13 @@ impl App {
         if self.input.value().trim().is_empty() {
             return;
         }
-        let message = self.input.take().trim().to_string();
+        let raw = self.input.take();
+        let message = raw.trim().to_string();
         self.selection = None;
         self.menu = None;
-        if let Err(e) = self.history.push(&message) {
+        if kept_out(&raw) {
+            self.history.end_walk();
+        } else if let Err(e) = self.history.push(&message) {
             self.note(Entry::Error(format!("could not save prompt history: {e}")));
         }
         // Inside a child's pane the prompt types into that child, not the session, so
@@ -3617,6 +3620,20 @@ mod tests {
             crate::search::Pick::Waiting,
             "the session itself is not listed"
         );
+    }
+
+    #[test]
+    fn a_leading_space_or_a_credential_keeps_a_prompt_out_of_the_history() {
+        let mut app = App::detached();
+        for text in [
+            "/skills",
+            " /permissions",
+            "/model sk-proj-abcdefghijklmnopqrstuvwxyz",
+        ] {
+            type_text(&mut app, text);
+            app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        assert_eq!(app.history.entries(), ["/skills"]);
     }
 
     #[test]

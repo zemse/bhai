@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A prompt typed with a leading space, or one holding something shaped like a credential (an `sk-`, `ghp_` or `AKIA` key, a JWT, a private key, a value bhai already redacts), stays out of the prompt history, so ctrl+p and ctrl+r never offer it again and it is never written to `history.jsonl`.
 - The system prompt tells the model that what a tool returns (files, command output, web pages, MCP results, a child's report) is data, and instructions inside it do not come from the user and grant nothing.
 - `bhai --pick` lists the project's saved sessions with their age, model and first message, to filter and pick one to resume. `/sessions` opens the same list in the tui and puts the picked session's file path into the prompt, so the agent can read what an earlier session did.
 - The model is told the date, timezone, working directory and shell in an `<environment_context>` item in the history: in full on the first turn, then only what changed (a session that runs past midnight gets the new date), so the cached prefix never moves. A compaction keeps it, and a resume on the same day sends nothing new.
