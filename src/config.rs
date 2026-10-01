@@ -123,6 +123,10 @@ pub struct McpServer {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: Headers,
+    /// Seconds it gets to start and list its tools, in place of the default.
+    pub startup_timeout_sec: Option<f64>,
+    /// Seconds it gets to answer one call, in place of the default.
+    pub tool_timeout_sec: Option<f64>,
 }
 
 /// HTTP headers for an MCP server. Debug output names them but hides the values.
@@ -830,7 +834,7 @@ mod tests {
         write(
             &home.join(".config/bhai/config.toml"),
             "[mcp]\nenabled = true\n[mcp.servers.fs]\ncommand = \"fs-mcp\"\nargs = [\"/tmp\"]\n\
-             [mcp.servers.web]\nurl = \"http://x\"\nheaders = { Authorization = \"Bearer s3\" }\n",
+             startup_timeout_sec = 30\ntool_timeout_sec = 2.5\n[mcp.servers.web]\nurl = \"http://x\"\nheaders = { Authorization = \"Bearer s3\" }\n",
         );
         write(
             &cwd.join(".bhai/config.toml"),
@@ -842,6 +846,8 @@ mod tests {
         assert_eq!(names, ["fs", "web"]);
         assert_eq!(config.mcp_servers["fs"].args, ["/tmp"]);
         assert!(config.mcp_servers["fs"].env.is_empty());
+        assert_eq!(config.mcp_servers["fs"].startup_timeout_sec, Some(30.0));
+        assert_eq!(config.mcp_servers["fs"].tool_timeout_sec, Some(2.5));
         let web = &config.mcp_servers["web"];
         assert_eq!(web.url.as_deref(), Some("http://x"));
         assert_eq!(web.headers.0["Authorization"], "Bearer s3");

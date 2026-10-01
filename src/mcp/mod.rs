@@ -28,10 +28,12 @@ pub mod servers;
 
 use servers::Server;
 
-/// How long a server gets to start, initialize and list its tools.
+/// How long a server gets to start, initialize and list its tools, unless its entry sets
+/// `startup_timeout_sec`.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a server gets to answer one call. Generous: MCP tools can legitimately run
-/// for minutes, and an interrupt already ends the wait sooner.
+/// How long a server gets to answer one call, unless its entry sets `tool_timeout_sec`.
+/// Generous: MCP tools can legitimately run for minutes, and an interrupt already ends
+/// the wait sooner.
 const CALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Tool names the prompt line shows per server.
 const PROMPT_TOOLS: usize = 3;
@@ -109,6 +111,8 @@ struct Shared {
     late: tokio::sync::Mutex<Vec<(Status, Option<Peer<RoleClient>>)>>,
     log_dir: PathBuf,
     timeout: Duration,
+    /// Each server's call timeout, by name.
+    call_timeouts: HashMap<String, Duration>,
 }
 
 /// The servers of a session as one identity sees them: their status, tools, and the
@@ -155,6 +159,10 @@ impl Hub {
     ) -> Self {
         let mut deferred = Vec::new();
         let mut starts = Vec::new();
+        let call_timeouts = servers
+            .iter()
+            .map(|s| (s.name.clone(), s.tool_timeout.unwrap_or(CALL_TIMEOUT)))
+            .collect();
         for server in servers {
             if server.skip.is_none() && !identity.allows_mcp_server(&server.name) {
                 deferred.push(server.clone());
@@ -187,6 +195,7 @@ impl Hub {
             late: tokio::sync::Mutex::default(),
             log_dir: log_dir.to_path_buf(),
             timeout,
+            call_timeouts,
         });
         Hub {
             peers,
@@ -257,6 +266,7 @@ impl Hub {
             late: tokio::sync::Mutex::default(),
             log_dir: PathBuf::new(),
             timeout: START_TIMEOUT,
+            call_timeouts: HashMap::new(),
         });
         Hub {
             root: true,
@@ -385,15 +395,6 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
     /// Run `full_name`; returns the output and whether it succeeded. A tool of a deferred
     /// server starts that server first.
     pub async fn call(&self, full_name: &str, arguments: Value) -> (String, bool) {
-        self.call_within(full_name, arguments, CALL_TIMEOUT).await
-    }
-
-    async fn call_within(
-        &self,
-        full_name: &str,
-        arguments: Value,
-        timeout: Duration,
-    ) -> (String, bool) {
         let found = match self.find(full_name) {
             Some(tool) => Some((
                 tool.clone(),
@@ -418,6 +419,12 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
                 false,
             );
         };
+        let timeout = self
+            .shared
+            .call_timeouts
+            .get(&tool.server)
+            .copied()
+            .unwrap_or(CALL_TIMEOUT);
         let mut params = CallToolRequestParams::new(tool.name.clone());
         if let Value::Object(arguments) = arguments {
             params = params.with_arguments(arguments);
@@ -432,7 +439,7 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
                 format!(
                     "MCP server `{}` did not answer in {}s.",
                     tool.server,
-                    timeout.as_secs()
+                    timeout.as_secs_f64()
                 ),
                 false,
             ),
@@ -549,6 +556,8 @@ pub fn fake_server(name: &str, mode: &str) -> Option<Server> {
         url: None,
         headers: crate::config::Headers::default(),
         skip: None,
+        startup_timeout: None,
+        tool_timeout: None,
     })
 }
 
@@ -601,12 +610,14 @@ fn skipped(server: &Server, reason: String) -> Status {
     }
 }
 
-/// Start one server within `timeout`; a failure is only marked in its status.
+/// Start one server within its own startup timeout, or `timeout` when it sets none; a
+/// failure is only marked in its status.
 async fn start_one(
     server: &Server,
     log_dir: &Path,
     timeout: Duration,
 ) -> (Status, Option<Running>) {
+    let timeout = server.startup_timeout.unwrap_or(timeout);
     let mut status = Status {
         state: State::Connected,
         ..skipped(server, String::new())
@@ -621,7 +632,7 @@ async fn start_one(
             (status, None)
         }
         Err(_) => {
-            status.state = State::Failed(format!("timed out after {}s", timeout.as_secs()));
+            status.state = State::Failed(format!("timed out after {}s", timeout.as_secs_f64()));
             (status, None)
         }
     }
@@ -1011,6 +1022,8 @@ mod tests {
                 "s3cret".to_string(),
             )])),
             skip: None,
+            startup_timeout: None,
+            tool_timeout: None,
         };
         let Err(why) = http(&server, &url).await else {
             panic!("a cross-origin redirect was followed");
@@ -1133,24 +1146,54 @@ mod tests {
             return;
         }
         let dir = temp_dir();
+        let stuck = Server {
+            tool_timeout: Some(Duration::from_millis(200)),
+            ..fake("stuck", "hangcall")
+        };
         let hub = Hub::connect(
-            vec![fake("stuck", "hangcall")],
+            vec![stuck],
             &Identity::default(),
             &dir,
             Duration::from_secs(10),
         )
         .await;
         assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
+        let started = std::time::Instant::now();
         let (out, ok) = hub
-            .call_within(
-                "mcp__stuck__echo",
-                serde_json::json!({"message": "hi"}),
-                Duration::from_millis(200),
-            )
+            .call("mcp__stuck__echo", serde_json::json!({"message": "hi"}))
             .await;
-        assert!(!ok && out.contains("`stuck`"), "{out}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(out, "MCP server `stuck` did not answer in 0.2s.");
+        assert!(!ok);
         hub.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_server_with_its_own_startup_timeout_gets_that_one() {
+        if !python() {
+            return;
+        }
+        let dir = temp_dir();
+        let hangs = Server {
+            startup_timeout: Some(Duration::from_millis(300)),
+            ..fake("hangs", "hang")
+        };
+        let started = std::time::Instant::now();
+        let hub = Hub::connect(
+            vec![hangs],
+            &Identity::default(),
+            &dir,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            hub.servers[0].state,
+            State::Failed("timed out after 0.3s".to_string())
+        );
+        hub.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

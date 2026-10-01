@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -38,6 +39,10 @@ pub struct Server {
     pub headers: Headers,
     /// Why it is not started, if it is not.
     pub skip: Option<String>,
+    /// `startup_timeout_sec`: how long it gets to start, when not the default.
+    pub startup_timeout: Option<Duration>,
+    /// `tool_timeout_sec`: how long it gets to answer one call, when not the default.
+    pub tool_timeout: Option<Duration>,
 }
 
 /// Every configured server, merged by name in source order. A `.mcp.json` server whose
@@ -124,6 +129,8 @@ pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
                 url: server.url.clone(),
                 headers,
                 skip,
+                startup_timeout: server.startup_timeout_sec.and_then(seconds),
+                tool_timeout: server.tool_timeout_sec.and_then(seconds),
             },
         );
     }
@@ -302,7 +309,23 @@ fn server(name: &str, entry: &Value, source: &str) -> Server {
         url,
         headers,
         skip,
+        startup_timeout: entry
+            .get("startup_timeout_sec")
+            .and_then(Value::as_f64)
+            .and_then(seconds),
+        tool_timeout: entry
+            .get("tool_timeout_sec")
+            .and_then(Value::as_f64)
+            .and_then(seconds),
     }
+}
+
+/// A timeout of `secs`, or `None` for one that is not positive or does not fit, which
+/// leaves the default in place.
+fn seconds(secs: f64) -> Option<Duration> {
+    Duration::try_from_secs_f64(secs)
+        .ok()
+        .filter(|d| !d.is_zero())
 }
 
 /// Header values with `${VAR}` expanded, and why the server cannot start if a var is unset.
@@ -370,8 +393,11 @@ mod tests {
             &home.join(".claude.json"),
             json!({
                 "mcpServers": {
-                    "a": {"type": "stdio", "command": "a-global", "args": ["x"], "env": {"K": "v"}},
+                    "a": {"type": "stdio", "command": "a-global", "args": ["x"], "env": {"K": "v"},
+                        "startup_timeout_sec": 45, "tool_timeout_sec": 1.5},
                     "b": {"command": "b-global"},
+                    "slow": {"command": "slow", "startup_timeout_sec": -1,
+                        "tool_timeout_sec": "60"},
                     "web": {"type": "http", "url": "https://x", "headers": {
                         "Authorization": "Bearer ${BHAI_TEST_UNSET_VAR:-s3cret}",
                     }},
@@ -407,6 +433,8 @@ mod tests {
             env: BTreeMap::new(),
             url: None,
             headers: Headers::default(),
+            startup_timeout_sec: None,
+            tool_timeout_sec: None,
         };
         let bhai = BTreeMap::from([
             ("b".to_string(), bhai_server("b-bhai")),
@@ -432,6 +460,7 @@ mod tests {
                 "off",
                 "ok",
                 "p__q",
+                "slow",
                 "sse",
                 "trailing_",
                 "unset",
@@ -472,6 +501,12 @@ mod tests {
 
         assert_eq!(get("a").args, ["x"]);
         assert_eq!(get("a").env["K"], "v");
+        assert_eq!(get("a").startup_timeout, Some(Duration::from_secs(45)));
+        assert_eq!(get("a").tool_timeout, Some(Duration::from_millis(1500)));
+        // A negative or non-numeric timeout leaves the default.
+        assert_eq!(get("slow").startup_timeout, None);
+        assert_eq!(get("slow").tool_timeout, None);
+        assert_eq!(get("b").tool_timeout, None);
         let servers = load(&roots, &BTreeMap::new());
         let b = servers.iter().find(|s| s.name == "b").unwrap();
         assert_eq!(b.command, "b-project");
@@ -503,6 +538,15 @@ mod tests {
         assert!(approve(&roots, &BTreeMap::new(), "web").is_err());
         assert!(approve(&roots, &BTreeMap::new(), "nothing").is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_timeout_must_be_positive_and_fit() {
+        assert_eq!(seconds(30.0), Some(Duration::from_secs(30)));
+        assert_eq!(seconds(0.25), Some(Duration::from_millis(250)));
+        for bad in [0.0, -5.0, f64::NAN, f64::INFINITY, 1e30] {
+            assert_eq!(seconds(bad), None, "{bad}");
+        }
     }
 
     #[test]
