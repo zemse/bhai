@@ -570,16 +570,20 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let [text_area, bar_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     let width = text_area.width.max(10) as usize;
-    let mut lines: Vec<Line> = Vec::new();
+    let mut cache = std::mem::take(&mut app.drawn);
     let entries = app.entries();
+    cache.fit(entries.list.len());
     let mut spans = Vec::with_capacity(entries.list.len());
+    let mut plains: Vec<String> = Vec::new();
     let mut joins: Vec<Join> = Vec::new();
     let mut margins: Vec<usize> = Vec::new();
     let mut sources: Vec<Option<Source>> = Vec::new();
     let mut copies = Vec::new();
     let mut folds = HashMap::new();
+    // Each drawn entry and how many of its cached rows it shows.
+    let mut parts: Vec<(usize, usize)> = Vec::new();
     for (index, entry) in entries.list.iter().enumerate() {
-        let start = lines.len();
+        let start = plains.len();
         // Only the last entry can be run again: anything after it has moved the history
         // on, and a turn of its own is already running.
         let retryable = index + 1 == entries.list.len() && !app.working;
@@ -600,41 +604,38 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
             .list
             .get(index + 1)
             .and_then(|next| shell_result(entry, next));
-        let mut rows = entry_lines(entry, width, expanded, retryable, result);
+        let rows = cache.rows(index, entry, width, expanded, retryable, result);
         // A diff hangs from the command that made it, with no separator between them.
         let hangs = matches!(entries.list.get(index + 1), Some(Entry::Diff(_)));
-        if hangs {
-            rows.lines.pop();
-            rows.joins.pop();
-            rows.margins.pop();
-            rows.origins.pop();
-        }
-        lines.extend(rows.lines);
-        joins.extend(rows.joins);
-        margins.extend(rows.margins);
-        sources.extend(rows.origins.into_iter().map(|row| {
-            row.map(|origins| Source {
+        let shown = rows.lines.len() - usize::from(hangs);
+        plains.extend(rows.plains[..shown].iter().cloned());
+        joins.extend_from_slice(&rows.joins[..shown]);
+        margins.extend_from_slice(&rows.margins[..shown]);
+        sources.extend(rows.origins[..shown].iter().map(|row| {
+            row.clone().map(|origins| Source {
                 entry: index,
                 origins,
             })
         }));
         copies.extend(
             rows.copies
-                .into_iter()
-                .map(|(row, chars, code)| (start + row, chars, code)),
+                .iter()
+                .map(|(row, chars, code)| (start + row, chars.clone(), code.clone())),
         );
         if rows.folded || owner != index {
             folds.insert(index, owner);
         }
+        parts.push((index, shown));
         // The blank separator line belongs to no entry.
-        spans.push((start..lines.len() - usize::from(!hangs), index));
+        spans.push((start..plains.len() - usize::from(!hangs), index));
     }
     drop(entries);
     app.folds = folds;
 
+    let total = plains.len();
     let height = area.height as usize;
     app.page = height.saturating_sub(1).max(1);
-    let max_scroll = lines.len().saturating_sub(height);
+    let max_scroll = total.saturating_sub(height);
     if app.follow {
         app.scroll = max_scroll;
     } else {
@@ -643,15 +644,36 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     app.max_scroll = max_scroll;
     app.rows = row_map(&spans, app.scroll, area);
     app.transcript_area = Some(text_area);
-    app.lines = lines.iter().map(plain).collect();
+    app.lines = plains;
     app.joins = joins;
     app.margins = margins;
     app.sources = sources;
     app.copies = copies;
     app.rehover();
 
+    // Only the rows in view are cloned out of the cache. Scrolling by leaving out the
+    // rows above the view, rather than by the widget's own offset, which is a u16, also
+    // keeps a transcript longer than 65535 rows from wrapping back to the top of itself.
+    let view = app.scroll..(app.scroll + height).min(total);
+    let mut lines: Vec<Line> = Vec::with_capacity(view.len());
+    let mut at = 0;
+    for (index, shown) in parts {
+        let rows = &cache.slots[index].as_ref().expect("drawn above").1;
+        let from = view.start.max(at) - at;
+        let to = view.end.min(at + shown).saturating_sub(at);
+        if from < to {
+            lines.extend(rows.lines[from..to].iter().cloned());
+        }
+        at += shown;
+        if at >= view.end {
+            break;
+        }
+    }
+    app.drawn = cache;
+
     if let Some(selection) = app.selection {
-        for (index, line) in lines.iter_mut().enumerate() {
+        for (offset, line) in lines.iter_mut().enumerate() {
+            let index = view.start + offset;
             let Some(range) = selection.on_line(index, app.lines[index].chars().count()) else {
                 continue;
             };
@@ -659,10 +681,6 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     }
 
-    // Scrolled by dropping the rows above the view rather than by the widget's own
-    // offset, which is a u16: a transcript longer than 65535 rows would wrap back to the
-    // top of itself. It also stops the widget walking every row it is not drawing.
-    lines.drain(..app.scroll.min(lines.len()));
     frame.render_widget(Paragraph::new(lines), text_area);
     render_badges(frame, text_area, app);
 
@@ -881,11 +899,72 @@ fn shell_status(result: &Entry) -> Option<(String, Color)> {
     }
 }
 
-/// What an entry draws: its rows, how each one joins the row above it, how many chars
-/// in front of each are drawn rather than text, where each char of a markdown row came
-/// from, the code blocks a click copies and whether it has rows a click folds away.
+/// Each entry's rows as last drawn, so a frame lays out only the entries that changed
+/// since the one before: markdown, syntax highlighting and wrapping cost the same however
+/// little of the transcript moved, and the transcript only grows.
+#[derive(Default)]
+pub struct Drawn {
+    slots: Vec<Option<(Key, Rows)>>,
+    /// Entries laid out afresh rather than taken from the cache.
+    #[cfg(test)]
+    built: usize,
+}
+
+/// What an entry's rows were drawn from. The entry is fingerprinted rather than given a
+/// revision because `Entries::list` is changed in place all over the session.
+#[derive(PartialEq)]
+struct Key {
+    fingerprint: u64,
+    width: usize,
+    expanded: bool,
+    retryable: bool,
+}
+
+impl Drawn {
+    /// One slot per entry, dropping those past the end of a transcript that shrank.
+    fn fit(&mut self, len: usize) {
+        self.slots.truncate(len);
+        self.slots.resize_with(len, || None);
+    }
+
+    fn rows(
+        &mut self,
+        index: usize,
+        entry: &Entry,
+        width: usize,
+        expanded: bool,
+        retryable: bool,
+        result: Option<&Entry>,
+    ) -> &Rows {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        (entry, result).hash(&mut hasher);
+        let key = Key {
+            fingerprint: hasher.finish(),
+            width,
+            expanded,
+            // Only a failure draws it, so the entry before a new one stays cached.
+            retryable: retryable && matches!(entry, Entry::Failed(_)),
+        };
+        let slot = &mut self.slots[index];
+        if slot.as_ref().is_none_or(|(drawn, _)| *drawn != key) {
+            #[cfg(test)]
+            {
+                self.built += 1;
+            }
+            *slot = Some((key, entry_lines(entry, width, expanded, retryable, result)));
+        }
+        &slot.as_ref().expect("filled above").1
+    }
+}
+
+/// What an entry draws: its rows and their text, how each one joins the row above it,
+/// how many chars in front of each are drawn rather than text, where each char of a
+/// markdown row came from, the code blocks a click copies and whether it has rows a click
+/// folds away.
 struct Rows {
     lines: Vec<Line<'static>>,
+    plains: Vec<String>,
     joins: Vec<Join>,
     margins: Vec<usize>,
     origins: Vec<Option<Vec<Option<Origin>>>>,
@@ -955,6 +1034,7 @@ fn entry_lines(
         margins.push(0);
         origins.push(None);
         return Rows {
+            plains: lines.iter().map(plain).collect(),
             lines,
             joins,
             margins,
@@ -1092,6 +1172,7 @@ fn entry_lines(
     margins.resize(lines.len(), 0);
     Rows {
         origins: vec![None; lines.len()],
+        plains: lines.iter().map(plain).collect(),
         lines,
         joins,
         margins,
@@ -1167,6 +1248,7 @@ fn diff_entry(text: &str, width: usize, expanded: bool) -> Rows {
     margins.resize(lines.len(), 0);
     Rows {
         origins: vec![None; lines.len()],
+        plains: lines.iter().map(plain).collect(),
         lines,
         joins,
         margins,
@@ -1871,6 +1953,86 @@ mod tests {
             lines[rows.end as usize]
         );
         assert!(matches!(&app.entries().list[1], Entry::Assistant(t) if t == raw));
+    }
+
+    /// A long session of markdown with code in it, the kind that is slow to lay out.
+    fn long_session(messages: usize) -> App {
+        let app = App::detached();
+        let mut entries = app.entries();
+        for i in 0..messages {
+            entries.push(Entry::User(format!("question {i}")));
+            entries.push(Entry::Assistant(format!(
+                "## Step {i}\n\nrun **this** with `care`:\n\n```rust\nfn step_{i}() -> u32 {{\n    \
+                 let x = {i};\n    x * 2\n}}\n```\n\n- one\n- two"
+            )));
+        }
+        drop(entries);
+        app
+    }
+
+    #[test]
+    fn a_frame_lays_out_only_the_entries_that_changed() {
+        let mut app = long_session(50);
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let all = app.entries().list.len();
+        assert_eq!(app.drawn.built, all);
+        let first = screen(&terminal);
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.drawn.built, all,
+            "nothing changed, so nothing is laid out"
+        );
+        assert_eq!(screen(&terminal), first);
+
+        // A streaming answer grows its own entry and no other.
+        app.entries()
+            .apply(&crate::session::Event::Text("\n\nand more".to_string()));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.drawn.built, all + 1);
+        assert!(screen(&terminal).contains("and more"));
+
+        // A new entry is laid out by itself, and opening one lays out that one.
+        app.entries()
+            .push(Entry::Output("a\nb\nc\nd\ne".to_string()));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.drawn.built, all + 2);
+        app.expanded.insert(all);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.drawn.built, all + 3);
+        assert!(screen(&terminal).contains("[collapse]"));
+
+        // A new width wraps everything again, and a cleared transcript drops the rest.
+        terminal.backend_mut().resize(50, 20);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.drawn.built, 2 * all + 4);
+        app.entries().list.truncate(1);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.drawn.slots.len(), 1);
+    }
+
+    /// The point of the cache: a frame over a long transcript that has not changed costs
+    /// a small part of laying it out. The margin is wide so a loaded machine still passes.
+    #[test]
+    fn a_long_transcript_redraws_from_its_cache_quickly() {
+        let mut app = long_session(200);
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let began = Instant::now();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let laid_out = began.elapsed();
+        let cached = (0..3)
+            .map(|_| {
+                let began = Instant::now();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                began.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(
+            cached * 10 < laid_out,
+            "cached {cached:?}, laid out {laid_out:?}"
+        );
     }
 
     fn left(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {

@@ -1519,10 +1519,7 @@ fn apply(app: &mut App, event: Event, root: &std::path::Path) -> bool {
             app.resync();
             true
         }
-        Event::Tick => {
-            app.tick();
-            true
-        }
+        Event::Tick => app.tick(),
     }
 }
 

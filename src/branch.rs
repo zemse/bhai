@@ -31,13 +31,17 @@ impl Branch {
         branch
     }
 
-    /// Read the name again once what is on screen is older than `REFRESH`.
-    pub fn refresh(&mut self) {
+    /// Read the name again once what is on screen is older than `REFRESH`; returns
+    /// whether it changed.
+    pub fn refresh(&mut self) -> bool {
         if self.read_at.is_some_and(|at| at.elapsed() < REFRESH) {
-            return;
+            return false;
         }
         self.read_at = Some(Instant::now());
-        self.name = head(&self.root);
+        let name = head(&self.root);
+        let changed = name != self.name;
+        self.name = name;
+        changed
     }
 
     /// The branch, or nothing outside a repository.

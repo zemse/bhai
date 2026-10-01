@@ -15,7 +15,7 @@ const LABEL_CHARS: usize = 40;
 /// Bytes of a running command's output kept for the transcript; older output is dropped.
 const LIVE_BYTES: usize = 16_000;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub enum Entry {
     User(String),
     Assistant(String),

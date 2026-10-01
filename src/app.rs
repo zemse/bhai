@@ -179,6 +179,8 @@ pub struct App {
     /// Entries with rows folded away right now, filled in by the renderer, each to the
     /// entry a click on it opens or closes. A click anywhere else pins the badge.
     pub folds: HashMap<usize, usize>,
+    /// Each entry's rows as the renderer last laid them out.
+    pub drawn: crate::ui::Drawn,
     pub all_badges: bool,
     /// Clickable approval choices and the key each stands for, filled in by the renderer.
     pub buttons: Vec<(Rect, KeyCode)>,
@@ -250,6 +252,8 @@ pub struct App {
     pub page: usize,
     pub follow: bool,
     pub spinner: usize,
+    /// The wall clock second the last tick saw.
+    second: u64,
     pub model: String,
     pub effort: String,
     pub identity: String,
@@ -323,6 +327,7 @@ impl App {
             pinned: HashSet::new(),
             expanded: HashSet::new(),
             folds: HashMap::new(),
+            drawn: crate::ui::Drawn::default(),
             all_badges: false,
             buttons: Vec::new(),
             input_area: None,
@@ -358,6 +363,7 @@ impl App {
             page: 10,
             follow: true,
             spinner: 0,
+            second: 0,
             model: session.state().model,
             effort: session.state().effort,
             identity: session.state().identity,
@@ -1274,19 +1280,32 @@ impl App {
         self.identity = state.identity;
     }
 
-    pub fn tick(&mut self) {
-        self.branch.refresh();
+    /// Move on what moves by itself; returns whether any of it shows, so an idle session
+    /// is not drawn again every tick.
+    pub fn tick(&mut self) -> bool {
+        let mut changed = self.branch.refresh();
         if self.busy() {
             self.spinner = self.spinner.wrapping_add(1);
+            changed = true;
+        }
+        // The countdowns on the bar, a status line's clock and the copy note are read off
+        // the wall clock when drawn, so a new second may change what they say.
+        let second = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if second != self.second {
+            self.second = second;
+            changed = true;
         }
         // A selection drag still held past the edge of the transcript, which the
         // terminal has nothing more to say about until the pointer moves again.
         if let Some((x, y)) = self.drag_at.filter(|&(_, y)| self.edge_scroll(y) != 0) {
             self.extend_selection(x, y, self.edge_scroll(y));
+            changed = true;
         }
         // The backends answer on a task of their own; this is where the picker hears.
         if let Some(picker) = &mut self.picker {
-            picker.poll();
+            changed |= picker.poll();
         }
         let designed = self
             .designing
@@ -1299,7 +1318,9 @@ impl App {
                 Ok(template) => self.set_statusline(Some(template)),
                 Err(e) => self.note(Entry::Error(format!("no status line: {e}"))),
             }
+            changed = true;
         }
+        changed
     }
 
     fn submit(&mut self) {
@@ -3188,6 +3209,20 @@ mod tests {
         app.max_scroll = lines - height as usize;
         app.follow = false;
         app
+    }
+
+    #[test]
+    fn an_idle_tick_asks_for_no_redraw_and_a_busy_one_does() {
+        let mut app = App::detached();
+        app.tick();
+        // The wall clock moves on once a second, which a run of ticks may straddle once.
+        let redraws = (0..10).filter(|_| app.tick()).count();
+        assert!(redraws <= 1, "{redraws} redraws while idle");
+
+        app.working = true;
+        let spinner = app.spinner;
+        assert!((0..3).all(|_| app.tick()));
+        assert_eq!(app.spinner, spinner + 3);
     }
 
     /// The whole point of a drag: the text worth copying is usually longer than the
