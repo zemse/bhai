@@ -211,6 +211,9 @@ impl Entries {
                         None if text("content").starts_with(crate::goal::CONTINUE) => {
                             Entry::Info("resumed on the goal".to_string())
                         }
+                        None if text("content") == crate::agent::TURN_ABORTED => {
+                            Entry::Info("interrupted".to_string())
+                        }
                         None => Entry::User(text("content")),
                     },
                 },
@@ -895,5 +898,21 @@ mod tests {
         // The summary costs tokens like any other item, so it is still attributed.
         assert_eq!(app.list[2].text(), "did things");
         assert_eq!(app.attribution.items.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn a_restored_interrupt_marker_shows_as_the_interrupt() {
+        let mut app = intro();
+        let message = |text: &str| serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]});
+        app.restore(&[
+            message("hi"),
+            message(crate::agent::TURN_ABORTED),
+            message("again"),
+        ]);
+        let shown: Vec<_> = app.list[1..].iter().map(|e| (e.kind(), e.text())).collect();
+        assert_eq!(
+            shown,
+            [("user", "hi"), ("info", "interrupted"), ("user", "again")]
+        );
     }
 }

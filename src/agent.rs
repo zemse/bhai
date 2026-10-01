@@ -430,6 +430,12 @@ pub const CHILD_RESULT: &str = "A child agent you started has finished.";
 const CHILD_RESULT_LATE: &str = " You have already answered the user, so say what this \
 adds or changes and leave the rest of your answer standing.";
 
+/// What a turn the user interrupted ends on, so the next one does not take its plan as
+/// finished or a command it cut off as never run. Constant, so it costs nothing to cache.
+pub const TURN_ABORTED: &str = "<turn_aborted>\nThe user interrupted the previous turn on \
+purpose. Anything it was doing is unfinished, and any tool or command it was running may \
+have partially executed. Check before relying on its effects.\n</turn_aborted>";
+
 /// A report for every child the history says was started and never reported, which is
 /// what a session that ended mid-child holds: the call's "its report will reach you" with
 /// nothing after it. Nothing re-runs the child, so the model is told it is gone.
@@ -1161,6 +1167,15 @@ pub(crate) async fn run_with(
                     g.pause("its last turn spent no tokens");
                 }
             }
+        }
+        if cancel.load(Ordering::Relaxed) {
+            let at = history.len();
+            history.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": TURN_ABORTED }],
+            }));
+            record(&mut sink, &history[at..], &tx);
         }
         if let Err(e) = result.result {
             // A refused request that carried a new update may be refusing the update, and
@@ -3878,6 +3893,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_turn_after_an_interrupt_is_told_the_last_one_was_cut_off() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![fake::step(fake::HANG), vec![say("ok")]]);
+        let (mut rx, user, _control, cancel) = goal_session(&fake, Vec::new());
+        user.send("go".to_string()).await.unwrap();
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Text(_)) {
+                break;
+            }
+        }
+        cancel.stop();
+        settle(&mut rx).await;
+        cancel.clear();
+        user.send("again".to_string()).await.unwrap();
+        settle(&mut rx).await;
+
+        let calls = parent_calls(&fake);
+        assert_eq!(calls.len(), 2);
+        let input: Value = serde_json::from_str(&calls[1]).unwrap();
+        let said: Vec<_> = input
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["content"][0]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(said, ["go", TURN_ABORTED, "again"]);
+    }
+
+    #[tokio::test]
     async fn the_users_own_turn_goes_before_the_goal_and_is_charged_but_not_cut() {
         use fake::{Fake, call, say};
 
@@ -5887,8 +5932,11 @@ mod tests {
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["call_id"], bash["call_id"]);
         assert_eq!(input[2]["output"], expected.as_str());
+        // The command was cut off halfway, which the next turn is told before the message.
+        assert_eq!(input[3]["content"][0]["text"], TURN_ABORTED);
+        assert_eq!(input[4]["content"][0]["text"], "again");
         let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
-        assert_eq!(&loaded.items[..3], &input[..3]);
+        assert_eq!(&loaded.items[..5], &input[..5]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
