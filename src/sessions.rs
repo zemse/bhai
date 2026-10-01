@@ -478,6 +478,8 @@ pub struct Details {
     pub header: Header,
     pub first: Option<String>,
     pub items: usize,
+    /// The model the session was last on.
+    pub model: String,
 }
 
 /// Every session under `dir`, most recently written first. One that will not load
@@ -498,6 +500,7 @@ pub fn list(dir: &Path) -> Vec<Summary> {
                 .map(|loaded| Details {
                     first: loaded.items.iter().find_map(user_text).map(truncate),
                     items: loaded.items.len(),
+                    model: loaded.model,
                     header: loaded.header,
                 })
                 .map_err(|e| format!("{e:#}"));

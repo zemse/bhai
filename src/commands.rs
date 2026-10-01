@@ -73,6 +73,12 @@ pub const COMMANDS: &[Command] = &[
         args: "",
         help: "stop trusting them",
     },
+    // No args hint, though it takes words to filter by: the list is the usual way in.
+    Command {
+        name: "sessions",
+        args: "",
+        help: "mention a past session's file, which the agent can read",
+    },
     Command {
         name: "skills",
         args: "",

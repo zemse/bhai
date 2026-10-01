@@ -1,4 +1,6 @@
 //! The `ctrl+r` search: type to filter the prompt history, pick one to edit and send.
+//! The same list, over saved sessions, is `/sessions` (a mention of one) and `--pick`
+//! (one to resume).
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -18,10 +20,24 @@ pub enum Pick {
     Picked(String),
 }
 
+/// What the rows are and what a pick is for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Kind {
+    /// The prompt history; a pick replaces the draft.
+    History,
+    /// Saved sessions; a pick is the session file's path, put into the draft.
+    Mention,
+    /// Saved sessions; a pick is the id to resume.
+    Resume,
+}
+
 #[derive(Debug)]
 pub struct Search {
-    /// The history, newest first, each prompt once.
+    pub kind: Kind,
+    /// The rows, newest first, each prompt once.
     all: Vec<String>,
+    /// What picking each row gives, where it is not the row itself.
+    values: Vec<String>,
     query: String,
     /// Indices into `all` of what the query matches, newest first.
     found: Vec<usize>,
@@ -37,8 +53,44 @@ impl Search {
                 all.push(entry.clone());
             }
         }
+        Self::open(Kind::History, all, Vec::new())
+    }
+
+    /// Open over the sessions [`crate::sessions::list`] found, leaving out `current` and
+    /// any that will not load. Each row is its age, its model and its first message.
+    pub fn sessions(
+        kind: Kind,
+        list: &[crate::sessions::Summary],
+        current: &str,
+        now: std::time::SystemTime,
+    ) -> Self {
+        let (all, values) = list
+            .iter()
+            .filter(|s| s.id != current)
+            .filter_map(|s| {
+                let details = s.details.as_ref().ok()?;
+                let age = now.duration_since(s.modified).unwrap_or_default();
+                let row = format!(
+                    "{:>3}  {}  {}",
+                    ago(age),
+                    details.model,
+                    details.first.as_deref().unwrap_or("(no message)")
+                );
+                let value = match kind {
+                    Kind::Mention => s.path.display().to_string(),
+                    _ => s.id.clone(),
+                };
+                Some((row, value))
+            })
+            .unzip();
+        Self::open(kind, all, values)
+    }
+
+    fn open(kind: Kind, all: Vec<String>, values: Vec<String>) -> Self {
         let mut search = Self {
+            kind,
             all,
+            values,
             query: String::new(),
             found: Vec::new(),
             selected: 0,
@@ -60,6 +112,10 @@ impl Search {
         self.selected = 0;
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.all.is_empty()
+    }
+
     pub fn insert(&mut self, text: &str) {
         self.query.extend(text.chars().filter(|c| !c.is_control()));
         self.filter();
@@ -72,7 +128,7 @@ impl Search {
             KeyCode::Esc => return Pick::Closed,
             KeyCode::Enter | KeyCode::Tab => {
                 return match self.found.get(self.selected) {
-                    Some(&i) => Pick::Picked(self.all[i].clone()),
+                    Some(&i) => Pick::Picked(self.values.get(i).unwrap_or(&self.all[i]).clone()),
                     None => Pick::Waiting,
                 };
             }
@@ -107,12 +163,27 @@ impl Search {
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         let dim = Style::new().fg(Color::DarkGray);
-        let title = format!(" history · {} of {} ", self.found.len(), self.all.len());
+        let (what, keys, none) = match self.kind {
+            Kind::History => (
+                "history",
+                " ↑↓ or ctrl+r pick · enter take · esc close ",
+                " no prompts sent yet",
+            ),
+            Kind::Mention => (
+                "sessions",
+                " ↑↓ pick · enter mention its file · esc close ",
+                " no other saved sessions",
+            ),
+            Kind::Resume => (
+                "sessions",
+                " ↑↓ pick · enter resume · esc quit ",
+                " no saved sessions",
+            ),
+        };
+        let title = format!(" {what} · {} of {} ", self.found.len(), self.all.len());
         let block = Block::bordered()
             .title(title)
-            .title_bottom(
-                Line::styled(" ↑↓ or ctrl+r pick · enter take · esc close ", dim).right_aligned(),
-            )
+            .title_bottom(Line::styled(keys, dim).right_aligned())
             .border_style(Style::new().fg(Color::Cyan));
         let inner = block.inner(area);
         frame.render_widget(Clear, area);
@@ -141,7 +212,7 @@ impl Search {
         );
         if self.found.is_empty() {
             let empty = match self.all.is_empty() {
-                true => " no prompts sent yet",
+                true => none,
                 false => " nothing matches",
             };
             lines.push(Line::styled(empty, dim));
@@ -150,6 +221,51 @@ impl Search {
         let x = inner.x + 9 + self.query.chars().count() as u16;
         frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
     }
+}
+
+/// How long ago, in the largest unit that is at least one.
+fn ago(age: std::time::Duration) -> String {
+    match age.as_secs() {
+        s if s < 60 => "now".to_string(),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    }
+}
+
+/// Run `search` on the terminal on its own, before the session starts: the pick, or
+/// `None` when it was closed.
+pub fn run(mut search: Search) -> std::io::Result<Option<String>> {
+    use ratatui::crossterm::event::{self, Event, KeyEventKind};
+    let mut terminal = ratatui::init();
+    let picked = loop {
+        if let Err(e) = terminal.draw(|frame| {
+            let area = frame.area();
+            let height = search.height().min(area.height);
+            search.render(frame, Rect { height, ..area });
+        }) {
+            break Err(e);
+        }
+        let key = match event::read() {
+            Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => key,
+            Ok(Event::Paste(text)) => {
+                search.insert(&text);
+                continue;
+            }
+            Ok(_) => continue,
+            Err(e) => break Err(e),
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            break Ok(None);
+        }
+        match search.on_key(key) {
+            Pick::Waiting => {}
+            Pick::Closed => break Ok(None),
+            Pick::Picked(value) => break Ok(Some(value)),
+        }
+    };
+    ratatui::restore();
+    picked
 }
 
 /// A prompt on one row, its line breaks shown as `↵`.
@@ -173,6 +289,7 @@ fn line(entry: &str, selected: bool, width: usize) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     fn press(search: &mut Search, code: KeyCode) -> Pick {
         search.on_key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -202,6 +319,57 @@ mod tests {
             press(&mut search, KeyCode::Enter),
             Pick::Picked("run the Tests".to_string())
         );
+    }
+
+    #[test]
+    fn sessions_show_age_model_and_first_message_and_pick_their_id_or_path() {
+        use crate::sessions::{Details, Header, Summary};
+        use std::time::{Duration, SystemTime};
+
+        let now = SystemTime::now();
+        let summary = |id: &str, ago: u64, first: Option<&str>| Summary {
+            path: PathBuf::from(format!("/repo/.bhai/sessions/{id}.jsonl")),
+            id: id.to_string(),
+            modified: now - Duration::from_secs(ago),
+            details: Ok(Details {
+                header: Header::new(id, "default", "gpt-5", "low", Path::new("/repo")),
+                first: first.map(str::to_string),
+                items: 2,
+                model: "gpt-5.5".to_string(),
+            }),
+        };
+        let list = [
+            summary("current", 0, Some("this one")),
+            summary("aaa", 30, Some("fix the parser")),
+            summary("bbb", 7200, None),
+            Summary {
+                details: Err("bad header".to_string()),
+                ..summary("broken", 9000, None)
+            },
+            summary("ccc", 3 * 86400, Some("write the tests")),
+        ];
+
+        let mut search = Search::sessions(Kind::Resume, &list, "current", now);
+        assert_eq!(
+            search.all,
+            [
+                "now  gpt-5.5  fix the parser",
+                " 2h  gpt-5.5  (no message)",
+                " 3d  gpt-5.5  write the tests",
+            ]
+        );
+        search.insert("tests");
+        assert_eq!(
+            press(&mut search, KeyCode::Enter),
+            Pick::Picked("ccc".to_string())
+        );
+
+        let mut search = Search::sessions(Kind::Mention, &list, "current", now);
+        assert_eq!(
+            press(&mut search, KeyCode::Enter),
+            Pick::Picked("/repo/.bhai/sessions/aaa.jsonl".to_string())
+        );
+        assert!(Search::sessions(Kind::Mention, &list[..1], "current", now).is_empty());
     }
 
     #[test]

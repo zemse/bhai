@@ -193,14 +193,21 @@ async fn main() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [usage] [sessions [prune [n]]] [mcp approve <server>] [--probe [prompt]] [--cache-check [minutes]] [--judge-eval [file]] [--as <identity>] [--resume [id]] [--workflow <name> [input] [--workflow-yes]] [exec <prompt|-> [--json]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [usage] [sessions [prune [n]]] [mcp approve <server>] [--probe [prompt]] [--cache-check [minutes]] [--judge-eval [file]] [--as <identity>] [--resume [id] | --pick] [--workflow <name> [input] [--workflow-yes]] [exec <prompt|-> [--json]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
     };
     let cwd = std::env::current_dir()?;
     let dir = cwd.join(sessions::DIR);
-    let resumed = match &args.resume {
+    let resume = match args.pick {
+        true => match pick(&dir)? {
+            Some(id) => Some(Some(id)),
+            None => return Ok(()),
+        },
+        false => args.resume.clone(),
+    };
+    let resumed = match &resume {
         Some(id) => Some(sessions::find(&dir, id.as_deref())?),
         None => None,
     };
@@ -619,6 +626,8 @@ struct Args {
     trust: bool,
     /// `--resume [id]`: continue a saved session, the latest when no id is given.
     resume: Option<Option<String>>,
+    /// `--pick`: choose the session to resume from a list.
+    pick: bool,
     /// `--workflow <name> [input]`: run one workflow without the TUI.
     workflow: Option<(String, String)>,
     /// Answer the workflow confirmation with yes; without it the plan is only printed.
@@ -729,6 +738,21 @@ fn permissions(config: Config, home: Option<PathBuf>, cwd: PathBuf) -> (Policy, 
     (policy, notices)
 }
 
+/// `--pick`: the id of the session chosen from the list, or `None` when it was closed.
+fn pick(dir: &std::path::Path) -> Result<Option<String>> {
+    let list = sessions::list(dir);
+    let search = search::Search::sessions(
+        search::Kind::Resume,
+        &list,
+        "",
+        std::time::SystemTime::now(),
+    );
+    if search.is_empty() {
+        bail!("no sessions in {}", dir.display());
+    }
+    Ok(search::run(search)?)
+}
+
 /// The identity a resumed session runs as: its own, or the default with a warning
 /// when that no longer exists.
 fn resumed_identity(
@@ -814,6 +838,7 @@ fn parse_args(args: &[String]) -> Result<Args> {
             "--resume" => {
                 parsed.resume = Some(args.next_if(|a| !a.starts_with("--")).cloned());
             }
+            "--pick" => parsed.pick = true,
             "--workflow" => {
                 let name = args
                     .next()
@@ -842,7 +867,13 @@ fn parse_args(args: &[String]) -> Result<Args> {
     if parsed.json && parsed.exec.is_none() {
         bail!("--json is for exec");
     }
-    if parsed.resume.is_some() && parsed.identity.is_some() {
+    if parsed.pick && parsed.resume.is_some() {
+        bail!("--pick chooses the session --resume would name, so not both");
+    }
+    if parsed.pick && (parsed.headless || parsed.workflow.is_some() || parsed.exec.is_some()) {
+        bail!("--pick needs the terminal, so it takes no --headless, --workflow or exec");
+    }
+    if (parsed.resume.is_some() || parsed.pick) && parsed.identity.is_some() {
         bail!("--resume keeps the session's identity, so it takes no --as");
     }
     Ok(parsed)
@@ -2026,6 +2057,26 @@ mod tests {
             Some(Some("abc".to_string()))
         );
         assert!(resume(&["--resume", "--as", "router"]).is_err());
+    }
+
+    #[test]
+    fn pick_flag() {
+        let pick = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse_args(&args).map(|a| a.pick)
+        };
+        assert!(!pick(&[]).unwrap());
+        assert!(pick(&["--pick", "--profile"]).unwrap());
+        assert!(pick(&["--pick", "--serve"]).unwrap());
+        for refused in [
+            &["--pick", "--resume"][..],
+            &["--pick", "--as", "router"],
+            &["--pick", "--serve", "--headless"],
+            &["--pick", "exec", "hi"],
+            &["--pick", "--workflow", "w"],
+        ] {
+            assert!(pick(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]

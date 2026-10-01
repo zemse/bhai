@@ -29,7 +29,7 @@ use crate::markdown::{self, Origin};
 use crate::models::{Choice, Picker};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
-use crate::search::{Pick, Search};
+use crate::search::{Kind, Pick, Search};
 use crate::session::{Approval, ChildRow, Event, Prompt, Session, SubmitError};
 use crate::skills::Skill;
 use crate::speed::Speed;
@@ -496,9 +496,15 @@ impl App {
                 Pick::Waiting => {}
                 Pick::Closed => self.search = None,
                 Pick::Picked(text) => {
+                    let kind = search.kind;
                     self.search = None;
-                    self.history.end_walk();
-                    self.input.set(text);
+                    match kind {
+                        Kind::History => {
+                            self.history.end_walk();
+                            self.input.set(text);
+                        }
+                        _ => self.input.insert(&format!("{text} ")),
+                    }
                     self.menu = None;
                 }
             }
@@ -1571,6 +1577,14 @@ impl App {
             self.note(Entry::Info(mouse_notice(self.mouse)));
             return;
         }
+        if let Some(rest) = message.strip_prefix("/sessions")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            let dir = std::env::current_dir()
+                .unwrap_or_default()
+                .join(crate::sessions::DIR);
+            return self.mention(&crate::sessions::list(&dir), rest.trim());
+        }
         if message.starts_with("/skills") {
             self.follow = true;
             self.note(Entry::Info(skills_report(&self.skills)));
@@ -1972,6 +1986,18 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
                 Err(e) => Event::Error(format!("debug export failed: {e:#}")),
             });
         });
+    }
+
+    /// Open the session search, filtered by `query`, for a pick to put in the prompt.
+    fn mention(&mut self, list: &[crate::sessions::Summary], query: &str) {
+        let mut search = Search::sessions(
+            Kind::Mention,
+            list,
+            &self.session_id,
+            std::time::SystemTime::now(),
+        );
+        search.insert(query);
+        self.search = Some(search);
     }
 
     /// Everything the export carries except the profile, which has to be asked for.
@@ -3548,6 +3574,49 @@ mod tests {
         assert_eq!(app.input.value(), "/permissions");
         app.on_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert_eq!(app.input.value(), "draft");
+    }
+
+    #[test]
+    fn sessions_puts_the_picked_session_file_into_the_draft() {
+        use crate::sessions::{Details, Header, Summary};
+
+        let summary = |id: &str, first: &str| Summary {
+            path: PathBuf::from(format!("/repo/.bhai/sessions/{id}.jsonl")),
+            id: id.to_string(),
+            modified: std::time::SystemTime::now(),
+            details: Ok(Details {
+                header: Header::new(id, "default", "gpt-5", "low", std::path::Path::new("/")),
+                first: Some(first.to_string()),
+                items: 2,
+                model: "gpt-5".to_string(),
+            }),
+        };
+        let mut app = App::detached();
+        app.session_id = "me".to_string();
+        let list = [
+            summary("me", "this session"),
+            summary("aaa", "fix the parser"),
+            summary("bbb", "run the tests"),
+        ];
+        type_text(&mut app, "as in ");
+        app.mention(&list, "tests");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.search.is_none());
+        assert_eq!(
+            app.input.value(),
+            "as in /repo/.bhai/sessions/bbb.jsonl ",
+            "the draft is kept and the path goes in at the cursor"
+        );
+
+        app.mention(&list, "this session");
+        assert_eq!(
+            app.search
+                .as_mut()
+                .unwrap()
+                .on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            crate::search::Pick::Waiting,
+            "the session itself is not listed"
+        );
     }
 
     #[test]
