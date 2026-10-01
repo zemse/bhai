@@ -156,6 +156,10 @@ impl Entries {
             Event::Info(message) | Event::Compacting(message) => {
                 self.push(Entry::Info(message.clone()))
             }
+            Event::Retrying(message) => {
+                self.unstream();
+                self.push(Entry::Info(message.clone()));
+            }
             Event::Compacted {
                 notice, summary, ..
             } => {
@@ -349,6 +353,20 @@ impl Entries {
             }
         }
         self.attribution.mark = self.list.len();
+    }
+
+    /// Drop what the failed attempt of a call streamed: the run of text and reasoning at
+    /// the end, back to the last entry already accounted for. Anything else ends the run,
+    /// so an earlier attempt's retry notice stays.
+    fn unstream(&mut self) {
+        while self.list.len() > self.attribution.mark
+            && matches!(
+                self.list.last(),
+                Some(Entry::Assistant(_) | Entry::Commentary(_) | Entry::Reasoning(_))
+            )
+        {
+            self.list.pop();
+        }
     }
 
     /// The running command entry, if a call is still in flight.
@@ -804,6 +822,36 @@ mod tests {
         restored.restore(&[preamble, message("found it")]);
         let kinds: Vec<_> = restored.list[1..].iter().map(Entry::kind).collect();
         assert_eq!(kinds, ["commentary", "assistant"]);
+    }
+
+    #[test]
+    fn a_retry_drops_what_the_failed_attempt_streamed() {
+        let mut app = intro();
+        app.apply(&Event::Text("earlier answer".to_string()));
+        app.apply(&Event::Call(CallTokens {
+            usage: usage(10, 0, 3, 0),
+            sent: 1,
+            outputs: 1,
+            text: 3,
+            ..CallTokens::default()
+        }));
+        app.apply(&Event::Reasoning("thinking".to_string()));
+        app.apply(&Event::Text("half an ans".to_string()));
+        app.apply(&Event::Retrying("retrying (2/3) in 0.5s: boom".to_string()));
+        app.apply(&Event::Commentary("again".to_string()));
+        app.apply(&Event::Retrying("retrying (3/3) in 1.5s: boom".to_string()));
+        app.apply(&Event::Text("the answer".to_string()));
+        let texts: Vec<_> = app.list[1..].iter().map(Entry::text).collect();
+        assert_eq!(
+            texts,
+            [
+                "earlier answer",
+                "retrying (2/3) in 0.5s: boom",
+                "retrying (3/3) in 1.5s: boom",
+                "the answer"
+            ]
+        );
+        assert_eq!(app.tokens[&1].output, Some(3));
     }
 
     #[test]

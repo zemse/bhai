@@ -77,6 +77,9 @@ pub enum AgentEvent {
     },
     /// A notice for the transcript, such as a call the policy allowed.
     Info(String),
+    /// The model call failed and is sent again, so what it streamed so far is not the
+    /// answer; the string says why and when.
+    Retrying(String),
     /// The auto-approval judge is deciding this call, or `None` once it has.
     Judging(Option<String>),
     /// History was compacted, so earlier item indexes no longer hold; with a notice,
@@ -1509,7 +1512,7 @@ async fn turn(
                     of,
                     delay,
                     reason,
-                } => AgentEvent::Info(format!(
+                } => AgentEvent::Retrying(format!(
                     "retrying ({attempt}/{of}) in {:.1}s: {reason}",
                     delay.as_secs_f64()
                 )),
@@ -2100,7 +2103,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::ToolProgress(_)
                 | AgentEvent::ToolOutput(_)
                 | AgentEvent::ToolRejected { .. }
-                | AgentEvent::Info(_)) => inside(said),
+                | AgentEvent::Info(_)
+                | AgentEvent::Retrying(_)) => inside(said),
                 other @ (AgentEvent::ChildUsage(_)
                 | AgentEvent::CacheHit(_)
                 | AgentEvent::CacheStalled(_)

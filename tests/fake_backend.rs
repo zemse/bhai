@@ -567,7 +567,9 @@ async fn a_transient_failure_is_retried_and_says_so() {
     let fake = Arc::new(Fake::default());
     {
         let mut replies = fake.replies.lock().unwrap();
-        replies.push_back(fails("server_is_overloaded"));
+        // The failed attempt streams some text first, which the retry takes back.
+        let partial = sse(&[json!({ "type": "response.output_text.delta", "delta": "first ti" })]);
+        replies.push_back(partial + &fails("server_is_overloaded"));
         replies.push_back(says("second time"));
     }
     let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
@@ -576,12 +578,13 @@ async fn a_transient_failure_is_retried_and_says_so() {
     let (status, answer) = bhai.post("/prompt", json!({ "text": "go" })).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
 
-    let info = events.until("info").await;
-    let said = info["data"].as_str().unwrap_or_default();
-    assert!(said.starts_with("retrying (2/3) in "), "{info}");
-    assert!(said.contains("failed: server_is_overloaded"), "{info}");
+    let retrying = events.until("retrying").await;
+    let said = retrying["data"].as_str().unwrap_or_default();
+    assert!(said.starts_with("retrying (2/3) in "), "{retrying}");
+    assert!(said.contains("failed: server_is_overloaded"), "{retrying}");
+    assert_eq!(events.text(), "first ti");
     events.until("turn_end").await;
-    assert_eq!(events.text(), "second time");
+    assert_eq!(events.text(), "first tisecond time");
     assert_eq!(fake.responses().len(), 2);
 }
 

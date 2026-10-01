@@ -141,6 +141,9 @@ pub enum Event {
     Streaming(bool),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
+    /// The model call failed and is sent again; what it streamed is dropped from the
+    /// transcript, and the string says why and when.
+    Retrying(String),
     /// `/compact` started, from the prompt box or from the front of the queue; the
     /// string says what it keeps.
     Compacting(String),
@@ -1111,6 +1114,7 @@ impl Session {
                 Event::Streaming(on)
             }
             AgentEvent::Info(s) => Event::Info(s),
+            AgentEvent::Retrying(s) => Event::Retrying(s),
             AgentEvent::Judging(what) => Event::Judging(what),
             AgentEvent::Titled(name) => Event::Titled(name),
             // Either way the next call reads a history the cache has never seen.
@@ -1413,6 +1417,7 @@ fn said(event: AgentEvent) -> Option<Event> {
             reason,
         },
         AgentEvent::Info(s) => Event::Info(s),
+        AgentEvent::Retrying(s) => Event::Retrying(s),
         AgentEvent::Error(s) => Event::Error(s),
         _ => return None,
     })

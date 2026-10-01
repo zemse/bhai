@@ -934,7 +934,9 @@ async fn headless_workflow(
                     Some(id),
                 );
             }
-            session::Event::Info(message) | session::Event::Compacting(message) => {
+            session::Event::Info(message)
+            | session::Event::Retrying(message)
+            | session::Event::Compacting(message) => {
                 println!("{message}")
             }
             session::Event::ToolStart { summary, .. } => println!("$ {summary}"),
@@ -981,6 +983,8 @@ impl ExecRun {
                     summary, reason, ..
                 } => writeln!(err, "[rejected] {summary} {reason}")?,
                 Event::Info(message) => writeln!(err, "{message}")?,
+                // What stdout already has of the failed attempt cannot be taken back.
+                Event::Retrying(message) => writeln!(err, "{message}")?,
                 Event::Error(message) | Event::TurnFailed(message) => {
                     writeln!(err, "[error] {message}")?
                 }
@@ -1094,6 +1098,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
                 false => println!("[{}] {summary} ({reason})", by.label()),
             },
             AgentEvent::Info(message) => println!("[info] {message}"),
+            AgentEvent::Retrying(message) => println!("\n[retry] {message}"),
             AgentEvent::Compacted {
                 notice, summary, ..
             } => {
