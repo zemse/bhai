@@ -1,0 +1,11 @@
+version = "1.0"
+
+[metadata]
+difficulty = "easy"
+tags = ["python", "bugfix"]
+
+[agent]
+timeout_sec = 300
+
+[verifier]
+timeout_sec = 30
