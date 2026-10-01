@@ -135,6 +135,18 @@ pub fn effort_update(effort: &str) -> Value {
     json!({ "type": "configuration_update", "reasoning": { "effort": effort } })
 }
 
+/// Whether `model` compacts on the server: sent the history with a `compaction_trigger`
+/// after it, the backend answers with one opaque `compaction` item that stands for it.
+/// The GPT-6 family only, as with effort updates.
+pub fn compacts_on_server(model: &str) -> bool {
+    takes_effort_updates(model)
+}
+
+/// The item that asks the backend to compact the history in front of it.
+pub fn compaction_trigger() -> Value {
+    json!({ "type": "compaction_trigger" })
+}
+
 /// The effort the last `configuration_update` in `history` put the conversation on.
 pub fn announced_effort(history: &[Value]) -> Option<&str> {
     history

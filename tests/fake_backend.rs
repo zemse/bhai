@@ -691,6 +691,57 @@ async fn a_context_overflow_compacts_and_the_turn_runs_again() {
     assert!(!mentions(retried, "\"one\""));
 }
 
+/// The backend answering a `compaction_trigger` with its opaque item.
+fn compacts(encrypted: &str) -> String {
+    sse(&[
+        json!({
+            "type": "response.output_item.done",
+            "item": { "type": "compaction", "id": "cmp_1", "encrypted_content": encrypted }
+        }),
+        completed(),
+    ])
+}
+
+#[tokio::test]
+async fn a_gpt6_overflow_compacts_on_the_backend_and_the_turn_runs_again() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(says("one"));
+        replies.push_back(fails("context_length_exceeded"));
+        replies.push_back(compacts("opaque-state"));
+        replies.push_back(says("two"));
+    }
+    let backend = serve_fake(fake.clone()).await;
+    let bhai = Bhai::start_with(&backend, &[("BHAI_MODEL", "gpt-6-sol")]).await;
+    let mut events = bhai.events().await;
+    bhai.post("/prompt", json!({ "text": "first" })).await;
+    events.until("turn_end").await;
+
+    bhai.post("/prompt", json!({ "text": "second" })).await;
+    events.until("turn_end").await;
+    assert!(
+        !events.kinds().contains(&"turn_failed"),
+        "{:#?}",
+        events.got
+    );
+    assert!(events.kinds().contains(&"compacted"), "{:#?}", events.got);
+    assert_eq!(events.text(), "onetwo");
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 4, "{sent:#?}");
+    assert_eq!(sent[0].body["model"], "gpt-6-sol");
+    let asked = sent[2].body["input"].as_array().unwrap();
+    assert_eq!(asked.last(), Some(&json!({ "type": "compaction_trigger" })));
+    let retried = &sent[3].body;
+    let kept = items(retried, "compaction");
+    assert_eq!(kept.len(), 1, "{retried}");
+    assert_eq!(kept[0]["encrypted_content"], "opaque-state");
+    assert!(mentions(retried, "first") && mentions(retried, "second"));
+    assert!(!mentions(retried, "\"one\""));
+    assert!(items(retried, "compaction_trigger").is_empty());
+}
+
 #[tokio::test]
 async fn a_transient_failure_is_retried_and_says_so() {
     let fake = Arc::new(Fake::default());

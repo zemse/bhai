@@ -1,5 +1,6 @@
 //! Keeping history inside the context window: old tool outputs are evicted first, and
-//! only when that is not enough are the earlier turns replaced by a summary.
+//! only when that is not enough are the earlier turns replaced by a summary, or by the
+//! backend's own `compaction` item on a model that compacts on the server.
 
 use std::time::Duration;
 
@@ -31,6 +32,8 @@ pub const FORK_LEAD: Duration = Duration::from_secs(3 * 60);
 /// A conversation whose last call read fewer tokens than this is not forked: there is
 /// too little to fold away to be worth the summary call.
 pub const FORK_MIN: u64 = 16_000;
+/// The tokens of user messages a server compaction keeps beside its item.
+pub const RETAINED: u64 = 64_000;
 /// The most recent tool results are never evicted.
 const KEEP_RESULTS: usize = 6;
 /// How the summary starts in the compacted history.
@@ -178,6 +181,55 @@ pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
     Some(folded)
 }
 
+/// The history after a server compaction: the environment it told the model, the user
+/// messages that fit in `budget` tokens, newest first and the one that crosses it cut in
+/// the middle, and last the `compaction` item that stands for the rest.
+pub fn install(
+    history: &[Value],
+    compaction: Value,
+    budget: u64,
+    tokenizer: &dyn Tokenizer,
+) -> Vec<Value> {
+    let mut kept = Vec::new();
+    let mut left = budget;
+    let users = history
+        .iter()
+        .rev()
+        .filter(|item| is(item, "message") && item["role"] == "user");
+    for item in users {
+        if left == 0 {
+            break;
+        }
+        let text = tokens::item_text(item).unwrap_or_default();
+        let count = tokenizer.count(&text) as u64;
+        if count <= left {
+            left -= count;
+            kept.push(item.clone());
+            continue;
+        }
+        kept.push(user_message(&clip(&text, left)));
+        left = 0;
+    }
+    kept.reverse();
+    let mut installed: Vec<Value> = crate::environment::restated(history).into_iter().collect();
+    installed.extend(kept);
+    installed.push(compaction);
+    installed
+}
+
+/// `text` cut to about `tokens` tokens, its start and end kept.
+fn clip(text: &str, tokens: u64) -> String {
+    let half = (tokens as usize).saturating_mul(4) / 2;
+    let head = text.floor_char_boundary(half);
+    let tail = text.ceil_char_boundary(text.len().saturating_sub(half).max(head));
+    format!(
+        "{}\n[... {} bytes cut to fit the compacted history ...]\n{}",
+        &text[..head],
+        tail - head,
+        &text[tail..]
+    )
+}
+
 fn is(item: &Value, kind: &str) -> bool {
     item.get("type").and_then(Value::as_str) == Some(kind)
 }
@@ -318,6 +370,42 @@ mod tests {
         // A single turn has nothing earlier to fold.
         assert_eq!(fold(&history[..5], "s"), None);
         assert_eq!(fold(&[], "s"), None);
+    }
+
+    #[test]
+    fn install_keeps_the_newest_user_messages_then_the_item() {
+        use crate::environment::{Environment, update};
+
+        let env = Environment {
+            cwd: "/w".to_string(),
+            shell: "bash".to_string(),
+            current_date: "2026-10-01".to_string(),
+            timezone: "UTC".to_string(),
+        };
+        let mut history = vec![update(&[], &env).unwrap()];
+        turn(&mut history, &"a".repeat(400), 1);
+        turn(&mut history, &"b".repeat(400), 2);
+        turn(&mut history, "three", 1);
+        let item = json!({"type": "compaction", "encrypted_content": "opaque"});
+
+        let all = install(&history, item.clone(), u64::MAX, &ByteEstimate);
+        assert_eq!(all[0], history[0]);
+        assert_eq!(all[1], user_message(&"a".repeat(400)));
+        assert_eq!(all[2], user_message(&"b".repeat(400)));
+        assert_eq!(all[3], user_message("three"));
+        assert_eq!(all[4], item);
+        assert_eq!(all.len(), 5, "no tool calls, outputs or answers: {all:?}");
+
+        // 2 tokens for "three", the next 100-token message is cut to the 50 left, and
+        // nothing older is kept.
+        let some = install(&history, item.clone(), 52, &ByteEstimate);
+        assert_eq!(some.len(), 4, "{some:?}");
+        let cut = some[1]["content"][0]["text"].as_str().unwrap();
+        assert!(cut.starts_with(&"b".repeat(100)), "{cut}");
+        assert!(cut.ends_with(&"b".repeat(100)), "{cut}");
+        assert!(cut.contains("[... 200 bytes cut"), "{cut}");
+        assert_eq!(some[2], user_message("three"));
+        assert_eq!(some[3], item);
     }
 
     #[test]

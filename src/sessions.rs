@@ -368,14 +368,15 @@ pub fn load(path: &Path) -> Result<Loaded> {
             let (Some(switched), Some(to)) = (text("model"), text("effort")) else {
                 bail!("{}: model record {id} names no model", path.display());
             };
-            // As the live switch does: encrypted reasoning belongs to the model that
-            // produced it and cannot be replayed to another one, and an effort update
-            // to the model it was sent to. An effort alone keeps both.
+            // As the live switch does: encrypted reasoning and a server compaction
+            // belong to the model that produced them and cannot be replayed to another
+            // one, and an effort update to the model it was sent to. An effort alone
+            // keeps both.
             if switched != model {
                 items.retain(|(item, _)| {
                     !matches!(
                         item.get("type").and_then(Value::as_str),
-                        Some("reasoning" | "configuration_update")
+                        Some("reasoning" | "configuration_update" | "compaction")
                     )
                 });
             }
@@ -974,6 +975,25 @@ mod tests {
         let loaded = load(&path(&dir, "s1")).unwrap();
         assert_eq!(crate::client::announced_effort(&loaded.items), None);
         assert_eq!(loaded.items.len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_switch_drops_the_server_compaction_of_the_model_before_it() {
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("s1"));
+        let compaction = json!({"type": "compaction", "encrypted_content": "opaque"});
+        writer
+            .compact("server", 50, 10, &[items()[0].clone(), compaction.clone()])
+            .unwrap();
+        drop(writer);
+        let loaded = load(&path(&dir, "s1")).unwrap();
+        assert_eq!(loaded.items, [items()[0].clone(), compaction]);
+
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        writer.model("gpt-5.5", "low", "abc").unwrap();
+        let loaded = load(&path(&dir, "s1")).unwrap();
+        assert_eq!(loaded.items, [items()[0].clone()]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

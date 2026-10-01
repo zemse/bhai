@@ -267,6 +267,11 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// Whether the backend compacts the history itself, from a `compaction_trigger`.
+    fn compacts_on_server(&self) -> bool {
+        false
+    }
+
     /// Whether `--strict-cache` is on, so a cache warning must stop for the user.
     fn strict_cache(&self) -> bool {
         false
@@ -321,6 +326,11 @@ impl Model for Client {
     fn effort_updates(&self) -> Option<(&str, &str)> {
         crate::client::takes_effort_updates(self.model())
             .then(|| (self.effort(), self.effort_in_force()))
+    }
+
+    fn compacts_on_server(&self) -> bool {
+        self.provider() == crate::client::Provider::Codex
+            && crate::client::compacts_on_server(self.model())
     }
 
     fn strict_cache(&self) -> bool {
@@ -849,11 +859,12 @@ pub(crate) async fn run_with(
                         continue;
                     }
                     // Between turns, so the switch never lands mid-call. What the old
-                    // model thought is dropped: encrypted reasoning belongs to the model
-                    // that produced it and cannot be replayed to another one. An effort
-                    // alone keeps the model and its history, but the backend caches per
-                    // effort, so the next call is cold all the same, unless the model
-                    // takes the change as an update the next turn puts in the history.
+                    // model thought is dropped: encrypted reasoning, and a server
+                    // compaction, belong to the model that produced them and cannot be
+                    // replayed to another one. An effort alone keeps the model and its
+                    // history, but the backend caches per effort, so the next call is
+                    // cold all the same, unless the model takes the change as an update
+                    // the next turn puts in the history.
                     Control::Model { model: name, effort, window } => {
                         let same = name == model.name();
                         let updates = same && model.effort_updates().is_some();
@@ -873,7 +884,7 @@ pub(crate) async fn run_with(
                                     history.retain(|item| {
                                         !matches!(
                                             item.get("type").and_then(Value::as_str),
-                                            Some("reasoning" | "configuration_update")
+                                            Some("reasoning" | "configuration_update" | "compaction")
                                         )
                                     });
                                     // Earlier calls index the old history, and the new
@@ -1932,6 +1943,8 @@ enum Compacted {
     Evicted,
     /// The earlier turns folded into this summary.
     Summarised(String),
+    /// The history replaced by the backend's own `compaction` item.
+    OnServer,
     /// The earlier turns folded away with no summary, since the summary call itself was
     /// too long for the window.
     Dropped,
@@ -1994,9 +2007,29 @@ impl Compaction<'_> {
             self.model.reset("compaction: evict before summary");
         }
         // The summary call is the last one read, and it read `next` and the request.
-        let read = compact::estimate(&next, tokenizer)
-            + compact::estimate(&[compact::request(self.asked.as_deref())], tokenizer);
-        match self.summarize(&next).await {
+        let sent = compact::estimate(&next, tokenizer);
+        let read = sent + compact::estimate(&[compact::request(self.asked.as_deref())], tokenizer);
+        let summary = match self.on_server(&next).await {
+            Some(Ok(item)) => {
+                let installed = self.install(&next, item);
+                self.commit(before, sent, installed, Compacted::OnServer, history, sink);
+                return Ok(true);
+            }
+            // A summary call would be refused or cut off the same way.
+            Some(Err(e))
+                if crate::client::context_overflow(&e) || self.cancel.load(Ordering::Relaxed) =>
+            {
+                Err(e)
+            }
+            Some(Err(e)) => {
+                let _ = self.tx.send(AgentEvent::Info(format!(
+                    "the backend did not compact the history ({e:#}), so the model summarises it instead"
+                )));
+                self.summarize(&next).await
+            }
+            None => self.summarize(&next).await,
+        };
+        match summary {
             Ok(summary) => {
                 let folded =
                     compact::fold(&next, &crate::plan::restated(&summary, self.plan.as_ref()))
@@ -2045,6 +2078,52 @@ impl Compaction<'_> {
     async fn summarize(&self, history: &[Value]) -> anyhow::Result<String> {
         let mut input = history.to_vec();
         input.push(compact::request(self.asked.as_deref()));
+        let items = self.call(&input).await?;
+        final_text(&items)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| anyhow!("the model wrote no summary"))
+    }
+
+    /// One call on `history` with a `compaction_trigger` after it, and the one
+    /// `compaction` item it answered with. `None` where the backend does not compact, or
+    /// the user asked the summary to keep something, which only a written one can.
+    async fn on_server(&self, history: &[Value]) -> Option<anyhow::Result<Value>> {
+        if !self.model.compacts_on_server() || self.asked.is_some() {
+            return None;
+        }
+        let mut input = history.to_vec();
+        input.push(crate::client::compaction_trigger());
+        let items = match self.call(&input).await {
+            Ok(items) => items,
+            Err(e) => return Some(Err(e)),
+        };
+        let mut found = items.into_iter().filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("compaction")
+                && item.get("encrypted_content").is_some_and(Value::is_string)
+        });
+        Some(match (found.next(), found.next()) {
+            (Some(item), None) => Ok(item),
+            (None, _) => Err(anyhow!("it answered with no compaction item")),
+            (Some(_), Some(_)) => Err(anyhow!("it answered with more than one compaction item")),
+        })
+    }
+
+    /// The history after a server compaction, with the plan restated after the item,
+    /// since the call that set it may be in what the item stands for.
+    fn install(&self, history: &[Value], item: Value) -> Vec<Value> {
+        let name = self.model.name();
+        let budget = compact::RETAINED.min(self.limits.target(name) / 2);
+        let mut installed = compact::install(history, item, budget, tokens::for_model(name));
+        let plan = crate::plan::restated("", self.plan.as_ref());
+        if !plan.trim().is_empty() {
+            installed.push(compact::user_message(plan.trim()));
+        }
+        installed
+    }
+
+    /// One model call on `input`, reporting its usage and rate limits.
+    async fn call(&self, input: &[Value]) -> anyhow::Result<Vec<Value>> {
         let tx = self.tx;
         let mut on_delta = |delta: Delta| match delta {
             Delta::Usage(usage) => {
@@ -2055,20 +2134,15 @@ impl Compaction<'_> {
             }
             _ => {}
         };
-        let items = self
-            .model
+        self.model
             .respond(
                 self.instructions,
                 self.tools,
-                &input,
+                input,
                 &mut on_delta,
                 self.cancel,
             )
-            .await?;
-        final_text(&items)
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-            .ok_or_else(|| anyhow!("the model wrote no summary"))
+            .await
     }
 
     /// Replace `history` with `next`, reset the cache guard, record it and say so.
@@ -2088,6 +2162,7 @@ impl Compaction<'_> {
                 ("summary", "summarised earlier turns", Some(summary))
             }
             Compacted::Evicted => ("evict", "evicted old tool outputs", None),
+            Compacted::OnServer => ("server", "earlier turns compacted by the backend", None),
             Compacted::Dropped => (
                 "dropped",
                 "dropped earlier turns too long to summarise",
@@ -3105,6 +3180,10 @@ pub mod fake {
                 let in_force = self.in_force.as_deref().unwrap_or(&self.effort);
                 (self.effort.as_str(), in_force)
             })
+        }
+
+        fn compacts_on_server(&self) -> bool {
+            crate::client::compacts_on_server(&self.model)
         }
 
         fn strict_cache(&self) -> bool {
@@ -6443,6 +6522,203 @@ mod tests {
             Limits::default(),
         ));
         (fake, tx_user, tx_control, rx, cancel)
+    }
+
+    /// What the backend answers a `compaction_trigger` with.
+    fn compaction() -> Value {
+        json!({ "type": "compaction", "id": "cmp_1", "encrypted_content": "opaque" })
+    }
+
+    /// `/compact` with `asked`, and everything the loop says until it is done.
+    async fn compact_now(
+        tx_control: &mpsc::Sender<Control>,
+        rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+        asked: Option<&str>,
+    ) -> Vec<AgentEvent> {
+        tx_control
+            .send(Control::Compact(asked.map(str::to_string)))
+            .await
+            .unwrap();
+        settle(rx).await
+    }
+
+    fn texts(items: &[Value], role: &str) -> Vec<String> {
+        items
+            .iter()
+            .filter(|item| item["type"] == "message" && item["role"] == role)
+            .filter_map(|item| item["content"][0]["text"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_gpt6_compaction_is_the_backends_item_after_the_user_messages() {
+        use fake::say;
+
+        let script = vec![
+            vec![say("one")],
+            vec![say("two")],
+            vec![compaction()],
+            vec![say("three")],
+        ];
+        let (fake, tx_user, tx_control, mut rx, cancel) = gpt6(script);
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        let events = compact_now(&tx_control, &mut rx, None).await;
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::Compacted { notice, summary: None, .. }
+                if notice.contains("compacted by the backend"))
+            ),
+            "{events:?}"
+        );
+        drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        let input = |i: usize| bodies[i].1["input"].as_array().unwrap().clone();
+        let asked = input(2);
+        assert_eq!(asked.last(), Some(&crate::client::compaction_trigger()));
+        // It extends the last request, so it reads the cached prefix.
+        assert_eq!(asked[..input(1).len()], input(1)[..]);
+        assert_eq!(texts(&asked, "assistant"), ["one", "two"]);
+
+        let after = input(3);
+        assert!(crate::environment::is_context(&after[0]), "{after:?}");
+        assert_eq!(texts(&after, "user"), ["first", "second", "third"]);
+        assert!(texts(&after, "assistant").is_empty(), "{after:?}");
+        assert_eq!(after[after.len() - 2], compaction());
+        assert!(
+            !after
+                .iter()
+                .any(|item| item["type"] == "compaction_trigger"),
+            "the trigger is not kept: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gpt6_compaction_falls_back_to_a_summary_without_an_item() {
+        use fake::say;
+
+        let script = vec![
+            vec![say("one")],
+            vec![say("two")],
+            vec![say("not a compaction")],
+            vec![say("the summary")],
+            vec![say("three")],
+        ];
+        let (fake, tx_user, tx_control, mut rx, cancel) = gpt6(script);
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        let events = compact_now(&tx_control, &mut rx, None).await;
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Info(m)
+                if m.contains("no compaction item") && m.contains("summarises"))),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::Compacted { summary: Some(s), .. } if s == "the summary")
+            ),
+            "{events:?}"
+        );
+        drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        let summary_call = bodies[3].1["input"].as_array().unwrap();
+        assert!(
+            !summary_call
+                .iter()
+                .any(|item| item["type"] == "compaction_trigger"),
+            "{summary_call:?}"
+        );
+        assert!(bodies[4].1["input"].to_string().contains("the summary"));
+    }
+
+    #[tokio::test]
+    async fn a_gpt6_compact_with_a_prompt_writes_its_summary() {
+        use fake::say;
+
+        let script = vec![
+            vec![say("one")],
+            vec![say("two")],
+            vec![say("kept the names")],
+        ];
+        let (fake, tx_user, tx_control, mut rx, cancel) = gpt6(script);
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        let events = compact_now(&tx_control, &mut rx, Some("the names")).await;
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::Compacted { summary: Some(s), .. }
+                if s == "kept the names")
+            ),
+            "{events:?}"
+        );
+        let bodies = fake.bodies.lock().unwrap();
+        let sent = bodies[2].1["input"].as_array().unwrap();
+        assert_eq!(*sent.last().unwrap(), compact::request(Some("the names")));
+    }
+
+    #[test]
+    fn a_server_compaction_restates_the_plan_after_its_item() {
+        let mut model = fake::Fake::default();
+        model.model = "gpt-6-sol".to_string();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let plan = crate::plan::Plan::parse(&json!({
+            "plan": [{"step": "fix it", "status": "in_progress"}]
+        }))
+        .unwrap();
+        let pass = Compaction {
+            model: &model,
+            tools: &[],
+            instructions: "",
+            limits: Limits::default(),
+            tx: &tx,
+            cancel: &cancel,
+            asked: None,
+            plan,
+        };
+        let history = vec![compact::user_message("first")];
+        let installed = pass.install(&history, compaction());
+        assert_eq!(installed[0], compact::user_message("first"));
+        assert_eq!(installed[1], compaction());
+        let restated = installed[2]["content"][0]["text"].as_str().unwrap();
+        assert!(restated.starts_with("Your plan"), "{restated}");
+        assert!(restated.ends_with("[>] fix it"), "{restated}");
+        assert_eq!(installed.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_model_switch_drops_the_old_models_compaction() {
+        use fake::say;
+
+        let script = vec![
+            vec![say("one")],
+            vec![say("two")],
+            vec![compaction()],
+            vec![say("three")],
+        ];
+        let (fake, tx_user, tx_control, mut rx, cancel) = gpt6(script);
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        compact_now(&tx_control, &mut rx, None).await;
+        tx_control
+            .send(Control::Model {
+                model: "gpt-5.5".to_string(),
+                effort: "medium".to_string(),
+                window: None,
+            })
+            .await
+            .unwrap();
+        drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        let sent = bodies[3].1["input"].as_array().unwrap();
+        assert!(
+            !sent.iter().any(|item| item["type"] == "compaction"),
+            "{sent:?}"
+        );
+        assert_eq!(texts(sent, "user"), ["first", "second", "third"]);
     }
 
     fn effort(effort: &str) -> Control {
