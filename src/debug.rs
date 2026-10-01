@@ -498,4 +498,43 @@ mod tests {
             "{out}"
         );
     }
+
+    /// The export reads no environment and no auth file, so a credential sitting in
+    /// either must not reach the file, and the check is on the written file.
+    #[test]
+    fn credentials_in_auth_json_and_the_environment_stay_out_of_the_file() {
+        let token = "fake-access-token-7f3a91c2d4e8";
+        let home = std::env::temp_dir().join(format!("bhai-debug-{}", uuid::Uuid::new_v4()));
+        let codex = home.join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(
+            codex.join("auth.json"),
+            format!(r#"{{"tokens":{{"access_token":"{token}","refresh_token":"{token}-r"}}}}"#),
+        )
+        .unwrap();
+        let auth = crate::auth::Auth {
+            access_token: token.to_string(),
+            account_id: Some("acct".to_string()),
+        };
+
+        let mut b = bundle(vec![Entry::Output(format!("{auth:?}"))]);
+        b.home = Some(home.clone());
+        b.cwd = home.clone();
+        let path = export(&b, &home).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+
+        assert!(!written.contains(token), "auth token in the export");
+        assert!(written.contains("<redacted>"), "{written}");
+        // Whatever secrets this environment holds, none of them are in the file.
+        for (name, value) in std::env::vars() {
+            let upper = name.to_uppercase();
+            let secret = ["TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL"]
+                .iter()
+                .any(|word| upper.contains(word));
+            if secret && value.len() >= 12 {
+                assert!(!written.contains(&value), "{name} leaked into the export");
+            }
+        }
+    }
 }
