@@ -753,8 +753,63 @@ async fn http(server: &Server, url: &str) -> Result<Service> {
         headers.insert(name, value);
     }
     let config = StreamableHttpClientTransportConfig::with_uri(url).custom_headers(headers);
-    let transport = StreamableHttpClientTransport::from_config(config);
+    let transport = StreamableHttpClientTransport::with_client(http_client()?, config);
     ().serve(transport).await.context("initialize failed")
+}
+
+/// Redirects an HTTP server may send before the request fails.
+const MAX_REDIRECTS: usize = 10;
+
+/// The client for HTTP servers. rmcp's default client follows no redirect at all, so a
+/// server that moved `/mcp` to `/mcp/` could not be reached; this one follows the ones
+/// `redirect_allowed` passes. reqwest strips only its own credential headers across hosts,
+/// so a looser policy would carry a configured token header anywhere. Idle pooling is off
+/// as in rmcp's default client: reusing a connection whose body was not drained stalls on
+/// delayed ACK.
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .redirect(reqwest::redirect::Policy::custom(
+            |attempt| match redirect_allowed(attempt.url(), attempt.previous()) {
+                Ok(()) => attempt.follow(),
+                Err(why) => attempt.error(why),
+            },
+        ))
+        .build()
+        .context("building the HTTP client")
+}
+
+/// A redirect stays on the first URL's origin, goes over HTTPS unless the host is
+/// loopback, and the chain stays short. The refusal names only the target's origin: a
+/// path or query can carry a token.
+fn redirect_allowed(next: &reqwest::Url, previous: &[reqwest::Url]) -> Result<(), String> {
+    let Some(first) = previous.first() else {
+        return Ok(());
+    };
+    let origin = next.origin().ascii_serialization();
+    // `previous` starts with the original request, which is not a redirect.
+    if previous.len() > MAX_REDIRECTS {
+        return Err(format!("more than {MAX_REDIRECTS} redirects"));
+    }
+    if next.origin() != first.origin() {
+        return Err(format!("refused a redirect to another origin ({origin})"));
+    }
+    if next.scheme() != "https" && !loopback(next) {
+        return Err(format!("refused a redirect over plain HTTP ({origin})"));
+    }
+    Ok(())
+}
+
+fn loopback(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    }
 }
 
 /// Higher for a closer match: whole-name hits beat name substrings beat descriptions,
@@ -866,6 +921,135 @@ mod tests {
             !out.contains("mcp-r") && !out.contains("0f9e2d"),
             "{around}"
         );
+    }
+
+    #[test]
+    fn redirects_stay_on_the_origin_and_off_plain_http() {
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        let check = |from: &str, to: &str| redirect_allowed(&url(to), &[url(from)]);
+        assert_eq!(
+            check("https://a.example/mcp", "https://a.example/mcp/"),
+            Ok(())
+        );
+        assert_eq!(
+            check("http://127.0.0.1:9/mcp", "http://127.0.0.1:9/x"),
+            Ok(())
+        );
+        assert_eq!(
+            check("http://localhost:9/mcp", "http://localhost:9/x"),
+            Ok(())
+        );
+        assert_eq!(check("http://[::1]:9/mcp", "http://[::1]:9/x"), Ok(()));
+
+        let other = check("https://a.example/mcp", "https://b.example/mcp?token=t").unwrap_err();
+        assert!(
+            other.contains("https://b.example") && !other.contains("token"),
+            "{other}"
+        );
+        assert!(check("https://a.example/mcp", "https://a.example:8443/mcp").is_err());
+        assert!(check("https://a.example/mcp", "http://a.example/mcp").is_err());
+        assert!(check("http://127.0.0.1:9/mcp", "http://127.0.0.1:10/mcp").is_err());
+        // Same origin, but the headers would cross the network in the clear.
+        let plain = check("http://a.example/mcp", "http://a.example/x").unwrap_err();
+        assert!(plain.contains("plain HTTP"), "{plain}");
+
+        let chain = vec![url("https://a.example/0"); MAX_REDIRECTS];
+        assert_eq!(
+            redirect_allowed(&url("https://a.example/1"), &chain),
+            Ok(())
+        );
+        let chain = vec![url("https://a.example/0"); MAX_REDIRECTS + 1];
+        assert!(redirect_allowed(&url("https://a.example/1"), &chain).is_err());
+    }
+
+    /// Answers one request per connection: `/start` redirects to `location`, anything
+    /// else is a 200. Each request's head goes to the channel.
+    async fn redirecting_server(
+        location: Option<String>,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let own = format!("{base}/end");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let first = head.lines().next().unwrap_or_default();
+                let response = if first.contains(" /start ") {
+                    let to = location.clone().unwrap_or(own.clone());
+                    format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nlocation: {to}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+                        .to_string()
+                };
+                let _ = tx.send(head);
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (base, rx)
+    }
+
+    #[tokio::test]
+    async fn a_token_header_does_not_follow_a_redirect_to_another_origin() {
+        let (elsewhere, mut seen_elsewhere) = redirecting_server(None).await;
+        let (base, mut seen) = redirecting_server(Some(format!("{elsewhere}/steal"))).await;
+        let url = format!("{base}/start");
+        let server = Server {
+            name: "moved".to_string(),
+            source: "test".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: Some(url.clone()),
+            headers: crate::config::Headers(std::collections::BTreeMap::from([(
+                "X-API-Key".to_string(),
+                "s3cret".to_string(),
+            )])),
+            skip: None,
+        };
+        let Err(why) = http(&server, &url).await else {
+            panic!("a cross-origin redirect was followed");
+        };
+        let why = format!("{why:#}");
+        assert!(!why.contains("s3cret"), "{why}");
+        let first = seen.recv().await.unwrap();
+        assert!(first.starts_with("POST /start "), "{first}");
+        assert!(
+            seen_elsewhere.try_recv().is_err(),
+            "the other origin was contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_redirects_within_its_origin_is_reached() {
+        let Some((server, mut child)) = fake_http_server("moved") else {
+            return;
+        };
+        let url = server.url.as_deref().unwrap().replace("/mcp", "/old");
+        let server = Server {
+            url: Some(url),
+            ..server
+        };
+        let dir = temp_dir();
+        let hub = Hub::connect(
+            vec![server],
+            &Identity::default(),
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
+        let args = serde_json::json!({"message": "hi"});
+        let (out, ok) = hub.call("mcp__moved__echo", args).await;
+        assert_eq!((out.as_str(), ok), ("echo: hi", true));
+        hub.shutdown().await;
+        child.kill().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 `fake_mcp.py hang` never answers; `fake_mcp.py hangcall` answers everything but a call;
 `fake_mcp.py exit` quits at once; `fake_mcp.py grandchild` starts a `sleep` that outlives it
 and logs its pid to stderr, the way `npx` leaves the real server; `fake_mcp.py http` serves the same tools over streamable
-HTTP on a free port, printed as JSON on stdout.
+HTTP on a free port, printed as JSON on stdout, and redirects a POST to any other path there.
 """
 
 import json
@@ -95,6 +95,12 @@ def serve_http():
             self.end_headers()
 
         def do_POST(self):
+            if self.path != "/mcp":
+                self.send_response(308)
+                self.send_header("Location", "/mcp")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if self.headers.get("Authorization") != "Bearer " + TOKEN:
                 self.send_error(401)
                 return
