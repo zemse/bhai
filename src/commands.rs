@@ -267,6 +267,7 @@ pub fn help() -> String {
         "\nkeys",
         "\n  enter send · alt+enter or ctrl+j newline · shift+tab permission mode",
         "\n  ctrl+c interrupt, clear the draft (ctrl+z restores), then quit on a second press · ctrl+d quit on an empty prompt",
+        "\n  !<command> runs a shell command yourself, shown here and not told to the model",
         "\n  up and down walk the prompt history · tab takes the grey completion",
         "\n  up on an empty prompt takes the queued messages back to edit",
         "\n  wheel, pgup/pgdn or ctrl+up/down scroll · click a tool output to expand it",

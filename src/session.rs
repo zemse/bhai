@@ -826,6 +826,30 @@ impl Session {
         self.policy.trusted()
     }
 
+    /// Run a command the user typed after `!`. Their typing is the approval, so only a
+    /// deny rule or a mode that refuses the call stops it. It is audited like a tool
+    /// call and shown as a note, so it never reaches the model's history.
+    pub fn shell(self: &Arc<Self>, command: &str) {
+        use crate::permissions::Decision;
+        use crate::tools::{Tool, bash};
+        let args = serde_json::json!({ "command": command });
+        if let Decision::Deny(reason) = self.policy.check(bash::NAME, &args, true) {
+            self.policy
+                .audit(bash::NAME, command, "blocked", "rule", &reason);
+            self.publish(Event::Error(format!("not run: {reason}")));
+            return;
+        }
+        let session = Arc::clone(self);
+        let command = command.to_string();
+        tokio::spawn(async move {
+            session
+                .policy
+                .audit(bash::NAME, &command, "ran", "you", "typed after !");
+            let (output, _) = bash::Bash.execute(&args).await;
+            session.publish(Event::Info(format!("$ {command}\n{}", output.trim_end())));
+        });
+    }
+
     /// Add an allow rule, for `/allow`. It is the user's own, so it holds in every mode
     /// and is saved where a remembered approval goes. `auto` mode never prompts, so this
     /// is the only way to permit a call from the prompt rather than by changing mode:
@@ -2349,5 +2373,65 @@ mod tests {
         session.on_agent(AgentEvent::Streaming(false));
         called(&session, 86_000);
         assert_eq!(session.lock().last_call, Some(sent));
+    }
+
+    fn shell_session(deny: &[&str], log: std::path::PathBuf) -> Arc<Session> {
+        use crate::permissions::{Mode, Rule, Rules};
+        let rules = Rules {
+            deny: deny.iter().map(|r| Rule::parse(r).unwrap()).collect(),
+            ..Rules::default()
+        };
+        let policy =
+            Policy::new(Mode::Ask, rules, None, std::env::current_dir().unwrap()).with_log(log);
+        let (tx_user, _) = mpsc::channel(1);
+        let (tx_control, _) = mpsc::channel(1);
+        Session::new(
+            "m".to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            Arc::new(Cancel::default()),
+            Arc::new(policy),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_typed_shell_command_runs_is_logged_and_stays_out_of_the_history() {
+        let log = crate::tools::temp_dir().join("permissions.jsonl");
+        let session = shell_session(&[], log.clone());
+        let mut events = session.subscribe();
+        session.shell("echo hi");
+        let Event::Info(text) = events.recv().await.unwrap() else {
+            panic!("expected a note");
+        };
+        assert_eq!(text, "$ echo hi\nexit code: 0\nhi");
+        let audit = std::fs::read_to_string(&log).unwrap();
+        assert!(audit.contains("\"summary\":\"echo hi\"") && audit.contains("\"by\":\"you\""));
+        assert!(
+            !session
+                .entries()
+                .list
+                .iter()
+                .any(|e| matches!(e, Entry::Command { .. } | Entry::Output(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_typed_shell_command_a_deny_rule_covers_does_not_run() {
+        let log = crate::tools::temp_dir().join("permissions.jsonl");
+        let session = shell_session(&["Bash(echo:*)"], log.clone());
+        let mut events = session.subscribe();
+        session.shell("echo hi");
+        let Event::Error(text) = events.recv().await.unwrap() else {
+            panic!("expected an error");
+        };
+        assert!(text.starts_with("not run: "), "{text}");
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("\"blocked\"")
+        );
     }
 }

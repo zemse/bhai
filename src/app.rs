@@ -1313,6 +1313,14 @@ impl App {
             }
             return;
         }
+        if let Some(command) = message.strip_prefix('!') {
+            self.follow = true;
+            match command.trim() {
+                "" => self.note(Entry::Error("!<command>: run a shell command".to_string())),
+                command => self.session.shell(command),
+            }
+            return;
+        }
         if message == "/help" {
             self.follow = true;
             self.note(Entry::Info(commands::help()));
