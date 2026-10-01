@@ -6,6 +6,9 @@
 //!
 //! A model id prefixed `ollama:` is served by Ollama on this machine instead; the body
 //! and the stream are then [`crate::ollama`]'s, and everything else here is the same.
+//!
+//! With `websocket = true` a conversation's calls go over [`crate::websocket`] instead,
+//! and over HTTPS whenever a socket cannot be had.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -14,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -23,6 +26,7 @@ use crate::cache::{self, CacheBreak, CacheGuard};
 use crate::compact;
 use crate::limits::{self, RateLimits};
 use crate::ollama;
+use crate::websocket::{self, Last, Refusal, Socket};
 
 /// The ChatGPT backend, which the Codex endpoints and the usage endpoint hang off.
 const BACKEND: &str = "https://chatgpt.com/backend-api";
@@ -70,6 +74,8 @@ const TURN_STATE: &str = "x-codex-turn-state";
 pub const FAST_TIER: &str = "priority";
 /// The `text.verbosity` values the Responses API takes.
 pub const VERBOSITIES: [&str; 3] = ["low", "medium", "high"];
+/// The longest a WebSocket upgrade may take before the call goes over HTTPS.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The `reasoning.effort` values the Responses API takes. The models catalog also lists
 /// `ultra` for some models, which the API refuses.
@@ -198,6 +204,8 @@ pub struct Choice {
     pub reasoning_context: Option<String>,
     /// `text.verbosity` for Codex requests; left out when unset.
     pub verbosity: Option<String>,
+    /// `websocket`: a conversation's Codex calls go over the Responses WebSocket.
+    pub websocket: bool,
 }
 
 /// What the UI is told while a turn streams.
@@ -233,6 +241,8 @@ pub enum Delta {
         delay: Duration,
         reason: String,
     },
+    /// Something about the transport the user should hear once.
+    Notice(String),
 }
 
 /// Token counts for one model call, as `response.completed` reports them.
@@ -364,6 +374,8 @@ pub struct Client {
     fast: Arc<AtomicBool>,
     /// `reasoning.context` and `text.verbosity`, set from the config.
     controls: Controls,
+    /// The WebSocket transport, where the config turns it on.
+    ws: Option<Ws>,
 }
 
 /// Request fields the config may add to Codex calls. Unset, a request is what it was
@@ -374,6 +386,17 @@ pub struct Controls {
     pub verbosity: Option<String>,
 }
 
+#[derive(Clone)]
+struct Ws {
+    /// HTTP/1.1 only: an upgrade cannot ride an HTTP/2 connection.
+    http: reqwest::Client,
+    /// The conversation's socket, held for a whole call; shared by clones, fresh for
+    /// each child.
+    socket: Arc<tokio::sync::Mutex<Socket>>,
+    /// Set once the backend refuses an upgrade, for every conversation of the session.
+    refused: Arc<AtomicBool>,
+}
+
 impl Client {
     pub fn new(choice: &Choice) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -382,6 +405,18 @@ impl Client {
             .context("could not build HTTP client")?;
         let (model, effort) = model_settings(choice);
         let session_id = uuid::Uuid::new_v4().to_string();
+        let ws = match choice.websocket {
+            true => Some(Ws {
+                http: reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(20))
+                    .http1_only()
+                    .build()
+                    .context("could not build HTTP client")?,
+                socket: Arc::default(),
+                refused: Arc::default(),
+            }),
+            false => None,
+        };
         Ok(Self {
             http,
             cache_key: session_id.clone(),
@@ -403,6 +438,7 @@ impl Client {
                 reasoning_context: choice.reasoning_context.clone(),
                 verbosity: choice.verbosity.clone(),
             },
+            ws,
         })
     }
 
@@ -595,6 +631,9 @@ impl Client {
         let id = uuid::Uuid::new_v4().simple().to_string();
         child.guard = guard(&format!("{}/{}", child.cache_key, &id[..6]), strict);
         child.turn_state = Arc::default();
+        if let Some(ws) = &mut child.ws {
+            ws.socket = Arc::default();
+        }
         child
     }
 
@@ -787,7 +826,8 @@ impl Client {
 
     /// One call. `provider` is passed rather than read off the client, since `aside`
     /// may run its model on the other backend. A `routed` call carries the turn's
-    /// routing token and keeps the one it is given; an aside is outside the turn.
+    /// routing token and keeps the one it is given; an aside is outside the turn, and
+    /// never goes over the conversation's socket.
     async fn attempt(
         &self,
         provider: Provider,
@@ -806,6 +846,14 @@ impl Client {
             .ok_or(Error::Interrupted)?
             .map_err(Error::Fatal)?;
 
+        if routed
+            && let Some(ws) = &self.ws
+            && !ws.refused.load(Ordering::Relaxed)
+            && let Some(done) = self.attempt_ws(ws, &mut auth, body, on_delta, cancel).await
+        {
+            return done;
+        }
+
         let turn_state = routed.then(|| self.turn_state()).flatten();
         let turn_state = turn_state.as_deref();
         let mut resp = self.send(&auth, body, turn_state, cancel).await?;
@@ -819,15 +867,7 @@ impl Client {
             resp = self.send(&auth, body, turn_state, cancel).await?;
         }
 
-        // A debug aid only; a failed write must not fail the call or draw over the TUI.
-        if let Some(path) = &self.header_log {
-            let _ = limits::log_headers(path, resp.headers());
-        }
-        if let Some(found) =
-            RateLimits::from_headers(resp.headers(), chrono::Utc::now().timestamp())
-        {
-            on_delta(Delta::RateLimits(found));
-        }
+        self.read_headers(resp.headers(), on_delta);
 
         let status = resp.status();
         if !status.is_success() {
@@ -855,29 +895,10 @@ impl Client {
             self.observe_turn_state(found);
         }
 
-        // The credit balance is only in `/wham/usage`, so now and then it is asked for
-        // alongside the stream and reported once the call is done.
-        let usage_fetch = limits::due(chrono::Utc::now().timestamp()).then(|| {
-            let (http, auth) = (self.http.clone(), auth.clone());
-            tokio::spawn(async move { limits::fetch(&http, &auth).await })
-        });
-
+        let usage_fetch = self.usage_fetch(&auth);
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        // The ChatGPT backend leaves `response.completed.response.output` empty, so the
-        // turn is assembled from the per-item `done` events instead.
-        let mut items: Vec<Value> = Vec::new();
-        let mut completed = false;
-        let mut continues = false;
-        // Held until the attempt succeeds: an error after the terminal event retries the
-        // whole call, and usage reported for an attempt that was sent again is counted
-        // twice.
-        let mut usage: Option<Usage> = None;
-        let mut served: Option<String> = None;
-        // Ids of the messages in the `commentary` phase. The phase is on the item when it
-        // is added, not on its text deltas.
-        let mut commentary: Vec<String> = Vec::new();
-        let mut gaps = Gaps::new(std::time::Instant::now());
+        let mut call = Call::new();
 
         loop {
             let chunk = match watched(stream.next(), cancel, "stream idle for too long").await? {
@@ -892,125 +913,308 @@ impl Client {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue; // `event:` lines and blank separators carry nothing we need
                 };
-                let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    continue;
-                }
-                let Ok(event) = serde_json::from_str::<Value>(data) else {
+                let Some(event) = parse_event(data) else {
                     continue;
                 };
-                gaps.event(std::time::Instant::now());
-                debug_log(data);
-                match event.get("type").and_then(Value::as_str).unwrap_or("") {
-                    "response.output_item.added" => {
-                        if let Some(item) = event.get("item")
-                            && is_commentary(item)
-                            && let Some(id) = item.get("id").and_then(Value::as_str)
-                        {
-                            commentary.push(id.to_string());
-                        }
-                    }
-                    "response.output_text.delta" => {
-                        if let Some(d) = event.get("delta").and_then(Value::as_str) {
-                            let id = event.get("item_id").and_then(Value::as_str);
-                            on_delta(
-                                match id.is_some_and(|id| commentary.iter().any(|c| c == id)) {
-                                    true => Delta::Commentary(d.to_string()),
-                                    false => Delta::Text(d.to_string()),
-                                },
-                            );
-                        }
-                    }
-                    "response.reasoning_summary_text.delta" => {
-                        if let Some(d) = event.get("delta").and_then(Value::as_str) {
-                            on_delta(Delta::Reasoning(d.to_string()));
-                        }
-                    }
-                    "response.reasoning_summary_part.added" => {
-                        on_delta(Delta::Reasoning("\n".to_string()));
-                    }
-                    "response.output_item.done" => {
-                        if let Some(item) = event.get("item") {
-                            items.push(item.clone());
-                        }
-                    }
-                    // `incomplete` is terminal too: the model stopped at a cap, and what
-                    // it produced is the answer rather than something to send again.
-                    "response.completed" | "response.incomplete" => {
-                        completed = true;
-                        if event.get("type").and_then(Value::as_str) == Some("response.incomplete")
-                        {
-                            on_delta(Delta::Truncated);
-                        } else {
-                            continues = event.pointer("/response/end_turn") == Some(&json!(false));
-                        }
-                        // Some deployments do populate it; prefer their copy when present.
-                        if let Some(output) = event
-                            .pointer("/response/output")
-                            .and_then(Value::as_array)
-                            .filter(|output| !output.is_empty())
-                        {
-                            items = output.clone();
-                        }
-                        usage = Usage::from_completed(&event);
-                        served = event
-                            .pointer("/response/service_tier")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                    }
-                    // The same token in band, as the WebSocket transport carries it.
-                    "response.metadata" if routed => {
-                        self.observe_turn_state(metadata_turn_state(&event));
-                    }
-                    "codex.rate_limits" => {
-                        let now = chrono::Utc::now().timestamp();
-                        if let Some(found) = RateLimits::from_event(&event, now) {
-                            on_delta(Delta::RateLimits(found));
-                        }
-                    }
-                    "response.failed" => {
-                        let error = event.pointer("/response/error").unwrap_or(&Value::Null);
-                        return Err(failed_in_band(error, "response failed"));
-                    }
-                    // The error object is nested on some deployments and the event itself
-                    // on others.
-                    "error" => {
-                        let error = event.get("error").unwrap_or(&event);
-                        return Err(failed_in_band(error, "stream error"));
-                    }
-                    _ => {}
-                }
+                self.take(&mut call, &event, routed, on_delta)?;
             }
             // The rest of the batch is drained above, so nothing sharing the terminal
             // event's chunk is lost by leaving here rather than waiting for the close.
-            if completed {
+            if call.completed {
                 break;
             }
         }
+        call.finish(self, body, usage_fetch, on_delta).await
+    }
 
-        if completed {
-            on_delta(Delta::Stalls(gaps.stalls()));
-            if let Some(usage) = usage {
-                on_delta(Delta::Usage(usage));
+    /// The call over the conversation's socket, or `None` when it has to go over HTTPS
+    /// instead. A socket that was closed while idle is opened again and the history
+    /// replayed whole, once per call; one that fails mid-response is left for the retry.
+    async fn attempt_ws(
+        &self,
+        ws: &Ws,
+        auth: &mut Auth,
+        body: &Value,
+        on_delta: &mut impl FnMut(Delta),
+        cancel: &Arc<AtomicBool>,
+    ) -> Option<std::result::Result<Vec<Value>, Error>> {
+        let mut socket = match unless_cancelled(ws.socket.lock(), cancel).await {
+            Some(socket) => socket,
+            None => return Some(Err(Error::Interrupted)),
+        };
+        let mut reopened = false;
+        let mut replayed = false;
+        loop {
+            if socket.conn.is_none() {
+                match self.connect(ws, auth, on_delta, cancel).await {
+                    Ok(conn) => socket.conn = Some(conn),
+                    Err(Refusal::Interrupted) => return Some(Err(Error::Interrupted)),
+                    Err(Refusal::Failed(why)) => {
+                        debug_log(
+                            &json!({ "type": "bhai.websocket_failed", "why": why }).to_string(),
+                        );
+                        return None;
+                    }
+                    Err(Refusal::Refused(why)) => {
+                        ws.refused.store(true, Ordering::Relaxed);
+                        on_delta(Delta::Notice(format!(
+                            "the backend refused the WebSocket ({why}); calls go over HTTPS"
+                        )));
+                        return None;
+                    }
+                }
             }
-            if continues {
-                on_delta(Delta::Continues);
-            }
-            if let Some(tier) = self.downgraded(body, served) {
-                on_delta(Delta::Downgraded(tier));
-            }
-            if let Some(task) = usage_fetch
-                && let Ok(Ok(Ok(body))) = tokio::time::timeout(USAGE_WAIT, task).await
-                && let Some(found) = RateLimits::from_usage(&body, chrono::Utc::now().timestamp())
+            let conn = socket.conn.as_mut()?;
+            let last = conn.last.take();
+            let (frame, delta) = websocket::frame(last.as_ref(), body);
+            match self
+                .stream_ws(conn, frame, body, auth, on_delta, cancel)
+                .await
             {
-                on_delta(Delta::RateLimits(found));
+                Streamed::Done(items, id) => {
+                    conn.last = id.and_then(|id| Last::after(id, body, &items));
+                    return Some(Ok(items));
+                }
+                // The socket lost the response the delta built on; the socket is fine.
+                Streamed::Stale if delta && !replayed => replayed = true,
+                Streamed::Closed if !reopened => {
+                    socket.conn = None;
+                    reopened = true;
+                }
+                Streamed::Stale | Streamed::Closed => {
+                    socket.conn = None;
+                    return Some(Err(Error::Retryable(anyhow!(
+                        "the WebSocket closed before the response started"
+                    ))));
+                }
+                // Whatever is still in flight on it would be read as the next response.
+                Streamed::Failed(e) => {
+                    socket.conn = None;
+                    return Some(Err(e));
+                }
             }
-            Ok(items)
-        } else {
-            Err(Error::Retryable(anyhow!(
-                "stream ended before response.completed"
-            )))
         }
+    }
+
+    /// Open a socket: the upgrade carries what an HTTPS call's headers would.
+    async fn connect(
+        &self,
+        ws: &Ws,
+        auth: &mut Auth,
+        on_delta: &mut impl FnMut(Delta),
+        cancel: &Arc<AtomicBool>,
+    ) -> std::result::Result<websocket::Conn, Refusal> {
+        let turn_state = self.turn_state();
+        let (key, accept) = websocket::key();
+        let upgrade = |auth: &Auth| {
+            let req = ws
+                .http
+                .get(format!("{}/responses", base_url()))
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket")
+                .header("Sec-WebSocket-Version", "13")
+                .header("Sec-WebSocket-Key", &key)
+                .header("OpenAI-Beta", websocket::BETA);
+            let req = self.with_headers(req, auth, turn_state.as_deref());
+            let sent = tokio::time::timeout(HANDSHAKE_TIMEOUT, req.send());
+            async move {
+                match unless_cancelled(sent, cancel).await {
+                    None => Err(Refusal::Interrupted),
+                    Some(Err(_)) => Err(Refusal::Failed("the upgrade timed out".to_string())),
+                    Some(Ok(Err(e))) => Err(Refusal::Failed(format!("upgrade failed: {e}"))),
+                    Some(Ok(Ok(resp))) => Ok(resp),
+                }
+            }
+        };
+        let mut resp = upgrade(auth).await?;
+        if resp.status().as_u16() == 401 {
+            *auth = match unless_cancelled(auth::recover(&self.http, auth), cancel).await {
+                None => return Err(Refusal::Interrupted),
+                Some(Err(e)) => return Err(Refusal::Failed(format!("{e:#}"))),
+                Some(Ok(auth)) => auth,
+            };
+            resp = upgrade(auth).await?;
+        }
+        self.read_headers(resp.headers(), on_delta);
+        let found = resp.headers().get(TURN_STATE).and_then(|v| v.to_str().ok());
+        self.observe_turn_state(found);
+        websocket::open(resp, &accept).await
+    }
+
+    /// Send `frame` on `conn` and read the response it starts.
+    async fn stream_ws(
+        &self,
+        conn: &mut websocket::Conn,
+        frame: String,
+        body: &Value,
+        auth: &Auth,
+        on_delta: &mut impl FnMut(Delta),
+        cancel: &Arc<AtomicBool>,
+    ) -> Streamed {
+        use tokio_tungstenite::tungstenite::Message;
+        match watched(conn.ws.send(Message::text(frame)), cancel, "send timed out").await {
+            Err(e) => return Streamed::Failed(e),
+            Ok(Err(_)) => return Streamed::Closed,
+            Ok(Ok(())) => {}
+        }
+        let usage_fetch = self.usage_fetch(auth);
+        let mut call = Call::new();
+        let mut events = 0;
+        loop {
+            let message = match watched(conn.ws.next(), cancel, "stream idle for too long").await {
+                Err(e) => return Streamed::Failed(e),
+                Ok(message) => message,
+            };
+            let text = match message {
+                Some(Ok(Message::Text(text))) => text,
+                Some(Ok(Message::Close(_)) | Err(_)) | None => {
+                    return match events {
+                        0 => Streamed::Closed,
+                        _ => Streamed::Failed(Error::Retryable(anyhow!(
+                            "the WebSocket closed before response.completed"
+                        ))),
+                    };
+                }
+                // Pings are answered by the socket itself as it is read.
+                Some(Ok(_)) => continue,
+            };
+            let Some(event) = parse_event(text.as_str()) else {
+                continue;
+            };
+            events += 1;
+            if websocket::stale(&event) {
+                return Streamed::Stale;
+            }
+            if let Err(e) = self.take(&mut call, &event, true, on_delta) {
+                return Streamed::Failed(e);
+            }
+            if call.completed {
+                break;
+            }
+        }
+        let id = call.id.clone();
+        match call.finish(self, body, usage_fetch, on_delta).await {
+            Ok(items) => Streamed::Done(items, id),
+            Err(e) => Streamed::Failed(e),
+        }
+    }
+
+    /// Log and report the rate limits a response's headers carry.
+    fn read_headers(&self, headers: &reqwest::header::HeaderMap, on_delta: &mut impl FnMut(Delta)) {
+        // A debug aid only; a failed write must not fail the call or draw over the TUI.
+        if let Some(path) = &self.header_log {
+            let _ = limits::log_headers(path, headers);
+        }
+        if let Some(found) = RateLimits::from_headers(headers, chrono::Utc::now().timestamp()) {
+            on_delta(Delta::RateLimits(found));
+        }
+    }
+
+    /// The credit balance is only in `/wham/usage`, so now and then it is asked for
+    /// alongside the stream and reported once the call is done.
+    fn usage_fetch(&self, auth: &Auth) -> Option<UsageFetch> {
+        limits::due(chrono::Utc::now().timestamp()).then(|| {
+            let (http, auth) = (self.http.clone(), auth.clone());
+            tokio::spawn(async move { limits::fetch(&http, &auth).await })
+        })
+    }
+
+    /// Take one stream event into `call`; an error event ends the call with its error.
+    fn take(
+        &self,
+        call: &mut Call,
+        event: &Value,
+        routed: bool,
+        on_delta: &mut impl FnMut(Delta),
+    ) -> std::result::Result<(), Error> {
+        call.gaps.event(std::time::Instant::now());
+        match event.get("type").and_then(Value::as_str).unwrap_or("") {
+            "response.created" => {
+                if let Some(id) = event.pointer("/response/id").and_then(Value::as_str) {
+                    call.id = Some(id.to_string());
+                }
+            }
+            "response.output_item.added" => {
+                if let Some(item) = event.get("item")
+                    && is_commentary(item)
+                    && let Some(id) = item.get("id").and_then(Value::as_str)
+                {
+                    call.commentary.push(id.to_string());
+                }
+            }
+            "response.output_text.delta" => {
+                if let Some(d) = event.get("delta").and_then(Value::as_str) {
+                    let id = event.get("item_id").and_then(Value::as_str);
+                    on_delta(
+                        match id.is_some_and(|id| call.commentary.iter().any(|c| c == id)) {
+                            true => Delta::Commentary(d.to_string()),
+                            false => Delta::Text(d.to_string()),
+                        },
+                    );
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                if let Some(d) = event.get("delta").and_then(Value::as_str) {
+                    on_delta(Delta::Reasoning(d.to_string()));
+                }
+            }
+            "response.reasoning_summary_part.added" => {
+                on_delta(Delta::Reasoning("\n".to_string()));
+            }
+            "response.output_item.done" => {
+                if let Some(item) = event.get("item") {
+                    call.items.push(item.clone());
+                }
+            }
+            // `incomplete` is terminal too: the model stopped at a cap, and what it
+            // produced is the answer rather than something to send again.
+            "response.completed" | "response.incomplete" => {
+                call.completed = true;
+                if event.get("type").and_then(Value::as_str) == Some("response.incomplete") {
+                    on_delta(Delta::Truncated);
+                } else {
+                    call.continues = event.pointer("/response/end_turn") == Some(&json!(false));
+                }
+                if let Some(id) = event.pointer("/response/id").and_then(Value::as_str) {
+                    call.id = Some(id.to_string());
+                }
+                // Some deployments do populate it; prefer their copy when present.
+                if let Some(output) = event
+                    .pointer("/response/output")
+                    .and_then(Value::as_array)
+                    .filter(|output| !output.is_empty())
+                {
+                    call.items = output.clone();
+                }
+                call.usage = Usage::from_completed(event);
+                call.served = event
+                    .pointer("/response/service_tier")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            // The same token in band, as the WebSocket transport carries it.
+            "response.metadata" if routed => {
+                self.observe_turn_state(metadata_turn_state(event));
+            }
+            "codex.rate_limits" => {
+                let now = chrono::Utc::now().timestamp();
+                if let Some(found) = RateLimits::from_event(event, now) {
+                    on_delta(Delta::RateLimits(found));
+                }
+            }
+            "response.failed" => {
+                let error = event.pointer("/response/error").unwrap_or(&Value::Null);
+                return Err(failed_in_band(error, "response failed"));
+            }
+            // The error object is nested on some deployments and the event itself on
+            // others.
+            "error" => {
+                let error = event.get("error").unwrap_or(event);
+                return Err(failed_in_band(error, "stream error"));
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn send(
@@ -1032,20 +1236,31 @@ impl Client {
         body: &Value,
         turn_state: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        let mut req = self
+        let req = self
             .http
             .post(format!("{}/responses", base_url()))
-            .header("Authorization", format!("Bearer {}", auth.access_token))
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .header("OpenAI-Beta", "responses=experimental")
+            .json(body);
+        self.with_headers(req, auth, turn_state)
+    }
+
+    /// The headers every Responses request carries, an upgrade included.
+    fn with_headers(
+        &self,
+        mut req: reqwest::RequestBuilder,
+        auth: &Auth,
+        turn_state: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        req = req
+            .header("Authorization", format!("Bearer {}", auth.access_token))
             .header("originator", ORIGINATOR)
             .header("session-id", &self.session_id)
             .header(
                 "User-Agent",
                 concat!("bhai/", env!("CARGO_PKG_VERSION"), " (codex_cli_rs)"),
-            )
-            .json(body);
+            );
         if let Some(account_id) = &auth.account_id {
             req = req.header("ChatGPT-Account-ID", account_id);
         }
@@ -1054,6 +1269,98 @@ impl Client {
         }
         req
     }
+}
+
+type UsageFetch = tokio::task::JoinHandle<Result<Value>>;
+
+/// One call's stream, assembled event by event.
+struct Call {
+    /// The ChatGPT backend leaves `response.completed.response.output` empty, so the
+    /// output is assembled from the per-item `done` events instead.
+    items: Vec<Value>,
+    completed: bool,
+    continues: bool,
+    /// Held until the call succeeds: an error after the terminal event retries the whole
+    /// call, and usage reported for an attempt that was sent again is counted twice.
+    usage: Option<Usage>,
+    /// Ids of the messages in the `commentary` phase. The phase is on the item when it is
+    /// added, not on its text deltas.
+    commentary: Vec<String>,
+    /// The `service_tier` the response says it was served at.
+    served: Option<String>,
+    gaps: Gaps,
+    /// The response's id, which a follow-up on the same socket builds on.
+    id: Option<String>,
+}
+
+impl Call {
+    fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            completed: false,
+            continues: false,
+            usage: None,
+            commentary: Vec::new(),
+            served: None,
+            gaps: Gaps::new(std::time::Instant::now()),
+            id: None,
+        }
+    }
+
+    /// The output of a completed call, after reporting how it went. `body` is the request
+    /// `client` sent, whole, for whether it asked for [`FAST_TIER`].
+    async fn finish(
+        self,
+        client: &Client,
+        body: &Value,
+        usage_fetch: Option<UsageFetch>,
+        on_delta: &mut impl FnMut(Delta),
+    ) -> std::result::Result<Vec<Value>, Error> {
+        if !self.completed {
+            return Err(Error::Retryable(anyhow!(
+                "stream ended before response.completed"
+            )));
+        }
+        on_delta(Delta::Stalls(self.gaps.stalls()));
+        if let Some(usage) = self.usage {
+            on_delta(Delta::Usage(usage));
+        }
+        if self.continues {
+            on_delta(Delta::Continues);
+        }
+        if let Some(tier) = client.downgraded(body, self.served) {
+            on_delta(Delta::Downgraded(tier));
+        }
+        if let Some(task) = usage_fetch
+            && let Ok(Ok(Ok(body))) = tokio::time::timeout(USAGE_WAIT, task).await
+            && let Some(found) = RateLimits::from_usage(&body, chrono::Utc::now().timestamp())
+        {
+            on_delta(Delta::RateLimits(found));
+        }
+        Ok(self.items)
+    }
+}
+
+/// How a call on a socket ended.
+enum Streamed {
+    /// Completed, with its output and the response id, where the backend gave one.
+    Done(Vec<Value>, Option<String>),
+    /// The socket no longer holds the response the request named.
+    Stale,
+    /// The socket was closed before any event of the response came back.
+    Closed,
+    Failed(Error),
+}
+
+/// One stream event's JSON, logged for `BHAI_DEBUG_SSE`.
+fn parse_event(data: &str) -> Option<Value> {
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    let event = serde_json::from_str::<Value>(data).ok()?;
+    debug_log(data);
+    Some(event)
 }
 
 /// The [`TURN_STATE`] a `response.metadata` event carries in its `headers`.

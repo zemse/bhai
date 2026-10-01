@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- `websocket = true` in the global config sends a conversation's Codex calls over the Responses WebSocket, one socket per conversation. A call that extends the last one sends only its new items under `previous_response_id`, a new socket or a lost response replays the history whole, and a refused upgrade puts the session on HTTPS.
 - A key typed or a click made as an approval box appears no longer answers it. `y`, `a` and `p` wait 300 ms after the box reaches the screen, `a` and `p` need a second press after their "again to save" hint has been on screen, and `/approve` without an id is refused with a 409 for the same window.
 - `@` in the prompt opens a file finder in the `/` menu. It lists the project's files as git sees them (gitignore honoured, hidden files left out), walked off the UI thread and capped at 20000. The list filters as you type, and enter or tab writes `@path`.
 - Dictation records each take into its own private directory (0o700, log 0o600), and quitting or a hangup, interrupt, terminate or panic while whisper transcribes kills the transcriber's process group and deletes the recording.

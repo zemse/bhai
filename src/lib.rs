@@ -93,6 +93,7 @@ mod title;
 pub mod tokens;
 pub mod tools;
 mod ui;
+mod websocket;
 pub mod workflow;
 mod wrap;
 

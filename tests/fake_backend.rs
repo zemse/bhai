@@ -7,12 +7,14 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -45,11 +47,26 @@ struct Fake {
     /// Replies to `/codex/alpha/search`, as a status and a body, in the order queued.
     searches: Mutex<VecDeque<(u16, String)>>,
     seen: Mutex<Vec<Seen>>,
+    /// The status a WebSocket upgrade is refused with, if it is.
+    refuse_upgrade: Mutex<Option<u16>>,
+    /// Close each socket once it has answered one request.
+    close_after_reply: AtomicBool,
+    /// Responses given an id so far, which numbers the next.
+    ids: AtomicUsize,
 }
 
 impl Fake {
     fn responses(&self) -> Vec<Seen> {
         self.requests("/codex/responses")
+    }
+
+    /// The `response.create` frames sent over sockets, in order.
+    fn frames(&self) -> Vec<Seen> {
+        self.requests(FRAME)
+    }
+
+    fn upgrades(&self) -> Vec<Seen> {
+        self.requests(UPGRADE)
     }
 
     fn requests(&self, path: &str) -> Vec<Seen> {
@@ -106,6 +123,65 @@ fn working_directory(body: &Value) -> String {
         .to_string()
 }
 
+/// An upgrade to `/codex/responses` as the fake records it.
+const UPGRADE: &str = "ws upgrade";
+/// A frame sent on a socket as the fake records it.
+const FRAME: &str = "ws frame";
+
+async fn upgrade(
+    State(fake): State<Arc<Fake>>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    fake.seen.lock().unwrap().push(Seen {
+        path: UPGRADE,
+        headers: headers.clone(),
+        body: Value::Null,
+    });
+    if let Some(status) = *fake.refuse_upgrade.lock().unwrap() {
+        return (StatusCode::from_u16(status).unwrap(), "no websocket here").into_response();
+    }
+    upgrade.on_upgrade(move |socket| answer_socket(fake, headers, socket))
+}
+
+/// Answer each `response.create` on `socket` with the next queued reply, one frame per
+/// event, numbering each completed response.
+async fn answer_socket(fake: Arc<Fake>, headers: HeaderMap, mut socket: WebSocket) {
+    while let Some(Ok(message)) = socket.recv().await {
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let body: Value = serde_json::from_str(text.as_str()).unwrap_or(Value::Null);
+        let cwd = working_directory(&body);
+        fake.seen.lock().unwrap().push(Seen {
+            path: FRAME,
+            headers: headers.clone(),
+            body,
+        });
+        let reply = fake.replies.lock().unwrap().pop_front();
+        let Some(reply) = reply else {
+            let error = json!({ "type": "error", "error": { "message": "no reply queued" } });
+            let _ = socket.send(Message::Text(error.to_string().into())).await;
+            continue;
+        };
+        for line in reply.replace(CWD, &cwd).lines() {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let mut event: Value = serde_json::from_str(data).unwrap();
+            if event["type"] == "response.completed" {
+                let n = fake.ids.fetch_add(1, Ordering::Relaxed) + 1;
+                event["response"]["id"] = json!(format!("resp_{n}"));
+            }
+            let _ = socket.send(Message::Text(event.to_string().into())).await;
+        }
+        if fake.close_after_reply.load(Ordering::Relaxed) {
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    }
+}
+
 async fn usage(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
     fake.seen.lock().unwrap().push(Seen {
         path: "/wham/usage",
@@ -119,7 +195,7 @@ async fn serve_fake(fake: Arc<Fake>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = Router::new()
-        .route("/codex/responses", post(responses))
+        .route("/codex/responses", post(responses).get(upgrade))
         .route("/wham/usage", get(usage))
         .route("/codex/alpha/search", post(search))
         .with_state(fake);
@@ -1223,4 +1299,207 @@ async fn a_web_search_goes_to_the_search_endpoint_with_the_conversation_and_runs
         texts,
         ["first question", "ask me about rust", "what is new in rust"]
     );
+}
+
+/// Two turns on `websocket = true`, each answered with `says`, and what went out.
+async fn two_turns_over_a_socket(fake: &Arc<Fake>) -> Events {
+    let backend = serve_fake(fake.clone()).await;
+    let bhai = Bhai::start_in(&backend, &[], Some("websocket = true\n")).await;
+    let mut events = bhai.events().await;
+    bhai.post("/prompt", json!({ "text": "first" })).await;
+    events.until("turn_end").await;
+    bhai.post("/prompt", json!({ "text": "second" })).await;
+    events.until("turn_end").await;
+    assert!(
+        !events.kinds().contains(&"turn_failed"),
+        "{:#?}",
+        events.got
+    );
+    events
+}
+
+fn queue(fake: &Fake, replies: impl IntoIterator<Item = String>) {
+    fake.replies.lock().unwrap().extend(replies);
+}
+
+#[tokio::test]
+async fn a_socket_carries_the_conversation_and_a_follow_up_sends_only_what_is_new() {
+    let fake = Arc::new(Fake::default());
+    queue(&fake, [says("one"), says("two")]);
+    let events = two_turns_over_a_socket(&fake).await;
+    assert_eq!(events.text(), "onetwo");
+
+    assert!(fake.responses().is_empty(), "{:#?}", fake.responses());
+    let upgrades = fake.upgrades();
+    assert_eq!(upgrades.len(), 1, "{upgrades:#?}");
+    let headers = &upgrades[0].headers;
+    assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
+    assert_eq!(
+        headers["authorization"],
+        format!("Bearer {ACCESS_TOKEN}").as_str()
+    );
+    assert_eq!(headers["chatgpt-account-id"], ACCOUNT);
+    assert!(headers.contains_key("session-id"));
+
+    let frames = fake.frames();
+    assert_eq!(frames.len(), 2, "{frames:#?}");
+    let (first, second) = (&frames[0].body, &frames[1].body);
+    assert_eq!(first["type"], "response.create");
+    assert!(first.get("previous_response_id").is_none(), "{first}");
+    assert!(mentions(first, "first"));
+    assert_eq!(second["previous_response_id"], "resp_1", "{second}");
+    assert!(mentions(second, "second"));
+    assert!(
+        !mentions(second, "first") && !mentions(second, "\"one\""),
+        "{second}"
+    );
+    for field in ["instructions", "tools", "prompt_cache_key", "model"] {
+        assert_eq!(first[field], second[field], "{field}");
+    }
+}
+
+#[tokio::test]
+async fn a_socket_closed_between_calls_is_reopened_and_the_history_replayed() {
+    let fake = Arc::new(Fake::default());
+    fake.close_after_reply.store(true, Ordering::Relaxed);
+    queue(&fake, [says("one"), says("two")]);
+    let events = two_turns_over_a_socket(&fake).await;
+    assert_eq!(events.text(), "onetwo");
+    assert!(
+        !events.kinds().contains(&"retrying"),
+        "{:?}",
+        events.kinds()
+    );
+
+    assert!(fake.responses().is_empty());
+    assert_eq!(fake.upgrades().len(), 2);
+    let frames = fake.frames();
+    let replay = &frames.last().unwrap().body;
+    assert!(replay.get("previous_response_id").is_none(), "{replay}");
+    assert!(mentions(replay, "first") && mentions(replay, "\"one\"") && mentions(replay, "second"));
+}
+
+#[tokio::test]
+async fn a_lost_previous_response_is_replayed_whole_on_the_same_socket() {
+    let fake = Arc::new(Fake::default());
+    let lost = sse(&[json!({
+        "type": "error",
+        "error": { "code": "previous_response_not_found", "message": "not found" }
+    })]);
+    queue(&fake, [says("one"), lost, says("two")]);
+    let events = two_turns_over_a_socket(&fake).await;
+    assert_eq!(events.text(), "onetwo");
+    assert!(
+        !events.kinds().contains(&"retrying"),
+        "{:?}",
+        events.kinds()
+    );
+
+    assert_eq!(fake.upgrades().len(), 1);
+    let frames = fake.frames();
+    assert_eq!(frames.len(), 3, "{frames:#?}");
+    assert_eq!(frames[1].body["previous_response_id"], "resp_1");
+    let replay = &frames[2].body;
+    assert!(replay.get("previous_response_id").is_none(), "{replay}");
+    assert!(mentions(replay, "first") && mentions(replay, "second"));
+}
+
+#[tokio::test]
+async fn a_refused_upgrade_falls_back_to_https_for_the_rest_of_the_session() {
+    let fake = Arc::new(Fake::default());
+    *fake.refuse_upgrade.lock().unwrap() = Some(426);
+    queue(&fake, [says("one"), says("two")]);
+    let events = two_turns_over_a_socket(&fake).await;
+    assert_eq!(events.text(), "onetwo");
+    let infos: Vec<&Value> = events.got.iter().filter(|e| e["type"] == "info").collect();
+    assert_eq!(infos.len(), 1, "{:#?}", events.got);
+    assert!(
+        infos[0]["data"]
+            .as_str()
+            .is_some_and(|m| m.contains("refused the WebSocket") && m.contains("426")),
+        "{infos:?}"
+    );
+
+    assert_eq!(fake.upgrades().len(), 1);
+    assert!(fake.frames().is_empty());
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    // HTTPS replays the whole history every call.
+    assert!(mentions(&sent[1].body, "first") && mentions(&sent[1].body, "second"));
+}
+
+#[tokio::test]
+async fn a_socket_lost_mid_response_is_retried_on_a_new_one_with_the_history_whole() {
+    let fake = Arc::new(Fake::default());
+    fake.close_after_reply.store(true, Ordering::Relaxed);
+    let cut = sse(&[json!({ "type": "response.output_text.delta", "delta": "cut o" })]);
+    queue(&fake, [cut, says("whole")]);
+    let backend = serve_fake(fake.clone()).await;
+    let bhai = Bhai::start_in(&backend, &[], Some("websocket = true\n")).await;
+    let mut events = bhai.events().await;
+    bhai.post("/prompt", json!({ "text": "go" })).await;
+    let retrying = events.until("retrying").await;
+    assert!(
+        retrying["data"]
+            .as_str()
+            .is_some_and(|m| m.contains("closed before response.completed")),
+        "{retrying}"
+    );
+    events.until("turn_end").await;
+    assert_eq!(events.text(), "cut owhole");
+
+    assert_eq!(fake.upgrades().len(), 2);
+    let frames = fake.frames();
+    assert_eq!(frames.len(), 2, "{frames:#?}");
+    assert_eq!(frames[0].body["input"], frames[1].body["input"]);
+    assert!(frames[1].body.get("previous_response_id").is_none());
+}
+
+#[tokio::test]
+async fn a_reply_on_the_socket_at_the_default_tier_turns_fast_off() {
+    let fake = Arc::new(Fake::default());
+    queue(&fake, [says_at("one", "default"), says("two")]);
+    let backend = serve_fake(fake.clone()).await;
+    let bhai = Bhai::start_in(&backend, &[], Some("websocket = true\n")).await;
+    let mut events = bhai.events().await;
+
+    bhai.post("/fast", json!({ "on": true })).await;
+    assert_eq!(events.until("fast").await["data"], true);
+    bhai.post("/prompt", json!({ "text": "first" })).await;
+    assert_eq!(events.until("fast").await["data"], false);
+    events.until("turn_end").await;
+    bhai.post("/prompt", json!({ "text": "second" })).await;
+    events.until("turn_end").await;
+
+    assert!(fake.responses().is_empty());
+    let frames = fake.frames();
+    let tiers: Vec<&Value> = frames.iter().map(|f| &f.body["service_tier"]).collect();
+    assert_eq!(tiers, [&json!("priority"), &Value::Null], "{frames:#?}");
+    // The tier is outside the input, so the change replays the history whole.
+    assert!(frames[1].body.get("previous_response_id").is_none());
+}
+
+#[tokio::test]
+async fn a_tool_call_inside_a_turn_sends_only_its_output_on_the_socket() {
+    let fake = Arc::new(Fake::default());
+    queue(&fake, [runs("call_1", "true"), says("done")]);
+    let backend = serve_fake(fake.clone()).await;
+    let bhai = Bhai::start_in(&backend, &[], Some("websocket = true\n")).await;
+    let mut events = bhai.events().await;
+    bhai.post("/prompt", json!({ "text": "run it" })).await;
+    let approval = events.until("approval").await;
+    bhai.post("/approve", json!({ "id": approval["data"]["id"] }))
+        .await;
+    events.until("turn_end").await;
+    assert_eq!(events.text(), "done");
+
+    assert_eq!(fake.upgrades().len(), 1);
+    let frames = fake.frames();
+    assert_eq!(frames.len(), 2, "{frames:#?}");
+    let next = &frames[1].body;
+    assert_eq!(next["previous_response_id"], "resp_1", "{next}");
+    let input = next["input"].as_array().unwrap();
+    assert_eq!(input.len(), 1, "{next}");
+    assert_eq!(input[0]["type"], "function_call_output");
+    assert_eq!(input[0]["call_id"], "call_1");
 }

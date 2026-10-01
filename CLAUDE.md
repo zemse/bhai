@@ -10,6 +10,7 @@ items are the internal format everywhere, so both backends carry the same histor
 `src/` is flat, one module per subsystem.
 
 - **loop**: `agent.rs` (the turn, child agents), `client.rs` and `ollama.rs` (backends),
+  `websocket.rs` (the Responses WebSocket, behind `client.rs`),
   `compact.rs`, `limits.rs`, `workflow.rs`
 - **tui**: `app.rs` (state and keys), `ui.rs` (rendering), `input.rs`, `entries.rs`,
   `markdown.rs`, `wrap.rs`, `diff.rs`, `commands.rs`, `models.rs` (the `/model` picker),

@@ -1791,6 +1791,7 @@ async fn turn(
                     "retrying ({attempt}/{of}) in {:.1}s: {reason}",
                     delay.as_secs_f64()
                 )),
+                Delta::Notice(s) => AgentEvent::Info(s),
             });
         };
 

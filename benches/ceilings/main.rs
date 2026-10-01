@@ -119,6 +119,8 @@ mod tokens;
 mod tools;
 #[path = "../../src/ui.rs"]
 mod ui;
+#[path = "../../src/websocket.rs"]
+mod websocket;
 #[path = "../../src/workflow.rs"]
 mod workflow;
 #[path = "../../src/wrap.rs"]

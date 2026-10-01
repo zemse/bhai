@@ -19,7 +19,7 @@ async-trait = "0.1.92"
 axum = "0.8.9"
 base64 = "0.22.1"
 chrono = { version = "0.4.45", features = ["serde"] }
-futures-util = "0.3.33"
+futures-util = { version = "0.3.33", features = ["sink"] }
 htmlize = { version = "1.1.0", features = ["unescape"] }
 http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["server", "http1"] }
@@ -42,6 +42,7 @@ syntect = { version = "5.3.0", default-features = false, features = ["default-fa
 tiktoken-rs = "0.12"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "io-util", "net", "signal"] }
 tokio-rustls = { version = "0.26.4", default-features = false }
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
 toml = "1.1.6"
 tui-input = "0.15.3"
 unicode-width = "0.2.2"
@@ -54,6 +55,8 @@ dictation = []
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+# The fake backend's WebSocket endpoint.
+axum = { version = "0.8.9", features = ["ws"] }
 # Paused time, for the timers that fire after the cache would have lapsed.
 tokio = { version = "1.53.1", features = ["test-util"] }
 

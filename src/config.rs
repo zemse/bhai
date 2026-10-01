@@ -199,6 +199,7 @@ struct Layer {
     ollama_url: Option<String>,
     reasoning_context: Option<String>,
     verbosity: Option<String>,
+    websocket: Option<bool>,
     context_window: Option<u64>,
     compact_at: Option<f64>,
     statusline: Option<String>,
@@ -427,6 +428,9 @@ impl Config {
                 if value.is_some() {
                     *field = value.clone();
                 }
+            }
+            if let Some(websocket) = layer.websocket {
+                self.choice.websocket = websocket;
             }
         }
         self.apply(layer, trusted);
@@ -852,12 +856,12 @@ mod tests {
         let (home, cwd) = (dir.join("home"), dir.join("cwd"));
         write(
             &home.join(".config/bhai/config.toml"),
-            "model = \"ollama:gemma4:e2b\"\neffort = \"low\"\nollama_url = \"http://box:11434\"\n",
+            "model = \"ollama:gemma4:e2b\"\neffort = \"low\"\nollama_url = \"http://box:11434\"\nwebsocket = true\n",
         );
         // A cloned repo must not redirect inference, least of all to a URL of its own.
         write(
             &cwd.join(".bhai/config.toml"),
-            "model = \"gpt-5.5\"\nollama_url = \"http://elsewhere\"\n",
+            "model = \"gpt-5.5\"\nollama_url = \"http://elsewhere\"\nwebsocket = false\n",
         );
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert_eq!(
@@ -866,6 +870,7 @@ mod tests {
                 model: Some("ollama:gemma4:e2b".to_string()),
                 effort: Some("low".to_string()),
                 ollama_url: Some("http://box:11434".to_string()),
+                websocket: true,
                 ..Default::default()
             }
         );
