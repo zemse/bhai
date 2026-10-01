@@ -309,6 +309,9 @@ pub struct App {
     esc_armed: Option<Instant>,
     /// The draft ctrl+c last cleared, which ctrl+z puts back.
     cleared: Option<String>,
+    /// `ctrl+g` asked for the draft in the user's editor; the loop that owns the
+    /// terminal opens it.
+    pub editing: bool,
     session: Arc<Session>,
 }
 
@@ -396,6 +399,7 @@ impl App {
             quit_armed: None,
             esc_armed: None,
             cleared: None,
+            editing: false,
             session,
         }
     }
@@ -545,6 +549,7 @@ impl App {
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
             KeyCode::Char('y') if ctrl => self.copy(),
             KeyCode::Char('v') if ctrl => self.paste(),
+            KeyCode::Char('g') if ctrl => self.editing = true,
             KeyCode::Char('a') if ctrl && !self.input.is_empty() => self.input.select_all(),
             // With nothing drafted there is nothing in the prompt to take, so ctrl+a
             // reaches past it to the transcript, which is the thing worth taking whole.
@@ -1110,6 +1115,17 @@ impl App {
             None => self.note(Entry::Info(
                 "no clipboard reader here; use the terminal's own paste".to_string(),
             )),
+        }
+    }
+
+    /// What the user's editor left of the draft, or why it left nothing.
+    pub fn edited(&mut self, result: anyhow::Result<String>) {
+        match result {
+            Ok(text) => {
+                self.input.set(text);
+                self.refresh_menu();
+            }
+            Err(err) => self.note(Entry::Error(format!("editor: {err:#}"))),
         }
     }
 
@@ -3526,6 +3542,40 @@ mod tests {
         app.trust_gate = gate();
         app.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn ctrl_g_hands_the_draft_to_the_editor_and_takes_back_what_it_left() {
+        let mut app = App::detached();
+        type_text(&mut app, "short");
+        app.on_key(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(app.editing);
+        assert_eq!(app.input.value(), "short");
+
+        app.editing = false;
+        app.edited(Ok("short\nand long".to_string()));
+        assert_eq!(app.input.value(), "short\nand long");
+        assert_eq!(app.input.cursor(), "short\nand long".chars().count());
+
+        // An editor that failed leaves the draft and says why.
+        app.edited(Err(anyhow::anyhow!("vi exited with 1")));
+        assert_eq!(app.input.value(), "short\nand long");
+        assert!(matches!(
+            app.entries().list.last(),
+            Some(Entry::Error(text)) if text.contains("vi exited")
+        ));
+
+        // An approval is modal, so ctrl+g there does nothing.
+        let mut app = App::detached();
+        app.pending = Some(Approval {
+            id: 7,
+            tool: "bash".to_string(),
+            command: "ls".to_string(),
+            preview: None,
+            offers: Default::default(),
+        });
+        app.on_key(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(!app.editing);
     }
 
     #[test]

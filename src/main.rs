@@ -15,6 +15,7 @@ mod config;
 mod debug;
 mod diff;
 mod entries;
+mod external;
 mod frontmatter;
 mod goal;
 mod identity;
@@ -48,15 +49,18 @@ mod workflow;
 mod wrap;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event as TermEvent, KeyEvent, KeyboardEnhancementFlags,
     MouseEvent, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::{execute, terminal};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
@@ -446,8 +450,14 @@ allow it.",
     // exactly when the id is wanted, so the hint goes out after the panic message.
     let hook = std::panic::take_hook();
     let crashed = (dir.clone(), session_id.clone());
+    let modes = Modes {
+        mouse,
+        paste,
+        keyboard,
+        focus,
+    };
     std::panic::set_hook(Box::new(move |info| {
-        release_modes(mouse, paste, keyboard, focus);
+        modes.release();
         title::pop();
         hook(info);
         if let Some(hint) = sessions::exit_hint(&crashed.0, &crashed.1) {
@@ -459,7 +469,7 @@ allow it.",
     );
     let result = run(
         terminal,
-        mouse,
+        modes,
         session,
         events,
         listener,
@@ -478,7 +488,7 @@ allow it.",
         defaults,
     )
     .await;
-    release_modes(mouse, paste, keyboard, focus);
+    modes.release();
     title::pop();
     ratatui::restore();
     shutdown(hub).await;
@@ -498,20 +508,81 @@ fn set_capture(on: bool) -> bool {
     done == on
 }
 
-/// Turn off the terminal modes the TUI turned on.
-fn release_modes(mouse: bool, paste: bool, keyboard: bool, focus: bool) {
-    if focus {
-        let _ = execute!(std::io::stdout(), DisableFocusChange);
+/// The terminal modes the TUI turned on.
+#[derive(Clone, Copy)]
+struct Modes {
+    mouse: bool,
+    paste: bool,
+    keyboard: bool,
+    focus: bool,
+}
+
+impl Modes {
+    /// Turn them off.
+    fn release(self) {
+        if self.focus {
+            let _ = execute!(std::io::stdout(), DisableFocusChange);
+        }
+        if self.keyboard {
+            let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        if self.paste {
+            let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+        }
+        if self.mouse {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        }
     }
-    if keyboard {
-        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+
+    /// Turn them back on after `release`.
+    fn restore(self) {
+        if self.mouse {
+            let _ = execute!(std::io::stdout(), EnableMouseCapture);
+        }
+        if self.paste {
+            let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+        }
+        if self.keyboard {
+            let _ = execute!(
+                std::io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
+        }
+        if self.focus {
+            let _ = execute!(std::io::stdout(), EnableFocusChange);
+        }
     }
-    if paste {
-        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
-    }
-    if mouse {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture);
-    }
+}
+
+/// Lets the loop stop the input thread reading the terminal, while another program has it.
+#[derive(Default)]
+struct Reader {
+    paused: AtomicBool,
+    /// Held across each poll and read, so taking it waits out the one under way.
+    reading: Mutex<()>,
+}
+
+/// Hand the terminal to the user's editor on the draft, and take it back.
+fn edit_draft(
+    terminal: &mut ratatui::DefaultTerminal,
+    reader: &Reader,
+    modes: Modes,
+    draft: &str,
+) -> Result<String> {
+    reader.paused.store(true, Ordering::SeqCst);
+    let held = reader.reading.lock().unwrap_or_else(|e| e.into_inner());
+    modes.release();
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen, Show);
+    let _ = terminal::disable_raw_mode();
+    let edited = external::edit(&external::command(), draft);
+    let _ = terminal::enable_raw_mode();
+    let _ = execute!(std::io::stdout(), EnterAlternateScreen);
+    modes.restore();
+    // The editor drew over the screen ratatui thinks it last drew.
+    let _ = terminal.clear();
+    drop(held);
+    reader.paused.store(false, Ordering::SeqCst);
+    edited
 }
 
 /// Stop the MCP servers, if any were started.
@@ -1377,7 +1448,7 @@ fn cache_check_passed(rows: &[CacheRow]) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn run(
     mut terminal: ratatui::DefaultTerminal,
-    mouse: bool,
+    modes: Modes,
     session: Arc<Session>,
     mut events: broadcast::Receiver<session::Event>,
     listener: Option<TcpListener>,
@@ -1399,8 +1470,15 @@ async fn run(
 
     // Terminal input lives on its own thread; crossterm's reader is blocking.
     let input_tx = tx_event.clone();
+    let reader = Arc::new(Reader::default());
+    let gate = Arc::clone(&reader);
     std::thread::spawn(move || {
         loop {
+            if gate.paused.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let held = gate.reading.lock().unwrap_or_else(|e| e.into_inner());
             let event = match event::poll(TICK) {
                 Ok(true) => match event::read() {
                     Ok(TermEvent::Key(key)) => Event::Key(key),
@@ -1414,6 +1492,7 @@ async fn run(
                 Ok(false) => Event::Tick,
                 Err(_) => break,
             };
+            drop(held);
             if input_tx.send(event).is_err() {
                 break;
             }
@@ -1439,6 +1518,7 @@ async fn run(
         }
     });
 
+    let mouse = modes.mouse;
     let mut app = App::new(Arc::clone(&session));
     app.mouse = mouse;
     app.skills = skills;
@@ -1499,6 +1579,17 @@ async fn run(
         // `/mouse` hands the pointer back to the terminal, and takes it again.
         if app.mouse != captured {
             captured = set_capture(app.mouse);
+        }
+        if std::mem::take(&mut app.editing) {
+            // Mouse capture is whatever `/mouse` left it, not what it started as.
+            let modes = Modes {
+                mouse: captured,
+                ..modes
+            };
+            let draft = app.input.value().to_string();
+            let edited = edit_draft(&mut terminal, &reader, modes, &draft);
+            app.edited(edited);
+            dirty = true;
         }
     }
 

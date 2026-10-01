@@ -278,7 +278,7 @@ pub fn help() -> String {
         "\n  up on an empty prompt takes the queued messages back to edit",
         "\n  wheel, pgup/pgdn or ctrl+up/down scroll · click a tool output to expand it",
         "\n  drag selects, past the edge to keep going · ctrl+a takes the whole transcript",
-        "\n  ctrl+y copies · ctrl+v pastes · ctrl+t shows every badge",
+        "\n  ctrl+y copies · ctrl+v pastes · ctrl+g edits the draft in $EDITOR · ctrl+t shows every badge",
     ));
     out
 }
