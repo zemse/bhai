@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- A browser MCP server (chrome-devtools-mcp, Playwright's, Puppeteer's) runs in a profile of its own. One set to attach to the user's running browser (`--autoConnect`, `--extension`), point at a real Chrome/Firefox/Edge/Brave profile directory, or load cookies (`--storage-state`) is skipped, and everything such a server returns starts with a line framing it as untrusted page content.
 - A prompt can carry images: ctrl+v (or a terminal's empty paste) attaches the clipboard's image and pasting the path of an image file attaches that file, each shown in the prompt as `[image #N]`. Only the images whose placeholder is still in the text are sent, after the text, and they are kept in the session file; the transcript, token counts and Ollama see the placeholder.
 - `view_image` is judged like a read: in auto mode, a protected path or a `Read` ask rule keeps it for the user instead of handing it to the auto-approval judge.
 - `[bash] sudo = true` in the global config lets `sudo -A` in a bash command ask for the password in the terminal. A box shows the command's exact text and sudo's prompt with a fixed `********` mask, enter sends the password and esc refuses. The password goes straight to sudo through a helper on a private unix socket, so it never appears in the command's output, the history or the model's context. A project file may turn it off but not on, and it is off without a terminal (`--headless`, `exec`, `--workflow`).

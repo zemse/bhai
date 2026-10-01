@@ -186,6 +186,11 @@ pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
             },
         );
     }
+    for server in &mut found {
+        if server.skip.is_none() {
+            server.skip = super::browser::refused(server, roots.home.as_deref());
+        }
+    }
     found
 }
 
@@ -642,6 +647,58 @@ mod tests {
         approve(&roots, &BTreeMap::new(), "ok").unwrap();
         assert_eq!(pin.check("ok", &drifted), Ok(()));
         assert!(pin.check("ok", &tools).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_browser_server_on_the_users_own_browser_is_not_started_from_any_source() {
+        let dir = std::env::temp_dir().join(format!("bhai-mcp-{}", uuid::Uuid::new_v4()));
+        let (home, cwd) = (dir.join("home"), dir.join("repo"));
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        let profile = home.join("Library/Application Support/Google/Chrome");
+        write(
+            &home.join(".claude.json"),
+            json!({"mcpServers": {
+                "port": {"command": "npx",
+                    "args": ["chrome-devtools-mcp@latest", "--browser-url=http://127.0.0.1:9222"]},
+                "live": {"command": "npx", "args": ["chrome-devtools-mcp@latest", "--autoConnect"]},
+                "mine": {"command": "npx",
+                    "args": ["@playwright/mcp", "--user-data-dir", profile.to_str().unwrap()]},
+            }}),
+        );
+        let bhai = BTreeMap::from([(
+            "cookies".to_string(),
+            McpServer {
+                command: "npx".to_string(),
+                args: vec![
+                    "@playwright/mcp".into(),
+                    "--storage-state=state.json".into(),
+                ],
+                env: BTreeMap::new(),
+                url: None,
+                headers: Headers::default(),
+                startup_timeout_sec: None,
+                tool_timeout_sec: None,
+            },
+        )]);
+        let roots = Roots {
+            home: Some(home),
+            codex_home: None,
+            cwd,
+        };
+        let servers = load(&roots, &bhai);
+        let skip = |name: &str| {
+            servers
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .skip
+                .clone()
+        };
+        assert_eq!(skip("port"), None);
+        assert!(skip("live").unwrap().contains("running browser"));
+        assert!(skip("mine").unwrap().contains("user's browser profile"));
+        assert!(skip("cookies").unwrap().contains("cookies"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
