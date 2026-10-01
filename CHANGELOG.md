@@ -4,6 +4,13 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-01
+
+- `/model-default` and `/effort-default` save the model and effort new sessions start
+  on to `~/.config/bhai/config.toml`, leaving the running session where it is.
+  `/model-default` opens the `/model` picker on the current default; with a name it
+  saves without asking.
+
 ## 2026-09-30
 
 - The subagent panel stays up while any child is still running, not only while the

@@ -100,6 +100,17 @@ pub const COMMANDS: &[Command] = &[
         args: " <level>",
         help: "the reasoning effort, keeping the model",
     },
+    // No args hint, for the same reason as `/model`.
+    Command {
+        name: "model-default",
+        args: "",
+        help: "pick the model new sessions start on",
+    },
+    Command {
+        name: "effort-default",
+        args: " <level>",
+        help: "the effort new sessions start at",
+    },
     // No args hint, though it takes a request: on its own it shows the template and
     // the variables, which is where a first look starts.
     Command {

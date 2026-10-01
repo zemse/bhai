@@ -379,6 +379,8 @@ pub struct Picker {
     pub selected: usize,
     /// The model and effort the session is on, marked in the lists.
     current: (String, String),
+    /// Picking the default new sessions start on, for `/model-default`.
+    pub default: bool,
     /// Where the backends' answer lands, filled in by the task that asks them.
     incoming: Arc<Mutex<Option<Catalogue>>>,
 }
@@ -391,7 +393,16 @@ impl Picker {
             stage: Stage::Models,
             selected: 0,
             current: (model.to_string(), effort.to_string()),
+            default: false,
             incoming: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A picker for the default, marking the one in force now.
+    pub fn for_default(model: &str, effort: &str) -> Self {
+        Self {
+            default: true,
+            ..Self::new(model, effort)
         }
     }
 
@@ -532,11 +543,13 @@ impl Picker {
 
     /// The title of the list on show.
     fn title(&self) -> String {
+        let what = if self.default { "the default" } else { "an" };
         match self.stage {
+            Stage::Models if self.default => " pick the default model ".to_string(),
             Stage::Models => " pick a model ".to_string(),
             Stage::Efforts(at) => match self.models().get(at) {
-                Some(model) => format!(" {} · pick an effort ", model.label),
-                None => " pick an effort ".to_string(),
+                Some(model) => format!(" {} · pick {what} effort ", model.label),
+                None => format!(" pick {what} effort "),
             },
         }
     }
@@ -552,6 +565,7 @@ impl Picker {
         let dim = Style::new().fg(Color::DarkGray);
         let hint = match self.stage {
             Stage::Models => " ↑↓ pick · enter choose · esc close ",
+            Stage::Efforts(_) if self.default => " ↑↓ pick · enter save · esc back ",
             Stage::Efforts(_) => " ↑↓ pick · enter switch · esc back ",
         };
         let block = Block::bordered()

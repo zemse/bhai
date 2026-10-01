@@ -402,58 +402,67 @@ pub fn global_path(home: &Path) -> std::path::PathBuf {
     home.join(".config/bhai/config.toml")
 }
 
-/// Set the root-level `statusline` key of the file at `path`, or remove it for `None`,
+/// Set root-level string keys of the file at `path`, removing those given `None`,
 /// leaving every other line as it was. The file is only replaced once the new text
-/// reads back with the template in it.
-pub fn save_statusline(path: &Path, template: Option<&str>) -> Result<()> {
+/// reads back with every value in it.
+pub fn save(path: &Path, keys: &[(&str, Option<&str>)]) -> Result<()> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    // Keys under a `[table]` belong to it, so the root ends at the first header.
-    let root = lines
-        .iter()
-        .position(|line| line.trim_start().starts_with('['))
-        .unwrap_or(lines.len());
-    let at = lines[..root].iter().position(|line| {
-        line.trim_start()
-            .strip_prefix("statusline")
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    });
-    if let Some(at) = at {
-        let value = lines[at]
-            .split_once('=')
-            .map_or("", |(_, v)| v)
-            .trim_start();
-        if value.starts_with("\"\"\"") || value.starts_with("'''") {
-            anyhow::bail!(
-                "{} sets statusline over several lines; edit it there by hand",
-                path.display()
-            );
+    for &(key, value) in keys {
+        // Keys under a `[table]` belong to it, so the root ends at the first header.
+        let root = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with('['))
+            .unwrap_or(lines.len());
+        let at = lines[..root].iter().position(|line| {
+            line.trim_start()
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        });
+        if let Some(at) = at {
+            let old = lines[at]
+                .split_once('=')
+                .map_or("", |(_, v)| v)
+                .trim_start();
+            if old.starts_with("\"\"\"") || old.starts_with("'''") {
+                anyhow::bail!(
+                    "{} sets {key} over several lines; edit it there by hand",
+                    path.display()
+                );
+            }
         }
-    }
-    let line = template.map(|t| format!("statusline = {}", toml::Value::String(t.to_string())));
-    match (at, line) {
-        (Some(at), Some(line)) => lines[at] = line,
-        (Some(at), None) => {
-            lines.remove(at);
+        let line = value.map(|v| format!("{key} = {}", toml::Value::String(v.to_string())));
+        match (at, line) {
+            (Some(at), Some(line)) => lines[at] = line,
+            (Some(at), None) => {
+                lines.remove(at);
+            }
+            (None, Some(line)) => lines.insert(root, line),
+            (None, None) => {}
         }
-        (None, Some(line)) => lines.insert(root, line),
-        (None, None) => return Ok(()),
     }
     let mut new = lines.join("\n");
     if !new.is_empty() {
         new.push('\n');
     }
-    let layer: Layer = toml::from_str(&new)
+    if new == text {
+        return Ok(());
+    }
+    toml::from_str::<Layer>(&new)
         .with_context(|| format!("the new {} does not read back", path.display()))?;
-    anyhow::ensure!(
-        layer.statusline.as_deref() == template,
-        "the new {} does not read back with the template",
-        path.display()
-    );
+    let table: toml::Table = toml::from_str(&new)
+        .with_context(|| format!("the new {} does not read back", path.display()))?;
+    for &(key, value) in keys {
+        anyhow::ensure!(
+            table.get(key).and_then(toml::Value::as_str) == value,
+            "the new {} does not read back with its {key}",
+            path.display()
+        );
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -486,7 +495,7 @@ mod tests {
         let original = "# mine\nmodel = \"gpt-5\"\n\n[permissions]\nallow = [\"Bash(ls:*)\"]\n";
         write(&path, original);
 
-        save_statusline(&path, Some(r#"$model "quoted" \$"#)).unwrap();
+        save(&path, &[("statusline", Some(r#"$model "quoted" \$"#))]).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.starts_with("# mine\nmodel = \"gpt-5\"\n\nstatusline = "),
@@ -500,12 +509,45 @@ mod tests {
         assert_eq!(config.statusline.as_deref(), Some(r#"$model "quoted" \$"#));
 
         // A second save replaces the line rather than adding one.
-        save_statusline(&path, Some("$branch")).unwrap();
+        save(&path, &[("statusline", Some("$branch"))]).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("statusline").count(), 1, "{text}");
 
-        save_statusline(&path, None).unwrap();
+        save(&path, &[("statusline", None)]).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_default_model_is_saved_beside_the_rest() {
+        let dir = temp_dir();
+        let home = dir.join("home");
+        let path = global_path(&home);
+        write(
+            &path,
+            "model = \"gpt-5\"\n# keep\n[permissions]\nallow = [\"Bash(ls)\"]\n",
+        );
+
+        save(
+            &path,
+            &[("model", Some("gpt-5.5")), ("effort", Some("high"))],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "model = \"gpt-5.5\"\n# keep\neffort = \"high\"\n[permissions]\nallow = [\"Bash(ls)\"]\n"
+        );
+        let config = Config::load(Some(&home), &dir.join("cwd")).unwrap();
+        assert_eq!(config.choice.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(config.choice.effort.as_deref(), Some("high"));
+
+        // `model_x` is another key, not the model.
+        write(&path, "model_x = \"a\"\n");
+        save(&path, &[("model", Some("gpt-5.5"))]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "model_x = \"a\"\nmodel = \"gpt-5.5\"\n"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

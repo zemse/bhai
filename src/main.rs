@@ -216,8 +216,9 @@ async fn main() -> Result<()> {
     };
     let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
-    let mut client = client::Client::new(&choice)?
-        .with_overrides(identity.model.clone(), identity.effort.clone());
+    let client = client::Client::new(&choice)?;
+    let defaults = (client.model().to_string(), client.effort().to_string());
+    let mut client = client.with_overrides(identity.model.clone(), identity.effort.clone());
     // A resumed session goes back on the model it was last on: that is what its cached
     // prefix and its encrypted reasoning belong to. `--model` still wins over both.
     if let Some(loaded) = &resumed {
@@ -449,6 +450,7 @@ allow it.",
         limits,
         statusline,
         designer,
+        defaults,
     )
     .await;
     release_modes(mouse, paste, keyboard);
@@ -1208,6 +1210,7 @@ async fn run(
     limits: Limits,
     statusline: Option<String>,
     designer: Arc<dyn statusline::Design>,
+    defaults: (String, String),
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -1264,6 +1267,7 @@ async fn run(
     // One that does not parse was already reported with the notices.
     app.statusline = statusline.and_then(|t| statusline::Template::parse(&t).ok());
     app.config_path = std::env::var_os("HOME").map(|home| config::global_path(home.as_ref()));
+    app.defaults = defaults;
     app.designer = Some(designer);
     {
         let mut entries = app.entries();

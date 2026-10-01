@@ -266,8 +266,10 @@ pub struct App {
     pub session_id: String,
     /// The status bar's template, or `None` for the built-in bar.
     pub statusline: Option<statusline::Template>,
-    /// The global config file, which `/statusline` saves the template to.
+    /// The global config file, which `/statusline` and the `-default` commands save to.
     pub config_path: Option<PathBuf>,
+    /// The model and effort a new session starts on, before identity, resume and flags.
+    pub defaults: (String, String),
     /// The model call behind `/statusline <request>`.
     pub designer: Option<Arc<dyn statusline::Design>>,
     /// Its answer, once the task it runs on has one.
@@ -343,6 +345,7 @@ impl App {
             session_id: String::new(),
             statusline: None,
             config_path: None,
+            defaults: (session.state().model, session.state().effort),
             designer: None,
             designing: None,
             quit: false,
@@ -397,6 +400,7 @@ impl App {
         if let Some(picker) = &mut self.picker
             && !(ctrl && key.code == KeyCode::Char('c'))
         {
+            let default = picker.default;
             match picker.on_key(key.code) {
                 Choice::Waiting => {}
                 Choice::Closed => self.picker = None,
@@ -406,7 +410,10 @@ impl App {
                     window,
                 } => {
                     self.picker = None;
-                    self.switch_model(model, effort, window);
+                    match default {
+                        true => self.save_default(&model, Some(&effort)),
+                        false => self.switch_model(model, effort, window),
+                    }
                 }
             }
             return;
@@ -1220,6 +1227,20 @@ impl App {
             self.effort_command(rest.trim());
             return;
         }
+        if let Some(rest) = message.strip_prefix("/model-default")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            self.model_default_command(rest.trim());
+            return;
+        }
+        if let Some(rest) = message.strip_prefix("/effort-default")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            self.effort_default_command(rest.trim());
+            return;
+        }
         if let Some(rest) = message.strip_prefix("/statusline")
             && (rest.is_empty() || rest.starts_with(' '))
         {
@@ -1337,8 +1358,10 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     /// bar for `None`. Nothing changes unless it is saved.
     fn set_statusline(&mut self, template: Option<statusline::Template>) {
         if let Some(path) = &self.config_path
-            && let Err(e) =
-                crate::config::save_statusline(path, template.as_ref().map(|t| t.source.as_str()))
+            && let Err(e) = crate::config::save(
+                path,
+                &[("statusline", template.as_ref().map(|t| t.source.as_str()))],
+            )
         {
             self.note(Entry::Error(format!(
                 "could not save the status line: {e:#}"
@@ -1391,6 +1414,95 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             return;
         }
         self.switch_model(self.model.clone(), rest.to_string(), None);
+    }
+
+    /// `/model-default`: the picker again, but what it picks is saved for new sessions
+    /// rather than switched to. `/model-default <name> [effort]` saves without asking.
+    fn model_default_command(&mut self, rest: &str) {
+        if rest.is_empty() {
+            let picker = Picker::for_default(&self.defaults.0, &self.defaults.1);
+            picker.ask(&self.ollama_url);
+            self.picker = Some(picker);
+            return;
+        }
+        let (name, effort) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let effort = Some(effort.trim()).filter(|e| !e.is_empty());
+        self.save_default(name, effort);
+    }
+
+    /// `/effort-default <level>`: the effort new sessions start at. On its own it says
+    /// which that is.
+    fn effort_default_command(&mut self, rest: &str) {
+        if rest.is_empty() {
+            self.note(Entry::Info(format!(
+                "default effort: {}. Usage: /effort-default <low|medium|high|xhigh>",
+                self.defaults.1
+            )));
+            return;
+        }
+        if crate::client::Provider::of(&self.defaults.0) == crate::client::Provider::Ollama {
+            self.note(Entry::Error(format!(
+                "the default model, {}, is on Ollama, which takes no effort",
+                self.defaults.0
+            )));
+            return;
+        }
+        if !crate::client::EFFORTS.contains(&rest) {
+            self.note(Entry::Error(format!(
+                "unknown effort {rest}; one of {}",
+                crate::client::EFFORTS.join(", ")
+            )));
+            return;
+        }
+        let (model, effort) = (self.defaults.0.clone(), rest.to_string());
+        self.save_default(&model, Some(&effort));
+    }
+
+    /// Write `model`, and `effort` where given, to the global config for new sessions.
+    /// This session stays on what it runs.
+    fn save_default(&mut self, model: &str, effort: Option<&str>) {
+        let Some(path) = self.config_path.clone() else {
+            self.note(Entry::Error(
+                "no home directory to save the default in".to_string(),
+            ));
+            return;
+        };
+        let codex = crate::client::Provider::of(model) == crate::client::Provider::Codex;
+        // Nothing on Ollama reads an effort, so picking one of its models leaves it be.
+        let effort = effort.filter(|_| codex);
+        if let Some(effort) = effort
+            && !crate::client::EFFORTS.contains(&effort)
+        {
+            self.note(Entry::Error(format!(
+                "unknown effort {effort}; one of {}",
+                crate::client::EFFORTS.join(", ")
+            )));
+            return;
+        }
+        let mut keys = vec![("model", Some(model))];
+        keys.extend(effort.map(|e| ("effort", Some(e))));
+        if let Err(e) = crate::config::save(&path, &keys) {
+            self.note(Entry::Error(format!("could not save the default: {e:#}")));
+            return;
+        }
+        self.defaults.0 = model.to_string();
+        if let Some(effort) = effort {
+            self.defaults.1 = effort.to_string();
+        }
+        let shown = match codex {
+            true => format!("{} ({})", self.defaults.0, self.defaults.1),
+            false => self.defaults.0.clone(),
+        };
+        let mut notice = format!(
+            "default: {shown}, saved in {}. New sessions start on it; this one stays on {}.",
+            path.display(),
+            self.model
+        );
+        let set = |key: &str| std::env::var(key).is_ok_and(|v| !v.trim().is_empty());
+        for key in ["BHAI_MODEL", "BHAI_EFFORT"].into_iter().filter(|k| set(k)) {
+            notice.push_str(&format!(" {key} is set, and wins over the config."));
+        }
+        self.note(Entry::Info(notice));
     }
 
     /// Tokens the next message would re-read now that the cache has likely lapsed.
@@ -2288,6 +2400,70 @@ mod tests {
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.picker.is_none());
         assert_eq!(app.model, "gpt-5.5");
+    }
+
+    #[tokio::test]
+    async fn the_default_is_saved_and_the_session_stays() {
+        let (mut app, _user, _control) = connected();
+        let last = |app: &mut App| match app.entries().list.last() {
+            Some(Entry::Info(text) | Entry::Error(text)) => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        let dir = std::env::temp_dir().join(format!("bhai-default-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.toml");
+        app.config_path = Some(path.clone());
+        let session = app.session.state();
+
+        // The picker opens on the default, and enter saves rather than switches.
+        app.input.set("/model-default".to_string());
+        app.submit();
+        let picker = app.picker.as_mut().expect("the picker is up");
+        assert!(picker.default);
+        picker.fill(crate::models::Catalogue {
+            models: vec![crate::models::Model {
+                id: "ollama:gemma4:e2b".to_string(),
+                label: "gemma4:e2b".to_string(),
+                detail: String::new(),
+                efforts: Vec::new(),
+                default_effort: None,
+                window: None,
+            }],
+            notes: Vec::new(),
+        });
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.picker.is_none());
+        // An Ollama model takes no effort, so none is written.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "model = \"ollama:gemma4:e2b\"\n"
+        );
+        assert!(last(&mut app).starts_with("default: ollama:gemma4:e2b, saved in"));
+        app.input.set("/effort-default high".to_string());
+        app.submit();
+        assert!(last(&mut app).contains("on Ollama, which takes no effort"));
+
+        app.input.set("/model-default gpt-5.5 xhigh".to_string());
+        app.submit();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "model = \"gpt-5.5\"\neffort = \"xhigh\"\n"
+        );
+        app.input.set("/effort-default loud".to_string());
+        app.submit();
+        assert!(last(&mut app).starts_with("unknown effort loud"));
+        app.input.set("/effort-default low".to_string());
+        app.submit();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "model = \"gpt-5.5\"\neffort = \"low\"\n"
+        );
+        app.input.set("/effort-default".to_string());
+        app.submit();
+        assert!(last(&mut app).starts_with("default effort: low."));
+
+        let now = app.session.state();
+        assert_eq!((now.model, now.effort), (session.model, session.effort));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
