@@ -2438,7 +2438,10 @@ mod tests {
         let Event::Info(text) = events.recv().await.unwrap() else {
             panic!("expected a note");
         };
-        assert_eq!(text, "$ echo hi\nexit code: 0\nhi");
+        assert!(
+            text.starts_with("$ echo hi\nexit code: 0\nhi\n\n[output: 1 line,"),
+            "{text}"
+        );
         let audit = std::fs::read_to_string(&log).unwrap();
         assert!(audit.contains("\"summary\":\"echo hi\"") && audit.contains("\"by\":\"you\""));
         assert!(

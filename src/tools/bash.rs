@@ -3,7 +3,7 @@
 use std::io;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -28,6 +28,9 @@ const EXIT: &str = "exit code: ";
 const KILLED: &str = "killed by signal";
 const TIMED_OUT: &str = "Command timed out";
 const UNSTARTED: &str = "Could not start the command";
+/// What the last line of a result starts with: the lines the command printed in all and
+/// how long it ran, so a result cut in the middle still says how much it was.
+const TRAILER: &str = "[output: ";
 
 /// How a command ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +150,7 @@ fn parse_command(args: &Value) -> Result<String, String> {
 }
 
 async fn run(command: &str, live: Live<'_>) -> String {
+    let started = Instant::now();
     let mut bash = Command::new("bash");
     crate::childenv::scrub(&mut bash);
     crate::childenv::non_interactive(&mut bash);
@@ -168,13 +172,14 @@ async fn run(command: &str, live: Live<'_>) -> String {
         Ok(collected) => collected,
     };
     match status {
-        Some(status) => format_output(&stdout, &stderr, status),
+        Some(status) => format_output(&stdout, &stderr, status, started.elapsed()),
         // What it printed before the clock ran out is still what it was doing.
         None => format!(
             "{TIMED_OUT} after {}s and was killed. Run something shorter, or send it to \
-the background with its output redirected to a file and poll that.\n{}",
+the background with its output redirected to a file and poll that.\n{}{}",
             TIMEOUT.as_secs(),
-            truncate(&body(&stdout, &stderr))
+            truncate(&body(&stdout, &stderr)),
+            trailer(&stdout, &stderr, started.elapsed())
         ),
     }
 }
@@ -187,10 +192,18 @@ struct Kept {
     head: Vec<u8>,
     tail: std::collections::VecDeque<u8>,
     dropped: usize,
+    /// Newlines seen, trimmed ones included.
+    newlines: usize,
+    last: Option<u8>,
 }
 
 impl Kept {
     fn push(&mut self, bytes: &[u8]) {
+        let Some(&last) = bytes.last() else {
+            return;
+        };
+        self.newlines += bytes.iter().filter(|&&b| b == b'\n').count();
+        self.last = Some(last);
         let room = KEEP.saturating_sub(self.head.len()).min(bytes.len());
         let (head, rest) = bytes.split_at(room);
         self.head.extend_from_slice(head);
@@ -200,6 +213,11 @@ impl Kept {
             self.tail.drain(..over);
             self.dropped += over;
         }
+    }
+
+    /// Lines printed, a last one without its newline counted.
+    fn lines(&self) -> usize {
+        self.newlines + usize::from(self.last.is_some_and(|b| b != b'\n'))
     }
 
     fn bytes(&self) -> Vec<u8> {
@@ -329,12 +347,23 @@ fn body(stdout: &Kept, stderr: &Kept) -> String {
     body
 }
 
-/// The result the model sees: exit status, then stdout, then stderr.
-fn format_output(stdout: &Kept, stderr: &Kept, status: ExitStatus) -> String {
+/// The result the model sees: exit status, then stdout, then stderr, then the trailer.
+fn format_output(stdout: &Kept, stderr: &Kept, status: ExitStatus, took: Duration) -> String {
     let code = status
         .code()
         .map_or_else(|| KILLED.to_string(), |c| c.to_string());
-    format!("{EXIT}{code}\n{}", truncate(&body(stdout, stderr)))
+    format!(
+        "{EXIT}{code}\n{}{}",
+        truncate(&body(stdout, stderr)),
+        trailer(stdout, stderr, took)
+    )
+}
+
+/// Last, so [`outcome`], which reads the first line, is unaffected.
+fn trailer(stdout: &Kept, stderr: &Kept, took: Duration) -> String {
+    let lines = stdout.lines() + stderr.lines();
+    let s = if lines == 1 { "" } else { "s" };
+    format!("\n{TRAILER}{lines} line{s}, {:.1}s]", took.as_secs_f64())
 }
 
 #[cfg(test)]
@@ -475,11 +504,16 @@ mod tests {
             kept.push(bytes);
             kept
         };
-        assert_eq!(
-            out,
-            format_output(&kept(&plain.stdout), &kept(&plain.stderr), plain.status)
+        let (body, trailer) = out.rsplit_once('\n').unwrap();
+        assert!(trailer.starts_with("[output: 3 lines, "), "{out}");
+        let plain = format_output(
+            &kept(&plain.stdout),
+            &kept(&plain.stderr),
+            plain.status,
+            Duration::ZERO,
         );
-        assert_eq!(out, "exit code: 0\na\nb\ne");
+        assert_eq!(body, plain.rsplit_once('\n').unwrap().0);
+        assert_eq!(body, "exit code: 0\na\nb\ne");
     }
 
     #[tokio::test]
@@ -499,7 +533,10 @@ mod tests {
         let start = Instant::now();
         let out = run(&command, live).await;
         assert!(start.elapsed() < Duration::from_secs(1), "{out}");
-        assert_eq!(out, "exit code: killed by signal\na\n");
+        assert!(
+            out.starts_with("exit code: killed by signal\na\n\n[output: 1 line, "),
+            "{out}"
+        );
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(
             !marker.exists(),
@@ -535,5 +572,35 @@ mod tests {
         let mut small = Kept::default();
         small.push(b"a\nb\n");
         assert_eq!(small.bytes(), b"a\nb\n");
+    }
+
+    #[tokio::test]
+    async fn the_result_ends_with_the_line_count_and_wall_time() {
+        let out = run("seq 1 5", quiet()).await;
+        assert!(out.starts_with("exit code: 0\n1\n2\n3\n4\n5\n"), "{out}");
+        let last = out.lines().last().unwrap();
+        assert!(
+            last.starts_with("[output: 5 lines, ") && last.ends_with("s]"),
+            "{last}"
+        );
+        assert_eq!(outcome(&out), Some(Outcome::Succeeded));
+
+        let out = run("sleep 0.3", quiet()).await;
+        assert!(
+            out.contains("(no output)\n[output: 0 lines, 0.3s]"),
+            "{out}"
+        );
+
+        // A last line without its newline counts, and so does stderr.
+        let out = run("printf 'a\\nb'; echo e >&2; exit 2", quiet()).await;
+        assert!(out.contains("[output: 3 lines, "), "{out}");
+        assert_eq!(outcome(&out), Some(Outcome::Failed(2)));
+    }
+
+    #[tokio::test]
+    async fn the_line_count_includes_trimmed_output() {
+        let out = run("yes | head -n 200000", quiet()).await;
+        assert!(out.contains("bytes trimmed"), "{out}");
+        assert!(out.contains("\n[output: 200000 lines, "), "{out}");
     }
 }

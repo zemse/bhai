@@ -5151,8 +5151,11 @@ mod tests {
         }
         assert!(start.elapsed() < Duration::from_secs(3));
         assert_eq!(progress, ["a\n"]);
-        let expected = "exit code: killed by signal\na\n";
-        assert_eq!(output.as_deref(), Some(expected));
+        let expected = output.clone().unwrap();
+        assert!(
+            expected.starts_with("exit code: killed by signal\na\n\n[output: 1 line, "),
+            "{expected}"
+        );
 
         drive(&tx_user, &mut rx, &cancel, "again", &[]).await;
         assert_eq!(*fake.breaks.lock().unwrap(), []);
@@ -5161,7 +5164,7 @@ mod tests {
         assert_eq!(input[1], bash);
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["call_id"], bash["call_id"]);
-        assert_eq!(input[2]["output"], expected);
+        assert_eq!(input[2]["output"], expected.as_str());
         let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
         assert_eq!(&loaded.items[..3], &input[..3]);
         let _ = std::fs::remove_dir_all(dir);
