@@ -24,6 +24,18 @@ const READERS: &[&[&str]] = &[&["pbpaste"]];
 #[cfg(not(target_os = "macos"))]
 const READERS: &[&[&str]] = &[&["wl-paste"], &["xclip", "-o", "-selection", "clipboard"]];
 
+/// Commands that print the clipboard's image as PNG bytes, best first. macOS has none,
+/// so AppleScript prints it as `«data PNGf<hex>»`.
+#[cfg_attr(test, allow(dead_code))]
+#[cfg(target_os = "macos")]
+const IMAGE_READERS: &[&[&str]] = &[&["osascript", "-e", "the clipboard as «class PNGf»"]];
+#[cfg_attr(test, allow(dead_code))]
+#[cfg(not(target_os = "macos"))]
+const IMAGE_READERS: &[&[&str]] = &[
+    &["wl-paste", "--no-newline", "--type", "image/png"],
+    &["xclip", "-o", "-selection", "clipboard", "-t", "image/png"],
+];
+
 /// The most text OSC 52 carries, in bytes before base64. Terminals drop an escape
 /// longer than they allow whole, so the text is cut to fit instead.
 const MAX_OSC52: usize = 100_000;
@@ -98,6 +110,59 @@ pub fn paste() -> Option<String> {
             .success()
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     })
+}
+
+/// The clipboard's image as PNG bytes, when it holds one and a command can read it.
+#[cfg(not(test))]
+pub fn paste_image() -> Option<Vec<u8>> {
+    IMAGE_READERS.iter().find_map(|argv| {
+        let out = Command::new(argv[0])
+            .args(&argv[1..])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() || out.stdout.is_empty() {
+            return None;
+        }
+        match argv[0] {
+            "osascript" => applescript_data(&String::from_utf8_lossy(&out.stdout)),
+            _ => Some(out.stdout),
+        }
+    })
+}
+
+/// Under test the clipboard holds what `set_image` put there, so nothing runs.
+#[cfg(test)]
+pub fn paste_image() -> Option<Vec<u8>> {
+    IMAGE.with(|image| image.borrow().clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    static IMAGE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Put an image on this thread's test clipboard.
+#[cfg(test)]
+pub fn set_image(bytes: Option<Vec<u8>>) {
+    IMAGE.with(|image| *image.borrow_mut() = bytes);
+}
+
+/// The bytes in AppleScript's `«data PNGf89504E47...»`.
+#[cfg_attr(test, allow(dead_code))]
+fn applescript_data(out: &str) -> Option<Vec<u8>> {
+    let hex = out
+        .trim()
+        .strip_prefix("«data ")?
+        .strip_suffix('»')?
+        .get(4..)?;
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 /// Feed `text` to one clipboard command's stdin.
@@ -175,6 +240,17 @@ mod tests {
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         // The last two alphabet entries only show up on high bytes.
         assert_eq!(base64(&[0xff, 0xef, 0xbf]), "/++/");
+    }
+
+    #[test]
+    fn applescript_prints_the_image_as_hex() {
+        assert_eq!(
+            applescript_data("«data PNGf89504E47»\n"),
+            Some(vec![0x89, 0x50, 0x4e, 0x47])
+        );
+        assert_eq!(applescript_data("«data PNGf895»"), None);
+        assert_eq!(applescript_data("«data PNGfzz»"), None);
+        assert_eq!(applescript_data("some text"), None);
     }
 
     #[test]

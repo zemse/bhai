@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- A prompt can carry images: ctrl+v (or a terminal's empty paste) attaches the clipboard's image and pasting the path of an image file attaches that file, each shown in the prompt as `[image #N]`. Only the images whose placeholder is still in the text are sent, after the text, and they are kept in the session file; the transcript, token counts and Ollama see the placeholder.
 - `view_image` is judged like a read: in auto mode, a protected path or a `Read` ask rule keeps it for the user instead of handing it to the auto-approval judge.
 - `[bash] sudo = true` in the global config lets `sudo -A` in a bash command ask for the password in the terminal. A box shows the command's exact text and sudo's prompt with a fixed `********` mask, enter sends the password and esc refuses. The password goes straight to sudo through a helper on a private unix socket, so it never appears in the command's output, the history or the model's context. A project file may turn it off but not on, and it is off without a terminal (`--headless`, `exec`, `--workflow`).
 - `.bhai/MEMORY.md` that resolves outside the project (the file or `.bhai` a symlink out) is not loaded into the prompt, and startup says it was skipped; `remember` refuses to append to it.

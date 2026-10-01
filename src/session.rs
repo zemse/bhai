@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use crate::agent::{AgentEvent, Cancel, Control, Mailboxes, Rejecter};
+use crate::agent::{AgentEvent, Cancel, Control, Mailboxes, Rejecter, UserInput};
 use crate::cache::{CacheBreak, Hit};
 use crate::client::Usage;
 use crate::entries::{Entries, Entry};
@@ -17,6 +17,7 @@ use crate::judge::Judge;
 use crate::limits::RateLimits;
 use crate::permissions::{Answer, Mode, Offers, Policy, Remember};
 use crate::profile::{CallTokens, EntryTokens, Profile};
+use crate::tools::Image;
 use crate::workflow::Workflow;
 
 /// Events a slow consumer can fall behind by before it starts missing them.
@@ -301,12 +302,31 @@ pub struct State {
 pub struct Prompt {
     pub text: String,
     pub shown: String,
+    /// Attached images, sent after the text.
+    pub images: Vec<Image>,
 }
 
 impl Prompt {
     /// A prompt shown as something other than what it sends.
     pub fn shown_as(text: String, shown: String) -> Self {
-        Self { text, shown }
+        Self {
+            text,
+            shown,
+            images: Vec::new(),
+        }
+    }
+
+    /// The prompt with `images` attached.
+    pub fn with_images(self, images: Vec<Image>) -> Self {
+        Self { images, ..self }
+    }
+
+    /// What the agent is sent.
+    fn input(&self) -> UserInput {
+        UserInput {
+            text: self.text.clone(),
+            images: self.images.clone(),
+        }
     }
 }
 
@@ -333,10 +353,7 @@ impl Waiting {
 /// A plain prompt shows exactly what it sends.
 impl From<String> for Prompt {
     fn from(text: String) -> Self {
-        Self {
-            shown: text.clone(),
-            text,
-        }
+        Self::shown_as(text.clone(), text)
     }
 }
 
@@ -449,7 +466,7 @@ pub struct Session {
     /// Where a message typed into a child's pane is posted; the agent fills it in as
     /// each child starts.
     mailboxes: Mailboxes,
-    tx_user: mpsc::Sender<String>,
+    tx_user: mpsc::Sender<UserInput>,
     tx_control: mpsc::Sender<Control>,
     cancel: Arc<Cancel>,
     policy: Arc<Policy>,
@@ -463,7 +480,7 @@ impl Session {
         model: String,
         effort: String,
         identity: String,
-        tx_user: mpsc::Sender<String>,
+        tx_user: mpsc::Sender<UserInput>,
         tx_control: mpsc::Sender<Control>,
         cancel: Arc<Cancel>,
         policy: Arc<Policy>,
@@ -570,7 +587,7 @@ impl Session {
         // lands in between still stops the turn.
         self.cancel.clear();
         self.tx_user
-            .try_send(prompt.text)
+            .try_send(prompt.input())
             .map_err(|_| SubmitError::Closed)?;
         inner.start();
         self.publish(Event::User(prompt.shown));
@@ -591,7 +608,7 @@ impl Session {
         }
         self.cancel.clear();
         self.tx_control
-            .try_send(Control::Forked(prompt.text))
+            .try_send(Control::Forked(prompt.input()))
             .map_err(|_| SubmitError::Closed)?;
         inner.start();
         self.publish(Event::User(prompt.shown));
@@ -648,7 +665,7 @@ impl Session {
     /// Every prompt waiting ahead of the first `/compact`, as what is sent and what is
     /// shown, for the agent to read before its next model call. Nothing is handed over
     /// once the turn is interrupted, so the queue outlives the interrupt.
-    pub fn take_queued(&self) -> Vec<(String, String)> {
+    pub fn take_queued(&self) -> Vec<(UserInput, String)> {
         let mut inner = self.lock();
         if self.cancel.stopped() {
             return Vec::new();
@@ -656,15 +673,29 @@ impl Session {
         let mut taken = Vec::new();
         while let Some(Waiting::Prompt(_)) = inner.queue.front() {
             if let Some(Waiting::Prompt(p)) = inner.queue.pop_front() {
-                taken.push((p.text, p.shown));
+                taken.push((p.input(), p.shown));
             }
         }
         taken
     }
 
     /// Take everything waiting back out of the queue, as typed, to be edited.
+    /// Their images are dropped, since the text alone goes back into the prompt box.
     pub fn unqueue(&self) -> Vec<String> {
-        self.lock().queue.drain(..).map(|w| w.shown()).collect()
+        let taken: Vec<Waiting> = self.lock().queue.drain(..).collect();
+        let images: usize = taken
+            .iter()
+            .map(|w| match w {
+                Waiting::Prompt(prompt) => prompt.images.len(),
+                Waiting::Compact(_) => 0,
+            })
+            .sum();
+        if images > 0 {
+            self.publish(Event::Info(format!(
+                "dropped {images} image(s) from the queued prompts; paste them again"
+            )));
+        }
+        taken.iter().map(Waiting::shown).collect()
     }
 
     /// Hand the next queued prompt to the agent, with the state locked. A prompt the
@@ -682,11 +713,8 @@ impl Session {
             Some(Waiting::Prompt(prompt)) => prompt,
         };
         self.cancel.clear();
-        if let Err(e) = self.tx_user.try_send(prompt.text.clone()) {
-            inner.queue.push_front(Waiting::Prompt(Prompt::shown_as(
-                e.into_inner(),
-                prompt.shown,
-            )));
+        if self.tx_user.try_send(prompt.input()).is_err() {
+            inner.queue.push_front(Waiting::Prompt(prompt));
             inner.working = false;
             return;
         }
@@ -1513,7 +1541,7 @@ mod tests {
     use super::*;
     use crate::entries::Entry;
 
-    fn session() -> (Arc<Session>, mpsc::Receiver<String>) {
+    fn session() -> (Arc<Session>, mpsc::Receiver<UserInput>) {
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, _) = mpsc::channel(1);
         let cancel = Arc::new(Cancel::default());
@@ -1801,7 +1829,7 @@ mod tests {
             None,
         );
         session.submit("a".to_string()).unwrap();
-        assert_eq!(rx_user.try_recv().unwrap(), "a");
+        assert_eq!(rx_user.try_recv().unwrap().text, "a");
         session.submit("b".to_string()).unwrap();
         assert_eq!(
             session.compact(Some("the plan".to_string())),
@@ -1811,7 +1839,7 @@ mod tests {
         assert_eq!(session.queued(), ["b", "/compact the plan", "c"]);
 
         // The running turn takes what was typed before the compact, not what came after.
-        assert_eq!(session.take_queued(), [("b".to_string(), "b".to_string())]);
+        assert_eq!(session.take_queued(), [("b".into(), "b".to_string())]);
         assert!(session.take_queued().is_empty());
         assert!(rx_control.try_recv().is_err());
 
@@ -1823,7 +1851,7 @@ mod tests {
         assert!(session.state().working);
         assert_eq!(session.queued(), ["c"]);
         session.on_agent(AgentEvent::TurnEnd);
-        assert_eq!(rx_user.try_recv().unwrap(), "c");
+        assert_eq!(rx_user.try_recv().unwrap().text, "c");
     }
 
     #[test]
@@ -1831,7 +1859,7 @@ mod tests {
         let (session, mut rx_user) = session();
         let mut events = session.subscribe();
         assert_eq!(session.submit("a".to_string()), Ok(Submitted::Started));
-        assert_eq!(rx_user.try_recv().unwrap(), "a");
+        assert_eq!(rx_user.try_recv().unwrap().text, "a");
         assert_eq!(
             session.submit("b".to_string()),
             Ok(Submitted::Queued { position: 1 })
@@ -1846,11 +1874,11 @@ mod tests {
 
         // The first queued prompt starts as the turn ends, the next behind it.
         session.on_agent(AgentEvent::TurnEnd);
-        assert_eq!(rx_user.try_recv().unwrap(), "b");
+        assert_eq!(rx_user.try_recv().unwrap().text, "b");
         assert!(session.state().working);
         assert_eq!(session.state().queued, ["c"]);
         session.on_agent(AgentEvent::TurnEnd);
-        assert_eq!(rx_user.try_recv().unwrap(), "c");
+        assert_eq!(rx_user.try_recv().unwrap().text, "c");
         session.on_agent(AgentEvent::TurnEnd);
         assert!(!session.state().working);
         assert!(session.state().queued.is_empty());
@@ -1902,7 +1930,7 @@ mod tests {
         // as a conversation that never happened in that order.
         let (session, mut rx_user) = session();
         session.submit("a".to_string()).unwrap();
-        assert_eq!(rx_user.try_recv().unwrap(), "a");
+        assert_eq!(rx_user.try_recv().unwrap().text, "a");
         session.on_agent(AgentEvent::Text("half an ".to_string()));
         session.submit("b".to_string()).unwrap();
         session.on_agent(AgentEvent::Text("answer".to_string()));
@@ -1918,7 +1946,7 @@ mod tests {
         }
 
         session.on_agent(AgentEvent::TurnEnd);
-        assert_eq!(rx_user.try_recv().unwrap(), "b");
+        assert_eq!(rx_user.try_recv().unwrap().text, "b");
         let entries = session.entries();
         let texts: Vec<_> = entries
             .list
@@ -1935,7 +1963,7 @@ mod tests {
         let mut events = session.subscribe();
         let typed = || Prompt::shown_as("Use the `pdf` skill.".to_string(), "/pdf".to_string());
         session.submit(typed()).unwrap();
-        assert_eq!(rx_user.try_recv().unwrap(), "Use the `pdf` skill.");
+        assert_eq!(rx_user.try_recv().unwrap().text, "Use the `pdf` skill.");
         assert_eq!(events.try_recv(), Ok(Event::User("/pdf".to_string())));
 
         // Queued, and then started from the queue, it still shows as it was typed.
@@ -1943,7 +1971,7 @@ mod tests {
         assert_eq!(session.queued(), ["/pdf"]);
         assert_eq!(session.state().queued, ["/pdf"]);
         session.on_agent(AgentEvent::TurnEnd);
-        assert_eq!(rx_user.try_recv().unwrap(), "Use the `pdf` skill.");
+        assert_eq!(rx_user.try_recv().unwrap().text, "Use the `pdf` skill.");
         let seen: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok())
             .filter(|e| !matches!(e, Event::Done { .. }))
             .collect();
@@ -1978,8 +2006,8 @@ mod tests {
         assert_eq!(
             session.take_queued(),
             [
-                ("b".to_string(), "b".to_string()),
-                ("Use the `pdf` skill.".to_string(), "/pdf".to_string()),
+                ("b".into(), "b".to_string()),
+                ("Use the `pdf` skill.".into(), "/pdf".to_string()),
             ]
         );
         assert!(session.queued().is_empty());
@@ -1996,8 +2024,18 @@ mod tests {
                 "/pdf".to_string(),
             ))
             .unwrap();
-        assert_eq!(session.unqueue(), ["b", "/pdf"]);
+        let image = Image::new("image/png", "iVBORw0K").unwrap();
+        session
+            .submit(Prompt::from("c [image #1]".to_string()).with_images(vec![image]))
+            .unwrap();
+        let mut events = session.subscribe();
+        assert_eq!(session.unqueue(), ["b", "/pdf", "c [image #1]"]);
         assert!(session.queued().is_empty());
+        // Only the text goes back into the prompt box, so the user is told.
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            Event::Info(text) if text.contains("dropped 1 image(s)")
+        ));
         // Nothing is left to start once the turn ends.
         session.on_agent(AgentEvent::TurnEnd);
         assert!(!session.state().working);
@@ -2113,7 +2151,7 @@ mod tests {
         // turn went wrong was thrown away by the very keypress that stopped it.
         let (session, mut rx_user) = session();
         session.submit("a".to_string()).unwrap();
-        assert_eq!(rx_user.try_recv().unwrap(), "a");
+        assert_eq!(rx_user.try_recv().unwrap().text, "a");
         session.submit("b".to_string()).unwrap();
         session.submit("c".to_string()).unwrap();
         assert!(session.interrupt());
@@ -2121,12 +2159,12 @@ mod tests {
         // Nothing is sent until the cancelled turn ends; then the queue drains as usual.
         assert!(rx_user.try_recv().is_err());
         session.on_agent(AgentEvent::TurnEnd);
-        assert_eq!(rx_user.try_recv().unwrap(), "b");
+        assert_eq!(rx_user.try_recv().unwrap().text, "b");
         assert!(session.state().working);
         // The interrupt cleared the cancel flag on the way out, so the new turn runs.
         assert!(!session.cancel.stopped());
         session.on_agent(AgentEvent::TurnEnd);
-        assert_eq!(rx_user.try_recv().unwrap(), "c");
+        assert_eq!(rx_user.try_recv().unwrap().text, "c");
         session.on_agent(AgentEvent::TurnEnd);
         assert!(!session.state().working);
         let entries = session.entries();
@@ -2145,11 +2183,11 @@ mod tests {
         let (session, mut rx_user) = session();
         session.submit("a".to_string()).unwrap();
         session.submit("b".to_string()).unwrap();
-        assert_eq!(rx_user.try_recv().unwrap(), "a");
+        assert_eq!(rx_user.try_recv().unwrap().text, "a");
 
         assert!(session.interrupt());
         session.on_agent(AgentEvent::TurnEnd);
-        assert_eq!(rx_user.try_recv().unwrap(), "b");
+        assert_eq!(rx_user.try_recv().unwrap().text, "b");
         assert!(session.state().working);
 
         assert!(session.interrupt());
@@ -2164,7 +2202,7 @@ mod tests {
         session.submit("a".to_string()).unwrap();
         session.submit("b".to_string()).unwrap();
         session.submit("c".to_string()).unwrap();
-        assert_eq!(rx_user.try_recv().unwrap(), "a");
+        assert_eq!(rx_user.try_recv().unwrap().text, "a");
         assert!(session.interrupt());
         assert_eq!(session.clear_queue(), 2);
         session.on_agent(AgentEvent::TurnEnd);
@@ -2445,7 +2483,7 @@ mod tests {
         session
             .submit_forked(Prompt::from("go on".to_string()))
             .unwrap();
-        assert!(matches!(control.try_recv(), Ok(Control::Forked(m)) if m == "go on"));
+        assert!(matches!(control.try_recv(), Ok(Control::Forked(m)) if m.text == "go on"));
         assert_eq!(
             session.submit_forked(Prompt::from("again".to_string())),
             Err(SubmitError::Busy)

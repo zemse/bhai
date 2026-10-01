@@ -829,6 +829,15 @@ mod tests {
     }
 
     #[test]
+    fn a_restored_message_shows_its_images_as_the_placeholders_typed_with_them() {
+        let mut app = intro();
+        let image = crate::tools::Image::new("image/png", "iVBORw0K").unwrap();
+        app.restore(&[crate::tools::user_message("what is [image #1]", &[image])]);
+        assert_eq!(app.list[1].kind(), "user");
+        assert_eq!(app.list[1].text(), "what is [image #1]");
+    }
+
+    #[test]
     fn commentary_is_kept_apart_from_the_answer_it_leads_to() {
         let mut app = intro();
         app.apply(&Event::Commentary("checking ".to_string()));

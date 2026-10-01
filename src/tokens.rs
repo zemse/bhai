@@ -50,14 +50,23 @@ pub fn item_text(item: &Value) -> Option<String> {
     let field = |key: &str| item.get(key).and_then(Value::as_str);
     match field("type") {
         Some("reasoning") => None,
-        Some("message") => Some(
-            item.get("content")
-                .and_then(Value::as_array)
+        Some("message") => {
+            let parts = item.get("content").and_then(Value::as_array);
+            let mut text: String = parts
                 .into_iter()
                 .flatten()
                 .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .collect(),
-        ),
+                .collect();
+            let images = parts
+                .into_iter()
+                .flatten()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_image"));
+            for image in images {
+                text.push('\n');
+                text.push_str(&crate::tools::image_part(image));
+            }
+            Some(text)
+        }
         Some("function_call") => Some(format!(
             "{}{}",
             field("name").unwrap_or_default(),
@@ -77,13 +86,15 @@ pub fn item_text(item: &Value) -> Option<String> {
     }
 }
 
-/// What one image in a tool output counts as. Its pixels are not decoded, so this is a
+/// What one image in a tool output or a user message counts as. Its pixels are not decoded, so this is a
 /// fixed guess near what a high-detail screenshot costs.
 pub const IMAGE_TOKENS: u64 = 1_500;
 
 /// How many images a history item carries.
 pub fn images(item: &Value) -> usize {
-    item.get("output").map_or(0, crate::tools::output_images)
+    item.get("output")
+        .or_else(|| item.get("content"))
+        .map_or(0, crate::tools::output_images)
 }
 
 /// Tokens the model reads in a history item, each image at `IMAGE_TOKENS`, or `None`
@@ -157,5 +168,18 @@ mod tests {
         );
         let plain = json!({"type": "function_call_output", "output": "ok"});
         assert_eq!(item_tokens(&plain, &ByteEstimate), Some(1));
+    }
+
+    #[test]
+    fn an_image_the_user_attached_counts_like_one_a_tool_brought() {
+        let image = crate::tools::Image::new("image/jpeg", &"A".repeat(40_000)).unwrap();
+        let message = crate::tools::user_message("see [image #1]", &[image]);
+        let text = "see [image #1]\n[image image/jpeg]";
+        assert_eq!(item_text(&message).unwrap(), text);
+        assert_eq!(images(&message), 1);
+        assert_eq!(
+            item_tokens(&message, &ByteEstimate),
+            Some(ByteEstimate.count(text) as u64 + IMAGE_TOKENS)
+        );
     }
 }

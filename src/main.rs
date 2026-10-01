@@ -973,7 +973,7 @@ fn start(
     saved: Saved,
     limits: Limits,
 ) -> (Arc<Session>, broadcast::Receiver<session::Event>) {
-    let (tx_user, rx_user) = mpsc::channel::<String>(16);
+    let (tx_user, rx_user) = mpsc::channel::<agent::UserInput>(16);
     let (tx_control, rx_control) = mpsc::channel::<Control>(16);
     let (tx_agent, rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(agent::Cancel::default());
@@ -1219,7 +1219,7 @@ async fn headless_exec(session: &Arc<Session>, prompt: String, json: bool) -> Re
 /// runs in `ask` mode with no rules whatever the config says.
 async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
     let system = setup.prompt;
-    let (tx_user, rx_user) = mpsc::channel::<String>(1);
+    let (tx_user, rx_user) = mpsc::channel::<agent::UserInput>(1);
     let (_tx_control, rx_control) = mpsc::channel::<Control>(1);
     let (tx_agent, mut rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(agent::Cancel::default());
@@ -1248,7 +1248,11 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
     ));
 
     tx_user
-        .send(prompt.unwrap_or_else(|| "Reply with just: ok".to_string()))
+        .send(
+            prompt
+                .unwrap_or_else(|| "Reply with just: ok".to_string())
+                .into(),
+        )
         .await?;
 
     while let Some(event) = rx_agent.recv().await {

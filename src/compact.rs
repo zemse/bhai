@@ -209,7 +209,7 @@ pub fn install(
             break;
         }
         let text = tokens::item_text(item).unwrap_or_default();
-        let count = tokenizer.count(&text) as u64;
+        let count = tokens::item_tokens(item, tokenizer).unwrap_or_default();
         if count <= left {
             left -= count;
             kept.push(item.clone());

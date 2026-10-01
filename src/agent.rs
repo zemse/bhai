@@ -187,7 +187,7 @@ impl Rejecter {
 /// What the loop does next, once something has woken it: a turn on a new message, a
 /// turn on the history as it stands, or a compaction pass of its own.
 enum Next {
-    Turn(String),
+    Turn(UserInput),
     /// A child detached in an earlier turn finished while the session was idle. Its
     /// report opens a turn of its own, so the model reads it without being asked.
     Landed(ChildResult),
@@ -198,7 +198,7 @@ enum Next {
     /// The cache of an idle conversation is about to lapse: compact a copy of it.
     Fork,
     /// A message to run on the compacted copy rather than on the full history.
-    Forked(String),
+    Forked(UserInput),
 }
 
 /// Requests answered by the agent task, which owns the history, even mid-turn.
@@ -213,7 +213,7 @@ pub enum Control {
     Clear,
     /// Run a turn on this message from the compacted copy of the history, for
     /// `/compact-then`, dropping the full history.
-    Forked(String),
+    Forked(UserInput),
     /// Run a turn again on the history as it stands, after one failed. Nothing is added
     /// to the history, so the call goes out as the failed one did.
     Retry,
@@ -407,7 +407,37 @@ impl Drop for Mailbox {
 /// The session's queue, for the main agent: every prompt typed while it works, as what
 /// the model reads and what the transcript shows. Taken between steps, so nothing waits
 /// for the turn to end, and empty once the turn is interrupted.
-pub type Inbox = Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>;
+pub type Inbox = Arc<dyn Fn() -> Vec<(UserInput, String)> + Send + Sync>;
+
+/// A message the user sent, and the images attached to it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserInput {
+    pub text: String,
+    pub images: Vec<tools::Image>,
+}
+
+impl UserInput {
+    /// The history item the model reads it as. Without images it is the plain text
+    /// message every other user item is.
+    fn item(&self) -> Value {
+        tools::user_message(&self.text, &self.images)
+    }
+}
+
+impl From<String> for UserInput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for UserInput {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
 
 /// Where the messages typed into a running agent come from.
 enum Steer<'a> {
@@ -633,7 +663,7 @@ pub async fn run(
     policy: Arc<Policy>,
     judge: Option<Arc<Judge>>,
     namer: Option<Arc<dyn Name>>,
-    rx_user: mpsc::Receiver<String>,
+    rx_user: mpsc::Receiver<UserInput>,
     inbox: Option<Inbox>,
     rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
@@ -661,7 +691,7 @@ pub(crate) async fn run_with(
     policy: Arc<Policy>,
     judge: Option<Arc<Judge>>,
     mut namer: Option<Arc<dyn Name>>,
-    mut rx_user: mpsc::Receiver<String>,
+    mut rx_user: mpsc::Receiver<UserInput>,
     inbox: Option<Inbox>,
     mut rx_control: mpsc::Receiver<Control>,
     tx: mpsc::UnboundedSender<AgentEvent>,
@@ -1138,14 +1168,14 @@ pub(crate) async fn run_with(
         if let Some(message) = &message {
             // The judge decides against the task just given, with a fresh budget.
             if let Some(judge) = &judge {
-                judge.start_turn(message);
+                judge.start_turn(&message.text);
             }
             // The session is named once, off its first message: a title that changed
             // under the user every turn would be worse than one that is a little stale,
             // and naming is a model call. It runs beside the turn rather than in front
             // of it, since nothing waits on a tab title.
             if let Some(namer) = namer.take() {
-                let (tx, message) = (tx.clone(), message.clone());
+                let (tx, message) = (tx.clone(), message.text.clone());
                 tokio::spawn(async move {
                     if let Some(name) = namer.name(&message).await {
                         let _ = tx.send(AgentEvent::Titled(name));
@@ -1154,11 +1184,7 @@ pub(crate) async fn run_with(
             }
             // `Session::submit` clears `cancel` before sending, so an early interrupt
             // holds.
-            history.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": message }],
-            }));
+            history.push(message.item());
             let _ = tx.send(AgentEvent::Item(history.len() - 1));
         }
         let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
@@ -2016,9 +2042,9 @@ fn steered(
             }
         }
         Steer::Inbox(inbox) => {
-            for (text, shown) in inbox() {
+            for (input, shown) in inbox() {
                 let _ = tx.send(AgentEvent::Steered(shown));
-                history.push(message(text));
+                history.push(input.item());
                 let _ = tx.send(AgentEvent::Item(history.len() - 1));
             }
         }
@@ -4125,7 +4151,7 @@ mod tests {
             None,
             Limits::default(),
         ));
-        tx_user.send("go".to_string()).await.unwrap();
+        tx_user.send("go".into()).await.unwrap();
         // The turn that started the child ends while the child is still hanging: the
         // call did not wait for it, so the session is free with work still in flight.
         let mut events = settle(&mut rx).await;
@@ -4536,7 +4562,7 @@ mod tests {
             None,
             Limits::default(),
         ));
-        tx_user.send("go".to_string()).await.unwrap();
+        tx_user.send("go".into()).await.unwrap();
         // Two turns: the one that started the child, and the one its report opened.
         let mut events = Vec::new();
         let mut ended = 0;
@@ -4719,7 +4745,7 @@ mod tests {
     /// Send `message` and collect the turn's events, answering approvals in order and
     /// interrupting once the model starts streaming text.
     async fn drive(
-        tx_user: &mpsc::Sender<String>,
+        tx_user: &mpsc::Sender<UserInput>,
         rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
         cancel: &Cancel,
         message: &str,
@@ -4727,7 +4753,7 @@ mod tests {
     ) -> Vec<AgentEvent> {
         // As `Session::submit` does.
         cancel.clear();
-        tx_user.send(message.to_string()).await.unwrap();
+        tx_user.send(message.into()).await.unwrap();
         collect(rx, &cancel.flag(), message, answers).await
     }
 
@@ -4768,13 +4794,13 @@ mod tests {
             None,
             Limits::default(),
         ));
-        tx_user.send("one".to_string()).await.unwrap();
+        tx_user.send("one".into()).await.unwrap();
         let events = settle(&mut rx).await;
         assert!(
             !events.iter().any(|e| matches!(e, AgentEvent::Usage(_))),
             "{events:?}"
         );
-        tx_user.send("two".to_string()).await.unwrap();
+        tx_user.send("two".into()).await.unwrap();
         let events = settle(&mut rx).await;
         assert!(
             events
@@ -4806,6 +4832,59 @@ mod tests {
         events
     }
 
+    /// An image the user attaches goes to the model after the text, and is kept in the
+    /// session file, so a resumed session still has it.
+    #[tokio::test]
+    async fn an_image_the_user_attaches_reaches_the_model_and_the_session_file() {
+        use crate::sessions::Header;
+        use fake::{Fake, say};
+
+        let dir = tools::temp_dir();
+        let fake = Fake::new(vec![vec![say("a red button")]]);
+        let saved = Saved {
+            writer: Writer::create(&dir, Header::new("sess", "general", "fake", "medium", &dir)),
+            history: Vec::new(),
+        };
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            SystemPrompt::default(),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::new(Cancel::default()),
+            None,
+            None,
+            Some(saved),
+            Limits::default(),
+        ));
+        let image = tools::Image::new("image/png", "iVBORw0K").unwrap();
+        let input = UserInput {
+            text: "what is [image #1]".to_string(),
+            images: vec![image],
+        };
+        tx_user.send(input.clone()).await.unwrap();
+        settle(&mut rx).await;
+
+        let said = input.item();
+        assert_eq!(
+            said["content"][1],
+            json!({"type": "input_image", "image_url": "data:image/png;base64,iVBORw0K"})
+        );
+        let sent = fake.bodies.lock().unwrap().last().unwrap().1["input"].clone();
+        assert!(sent.as_array().unwrap().contains(&said), "{sent}");
+        let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
+        assert!(loaded.items.contains(&said), "{:?}", loaded.items);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A session on `fake` that nobody has typed into, with `controls` waiting for it.
     /// The senders are handed back, since a session whose input has closed ends.
     fn goal_session(
@@ -4813,7 +4892,7 @@ mod tests {
         controls: Vec<Control>,
     ) -> (
         mpsc::UnboundedReceiver<AgentEvent>,
-        mpsc::Sender<String>,
+        mpsc::Sender<UserInput>,
         mpsc::Sender<Control>,
         Arc<Cancel>,
     ) {
@@ -4961,7 +5040,7 @@ mod tests {
 
         let fake = Fake::new(vec![fake::step(fake::HANG), vec![say("ok")]]);
         let (mut rx, user, _control, cancel) = goal_session(&fake, Vec::new());
-        user.send("go".to_string()).await.unwrap();
+        user.send("go".into()).await.unwrap();
         while let Some(event) = rx.recv().await {
             if matches!(event, AgentEvent::Text(_)) {
                 break;
@@ -4970,7 +5049,7 @@ mod tests {
         cancel.stop();
         settle(&mut rx).await;
         cancel.clear();
-        user.send("again".to_string()).await.unwrap();
+        user.send("again".into()).await.unwrap();
         settle(&mut rx).await;
 
         let calls = parent_calls(&fake);
@@ -5000,7 +5079,7 @@ mod tests {
             &fake,
             vec![set_goal("tidy"), Control::Goal(goal::Command::Budget(10))],
         );
-        user.send("what is in hosts?".to_string()).await.unwrap();
+        user.send("what is in hosts?".into()).await.unwrap();
         let events = settle(&mut rx).await;
         assert!(
             !events.iter().any(|e| matches!(e, AgentEvent::Resumed(_))),
@@ -6301,7 +6380,7 @@ mod tests {
     fn forkable(
         fake: &fake::Fake,
     ) -> (
-        mpsc::Sender<String>,
+        mpsc::Sender<UserInput>,
         mpsc::Sender<Control>,
         mpsc::UnboundedReceiver<AgentEvent>,
         Arc<Cancel>,
@@ -6365,7 +6444,7 @@ mod tests {
 
         cancel.clear();
         tx_control
-            .send(Control::Forked("third".to_string()))
+            .send(Control::Forked("third".into()))
             .await
             .unwrap();
         let events = settle(&mut rx).await;
@@ -6418,7 +6497,7 @@ mod tests {
     fn session_on(
         fake: &fake::Fake,
     ) -> (
-        mpsc::Sender<String>,
+        mpsc::Sender<UserInput>,
         mpsc::UnboundedReceiver<AgentEvent>,
         Arc<Cancel>,
     ) {
@@ -6587,7 +6666,7 @@ mod tests {
             vec![say("done")],
         ]);
         let (mut rx, user, control, _cancel) = goal_session(&fake, Vec::new());
-        user.send("one".to_string()).await.unwrap();
+        user.send("one".into()).await.unwrap();
         settle(&mut rx).await;
         control.send(set_goal("g")).await.unwrap();
         let mut events = settle(&mut rx).await;
@@ -7044,7 +7123,7 @@ mod tests {
         script: Vec<Vec<Value>>,
     ) -> (
         fake::Fake,
-        mpsc::Sender<String>,
+        mpsc::Sender<UserInput>,
         mpsc::Sender<Control>,
         mpsc::UnboundedReceiver<AgentEvent>,
         Arc<Cancel>,
@@ -7594,7 +7673,7 @@ mod tests {
             Limits::default(),
         ));
 
-        tx_user.send("run it".to_string()).await.unwrap();
+        tx_user.send("run it".into()).await.unwrap();
         let start = std::time::Instant::now();
         let mut progress = Vec::new();
         let mut output = None;

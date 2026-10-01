@@ -295,7 +295,7 @@ pub fn help() -> String {
         "\n  wheel, pgup/pgdn or ctrl+up/down scroll",
         "\n  click a tool output to expand it · ctrl+l expands or collapses them all",
         "\n  drag selects, past the edge to keep going · ctrl+a takes the whole transcript",
-        "\n  ctrl+y copies · ctrl+v pastes · ctrl+g edits the draft in $EDITOR · ctrl+t shows every badge",
+        "\n  ctrl+y copies · ctrl+v pastes text or an image · ctrl+g edits the draft in $EDITOR · ctrl+t shows every badge",
     ));
     out
 }

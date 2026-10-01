@@ -100,22 +100,45 @@ pub fn with_images(text: &str, images: &[Image]) -> String {
 /// The `function_call_output` that answers `call_id`: its output a string, or with images
 /// a content array of the text and each image.
 pub fn function_output(call_id: &str, text: &str, images: &[Image]) -> Value {
-    let output = if images.is_empty() {
-        Value::String(text.to_string())
-    } else {
-        let mut parts = vec![serde_json::json!({"type": "input_text", "text": text})];
-        parts.extend(
-            images
-                .iter()
-                .map(|image| serde_json::json!({"type": "input_image", "image_url": image.url()})),
-        );
-        Value::Array(parts)
+    let output = match images.is_empty() {
+        true => Value::String(text.to_string()),
+        false => parts(text, images),
     };
     serde_json::json!({
         "type": "function_call_output",
         "call_id": call_id,
         "output": output,
     })
+}
+
+/// A user message of `text` and the images attached to it, after the text.
+pub fn user_message(text: &str, images: &[Image]) -> Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": parts(text, images),
+    })
+}
+
+/// A content array: `text`, then each image.
+fn parts(text: &str, images: &[Image]) -> Value {
+    let mut parts = vec![serde_json::json!({"type": "input_text", "text": text})];
+    parts.extend(
+        images
+            .iter()
+            .map(|image| serde_json::json!({"type": "input_image", "image_url": image.url()})),
+    );
+    Value::Array(parts)
+}
+
+/// The placeholder for an `input_image` part, its type read off the data URL.
+pub fn image_part(part: &Value) -> String {
+    let url = part.get("image_url").and_then(Value::as_str);
+    let mime = url
+        .and_then(|u| u.strip_prefix("data:"))
+        .and_then(|u| u.split_once(';'))
+        .map_or("", |(mime, _)| mime);
+    Image::placeholder(mime)
 }
 
 /// A tool output's text: the string, or a content array's text with a placeholder for
@@ -127,14 +150,7 @@ pub fn output_text(output: &Value) -> String {
             let texts: Vec<String> = parts
                 .iter()
                 .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-                    Some("input_image") => {
-                        let url = part.get("image_url").and_then(Value::as_str);
-                        let mime = url
-                            .and_then(|u| u.strip_prefix("data:"))
-                            .and_then(|u| u.split_once(';'))
-                            .map_or("", |(mime, _)| mime);
-                        Some(Image::placeholder(mime))
-                    }
+                    Some("input_image") => Some(image_part(part)),
                     _ => part.get("text").and_then(Value::as_str).map(str::to_string),
                 })
                 .filter(|text| !text.is_empty())
@@ -146,7 +162,7 @@ pub fn output_text(output: &Value) -> String {
     }
 }
 
-/// How many images a tool output carries.
+/// How many images a tool output or a message's content carries.
 pub fn output_images(output: &Value) -> usize {
     output.as_array().map_or(0, |parts| {
         parts
@@ -599,6 +615,16 @@ mod tests {
             output_text(&item["output"]),
             "shot\n[image image/png]\n[image image/png]"
         );
+    }
+
+    #[test]
+    fn a_user_message_without_images_is_the_plain_text_one() {
+        assert_eq!(user_message("hi", &[]), crate::compact::user_message("hi"));
+        let image = Image::new("image/png", "iVBORw0K").unwrap();
+        let item = user_message("see [image #1]", &[image]);
+        assert_eq!(item["content"][0]["text"], "see [image #1]");
+        assert_eq!(output_images(&item["content"]), 1);
+        assert_eq!(image_part(&item["content"][1]), "[image image/png]");
     }
 
     #[test]

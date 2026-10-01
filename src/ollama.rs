@@ -675,16 +675,18 @@ mod tests {
     }
 
     #[test]
-    fn an_image_result_goes_over_as_text_and_view_image_is_left_out() {
+    fn an_image_goes_over_as_text_and_view_image_is_left_out() {
         use crate::tools::Tool as _;
         let image = crate::tools::Image::new("image/png", "iVBORw0K").unwrap();
         let input = [
             json!({"type": "function_call", "call_id": "c1", "name": "mcp_call",
                    "arguments": "{}"}),
-            crate::tools::function_output("c1", "a screenshot", &[image]),
+            crate::tools::function_output("c1", "a screenshot", std::slice::from_ref(&image)),
+            crate::tools::user_message("and [image #1]", &[image]),
         ];
         let out = messages("", &input);
         assert_eq!(out[1]["content"], "a screenshot\n[image image/png]");
+        assert_eq!(out[2]["content"], "and [image #1]\n[image image/png]");
         let view = crate::tools::view_image::ViewImage.schema();
         assert!(tool_defs(&[view]).is_empty());
     }

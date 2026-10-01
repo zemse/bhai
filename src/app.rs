@@ -24,7 +24,7 @@ use crate::debug;
 use crate::diff::DiffView;
 use crate::entries::Entries;
 pub use crate::entries::Entry;
-use crate::input::{Editor, History, kept_out};
+use crate::input::{Attachments, Editor, History, kept_out};
 use crate::limits::{self, RateLimits};
 use crate::markdown::{self, Origin};
 use crate::models::{Choice, Picker};
@@ -227,6 +227,8 @@ pub struct App {
     /// The last drag's copy, for the note drawn where the drag ended.
     pub copied: Option<Copied>,
     pub input: Editor,
+    /// Images pasted into the prompt, sent with it.
+    attachments: Attachments,
     /// The `/` menu's highlighted row, while the menu is open.
     pub menu: Option<usize>,
     /// Submitted prompts, for `ctrl+p` and `ctrl+n`.
@@ -361,6 +363,7 @@ impl App {
             mouse: true,
             copied: None,
             input: Editor::default(),
+            attachments: Attachments::default(),
             menu: None,
             history: History::default(),
             working: false,
@@ -679,9 +682,38 @@ impl App {
             return search.insert(text);
         }
         if self.pending.is_none() && self.diff.is_none() {
+            // A terminal pastes nothing for an image, and a dropped file as its path.
+            if text.trim().is_empty() && self.paste_image() {
+                return;
+            }
+            if let Some(path) = crate::input::pasted_path(text)
+                && let Ok((_, image)) = crate::tools::view_image::load(&path)
+            {
+                self.attach(image);
+                return;
+            }
             self.input.insert(text);
             self.refresh_menu();
         }
+    }
+
+    /// Attach the clipboard's image to the prompt, if it holds one; false if not.
+    fn paste_image(&mut self) -> bool {
+        let Some(bytes) = clipboard::paste_image() else {
+            return false;
+        };
+        match crate::tools::view_image::image(&bytes) {
+            Ok(image) => self.attach(image),
+            Err(e) => self.note(Entry::Error(format!("could not paste the image: {e}"))),
+        }
+        true
+    }
+
+    /// Attach `image` and type its placeholder at the cursor.
+    fn attach(&mut self, image: crate::tools::Image) {
+        let placeholder = self.attachments.add(image);
+        self.input.insert(&placeholder);
+        self.refresh_menu();
     }
 
     /// Put every prompt still queued back in the prompt box, one per line, since what is
@@ -1197,6 +1229,9 @@ impl App {
     /// `ctrl+v`: insert what a clipboard command reads back. The terminal's own paste
     /// arrives as a bracketed paste instead, which needs no clipboard command.
     fn paste(&mut self) {
+        if self.paste_image() {
+            return;
+        }
         match clipboard::paste() {
             Some(text) => self.input.insert(&text),
             None => self.note(Entry::Info(
@@ -1439,6 +1474,7 @@ impl App {
         }
         let raw = self.input.take();
         let message = raw.trim().to_string();
+        let images = self.attachments.take(&message);
         self.selection = None;
         self.menu = None;
         if kept_out(&raw) {
@@ -1450,6 +1486,11 @@ impl App {
         // none of the commands below apply.
         if let Some(id) = self.inside.as_ref().map(|inside| inside.id.clone()) {
             self.follow = true;
+            if !images.is_empty() {
+                self.entries().push(Entry::Error(
+                    "a subagent reads text only, so the images were not sent".to_string(),
+                ));
+            }
             match self.session.steer(&id, message) {
                 Ok(()) => {}
                 Err(e @ SubmitError::TooLong(_)) => {
@@ -1532,7 +1573,7 @@ impl App {
                 ));
                 return;
             }
-            let prompt = Prompt::shown_as(rest.to_string(), message.clone());
+            let prompt = Prompt::shown_as(rest.to_string(), message.clone()).with_images(images);
             if let Err(e) = self.session.submit_forked(prompt) {
                 self.note(Entry::Error(e.to_string()));
             }
@@ -1700,7 +1741,7 @@ impl App {
             None => Prompt::from(message),
         };
         // The transcript entry arrives back as `Event::User` once the session accepts it.
-        if let Err(e) = self.session.submit(prompt) {
+        if let Err(e) = self.session.submit(prompt.with_images(images)) {
             self.note(Entry::Error(e.to_string()));
         }
     }
@@ -2516,7 +2557,7 @@ mod tests {
     /// receivers come back with it: dropped, the channels close and nothing is accepted.
     type Listening = (
         App,
-        tokio::sync::mpsc::Receiver<String>,
+        tokio::sync::mpsc::Receiver<crate::agent::UserInput>,
         tokio::sync::mpsc::Receiver<crate::agent::Control>,
     );
 
@@ -3656,6 +3697,49 @@ mod tests {
         assert_eq!(app.input.value(), "one\ntwo\n");
         assert!(!app.working);
         assert!(app.history.prev("").is_none(), "nothing was submitted");
+    }
+
+    #[test]
+    fn a_pasted_image_or_image_path_is_attached_and_sent_with_the_prompt() {
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+        let (mut app, mut user, _control) = connected();
+        type_text(&mut app, "compare ");
+        // ctrl+v with an image on the clipboard, and a terminal's empty paste of one.
+        clipboard::set_image(Some(PNG.to_vec()));
+        app.on_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        app.on_paste("");
+        clipboard::set_image(None);
+        // A file dropped on the terminal arrives as its path.
+        let dir = crate::tools::temp_dir();
+        let gif = dir.join("a shot.gif");
+        std::fs::write(&gif, b"GIF89a..").unwrap();
+        app.on_paste(&format!("'{}'", gif.display()));
+        // A path to something that is not an image stays text.
+        let notes = dir.join("notes.txt");
+        std::fs::write(&notes, "plain").unwrap();
+        app.on_paste(&format!(" {}", notes.display()));
+        assert_eq!(
+            app.input.value(),
+            format!("compare [image #1][image #2][image #3] {}", notes.display())
+        );
+
+        // The second is deleted from the text, so only two go.
+        app.input.set(format!(
+            "compare [image #1] and [image #3] {}",
+            notes.display()
+        ));
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let sent = user.try_recv().unwrap();
+        assert!(sent.text.starts_with("compare [image #1] and [image #3]"));
+        let mimes: Vec<&str> = sent.images.iter().map(|i| i.mime.as_str()).collect();
+        assert_eq!(mimes, ["image/png", "image/gif"]);
+
+        // Nothing carries over to the next prompt.
+        type_text(&mut app, "and now [image #1]");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.session.on_agent(crate::agent::AgentEvent::TurnEnd);
+        assert!(user.try_recv().unwrap().images.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -464,6 +464,67 @@ fn aws_key_id(token: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
+/// Images attached to the prompt being typed, each standing in the text as its
+/// placeholder until it is sent.
+#[derive(Debug, Default)]
+pub struct Attachments {
+    images: Vec<crate::tools::Image>,
+}
+
+impl Attachments {
+    /// Attach `image`, returning the placeholder to type in its place.
+    pub fn add(&mut self, image: crate::tools::Image) -> String {
+        self.images.push(image);
+        placeholder(self.images.len())
+    }
+
+    /// The images whose placeholder is still in `text`, in the order they were
+    /// attached; the rest are dropped with them, and numbering starts again.
+    pub fn take(&mut self, text: &str) -> Vec<crate::tools::Image> {
+        std::mem::take(&mut self.images)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| text.contains(&placeholder(i + 1)))
+            .map(|(_, image)| image)
+            .collect()
+    }
+}
+
+fn placeholder(n: usize) -> String {
+    format!("[image #{n}]")
+}
+
+/// The file a paste names when it is a single path, as terminals paste a file dragged
+/// onto them: maybe quoted, maybe with its spaces escaped, maybe a `file://` URL.
+pub fn pasted_path(text: &str) -> Option<PathBuf> {
+    let text = text.trim();
+    if text.is_empty() || text.contains('\n') {
+        return None;
+    }
+    let text = text.strip_prefix("file://").unwrap_or(text);
+    let unquoted = ['\'', '"'].iter().find_map(|&q| {
+        text.strip_prefix(q)
+            .and_then(|rest| rest.strip_suffix(q))
+            .map(str::to_string)
+    });
+    let path = unquoted.unwrap_or_else(|| {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => out.extend(chars.next()),
+                c => out.push(c),
+            }
+        }
+        out
+    });
+    let path = match path.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        None => PathBuf::from(path),
+    };
+    (path.is_absolute() && path.is_file()).then_some(path)
+}
+
 fn line(text: &str) -> Result<String> {
     Ok(serde_json::to_string(&Record {
         text: text.to_string(),
@@ -491,6 +552,51 @@ mod tests {
         let mut editor = Editor::default();
         editor.set(text.to_string());
         editor
+    }
+
+    #[test]
+    fn only_the_images_still_in_the_text_are_sent() {
+        let image = |data: &str| crate::tools::Image::new("image/png", data).unwrap();
+        let mut attached = Attachments::default();
+        assert_eq!(attached.add(image("AAAA")), "[image #1]");
+        assert_eq!(attached.add(image("BBBB")), "[image #2]");
+        assert_eq!(attached.add(image("CCCC")), "[image #3]");
+        let sent = attached.take("see [image #3] then [image #1]");
+        assert_eq!(sent, [image("AAAA"), image("CCCC")]);
+        // Numbering starts again for the next prompt.
+        assert_eq!(attached.add(image("DDDD")), "[image #1]");
+        assert!(attached.take("no image after all").is_empty());
+        assert!(attached.take("[image #1]").is_empty());
+    }
+
+    #[test]
+    fn a_pasted_path_is_read_as_terminals_paste_a_dropped_file() {
+        let dir = crate::tools::temp_dir();
+        let file = dir.join("a shot.png");
+        std::fs::write(&file, "x").unwrap();
+        let at = file.to_str().unwrap();
+        for pasted in [
+            at.to_string(),
+            format!("  {at}\n"),
+            format!("'{at}'"),
+            format!("\"{at}\""),
+            at.replace(' ', "\\ "),
+            format!("file://{at}"),
+        ] {
+            assert_eq!(
+                pasted_path(&pasted).as_deref(),
+                Some(file.as_path()),
+                "{pasted}"
+            );
+        }
+        assert_eq!(pasted_path(dir.to_str().unwrap()), None);
+        assert_eq!(
+            pasted_path(&dir.join("missing.png").to_string_lossy()),
+            None
+        );
+        assert_eq!(pasted_path(&format!("{at}\n{at}")), None);
+        assert_eq!(pasted_path("a shot.png"), None);
+        assert_eq!(pasted_path(""), None);
     }
 
     #[test]

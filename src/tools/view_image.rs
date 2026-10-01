@@ -73,7 +73,7 @@ impl Tool for ViewImage {
 }
 
 /// The line that goes with the image, and the image.
-fn load(path: &Path) -> Result<(String, Image), String> {
+pub(crate) fn load(path: &Path) -> Result<(String, Image), String> {
     let fail = |e: &dyn std::fmt::Display| format!("Could not read {}: {e}", path.display());
     let meta = std::fs::metadata(path).map_err(|e| fail(&e))?;
     if !meta.is_file() {
@@ -98,11 +98,16 @@ fn load(path: &Path) -> Result<(String, Image), String> {
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(too_large());
     }
-    let mime = sniff(&bytes)
-        .ok_or_else(|| format!("{} is not a PNG, JPEG, GIF or WebP image.", path.display()))?;
-    let image = Image::new(mime, &crate::clipboard::base64(&bytes))?;
-    let text = format!("{} ({mime}, {} bytes)", path.display(), bytes.len());
+    let image = image(&bytes)
+        .map_err(|_| format!("{} is not a PNG, JPEG, GIF or WebP image.", path.display()))?;
+    let text = format!("{} ({}, {} bytes)", path.display(), image.mime, bytes.len());
     Ok((text, image))
+}
+
+/// `bytes` as an image, typed by what they start with.
+pub(crate) fn image(bytes: &[u8]) -> Result<Image, String> {
+    let mime = sniff(bytes).ok_or("not a PNG, JPEG, GIF or WebP image")?;
+    Image::new(mime, &crate::clipboard::base64(bytes))
 }
 
 /// The type the file's first bytes say it is; the extension is not trusted.

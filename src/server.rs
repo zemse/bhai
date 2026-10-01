@@ -687,7 +687,7 @@ mod tests {
     const TOKEN: &str = "test-token";
 
     async fn start() -> (String, oneshot::Receiver<Answer>) {
-        let (tx_user, mut rx_user) = mpsc::channel::<String>(1);
+        let (tx_user, mut rx_user) = mpsc::channel::<crate::agent::UserInput>(1);
         let (tx_control, mut rx_control) = mpsc::channel::<Control>(1);
         let (tx_agent, rx_agent) = mpsc::unbounded_channel();
         let (tx_decision, rx_decision) = oneshot::channel();
