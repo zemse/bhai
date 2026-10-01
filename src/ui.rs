@@ -335,11 +335,14 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     }
     // How full the window is, from what the last call actually read: the number
     // compaction watches, and the only one here that says how much room is left.
-    if let Some(used) = app.last_usage.map(|usage| usage.input) {
+    // While the prompt starts with `/compact-then`, the compacted copy it would run on.
+    let fork = app.forked();
+    if let Some(used) = fork.or(app.last_usage.map(|usage| usage.input)) {
         let percent = 100.0 * used as f64 / app.limits.window(&app.model) as f64;
+        let label = if fork.is_some() { "fork ctx" } else { "ctx" };
         bar.push((
             ALWAYS,
-            Span::styled(format!("ctx {percent:.0}% "), headroom(percent)),
+            Span::styled(format!("{label} {percent:.0}% "), headroom(percent)),
         ));
     }
     if let Some(field) = &app.cache_break {
@@ -366,7 +369,17 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ));
     }
-    if let Some(left) = app.cache_left() {
+    // The copy has never been sent, so nothing of it past the first message is cached.
+    if let Some(tokens) = fork {
+        bar.push((
+            ALWAYS,
+            Span::styled(
+                format!("fork uncached: ~{} tokens ", compact(tokens)),
+                Style::new().fg(Color::Yellow),
+            ),
+        ));
+    }
+    if let Some(left) = app.cache_left().filter(|_| fork.is_none()) {
         bar.push((
             ALWAYS,
             Span::styled(
@@ -375,7 +388,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ));
     }
-    if let Some(tokens) = app.cold_tokens() {
+    if let Some(tokens) = app.cold_tokens().filter(|_| fork.is_none()) {
         bar.push((
             ALWAYS,
             Span::styled(
@@ -2726,6 +2739,48 @@ mod tests {
         let bar = status(&terminal);
         assert!(bar.contains("on main · ctx 95%"), "{bar}");
         assert_eq!(status_cell(&terminal, "95%").fg, Color::Red);
+    }
+
+    #[test]
+    fn status_bar_describes_the_compacted_copy_while_the_prompt_asks_for_it() {
+        let (tx_user, _) = tokio::sync::mpsc::channel(1);
+        let (tx_control, _) = tokio::sync::mpsc::channel(1);
+        let session = crate::session::Session::new(
+            "m".to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+            None,
+        );
+        let mut app = App::new(std::sync::Arc::clone(&session));
+        app.last_usage = Some(Usage {
+            input: 136_000,
+            ..Usage::default()
+        });
+        app.limits.window = Some(272_000);
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        app.input.set("/compact-then go on".to_string());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        // No copy yet, so the bar is the full history's.
+        assert!(
+            status(&terminal).contains(" ctx 50% "),
+            "{}",
+            status(&terminal)
+        );
+
+        session.on_agent(crate::agent::AgentEvent::Fork(Some(13_600)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let bar = status(&terminal);
+        assert!(bar.contains("fork ctx 5% "), "{bar}");
+        assert!(bar.contains("fork uncached: ~13.6k tokens"), "{bar}");
+
+        app.input.set("go on".to_string());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let bar = status(&terminal);
+        assert!(bar.contains(" ctx 50% ") && !bar.contains("fork"), "{bar}");
     }
 
     #[test]

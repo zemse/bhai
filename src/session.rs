@@ -125,6 +125,9 @@ pub enum Event {
     },
     /// History was dropped, so the transcript that showed it goes too.
     Cleared,
+    /// A compacted copy of the history is ready for `/compact-then`, and a call on it
+    /// would read this many tokens; `None` once it no longer stands for the history.
+    Fork(Option<u64>),
     /// The permission mode changed.
     Mode(Mode),
     /// `/model` switched the session to this model and reasoning effort.
@@ -279,6 +282,8 @@ pub enum SubmitError {
     CacheWarm(Duration),
     /// The Codex API takes no such `reasoning.effort`.
     UnknownEffort(String),
+    /// `/compact-then` with no compacted copy to continue from.
+    NoFork,
 }
 
 impl fmt::Display for SubmitError {
@@ -291,6 +296,9 @@ impl fmt::Display for SubmitError {
                 "this model caches per effort, so a change now re-reads the whole conversation uncached. It goes through once the cache expires in {}m{:02}s, or after /clear; a gpt-6 model changes effort without the miss",
                 left.as_secs() / 60,
                 left.as_secs() % 60
+            ),
+            SubmitError::NoFork => f.write_str(
+                "there is no compacted copy yet: one is made while the conversation is idle, just before its cache lapses",
             ),
             SubmitError::UnknownEffort(effort) => write!(
                 f,
@@ -317,6 +325,8 @@ struct Inner {
     sending: Option<Instant>,
     last_cache_break: Option<CacheBreak>,
     rate_limits: Option<RateLimits>,
+    /// The tokens a call on the compacted copy would read, while there is one.
+    fork: Option<u64>,
     next_id: u64,
     /// Calls waiting on the user, oldest first. Parallel workflow steps each park one,
     /// so there can be several; only the front is on screen.
@@ -427,6 +437,32 @@ impl Session {
         inner.working = true;
         self.publish(Event::User(prompt.shown));
         Ok(Submitted::Started)
+    }
+
+    /// Start a turn on `prompt` from the compacted copy of the history, for
+    /// `/compact-then`. The full history is dropped for the copy, so this is refused
+    /// rather than queued while a turn runs on it.
+    pub fn submit_forked(&self, prompt: impl Into<Prompt>) -> Result<(), SubmitError> {
+        let prompt = prompt.into();
+        let mut inner = self.lock();
+        if inner.working {
+            return Err(SubmitError::Busy);
+        }
+        if inner.fork.is_none() {
+            return Err(SubmitError::NoFork);
+        }
+        self.cancel.clear();
+        self.tx_control
+            .try_send(Control::Forked(prompt.text))
+            .map_err(|_| SubmitError::Closed)?;
+        inner.working = true;
+        self.publish(Event::User(prompt.shown));
+        Ok(())
+    }
+
+    /// The tokens a call on the compacted copy would read, while there is one.
+    pub fn fork(&self) -> Option<u64> {
+        self.lock().fork
     }
 
     /// The prompts waiting for the running turn, for `/queue`, as they were typed.
@@ -752,7 +788,7 @@ impl Session {
         wait.await.ok()
     }
 
-    fn on_agent(&self, event: AgentEvent) {
+    pub(crate) fn on_agent(&self, event: AgentEvent) {
         let mut inner = self.lock();
         let event = match event {
             AgentEvent::Reasoning(s) => Event::Reasoning(s),
@@ -879,6 +915,10 @@ impl Session {
                 inner.last_call = None;
                 inner.last_usage = None;
                 Event::Cleared
+            }
+            AgentEvent::Fork(tokens) => {
+                inner.fork = tokens;
+                Event::Fork(tokens)
             }
             AgentEvent::Effort(effort) => {
                 let mut current = self.model.lock().unwrap_or_else(|e| e.into_inner());
@@ -1087,6 +1127,13 @@ fn said(event: AgentEvent) -> Option<Event> {
         AgentEvent::Error(s) => Event::Error(s),
         _ => return None,
     })
+}
+
+/// The prompt of a message that asks to continue from the compacted copy rather than
+/// the full history: whatever follows `/compact-then`.
+pub fn compact_then(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix("/compact-then")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
 fn add(total: &mut Usage, usage: Usage) {
@@ -1843,6 +1890,37 @@ mod tests {
             input,
             ..Usage::default()
         }));
+    }
+
+    #[test]
+    fn compact_then_takes_the_prompt_after_it() {
+        assert_eq!(compact_then("/compact-then fix it"), Some("fix it"));
+        assert_eq!(compact_then("  /compact-then\nfix it "), Some("fix it"));
+        assert_eq!(compact_then("/compact-then"), Some(""));
+        assert_eq!(compact_then("/compact-thenx"), None);
+        assert_eq!(compact_then("/compact fix it"), None);
+        assert_eq!(compact_then("say /compact-then"), None);
+    }
+
+    #[test]
+    fn compact_then_runs_on_the_copy_only_while_there_is_one() {
+        let (session, mut control) = on("gpt-5.5");
+        assert_eq!(
+            session.submit_forked(Prompt::from("go on".to_string())),
+            Err(SubmitError::NoFork)
+        );
+        session.on_agent(AgentEvent::Fork(Some(9_000)));
+        assert_eq!(session.fork(), Some(9_000));
+        session
+            .submit_forked(Prompt::from("go on".to_string()))
+            .unwrap();
+        assert!(matches!(control.try_recv(), Ok(Control::Forked(m)) if m == "go on"));
+        assert_eq!(
+            session.submit_forked(Prompt::from("again".to_string())),
+            Err(SubmitError::Busy)
+        );
+        session.on_agent(AgentEvent::Fork(None));
+        assert_eq!(session.fork(), None);
     }
 
     #[test]

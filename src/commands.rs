@@ -34,6 +34,11 @@ pub const COMMANDS: &[Command] = &[
         help: "summarise the conversation, /compact <prompt> to steer it",
     },
     Command {
+        name: "compact-then",
+        args: " <prompt>",
+        help: "continue from the copy compacted while the cache was warm",
+    },
+    Command {
         name: "clear",
         args: "",
         help: "drop the conversation and start over",
@@ -327,11 +332,19 @@ mod tests {
         let names: Vec<_> = c.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(
             names,
-            ["compact", "clear", "context", "copy", "commit-helper"]
+            [
+                "compact",
+                "compact-then",
+                "clear",
+                "context",
+                "copy",
+                "commit-helper"
+            ]
         );
-        assert_eq!(c[4].help, "Does a thing.");
-        assert!(c[4].takes_input(), "a skill takes free text");
+        assert_eq!(c[5].help, "Does a thing.");
+        assert!(c[5].takes_input(), "a skill takes free text");
         assert!(!c[0].takes_input(), "/compact takes nothing");
+        assert!(c[1].takes_input(), "/compact-then takes a prompt");
         assert!(matches("/zzz", &skills()).is_empty());
         assert!(matches("hello", &skills()).is_empty());
     }
@@ -359,7 +372,7 @@ mod tests {
         };
         assert_eq!(tail("/pd"), ["f"]);
         assert_eq!(tail("/pdf"), [""]);
-        assert_eq!(tail("/c")[4], "ommit-helper");
+        assert_eq!(tail("/c")[5], "ommit-helper");
         // The menu matches whatever the case, but completing would rewrite the text.
         assert_eq!(tail("/PD"), [""]);
         assert!(tail("/pdf x").is_empty());

@@ -954,6 +954,10 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
                 }
             }
             AgentEvent::Cleared => println!("[info] history cleared"),
+            AgentEvent::Fork(Some(tokens)) => {
+                println!("[info] compacted copy ready, ~{tokens} tokens")
+            }
+            AgentEvent::Fork(None) => {}
             AgentEvent::Effort(effort) => println!("[info] effort {effort}"),
             AgentEvent::Usage(u) => println!(
                 "\n[usage] input={} cached={} output={} reasoning={}",

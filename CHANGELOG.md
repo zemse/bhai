@@ -6,6 +6,13 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- An idle conversation whose cache is about to lapse gets a compacted copy, summarised
+  three minutes before the cache's expected 30 while the history still reads from it.
+  A normal message carries on with the full history; `/compact-then <prompt>` runs the
+  prompt on the copy instead. While the prompt starts with `/compact-then`, the status
+  bar's context fill is the copy's, with `fork uncached: ~Nk tokens` in place of the
+  cache timer; the `fork` statusline variable says the same. Only on Codex, and only
+  past 16k tokens.
 - A message typed while a turn runs joins that turn before its next model call, after
   the tool results or the answer it was typed during, instead of waiting for the turn
   to end. Everything waiting goes in together, each as its own message, and shows in

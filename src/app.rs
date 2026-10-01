@@ -1182,6 +1182,21 @@ impl App {
             self.clear();
             return;
         }
+        // Before `/compact`, which it starts with.
+        if let Some(rest) = crate::session::compact_then(&message) {
+            self.follow = true;
+            if rest.is_empty() {
+                self.note(Entry::Error(
+                    "/compact-then <prompt>: say what to do from the compacted copy".to_string(),
+                ));
+                return;
+            }
+            let prompt = Prompt::shown_as(rest.to_string(), message.clone());
+            if let Err(e) = self.session.submit_forked(prompt) {
+                self.note(Entry::Error(e.to_string()));
+            }
+            return;
+        }
         if let Some(rest) = message.strip_prefix("/compact") {
             let asked = rest.trim();
             self.follow = true;
@@ -1526,6 +1541,15 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             notice.push_str(&format!(" {key} is set, and wins over the config."));
         }
         self.note(Entry::Info(notice));
+    }
+
+    /// The tokens a call on the compacted copy would read, while the prompt being typed
+    /// asks to continue from it: the bar then describes the copy, not the history.
+    pub fn forked(&self) -> Option<u64> {
+        if self.inside.is_some() {
+            return None;
+        }
+        crate::session::compact_then(self.input.value()).and(self.session.fork())
     }
 
     /// Tokens the next message would re-read now that the cache has likely lapsed.
@@ -3262,7 +3286,16 @@ mod tests {
         let mut app = with_skill("commit-helper");
         type_text(&mut app, "/co");
         let names: Vec<_> = app.menu_items().iter().map(|i| i.name.clone()).collect();
-        assert_eq!(names, ["compact", "context", "copy", "commit-helper"]);
+        assert_eq!(
+            names,
+            [
+                "compact",
+                "compact-then",
+                "context",
+                "copy",
+                "commit-helper"
+            ]
+        );
 
         app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
         app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));

@@ -185,6 +185,9 @@ pub struct CacheMonitor {
     cached: Option<u64>,
     /// When the current call was sent, and whether its request broke the cache.
     sent: Option<(Instant, bool)>,
+    /// When the latest call was sent, which is when the backend last wrote or reused the
+    /// conversation's cached prefix.
+    last_sent: Option<Instant>,
     /// Calls finished so far, including the ones too small to judge.
     calls: u64,
     misses: usize,
@@ -194,6 +197,12 @@ impl CacheMonitor {
     /// Note a request going out, with the guard's verdict on it.
     pub fn sent(&mut self, found: Option<&CacheBreak>, now: Instant) {
         self.sent = Some((now, found.is_some()));
+        self.last_sent = Some(now);
+    }
+
+    /// When the latest call was sent, while what it cached is still the conversation's.
+    pub fn last_sent(&self) -> Option<Instant> {
+        self.last_sent
     }
 
     /// Judge a finished call. Only a call sent within the cache lifetime of the previous
@@ -230,6 +239,7 @@ impl CacheMonitor {
     /// The next call reads a cold cache on purpose, so it is not judged.
     pub fn forget(&mut self) {
         self.previous = None;
+        self.last_sent = None;
     }
 
     /// Whether enough judged calls missed in a row to warn about.

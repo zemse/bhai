@@ -218,6 +218,16 @@ async fn prompt(State(session): State<Arc<Session>>, Json(body): Json<Prompt>) -
     if text.is_empty() {
         return error(StatusCode::BAD_REQUEST, "text is empty");
     }
+    if let Some(rest) = crate::session::compact_then(&text) {
+        if rest.is_empty() {
+            return error(StatusCode::BAD_REQUEST, "/compact-then takes a prompt");
+        }
+        let prompt = crate::session::Prompt::shown_as(rest.to_string(), text.clone());
+        return match session.submit_forked(prompt) {
+            Ok(()) => ok(),
+            Err(e) => error(StatusCode::CONFLICT, &e.to_string()),
+        };
+    }
     match session.submit(text) {
         Ok(Submitted::Started) => ok(),
         Ok(Submitted::Queued { position }) => {

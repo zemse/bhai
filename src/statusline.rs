@@ -27,8 +27,14 @@ pub const VARIABLES: &[(&str, &str)] = &[
     ("branch", "the git branch of the working directory"),
     ("dir", "the working directory's name"),
     ("cwd", "the working directory, with the home directory as ~"),
-    ("ctx", "how full the context window is, as `42%`"),
-    ("ctx_used", "tokens the last call read, as `12.3k`"),
+    (
+        "ctx",
+        "how full the context window is, as `42%`; the compacted copy's while the prompt starts with /compact-then",
+    ),
+    (
+        "ctx_used",
+        "tokens the last call read, as `12.3k`, or the copy's",
+    ),
     ("ctx_window", "the context window, as `272.0k`"),
     ("tokens_in", "input tokens this session, as `1.2M`"),
     ("tokens_out", "output tokens this session"),
@@ -47,6 +53,10 @@ pub const VARIABLES: &[(&str, &str)] = &[
     (
         "cache_expired",
         "`cache expired: /clear to save ~86k tokens`, once the cache has likely lapsed",
+    ),
+    (
+        "fork",
+        "`fork uncached: ~9k tokens`, while the prompt starts with /compact-then",
     ),
     (
         "limits",
@@ -441,8 +451,9 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
     );
     let window = app.limits.window(&app.model);
     set("ctx_window", Value::plain(compact(window)));
-    match app.last_usage {
-        Some(Usage { input, .. }) => {
+    let fork = app.forked();
+    match fork.or(app.last_usage.map(|Usage { input, .. }| input)) {
+        Some(input) => {
             let percent = 100.0 * input as f64 / window as f64;
             set(
                 "ctx",
@@ -491,7 +502,7 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
     set("cache_alert", cache_alert);
     set(
         "cache_timer",
-        match app.cache_left() {
+        match app.cache_left().filter(|_| fork.is_none()) {
             Some(left) => Value {
                 text: format!("cache expires in {}", crate::ui::clock(left)),
                 alert: Some(Style::new().fg(Color::Yellow)),
@@ -501,9 +512,19 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
     );
     set(
         "cache_expired",
-        match app.cold_tokens() {
+        match app.cold_tokens().filter(|_| fork.is_none()) {
             Some(tokens) => Value {
                 text: format!("cache expired: /clear to save ~{} tokens", compact(tokens)),
+                alert: Some(Style::new().fg(Color::Yellow)),
+            },
+            None => Value::default(),
+        },
+    );
+    set(
+        "fork",
+        match fork {
+            Some(tokens) => Value {
+                text: format!("fork uncached: ~{} tokens", compact(tokens)),
                 alert: Some(Style::new().fg(Color::Yellow)),
             },
             None => Value::default(),

@@ -76,6 +76,9 @@ pub enum AgentEvent {
     },
     /// History was dropped: the conversation starts again from nothing.
     Cleared,
+    /// A compacted copy of the history is ready for `/compact-then`, and a call on it
+    /// would read this many tokens; `None` once the history has moved on without it.
+    Fork(Option<u64>),
     /// The model runs at this effort again, after the backend refused an update to
     /// another one.
     Effort(String),
@@ -170,6 +173,10 @@ enum Next {
     Landed(ChildResult),
     Retry,
     Compact,
+    /// The cache of an idle conversation is about to lapse: compact a copy of it.
+    Fork,
+    /// A message to run on the compacted copy rather than on the full history.
+    Forked(String),
 }
 
 /// Requests answered by the agent task, which owns the history, even mid-turn.
@@ -182,6 +189,9 @@ pub enum Control {
     Compact(Option<String>),
     /// Drop the history, so the next turn starts from nothing.
     Clear,
+    /// Run a turn on this message from the compacted copy of the history, for
+    /// `/compact-then`, dropping the full history.
+    Forked(String),
     /// Run a turn again on the history as it stands, after one failed. Nothing is added
     /// to the history, so the call goes out as the failed one did.
     Retry,
@@ -612,8 +622,25 @@ pub(crate) async fn run_with(
     let mut compact_next = false;
     // What the user asked the next summary to keep, from `/compact <prompt>`.
     let mut asked: Option<String> = None;
+    // The compacted copy `/compact-then` continues from, and the call whose cache the
+    // last attempt at one read, so an idle stretch makes at most one.
+    let mut fork: Option<Fork> = None;
+    let mut forked_at: Option<Instant> = None;
 
     loop {
+        // Only a backend with a prompt cache has one to lapse, and only a conversation
+        // with something to fold is worth the summary call. An interrupt holds until the
+        // next message, and would cut the call off.
+        let fork_at = monitor
+            .last_sent()
+            .filter(|sent| fork.is_none() && model.reports_cache() && forked_at != Some(*sent))
+            .filter(|_| !cancel.load(Ordering::Relaxed))
+            .filter(|_| {
+                calls
+                    .last()
+                    .is_some_and(|c| c.usage.input >= compact::FORK_MIN)
+            })
+            .map(|sent| sent + cache::CACHE_TTL.saturating_sub(compact::FORK_LEAD));
         let next = tokio::select! {
             // Control first, so a `/model` switch is in force for the message typed
             // right after it rather than one turn late.
@@ -629,6 +656,7 @@ pub(crate) async fn run_with(
                     Control::Clear => {
                         let before = compact::estimate(&history, tokenizer);
                         history.clear();
+                        drop_fork(&mut fork, &tx);
                         (calls, monitor) = (Vec::new(), CacheMonitor::default());
                         model.reset("cleared");
                         if let Some(writer) = &mut writer
@@ -677,6 +705,8 @@ pub(crate) async fn run_with(
                         let updates = same && model.effort_updates().is_some();
                         match model.switch(&name, &effort) {
                             Some(switched) => {
+                                // The copy was summarised by, and for, the old model.
+                                drop_fork(&mut fork, &tx);
                                 model = switched;
                                 // Children run at the effort in force.
                                 registry = build(&model);
@@ -722,15 +752,88 @@ pub(crate) async fn run_with(
                         Next::Compact
                     }
                     Control::Retry => Next::Retry,
+                    Control::Forked(message) => Next::Forked(message),
                 }
             }
             message = rx_user.recv() => match message {
                 Some(message) => Next::Turn(message),
                 None => break,
             },
-            // Last: a message already typed is the turn to run, and it picks up every
-            // waiting report on its way past `delivered`.
+            // A message already typed is the turn to run, and it picks up every waiting
+            // report on its way past `delivered`.
             Some(result) = rx_results.recv() => Next::Landed(result),
+            // Last: anything the user or a child does first moves the history on.
+            _ = tokio::time::sleep_until(fork_at.unwrap_or_else(Instant::now).into()),
+                if fork_at.is_some() => Next::Fork,
+        };
+        // The summary call only appends to the history, so it reads the cached prefix and
+        // refreshes it; the guard is put back on the history after, which the next call
+        // on it extends.
+        if let Next::Fork = next {
+            forked_at = monitor.last_sent();
+            let pass = Compaction {
+                model: model.as_ref(),
+                tools: &tools,
+                instructions: &prompt.text,
+                limits,
+                tx: &tx,
+                cancel: &cancel,
+                asked: None,
+            };
+            match pass.fork(&history).await {
+                Ok(Some(made)) => {
+                    let tokens = prompt_tokens(model.name(), &prompt.text, &tools, &made.history);
+                    let _ = tx.send(AgentEvent::Info(format!(
+                        "the cache is about to lapse, so a compacted copy is ready: /compact-then <prompt> continues from ~{tokens} tokens instead"
+                    )));
+                    let _ = tx.send(AgentEvent::Fork(Some(tokens)));
+                    fork = Some(made);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = tx.send(AgentEvent::Error(format!("compacted copy: {e:#}")));
+                }
+            }
+            model.seed(&prompt.text, &tools, &history);
+            continue;
+        }
+        // Anything else moves the history on, so the copy no longer stands for it, unless
+        // it is the copy the turn is to run on.
+        let next = match next {
+            Next::Forked(message) => match fork.take() {
+                Some(made) => {
+                    let _ = tx.send(AgentEvent::Fork(None));
+                    let before = compact::estimate(&history, tokenizer);
+                    let after = compact::estimate(&made.history, tokenizer);
+                    history = made.history;
+                    model.reset("compaction: fork");
+                    (calls, monitor) = (Vec::new(), CacheMonitor::default());
+                    if let Some(writer) = &mut writer
+                        && let Err(e) = writer.compact("fork", before, after, &history)
+                    {
+                        let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+                    }
+                    let _ = tx.send(AgentEvent::Compacted {
+                        notice: format!(
+                            "continuing from the compacted copy: ~{before} -> ~{after} tokens"
+                        ),
+                        summary: Some(made.summary),
+                        freed: before.saturating_sub(after),
+                    });
+                    Next::Turn(message)
+                }
+                None => {
+                    let _ = tx.send(AgentEvent::Error(
+                        "there is no compacted copy to continue from".to_string(),
+                    ));
+                    let _ = tx.send(AgentEvent::TurnEnd);
+                    continue;
+                }
+            },
+            next => {
+                drop_fork(&mut fork, &tx);
+                next
+            }
         };
         if let Next::Compact = next {
             let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
@@ -758,7 +861,7 @@ pub(crate) async fn run_with(
             Next::Landed(result) => (Some(result), None),
             Next::Turn(message) => (None, Some(message)),
             // A retry adds nothing: it runs the turn the history already describes.
-            Next::Retry | Next::Compact => (None, None),
+            Next::Retry | Next::Compact | Next::Fork | Next::Forked(_) => (None, None),
         };
         // Just before what opens the turn, which is where the API takes an update.
         let mut update_at = None;
@@ -874,7 +977,7 @@ pub(crate) async fn run_with(
                                     .to_string(),
                             ));
                         }
-                        Control::Retry => {
+                        Control::Retry | Control::Forked(_) => {
                             let _ = tx.send(AgentEvent::Error(
                                 "a turn is already running".to_string(),
                             ));
@@ -950,6 +1053,25 @@ fn effort_change(model: &dyn Model, history: &[Value]) -> Option<Value> {
     let (request, in_force) = model.effort_updates()?;
     let announced = crate::client::announced_effort(history).unwrap_or(request);
     (announced != in_force).then(|| crate::client::effort_update(in_force))
+}
+
+/// Drop the compacted copy, saying so if there was one.
+fn drop_fork(fork: &mut Option<Fork>, tx: &mpsc::UnboundedSender<AgentEvent>) {
+    if fork.take().is_some() {
+        let _ = tx.send(AgentEvent::Fork(None));
+    }
+}
+
+/// Tokens a call on `items` reads before it can answer: the instructions, the tool
+/// schemas and the items, encrypted reasoning not counted.
+fn prompt_tokens(model: &str, instructions: &str, tools: &[Value], items: &[Value]) -> u64 {
+    let counter = tokens::for_model(model);
+    (counter.count(instructions)
+        + tools
+            .iter()
+            .map(|t| counter.count(&t.to_string()))
+            .sum::<usize>()) as u64
+        + compact::estimate(items, counter)
 }
 
 /// How one turn ended: the model calls it made, whether its step budget was spent, and
@@ -1098,18 +1220,8 @@ async fn turn(
         // function_call without its matching output.
         // What the backend has to read before it can answer. Counted here rather than
         // taken from the call's usage, which only arrives once the answer is over.
-        let counter = crate::tokens::for_model(model.name());
-        let prompt: usize = counter.count(instructions)
-            + tools
-                .iter()
-                .map(|t| counter.count(&t.to_string()))
-                .sum::<usize>()
-            + history
-                .iter()
-                .filter_map(crate::tokens::item_text)
-                .map(|text| counter.count(&text))
-                .sum::<usize>();
-        let _ = tx.send(AgentEvent::Sending(prompt as u64));
+        let prompt = prompt_tokens(model.name(), instructions, tools, history);
+        let _ = tx.send(AgentEvent::Sending(prompt));
         let _ = tx.send(AgentEvent::Streaming(true));
         let answer = model
             .respond(instructions, tools, history, &mut on_delta, cancel)
@@ -1278,6 +1390,13 @@ fn steered(
     (history.len() > from).then_some(from)
 }
 
+/// A compacted copy of the history, made while its cache was warm, which `/compact-then`
+/// continues from instead of the full history.
+struct Fork {
+    history: Vec<Value>,
+    summary: String,
+}
+
 /// One compaction of a conversation's history.
 struct Compaction<'a> {
     model: &'a dyn Model,
@@ -1340,6 +1459,20 @@ impl Compaction<'_> {
                 Err(e)
             }
         }
+    }
+
+    /// A compacted copy of `history`, which is left as it is. `None` when there is no
+    /// earlier turn to fold.
+    async fn fork(&self, history: &[Value]) -> anyhow::Result<Option<Fork>> {
+        if compact::fold(history, "").is_none() {
+            return Ok(None);
+        }
+        let summary = self.summarize(history).await?;
+        let folded = compact::fold(history, &summary).expect("checked above");
+        Ok(Some(Fork {
+            history: folded,
+            summary,
+        }))
     }
 
     /// One model call on `history` with a request for a summary appended.
@@ -1571,6 +1704,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::Titled(_)
                 | AgentEvent::Compacted { .. }
                 | AgentEvent::Cleared
+                | AgentEvent::Fork(_)
                 // A child's effort is its own request's, never an update.
                 | AgentEvent::Effort(_) => continue,
                 // An approval is modal, so it is answered where every other one is,
@@ -4091,6 +4225,123 @@ mod tests {
         let input = fake.bodies.lock().unwrap()[0].1["input"].clone();
         assert_eq!(&input.as_array().unwrap()[..4], loaded.items.as_slice());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A loop on `fake` whose calls read enough to be forked, idle until driven.
+    fn forkable(
+        fake: &fake::Fake,
+    ) -> (
+        mpsc::Sender<String>,
+        mpsc::Sender<Control>,
+        mpsc::UnboundedReceiver<AgentEvent>,
+        Arc<Cancel>,
+    ) {
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone().with_usage(Usage {
+                input: compact::FORK_MIN,
+                ..fake::USAGE
+            })),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        (tx_user, tx_control, rx, cancel)
+    }
+
+    /// Wait out the idle stretch until the copy is ready, returning when that was.
+    async fn forked(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> tokio::time::Instant {
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Fork(Some(_)) = event {
+                return tokio::time::Instant::now();
+            }
+        }
+        panic!("the loop ended without a copy");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_conversation_is_forked_before_its_cache_lapses() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![
+            vec![say("one")],
+            vec![say("two")],
+            vec![say("the summary")],
+            vec![say("three")],
+        ]);
+        let (tx_user, tx_control, mut rx, cancel) = forkable(&fake);
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        let idle = tokio::time::Instant::now();
+        let at = forked(&mut rx).await;
+        let lead = cache::CACHE_TTL - compact::FORK_LEAD;
+        // The send is timed on the real clock and the wait on the paused one.
+        let off = (at - idle).abs_diff(lead);
+        assert!(off < std::time::Duration::from_secs(1), "{:?}", at - idle);
+
+        cancel.clear();
+        tx_control
+            .send(Control::Forked("third".to_string()))
+            .await
+            .unwrap();
+        let events = settle(&mut rx).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Fork(None))));
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Compacted { summary: Some(s), .. } if s == "the summary")));
+
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let bodies = fake.bodies.lock().unwrap();
+        // The summary call extends the history, so it reads it from the cache.
+        let summary = bodies[2].1["input"].as_array().unwrap();
+        assert_eq!(summary[..3], *bodies[1].1["input"].as_array().unwrap());
+        assert_eq!(summary.len(), 5);
+        let third = bodies[3].1["input"].as_array().unwrap();
+        assert_eq!(
+            third[1]["content"][0]["text"],
+            "Summary of earlier conversation:\nthe summary"
+        );
+        assert_eq!(third.len(), 5);
+        assert_eq!(third[4]["content"][0]["text"], "third");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_message_on_the_full_history_drops_the_copy_and_reads_the_cache() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![
+            vec![say("one")],
+            vec![say("two")],
+            vec![say("the summary")],
+            vec![say("three")],
+        ]);
+        let (tx_user, _tx_control, mut rx, cancel) = forkable(&fake);
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        forked(&mut rx).await;
+        let events = drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Fork(None))));
+
+        // The guard was put back on the history, so the turn after the summary call
+        // extends it without a break.
+        assert_eq!(*fake.breaks.lock().unwrap(), []);
+        let bodies = fake.bodies.lock().unwrap();
+        let third = bodies[3].1["input"].as_array().unwrap();
+        assert_eq!(third[..3], *bodies[1].1["input"].as_array().unwrap());
+        assert_eq!(third.len(), 5);
     }
 
     #[tokio::test]

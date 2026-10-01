@@ -1,6 +1,8 @@
 //! Keeping history inside the context window: old tool outputs are evicted first, and
 //! only when that is not enough are the earlier turns replaced by a summary.
 
+use std::time::Duration;
+
 use serde_json::{Value, json};
 
 use crate::tokens::{self, Tokenizer};
@@ -21,6 +23,12 @@ pub const COMPACT_AT: f64 = 0.8;
 /// trigger: a target equal to the trigger would leave the next turn over it again.
 const TARGET: f64 = 0.6;
 const TARGET_OF_TRIGGER: f64 = 0.75;
+/// A compacted copy of an idle conversation is made this long before its cache is
+/// expected to lapse, so the summary call still reads the history from the cache.
+pub const FORK_LEAD: Duration = Duration::from_secs(3 * 60);
+/// A conversation whose last call read fewer tokens than this is not forked: there is
+/// too little to fold away to be worth the summary call.
+pub const FORK_MIN: u64 = 16_000;
 /// The most recent tool results are never evicted.
 const KEEP_RESULTS: usize = 6;
 /// How the summary starts in the compacted history.

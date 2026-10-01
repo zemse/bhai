@@ -35,3 +35,7 @@ toml = "1.1.6"
 tui-input = "0.15.3"
 unicode-width = "0.2.2"
 uuid = { version = "1.24.0", features = ["v4"] }
+
+[dev-dependencies]
+# Paused time, for the timers that fire after the cache would have lapsed.
+tokio = { version = "1.53.1", features = ["test-util"] }
