@@ -387,6 +387,7 @@ mod tests {
                 rate_limits: None,
                 pending: None,
                 entries: Vec::new(),
+                seq: 0,
             },
             wanted_mode: Mode::Auto,
             trusted: true,

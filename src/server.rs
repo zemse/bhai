@@ -1,11 +1,11 @@
 //! A localhost debug server: inspect and drive a running session over HTTP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{self, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -15,7 +15,6 @@ use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast::error::RecvError;
 
 use crate::permissions::{Answer, Mode, Remember};
 use crate::session::{self, Session, Submitted};
@@ -150,32 +149,87 @@ async fn state(State(session): State<Arc<Session>>) -> Response {
     Json(session.state()).into_response()
 }
 
-async fn events(
-    State(session): State<Arc<Session>>,
-) -> Sse<impl Stream<Item = Result<sse::Event, axum::Error>>> {
-    let rx = session.subscribe();
-    let stream = futures_util::stream::unfold((rx, 0u64), |(mut rx, mut seq)| async move {
-        let (count, item) = sent(rx.recv().await)?;
-        // The SSE id counts events since this connection opened, the ones it missed
-        // included, so a jump in it is a gap and `lagged` says how big.
-        seq += count;
-        let event = item
-            .map_err(axum::Error::new)
-            .and_then(|value| sse::Event::default().id(seq.to_string()).json_data(value));
-        Some((event, (rx, seq)))
-    });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+/// The live stream, each event with its `seq` as the SSE `id`. A `Last-Event-ID` header
+/// replays what came after that id first, so a client that dropped picks up where it was;
+/// `0` replays all the log holds, and the `seq` in `/state` is where a snapshot leaves off.
+async fn events(State(session): State<Arc<Session>>, headers: HeaderMap) -> Response {
+    let latest = session.seq();
+    let after = match headers.get("last-event-id") {
+        None => latest,
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Some(after) if after <= latest => after,
+            // Ids restart with each run, so one from the future is from another run.
+            Some(_) => {
+                return error(
+                    StatusCode::CONFLICT,
+                    "that event id is not from this run; reconnect without Last-Event-ID",
+                );
+            }
+            None => return error(StatusCode::BAD_REQUEST, "Last-Event-ID is not a number"),
+        },
+    };
+    Sse::new(stream(session, after))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
-/// What `/events` sends for one receive, or `None` once the session has gone away. A
-/// consumer that fell behind is told how many it missed, rather than left with a hole in
-/// the stream that reads as nothing having happened. The count is how many events the
-/// receive stands for.
-fn sent(received: Result<session::Event, RecvError>) -> Option<(u64, serde_json::Result<Value>)> {
-    match received {
-        Ok(event) => Some((1, serde_json::to_value(event))),
-        Err(RecvError::Lagged(n)) => Some((n, Ok(json!({ "type": "lagged", "data": n })))),
-        Err(RecvError::Closed) => None,
+/// Events after `after`, read from the session's log as it grows.
+fn stream(
+    session: Arc<Session>,
+    after: u64,
+) -> impl Stream<Item = Result<sse::Event, axum::Error>> {
+    let wake = session.watch_seq();
+    let state = (session, wake, after, VecDeque::new());
+    futures_util::stream::unfold(
+        state,
+        |(session, mut wake, mut after, mut ready)| async move {
+            while ready.is_empty() {
+                wake.borrow_and_update();
+                let since = session.since(after);
+                if since.missed > 0 {
+                    ready.push_back(Sent::Lagged(since.missed));
+                }
+                if let Some(&(last, _)) = since.events.last() {
+                    after = last;
+                }
+                ready.extend(since.events.into_iter().map(|(seq, e)| Sent::Event(seq, e)));
+                if ready.is_empty() {
+                    wake.changed().await.ok()?;
+                }
+            }
+            let item = ready.pop_front()?.into_sse();
+            Some((item, (session, wake, after, ready)))
+        },
+    )
+}
+
+/// One thing `/events` sends.
+enum Sent {
+    Event(u64, session::Event),
+    /// A consumer that fell behind the log is told how many it missed, rather than left
+    /// with a hole in the stream that reads as nothing having happened.
+    Lagged(u64),
+}
+
+impl Sent {
+    fn value(&self) -> serde_json::Result<Value> {
+        match self {
+            Sent::Event(_, event) => serde_json::to_value(event),
+            Sent::Lagged(n) => Ok(json!({ "type": "lagged", "data": n })),
+        }
+    }
+
+    fn into_sse(self) -> Result<sse::Event, axum::Error> {
+        let value = self.value().map_err(axum::Error::new)?;
+        let event = match self {
+            Sent::Event(seq, _) => sse::Event::default().id(seq.to_string()),
+            Sent::Lagged(_) => sse::Event::default(),
+        };
+        event.json_data(value)
     }
 }
 
@@ -439,28 +493,146 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(5);
 
-    /// A tool that streams a lot of progress can outrun a consumer that forks per line,
-    /// and the stream then jumps. It has to say so, or the gap reads as a quiet patch.
+    /// A server over a session with no agent behind it, for tests that only publish.
+    async fn quiet() -> (String, Arc<Session>) {
+        let (tx_user, _) = mpsc::channel(1);
+        let (tx_control, _) = mpsc::channel(1);
+        let session = Session::new(
+            "test-model".to_string(),
+            "medium".to_string(),
+            "router".to_string(),
+            tx_user,
+            tx_control,
+            Arc::new(crate::agent::Cancel::default()),
+            Arc::new(Policy::default()),
+            None,
+        );
+        let listener = bind(0).await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(serve(listener, Arc::clone(&session), TOKEN.to_string()));
+        (base, session)
+    }
+
+    fn text(s: &str) -> session::Event {
+        session::Event::Text(s.to_string())
+    }
+
+    /// Read `/events` until `n` SSE events have arrived, as `(id, data)`.
+    async fn read_sse(response: reqwest::Response, n: usize) -> Vec<(Option<String>, String)> {
+        let mut body = String::new();
+        let mut stream = response.bytes_stream();
+        timeout(WAIT, async {
+            while body.matches("\n\n").count() < n {
+                let chunk = stream.next().await.unwrap().unwrap();
+                body.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await
+        .expect("too few events on /events");
+        body.split("\n\n")
+            .take(n)
+            .map(|block| {
+                let field = |name: &str| {
+                    block
+                        .lines()
+                        .find_map(|l| l.strip_prefix(name))
+                        .map(str::to_string)
+                };
+                (field("id: "), field("data: ").unwrap_or_default())
+            })
+            .collect()
+    }
+
+    fn events_after(http: &reqwest::Client, base: &str, id: &str) -> reqwest::RequestBuilder {
+        http.get(format!("{base}/events"))
+            .header(TOKEN_HEADER, TOKEN)
+            .header("last-event-id", id)
+    }
+
+    /// A client that dropped reconnects with the last id it saw and gets what it missed,
+    /// then the live stream, with nothing twice.
     #[tokio::test]
-    async fn a_consumer_that_falls_behind_is_told_what_it_missed() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel(2);
-        for i in 0..5 {
-            let _ = tx.send(session::Event::Text(i.to_string()));
+    async fn last_event_id_replays_what_came_after_it() {
+        let (base, session) = quiet().await;
+        let http = reqwest::Client::new();
+        for s in ["a", "b", "c"] {
+            session.publish(text(s));
         }
-        let (count, lagged) = sent(rx.recv().await).unwrap();
-        assert_eq!(count, 3);
-        assert_eq!(lagged.unwrap(), json!({"type": "lagged", "data": 3}));
-        // The stream goes on from where the ring now starts.
+        assert_eq!(get_json(&http, format!("{base}/state")).await["seq"], 3);
+        let response = events_after(&http, &base, "1").send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        session.publish(text("d"));
+        let got = read_sse(response, 3).await;
+        let want: Vec<_> = [("2", "b"), ("3", "c"), ("4", "d")]
+            .into_iter()
+            .map(|(id, data)| {
+                let data = format!(r#"{{"type":"text","data":"{data}"}}"#);
+                (Some(id.to_string()), data)
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// Without the header the stream starts at now, as it always did.
+    #[tokio::test]
+    async fn events_without_an_id_start_live() {
+        let (base, session) = quiet().await;
+        let http = reqwest::Client::new();
+        session.publish(text("old"));
+        let response = http
+            .get(format!("{base}/events"))
+            .header(TOKEN_HEADER, TOKEN)
+            .send()
+            .await
+            .unwrap();
+        session.publish(text("new"));
+        let got = read_sse(response, 1).await;
         assert_eq!(
-            sent(rx.recv().await).unwrap().1.unwrap(),
-            json!({"type": "text", "data": "3"})
+            got,
+            vec![(
+                Some("2".to_string()),
+                r#"{"type":"text","data":"new"}"#.to_string()
+            )]
         );
-        drop(tx);
+    }
+
+    /// A reader further back than the log reaches is told how many it missed, rather than
+    /// left with a hole in the stream that reads as nothing having happened.
+    #[tokio::test]
+    async fn a_reader_behind_the_log_is_told_what_it_missed() {
+        let (base, session) = quiet().await;
+        let http = reqwest::Client::new();
+        let total = session::EVENT_LOG as u64 + 3;
+        for i in 1..=total {
+            session.publish(text(&i.to_string()));
+        }
+        let response = events_after(&http, &base, "0").send().await.unwrap();
+        let got = read_sse(response, 2).await;
         assert_eq!(
-            sent(rx.recv().await).unwrap().1.unwrap(),
-            json!({"type": "text", "data": "4"})
+            got,
+            vec![
+                (None, r#"{"type":"lagged","data":3}"#.to_string()),
+                (
+                    Some("4".to_string()),
+                    r#"{"type":"text","data":"4"}"#.to_string()
+                ),
+            ]
         );
-        assert!(sent(rx.recv().await).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bad_or_foreign_last_event_id_is_refused() {
+        let (base, session) = quiet().await;
+        let http = reqwest::Client::new();
+        session.publish(text("a"));
+        let status = |id: &'static str| {
+            let request = events_after(&http, &base, id);
+            async move { request.send().await.unwrap().status().as_u16() }
+        };
+        assert_eq!(status("x").await, 400);
+        // Ids restart with each run, so one past the newest is from another.
+        assert_eq!(status("2").await, 409);
+        assert_eq!(status("1").await, 200);
     }
 
     /// Start a server on an ephemeral port in front of a fake agent that says hi, asks

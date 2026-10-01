@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `/events` frames carry the session's event `seq` as their SSE id (1 for the first event of the run). The newest 4096 events are kept, and a `Last-Event-ID` header replays the ones after it before going live: `0` replays all that are kept, a reader further back gets `{"type":"lagged","data":n}` first, a non-number is a 400 and an id past the newest (from another run) is a 409. `/state` has a `seq` field, so a snapshot followed by `/events` from that id misses nothing.
 - A test runs /export-debug in a child process with a fake auth.json (via CODEX_HOME) and a secret env var, and checks that neither credential reaches the written file.
 - `POST /approve` and `POST /reject` take an optional `id` (the approval's id from `/state` or `/events`); an approval other than that one is left unanswered and the request is a 409. Every `/events` frame carries an SSE `id:` counting the events since the connection opened, those a lagging consumer missed included, so a jump in it is a gap.
 - `BHAI_MODE=ask|auto` sets the permission mode for a run where `--mode` is not given, over the config file's `permission_mode`; `--mode` still wins. `BHAI_MODE=bypass` is refused with an error, so the environment cannot turn the safeties off. `BHAI_MODEL` and `BHAI_EFFORT` already worked the same way.

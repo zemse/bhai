@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::agent::{AgentEvent, Cancel, Control, Mailboxes, Rejecter};
 use crate::cache::{CacheBreak, Hit};
@@ -21,6 +21,25 @@ use crate::workflow::Workflow;
 
 /// Events a slow consumer can fall behind by before it starts missing them.
 const EVENT_BUFFER: usize = 4096;
+/// Events kept for a `/events` client that reconnects to replay.
+pub const EVENT_LOG: usize = 4096;
+
+/// The recent events, each with its `seq`: 1 for the first of the run, then one more for
+/// each, so a gap in what a reader holds is a gap in what it saw.
+#[derive(Default)]
+struct Log {
+    last: u64,
+    ring: VecDeque<(u64, Event)>,
+}
+
+/// What [`Session::since`] has for a reader at some `seq`.
+#[derive(Debug, Default, PartialEq)]
+pub struct Since {
+    /// Events after it that the log has already let go of.
+    pub missed: u64,
+    /// The rest, oldest first.
+    pub events: Vec<(u64, Event)>,
+}
 
 /// An agent event as consumers see it: cloneable, serializable, approvals by id.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -245,6 +264,9 @@ pub struct State {
     pub pending: Option<Approval>,
     /// Transcript entries with token attribution, as the hover badges show them.
     pub entries: Vec<EntryTokens>,
+    /// The `seq` of the last event published before this was read. Every event this
+    /// state does not reflect comes after it, so `/events` from here misses nothing.
+    pub seq: u64,
 }
 
 /// A submitted prompt: what the agent is sent, and what the transcript shows. The two
@@ -381,6 +403,9 @@ pub struct Session {
     model: Mutex<(String, String)>,
     identity: String,
     events: broadcast::Sender<Event>,
+    log: Mutex<Log>,
+    /// The newest `seq`, for `/events` readers to wait on.
+    latest: watch::Sender<u64>,
     inner: Mutex<Inner>,
     entries: Mutex<Entries>,
     /// The child agents of the running turn, oldest first.
@@ -415,6 +440,8 @@ impl Session {
             model: Mutex::new((model, effort)),
             identity,
             events: broadcast::channel(EVENT_BUFFER).0,
+            log: Mutex::default(),
+            latest: watch::Sender::new(0),
             inner: Mutex::default(),
             entries: Mutex::default(),
             children: Mutex::default(),
@@ -441,7 +468,33 @@ impl Session {
         self.events.subscribe()
     }
 
+    /// The `seq` of the newest event, 0 before the first.
+    pub fn seq(&self) -> u64 {
+        *self.latest.borrow()
+    }
+
+    /// Wakes when an event is published.
+    pub fn watch_seq(&self) -> watch::Receiver<u64> {
+        self.latest.subscribe()
+    }
+
+    /// The events published after `after`, as far back as the log still holds them.
+    pub fn since(&self, after: u64) -> Since {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&(first, _)) = log.ring.front() else {
+            return Since::default();
+        };
+        let from = after.saturating_add(1);
+        let skip = usize::try_from(from.saturating_sub(first)).unwrap_or(usize::MAX);
+        Since {
+            missed: first.saturating_sub(from),
+            events: log.ring.iter().skip(skip).cloned().collect(),
+        }
+    }
+
     pub fn state(&self) -> State {
+        // Read before the rest, so an event racing the snapshot is replayed, not lost.
+        let seq = self.seq();
         let inner = self.lock();
         let (model, effort) = self.model();
         State {
@@ -466,6 +519,7 @@ impl Session {
             rate_limits: inner.rate_limits,
             pending: inner.pending.front().map(|(approval, _)| approval.clone()),
             entries: self.entries().attributed(),
+            seq,
         }
     }
 
@@ -1050,8 +1104,21 @@ impl Session {
     pub fn publish(&self, event: Event) {
         self.route(&event);
         self.entries().apply(&event);
+        self.record(&event);
         // No subscribers is fine; the event is simply dropped.
         let _ = self.events.send(event);
+    }
+
+    fn record(&self, event: &Event) {
+        let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        log.last += 1;
+        let seq = log.last;
+        if log.ring.len() == EVENT_LOG {
+            log.ring.pop_front();
+        }
+        log.ring.push_back((seq, event.clone()));
+        // Under the log's lock, so the value only ever goes up.
+        self.latest.send_replace(seq);
     }
 
     /// Keep the child panes up with the event, before the transcript sees it.
@@ -1313,6 +1380,28 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Entry::Failed(text) if text.contains("panic")));
         assert!(said, "{:?}", session.entries().list);
+    }
+
+    #[test]
+    fn the_log_numbers_events_and_keeps_the_newest() {
+        let (session, _rx) = session();
+        let text = |i: u64| Event::Text(i.to_string());
+        assert_eq!(session.since(0), Since::default());
+        assert_eq!(session.state().seq, 0);
+        let total = EVENT_LOG as u64 + 2;
+        for i in 1..=total {
+            session.publish(text(i));
+        }
+        assert_eq!(session.seq(), total);
+        assert_eq!(session.state().seq, total);
+        let tail = session.since(total - 1);
+        assert_eq!((tail.missed, tail.events), (0, vec![(total, text(total))]));
+        assert_eq!(session.since(total), Since::default());
+        // The first two have rolled out of the ring.
+        let all = session.since(0);
+        assert_eq!(all.missed, 2);
+        assert_eq!(all.events.len(), EVENT_LOG);
+        assert_eq!(all.events[0], (3, text(3)));
     }
 
     fn approval(session: &Session) -> oneshot::Receiver<Answer> {
