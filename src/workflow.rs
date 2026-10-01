@@ -1320,6 +1320,7 @@ async fn step(
         steer: Some(steer),
         judge: run.judge.map(|judge| judge.child(&id, prompt)),
         contract: step.contract.clone(),
+        history: Vec::new(),
     })
     .await;
     let output = match &finished.result {

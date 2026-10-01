@@ -1196,6 +1196,27 @@ impl Session {
                 description,
                 task,
             } => {
+                // A continued child carries on in the pane it had, which a turn since may
+                // have moved to the ended ones.
+                let kept = match children.iter().position(|p| p.row.id == *id) {
+                    Some(at) => Some(children.remove(at)),
+                    None => {
+                        let mut ended = self.ended.lock().unwrap_or_else(|e| e.into_inner());
+                        let at = ended.iter().position(|p| p.row.id == *id);
+                        at.map(|at| ended.remove(at))
+                    }
+                };
+                if let Some(mut pane) = kept {
+                    pane.row.description = description.clone();
+                    pane.row.state = ChildState::Running;
+                    pane.row.last = Instant::now();
+                    pane.entries
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(Entry::User(task.clone()));
+                    children.push(pane);
+                    return;
+                }
                 let entries = Entries::default();
                 let entries = Arc::new(Mutex::new(entries));
                 entries
@@ -1567,6 +1588,34 @@ mod tests {
         let ids: Vec<&str> = logs.iter().map(|log| log.row.id.as_str()).collect();
         assert_eq!(ids, ["a1", "b2"]);
         assert!(matches!(&logs[1].entries[0], Entry::User(t) if t == "read the docs"));
+    }
+
+    #[test]
+    fn a_continued_child_carries_on_in_the_pane_it_had() {
+        let (session, _rx) = session();
+        child(&session, "a1", "review it");
+        session.on_agent(AgentEvent::ChildEnded {
+            id: "a1".to_string(),
+            ok: true,
+        });
+        session.publish(Event::User("something else".to_string()));
+        assert!(session.children().is_empty());
+
+        child(&session, "a1", "now fix it");
+        let rows = session.children();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, ChildState::Running);
+        let logs = session.child_logs();
+        assert_eq!(logs.len(), 1, "one pane, not a second one beside the first");
+        let tasks: Vec<&str> = logs[0]
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::User(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tasks, ["review it", "now fix it"]);
     }
 
     #[test]

@@ -1,5 +1,6 @@
-//! Delegate a task to a child agent with a fresh context. Needs no approval itself;
-//! every call the child makes goes through the session's permission policy.
+//! Delegate a task to a child agent with a fresh context, or more work to one that has
+//! finished. Needs no approval itself; every call the child makes goes through the
+//! session's permission policy.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,9 +72,9 @@ impl Tool for Agent {
         json!({
             "type": "function",
             "name": NAME,
-            "description": "Start a task in a child agent with a fresh context. The call \
-        returns as soon as the child is running, so several can be started in a row and run \
-        at once; do not wait for one before starting the next, and do not poll. The child's \
+            "description": "Start a task in a child agent with a fresh context, or give a \
+        finished one more work with `continue`. The call returns as soon as the child is \
+        running, so several can be started in a row and run at once; do not wait for one before starting the next, and do not poll. The child's \
         report arrives on its own, as a message, whether the turn is still going or has long \
         ended. Get on with other work, or say what you have started and stop. The child cannot \
         see this conversation, so give it everything it needs.",
@@ -103,6 +104,13 @@ impl Tool for Agent {
                     "prompt": {
                         "type": "string",
                         "description": "The complete task for the child."
+                    },
+                    "continue": {
+                        "type": "string",
+                        "description": "The id of a child that has finished, to carry on from \
+        everything it already read and did, such as fixing what it found, rather than starting \
+        a fresh one that reads it all again. It runs as the identity and model it had, so leave \
+        out `identity`, `model` and `effort`; `prompt` is its next message."
                     }
                 },
                 "required": ["description", "prompt"],
@@ -117,7 +125,10 @@ impl Tool for Agent {
 
     fn describe(&self, args: &Value) -> Result<String, String> {
         let (identity, description, _) = self.parse(args)?;
-        Ok(format!("agent {}: {description}", identity.name))
+        match continued(args) {
+            Some(id) => Ok(format!("agent {id} continues: {description}")),
+            None => Ok(format!("agent {}: {description}", identity.name)),
+        }
     }
 
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
@@ -126,14 +137,27 @@ impl Tool for Agent {
                 Ok(parsed) => parsed,
                 Err(e) => return (e, false),
             };
+            let (id, identity, history) = match continued(args) {
+                Some(id) => match self.reopen(id) {
+                    Ok((identity, history)) => (id.to_string(), identity, history),
+                    Err(e) => return (e, false),
+                },
+                None => {
+                    let id = uuid::Uuid::new_v4().simple().to_string()[..6].to_string();
+                    (id, identity, Vec::new())
+                }
+            };
             // Before the spawn, not after: a typo otherwise costs a child that runs far
             // enough to be refused by the backend, and a report the parent has to read.
             if let Some(e) = self.unserved(&identity).await {
                 return (e, false);
             }
-            let id = uuid::Uuid::new_v4().simple().to_string()[..6].to_string();
             let waiting = MAX_RUNNING.saturating_sub(self.slots.available_permits());
-            self.spawn(&id, &identity, description, task);
+            let again = match history.is_empty() {
+                true => "",
+                false => " again, from where it left off",
+            };
+            self.spawn(&id, &identity, description, task, history);
             let name = &identity.name;
             let queued = match waiting >= MAX_RUNNING {
                 true => format!(
@@ -143,7 +167,7 @@ impl Tool for Agent {
             };
             (
                 format!(
-                    "child {id} ({name}) started{queued}. Its report will reach you as a \
+                    "child {id} ({name}) started{again}{queued}. Its report will reach you as a \
 message when it finishes; nothing else is needed to collect it."
                 ),
                 true,
@@ -212,11 +236,26 @@ impl Agent {
     /// Run the child detached, so the turn that asked for it carries on. It holds a
     /// slot for as long as it runs and posts its report when it ends; the parent reads
     /// that between steps, or in a turn of its own once the session is idle.
-    fn spawn(&self, id: &str, identity: &Identity, description: &str, task: &str) {
+    fn spawn(
+        &self,
+        id: &str,
+        identity: &Identity,
+        description: &str,
+        task: &str,
+        history: Vec<Value>,
+    ) {
         let (id, description, task) = (id.to_string(), description.to_string(), task.to_string());
         let identity = identity.clone();
         let transcript = self.transcripts.join(format!("child-{id}.jsonl"));
         let model = self.model.child(&identity);
+        // What `continue` runs it as. Without it the child still runs, it just cannot be
+        // continued, so a failed write is reported rather than refused.
+        if let Err(e) = self.remember(&id, &identity, model.name()) {
+            let _ = self.tx.send(AgentEvent::Error(format!(
+                "{}{e:#}",
+                agent::TRANSCRIPT_ERROR
+            )));
+        }
         let prompt = (self.delegation.prompt)(&identity);
         let (mailboxes, policy) = (
             Arc::clone(&self.delegation.mailboxes),
@@ -263,6 +302,7 @@ impl Agent {
                 steer: Some(steer),
                 judge,
                 contract: None,
+                history,
             })
             .await;
             let name = &identity.name;
@@ -296,6 +336,58 @@ impl Agent {
         });
     }
 
+    /// Where the identity a child was started as is kept, beside its transcript.
+    fn meta(&self, id: &str) -> PathBuf {
+        self.transcripts.join(format!("child-{id}.json"))
+    }
+
+    /// The model is the one it ran on rather than the identity's: its encrypted reasoning
+    /// replays only to that one, whatever the session has switched to since.
+    fn remember(&self, id: &str, identity: &Identity, model: &str) -> std::io::Result<()> {
+        crate::sessions::private_dir(&self.transcripts)?;
+        let meta = json!({
+            "identity": identity.name,
+            "model": model,
+            "effort": identity.effort,
+        });
+        crate::sessions::private_write(&self.meta(id), &meta.to_string())
+    }
+
+    /// The identity and history of finished child `id`, for `continue`.
+    fn reopen(&self, id: &str) -> Result<(Identity, Vec<Value>), String> {
+        let gone = || {
+            format!(
+                "no finished child {id} to continue: give the id an `agent` call of this \
+session returned."
+            )
+        };
+        // The id names a file, so it is held to what `agent` hands out.
+        if id.len() > 32 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(gone());
+        }
+        if self.cancel.running(id) {
+            return Err(format!(
+                "child {id} is still running. Its report will reach you; continue it after that."
+            ));
+        }
+        let meta: Value = std::fs::read_to_string(self.meta(id))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .ok_or_else(gone)?;
+        let field = |key: &str| meta.get(key).and_then(Value::as_str).map(str::to_string);
+        let name = field("identity").ok_or_else(gone)?;
+        let mut identity = identity::find(&self.delegation.identities, &name)
+            .map_err(|e| format!("child {id} cannot be continued: {e:#}."))?;
+        (identity.model, identity.effort) = (field("model"), field("effort"));
+        let transcript = self.transcripts.join(format!("child-{id}.jsonl"));
+        let history = crate::sessions::load_child(&transcript)
+            .map_err(|e| format!("child {id} cannot be continued: {e:#}."))?;
+        if history.is_empty() {
+            return Err(gone());
+        }
+        Ok((identity, history))
+    }
+
     /// What is wrong with the model the child would run on, if anything. `None` when it
     /// runs on this session's, which needs no list to be known servable.
     async fn unserved(&self, identity: &Identity) -> Option<String> {
@@ -320,6 +412,16 @@ impl Agent {
         };
         let description = required("description")?;
         let prompt = required("prompt")?;
+        if continued(args).is_some()
+            && let Some(key) = ["identity", "model", "effort"]
+                .into_iter()
+                .find(|key| string_arg(args, key).is_some_and(|v| !v.trim().is_empty()))
+        {
+            return Err(format!(
+                "`{key}` cannot be given with `continue`: a continued child runs as the \
+identity and model it had, since its history belongs to them."
+            ));
+        }
         let name = string_arg(args, "identity")
             .map(str::trim)
             .filter(|v| !v.is_empty())
@@ -354,6 +456,13 @@ impl Agent {
         }
         Ok((identity, description, prompt))
     }
+}
+
+/// The child a call continues, if it names one.
+fn continued(args: &Value) -> Option<&str> {
+    string_arg(args, "continue")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
 /// Neutralise lines of child output that imitate turn markers or control tags: escape
@@ -765,6 +874,86 @@ mod tests {
                 .all(|r| r.contains("interrupted by the user")),
             "{running:?}"
         );
+        harness.cleanup();
+    }
+
+    /// "Now fix what you found" goes to the child that found it, which still has what it
+    /// read, rather than to a fresh one that reads it all again.
+    #[tokio::test]
+    async fn a_finished_child_carries_on_from_its_own_history() {
+        let fake = Fake::new(vec![vec![say("found a bug")], vec![say("fixed it")]]);
+        let mut harness = tool(&fake, false);
+        let first = harness
+            .report(json!({"description": "review", "prompt": "review the parser"}))
+            .await;
+        let id = first["child ".len()..]
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let args = json!({"description": "fix it", "prompt": "now fix it", "continue": id});
+        assert_eq!(
+            harness.agent.describe(&args).unwrap(),
+            format!("agent {id} continues: fix it")
+        );
+        let (started, ok) = harness.agent.execute(&args).await;
+        assert!(ok, "{started}");
+        assert!(
+            started.starts_with(&format!(
+                "child {id} (general) started again, from where it left off."
+            )),
+            "{started}"
+        );
+        let second = harness.results.recv().await.expect("a report").text;
+        assert!(second.starts_with(&format!("child {id} (general) finished")));
+        assert!(second.ends_with("fixed it"), "{second}");
+
+        // The model read the first run before the new message.
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let input = bodies.last().unwrap().1["input"].to_string();
+        let at = |text: &str| {
+            input
+                .find(text)
+                .unwrap_or_else(|| panic!("{text}: {input}"))
+        };
+        assert!(at("review the parser") < at("found a bug"));
+        assert!(at("found a bug") < at("now fix it"));
+        // Both runs are one transcript and one profiler row.
+        let transcript = harness.agent.transcripts.join(format!("child-{id}.jsonl"));
+        let saved = crate::sessions::load_child(&transcript).unwrap();
+        assert_eq!(saved.len(), 4, "{saved:?}");
+        assert_eq!(harness.agent.children.lock().unwrap().len(), 1);
+        harness.cleanup();
+    }
+
+    #[tokio::test]
+    async fn only_a_finished_child_of_this_session_can_be_continued() {
+        let mut harness = tool(&Fake::default(), false);
+        let call = |id: &str| json!({"description": "d", "prompt": "p", "continue": id});
+        for id in ["nobody", "../../etc/passwd"] {
+            let (out, ok) = harness.agent.execute(&call(id)).await;
+            assert!(!ok);
+            assert!(
+                out.starts_with(&format!("no finished child {id} to continue")),
+                "{out}"
+            );
+        }
+        // Still running, or still waiting for a slot.
+        let _flag = harness.agent.cancel.child("a1b2c3");
+        let (out, ok) = harness.agent.execute(&call("a1b2c3")).await;
+        assert!(!ok);
+        assert!(out.starts_with("child a1b2c3 is still running."), "{out}");
+        // Its history belongs to the identity and model it ran as.
+        let err = harness
+            .agent
+            .describe(&json!({"description": "d", "prompt": "p", "continue": "a1", "model": "m"}))
+            .unwrap_err();
+        assert!(
+            err.starts_with("`model` cannot be given with `continue`"),
+            "{err}"
+        );
+        assert!(harness.results.try_recv().is_err(), "nothing was started");
         harness.cleanup();
     }
 

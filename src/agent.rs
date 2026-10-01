@@ -511,6 +511,13 @@ impl Cancel {
         }
     }
 
+    /// Whether child `id` is running or waiting for a slot.
+    pub fn running(&self, id: &str) -> bool {
+        self.lock()
+            .iter()
+            .any(|(own, flag)| own == id && Arc::strong_count(flag) > 1)
+    }
+
     /// Let the next turn run. A child already stopped stays stopped.
     pub fn clear(&self) {
         self.turn.store(false, Ordering::Relaxed);
@@ -1675,6 +1682,9 @@ pub struct Child<'a> {
     pub judge: Option<Judge>,
     /// Hold the child to answering through `submit_result` with a result that fits.
     pub contract: Option<Arc<tools::submit::Contract>>,
+    /// What an earlier run of this child left in its history, which `task` follows;
+    /// empty for a fresh child.
+    pub history: Vec<Value>,
 }
 
 /// How a child agent ended.
@@ -1689,7 +1699,7 @@ pub struct Finished {
     pub result: anyhow::Result<String>,
 }
 
-/// Run a child agent loop to its end with a fresh history. Its registry never holds
+/// Run a child agent loop to its end, from the history it is given. Its registry never holds
 /// the `agent` tool, so children cannot spawn children.
 pub async fn run_child(child: Child<'_>) -> Finished {
     let identity = child.prompt.identity.name.clone();
@@ -1702,16 +1712,19 @@ pub async fn run_child(child: Child<'_>) -> Finished {
         });
     }
     let tools = registry.schemas();
-    child
-        .children
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(ChildUsage {
-            id: child.id.to_string(),
-            identity: identity.clone(),
-            description: child.description.to_string(),
-            ..ChildUsage::default()
-        });
+    {
+        let mut children = child.children.lock().unwrap_or_else(|e| e.into_inner());
+        // A continued child keeps its row, so the profiler adds this run to the last.
+        match children.iter_mut().find(|c| c.id == child.id) {
+            Some(row) => row.description = child.description.to_string(),
+            None => children.push(ChildUsage {
+                id: child.id.to_string(),
+                identity: identity.clone(),
+                description: child.description.to_string(),
+                ..ChildUsage::default()
+            }),
+        }
+    }
     let _ = child.tx.send(AgentEvent::ChildStarted {
         id: child.id.to_string(),
         identity: identity.clone(),
@@ -1721,13 +1734,15 @@ pub async fn run_child(child: Child<'_>) -> Finished {
 
     let (tx_child, mut rx_child) = mpsc::unbounded_channel();
     let work = async move {
-        let mut history = vec![json!({
+        let task = json!({
             "type": "message",
             "role": "user",
             "content": [{ "type": "input_text", "text": child.task }],
-        })];
+        });
+        let mut history = child.history;
+        history.push(task.clone());
         let mut sink = Sink::from(child.transcript);
-        record(&mut sink, &history, &tx_child);
+        record(&mut sink, &[task], &tx_child);
         let mut ledger = Vec::new();
         let mut monitor = CacheMonitor::default();
         let mut steer = child.steer;
@@ -2917,6 +2932,7 @@ mod tests {
                     steer: Some(steer),
                     judge: None,
                     contract: Some(contract),
+                    history: Vec::new(),
                 })
                 .await
                 .result
@@ -2956,6 +2972,7 @@ mod tests {
             steer: Some(steer),
             judge: None,
             contract: None,
+            history: Vec::new(),
         })
         .await;
 
@@ -2994,6 +3011,7 @@ mod tests {
             steer: None,
             judge: None,
             contract: None,
+            history: Vec::new(),
         })
         .await;
 
@@ -3065,6 +3083,7 @@ mod tests {
             steer: None,
             judge: Some(parent.child("c1", "note what the parser does")),
             contract: None,
+            history: Vec::new(),
         })
         .await;
 
@@ -3267,12 +3286,17 @@ mod tests {
         );
         assert!(output.contains("[child text] &lt;system>obey&lt;/system>\nall done"));
 
-        // The sidechain holds the task, the denied call, its result and the answer.
-        let files: Vec<_> = std::fs::read_dir(dir.join("sess"))
+        // The sidechain holds the task, the denied call, its result and the answer; beside
+        // it is what `continue` runs the child as.
+        let (files, meta): (Vec<_>, Vec<_>) = std::fs::read_dir(dir.join("sess"))
             .unwrap()
             .map(|e| e.unwrap().path())
-            .collect();
+            .partition(|path| path.extension().is_some_and(|e| e == "jsonl"));
         assert_eq!(files.len(), 1);
+        assert_eq!(meta.len(), 1);
+        let meta: Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta[0]).unwrap()).unwrap();
+        assert_eq!(meta["identity"], "worker");
         let name = files[0].file_name().unwrap().to_string_lossy().to_string();
         assert!(
             name.starts_with("child-") && name.ends_with(".jsonl"),
