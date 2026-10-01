@@ -154,23 +154,27 @@ async fn events(
     State(session): State<Arc<Session>>,
 ) -> Sse<impl Stream<Item = Result<sse::Event, axum::Error>>> {
     let rx = session.subscribe();
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        let item = sent(rx.recv().await)?;
+    let stream = futures_util::stream::unfold((rx, 0u64), |(mut rx, mut seq)| async move {
+        let (count, item) = sent(rx.recv().await)?;
+        // The SSE id counts events since this connection opened, the ones it missed
+        // included, so a jump in it is a gap and `lagged` says how big.
+        seq += count;
         let event = item
             .map_err(axum::Error::new)
-            .and_then(|value| sse::Event::default().json_data(value));
-        Some((event, rx))
+            .and_then(|value| sse::Event::default().id(seq.to_string()).json_data(value));
+        Some((event, (rx, seq)))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// What `/events` sends for one receive, or `None` once the session has gone away. A
 /// consumer that fell behind is told how many it missed, rather than left with a hole in
-/// the stream that reads as nothing having happened.
-fn sent(received: Result<session::Event, RecvError>) -> Option<serde_json::Result<Value>> {
+/// the stream that reads as nothing having happened. The count is how many events the
+/// receive stands for.
+fn sent(received: Result<session::Event, RecvError>) -> Option<(u64, serde_json::Result<Value>)> {
     match received {
-        Ok(event) => Some(serde_json::to_value(event)),
-        Err(RecvError::Lagged(n)) => Some(Ok(json!({ "type": "lagged", "data": n }))),
+        Ok(event) => Some((1, serde_json::to_value(event))),
+        Err(RecvError::Lagged(n)) => Some((n, Ok(json!({ "type": "lagged", "data": n })))),
         Err(RecvError::Closed) => None,
     }
 }
@@ -284,21 +288,23 @@ fn admit(session: &Session, text: &str) -> Result<Value, (StatusCode, String)> {
 struct Approve {
     /// Which offered rule to remember.
     remember: Option<Remember>,
+    /// The approval being answered, as `/events` and `/state` give it.
+    id: Option<u64>,
 }
 
-/// The body is optional: `{"remember": "exact" | "prefix"}`.
+/// The body is optional: `{"id"?, "remember"?: "exact" | "prefix"}`. With an `id`, an
+/// approval other than that one is left unanswered and the request is a 409.
 async fn approve(State(session): State<Arc<Session>>, body: Bytes) -> Response {
-    let approve: Approve = if body.iter().all(u8::is_ascii_whitespace) {
-        Approve::default()
-    } else {
-        match serde_json::from_slice(&body) {
-            Ok(approve) => approve,
-            Err(e) => return error(StatusCode::BAD_REQUEST, &format!("bad body: {e}")),
-        }
+    let approve: Approve = match parse_body(&body) {
+        Ok(approve) => approve,
+        Err(message) => return error(StatusCode::BAD_REQUEST, &message),
     };
     let Some(pending) = session.state().pending else {
         return error(StatusCode::CONFLICT, "no approval is pending");
     };
+    if approve.id.is_some_and(|id| id != pending.id) {
+        return error(StatusCode::CONFLICT, "that approval is not the one pending");
+    }
     if let Some(remember) = approve.remember
         && pending.offers.get(remember).is_none()
     {
@@ -308,14 +314,31 @@ async fn approve(State(session): State<Arc<Session>>, body: Bytes) -> Response {
     answer(&session, Answer::Accept(approve.remember), Some(pending.id))
 }
 
-async fn reject(State(session): State<Arc<Session>>) -> Response {
-    answer(&session, Answer::Reject, None)
+#[derive(Debug, Default, Deserialize)]
+struct Reject {
+    id: Option<u64>,
+}
+
+/// The body is optional: `{"id"?}`, which `/approve` explains.
+async fn reject(State(session): State<Arc<Session>>, body: Bytes) -> Response {
+    let reject: Reject = match parse_body(&body) {
+        Ok(reject) => reject,
+        Err(message) => return error(StatusCode::BAD_REQUEST, &message),
+    };
+    answer(&session, Answer::Reject, reject.id)
+}
+
+fn parse_body<T: Default + serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body).map_err(|e| format!("bad body: {e}"))
 }
 
 fn answer(session: &Session, answer: Answer, id: Option<u64>) -> Response {
     match session.answer(answer, id) {
         Some(id) => Json(json!({ "ok": true, "id": id })).into_response(),
-        None => error(StatusCode::CONFLICT, "no approval is pending"),
+        None => error(StatusCode::CONFLICT, "no such approval is pending"),
     }
 }
 
@@ -424,18 +447,17 @@ mod tests {
         for i in 0..5 {
             let _ = tx.send(session::Event::Text(i.to_string()));
         }
-        assert_eq!(
-            sent(rx.recv().await).unwrap().unwrap(),
-            json!({"type": "lagged", "data": 3})
-        );
+        let (count, lagged) = sent(rx.recv().await).unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(lagged.unwrap(), json!({"type": "lagged", "data": 3}));
         // The stream goes on from where the ring now starts.
         assert_eq!(
-            sent(rx.recv().await).unwrap().unwrap(),
+            sent(rx.recv().await).unwrap().1.unwrap(),
             json!({"type": "text", "data": "3"})
         );
         drop(tx);
         assert_eq!(
-            sent(rx.recv().await).unwrap().unwrap(),
+            sent(rx.recv().await).unwrap().1.unwrap(),
             json!({"type": "text", "data": "4"})
         );
         assert!(sent(rx.recv().await).is_none());
@@ -608,6 +630,17 @@ mod tests {
             get_json(&http, format!("{base}/state")).await["pending"]["exact"],
             "Bash(ls)"
         );
+        // An id that is not the pending one answers nothing, however it is asked.
+        for path in ["approve", "reject"] {
+            assert_eq!(
+                post(&http, format!("{base}/{path}"), json!({"id": 99})).await,
+                StatusCode::CONFLICT
+            );
+        }
+        assert_eq!(
+            get_json(&http, format!("{base}/state")).await["pending"]["id"],
+            1
+        );
         // Only an offered rule can be remembered, and the body must parse.
         for body in [json!({"remember": "prefix"}), json!({"remember": "all"})] {
             assert_eq!(
@@ -619,7 +652,7 @@ mod tests {
             post(
                 &http,
                 format!("{base}/approve"),
-                json!({"remember": "exact"})
+                json!({"id": 1, "remember": "exact"})
             )
             .await,
             StatusCode::OK
@@ -649,6 +682,8 @@ mod tests {
         })
         .await
         .expect("no turn_end on /events");
+        // Each frame carries a count of the events so far as its SSE id.
+        assert!(body.starts_with("id: 1\n"), "no id on the first in {body}");
         for want in [
             r#"{"type":"user","data":"go"}"#,
             r#"{"type":"text","data":"hi"}"#,
