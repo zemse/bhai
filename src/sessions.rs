@@ -443,14 +443,21 @@ pub fn load_child(path: &Path) -> Result<Vec<Value>> {
     };
     let answered: Vec<String> = items
         .iter()
-        .filter(|item| kind(item).as_deref() == Some("function_call_output"))
+        .filter(|item| {
+            matches!(
+                kind(item).as_deref(),
+                Some("function_call_output" | "tool_search_output")
+            )
+        })
         .filter_map(call_id)
         .collect();
     let mut kept = Vec::with_capacity(items.len());
     let mut dropping = false;
     for item in items.into_iter().rev() {
         match kind(&item).as_deref() {
-            Some("function_call") if !call_id(&item).is_some_and(|id| answered.contains(&id)) => {
+            Some("function_call" | "tool_search_call")
+                if !call_id(&item).is_some_and(|id| answered.contains(&id)) =>
+            {
                 dropping = true;
             }
             Some("reasoning") if dropping => {}
@@ -471,8 +478,10 @@ fn answered<'a>(items: impl Iterator<Item = &'a Value>) -> usize {
     for (index, item) in items.enumerate() {
         let call_id = || item.get("call_id").and_then(Value::as_str).unwrap_or("");
         match item.get("type").and_then(Value::as_str) {
-            Some("function_call") => open.push(call_id()),
-            Some("function_call_output") => open.retain(|id| *id != call_id()),
+            Some("function_call" | "tool_search_call") => open.push(call_id()),
+            Some("function_call_output" | "tool_search_output") => {
+                open.retain(|id| *id != call_id())
+            }
             _ => {}
         }
         if open.is_empty() {
@@ -1190,12 +1199,17 @@ mod tests {
         let reasoning = json!({"type": "reasoning", "id": "rs1"});
         let call = |id: &str| json!({"type": "function_call", "call_id": id, "name": "read", "arguments": "{}"});
         let output = json!({"type": "function_call_output", "call_id": "c1", "output": "ok"});
+        let search = |id: &str| json!({"type": "tool_search_call", "call_id": id, "arguments": {}});
+        let found = json!({"type": "tool_search_output", "call_id": "s1", "tools": []});
         let lines = [
             user("review"),
             call("c1"),
             output.clone(),
+            search("s1"),
+            found.clone(),
             reasoning,
             call("c2"),
+            search("s2"),
             user("now fix it"),
         ];
         let mut text: String = lines.iter().map(|item| format!("{item}\n")).collect();
@@ -1204,7 +1218,14 @@ mod tests {
         let items = load_child(&path).unwrap();
         assert_eq!(
             items,
-            [user("review"), call("c1"), output, user("now fix it")]
+            [
+                user("review"),
+                call("c1"),
+                output,
+                search("s1"),
+                found,
+                user("now fix it")
+            ]
         );
 
         std::fs::write(&path, "{}\nnot json\n{}\n").unwrap();

@@ -8,6 +8,7 @@
 //! `POST {url}/api/chat` streams one JSON object per line rather than SSE, and a tool
 //! call arrives whole in a single chunk, so nothing is reassembled from deltas.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -59,7 +60,7 @@ pub fn messages(instructions: &str, input: &[Value]) -> Vec<Value> {
     }
     // A `function_call_output` carries only the call id, and Ollama pairs a result with
     // its tool by name, so the names are remembered as the calls go past.
-    let mut names: HashMap<&str, &str> = HashMap::new();
+    let mut names: HashMap<&str, Cow<str>> = HashMap::new();
     for item in input {
         let field = |key: &str| item.get(key).and_then(Value::as_str);
         let text = crate::tokens::item_text(item).unwrap_or_default();
@@ -73,9 +74,16 @@ pub fn messages(instructions: &str, input: &[Value]) -> Vec<Value> {
                 "content": text,
             })),
             Some("function_call") => {
-                let name = field("name").unwrap_or_default();
+                // A function `tool_search` loaded is named by its namespace and name
+                // together, which is its `mcp__server__tool` name.
+                let name = match field("namespace") {
+                    Some(namespace) => {
+                        Cow::Owned(format!("{namespace}{}", field("name").unwrap_or_default()))
+                    }
+                    None => Cow::Borrowed(field("name").unwrap_or_default()),
+                };
                 if let Some(id) = field("call_id") {
-                    names.insert(id, name);
+                    names.insert(id, name.clone());
                 }
                 out.push(json!({
                     "role": "assistant",
@@ -89,7 +97,7 @@ pub fn messages(instructions: &str, input: &[Value]) -> Vec<Value> {
             Some("function_call_output") => out.push(json!({
                 "role": "tool",
                 "tool_name": field("call_id")
-                    .and_then(|id| names.get(id).copied())
+                    .and_then(|id| names.get(id).cloned())
                     .unwrap_or_default(),
                 "content": text,
             })),
@@ -99,10 +107,12 @@ pub fn messages(instructions: &str, input: &[Value]) -> Vec<Value> {
     out
 }
 
-/// The flat Responses function schemas as Ollama's nested ones.
+/// The flat Responses function schemas as Ollama's nested ones. A tool of another type,
+/// like `tool_search`, is the Responses API's own and is left out.
 pub fn tool_defs(tools: &[Value]) -> Vec<Value> {
     tools
         .iter()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
         .map(|tool| {
             let field = |key: &str| tool.get(key).cloned();
             json!({
@@ -598,6 +608,28 @@ mod tests {
         assert_eq!(defs[0]["function"]["name"], "read");
         assert_eq!(defs[0]["function"]["description"], "Read a file.");
         assert_eq!(defs[0]["function"]["parameters"], flat["parameters"]);
+        let search = json!({"type": "tool_search", "execution": "client"});
+        assert_eq!(tool_defs(&[search, flat]).len(), 1);
+    }
+
+    #[test]
+    fn a_tool_search_round_goes_over_as_the_mcp_call_it_was() {
+        let input = [
+            json!({"type": "tool_search_call", "call_id": "s1", "execution": "client",
+                   "arguments": {"query": "issue"}}),
+            json!({"type": "tool_search_output", "call_id": "s1", "execution": "client",
+                   "status": "completed", "tools": []}),
+            json!({"type": "function_call", "call_id": "c1", "namespace": "mcp__gh__",
+                   "name": "get_issue", "arguments": "{\"n\":1}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "open"}),
+        ];
+        let out = messages("", &input);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(
+            out[0]["tool_calls"][0]["function"]["name"],
+            "mcp__gh__get_issue"
+        );
+        assert_eq!(out[1]["tool_name"], "mcp__gh__get_issue");
     }
 
     #[test]

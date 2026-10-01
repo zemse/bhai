@@ -73,6 +73,8 @@ pub struct Live<'a> {
 
 pub struct Registry {
     tools: Vec<Box<dyn Tool>>,
+    /// The hub calls to functions `tool_search` loaded are resolved against.
+    native: Option<Arc<crate::mcp::Hub>>,
 }
 
 impl Registry {
@@ -87,18 +89,34 @@ impl Registry {
         if !skills.is_empty() {
             tools.push(Box::new(skill::Skill { skills }));
         }
-        Self { tools }
+        Self {
+            tools,
+            native: None,
+        }
     }
 
-    /// `mcp_search` and `mcp_call`, when the hub has tools to offer.
+    /// `mcp_search` and `mcp_call`, when the hub has tools to offer, and `tool_search` when
+    /// the session turned it on.
     pub fn with_mcp(mut self, hub: Option<Arc<crate::mcp::Hub>>) -> Self {
         if let Some(hub) = hub.filter(|h| h.has_tools()) {
             self.tools.push(Box::new(mcp::Search {
                 hub: Arc::clone(&hub),
             }));
+            if hub.tool_search() {
+                self.tools.push(Box::new(mcp::ToolSearch {
+                    hub: Arc::clone(&hub),
+                }));
+                self.native = Some(Arc::clone(&hub));
+            }
             self.tools.push(Box::new(mcp::Call { hub }));
         }
         self
+    }
+
+    /// A call to a function `tool_search` loaded, as the `mcp_call` that runs it; `None`
+    /// for any other call.
+    pub async fn resolve(&self, call: &Value) -> Option<Value> {
+        mcp::resolve(self.native.as_deref()?, call).await
     }
 
     /// The `agent` tool and its `close_agent`, for a parent session only.

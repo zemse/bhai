@@ -1695,7 +1695,12 @@ async fn turn(
 
         let calls: Vec<&Value> = items
             .iter()
-            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .filter(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("function_call" | "tool_search_call")
+                )
+            })
             .collect();
 
         if calls.is_empty() {
@@ -1731,14 +1736,20 @@ async fn turn(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let (output, ok) = execute(registry, policy, judge, call, tx, cancel).await;
+            // A `tool_search_call` runs as a call to `tool_search` and is answered in kind.
+            let search = tools::mcp::search_call(call);
+            let run = search.as_ref().unwrap_or(call);
+            let (output, ok) = execute(registry, policy, judge, run, tx, cancel).await;
             all_failed &= !ok;
             let _ = tx.send(AgentEvent::Item(sent + items.len() + index));
-            results.push(json!({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": output,
-            }));
+            results.push(match search {
+                Some(_) => tools::mcp::search_output(&call_id, &output),
+                None => json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                }),
+            });
         }
 
         // Append the assistant items and every matching result together.
@@ -2497,6 +2508,9 @@ async fn execute(
         );
     }
 
+    // A function `tool_search` loaded is decided and run as the `mcp_call` it stands for.
+    let resolved = registry.resolve(call).await;
+    let call = resolved.as_ref().unwrap_or(call);
     let name = call.get("name").and_then(Value::as_str).unwrap_or_default();
     let Some(tool) = registry.get(name) else {
         return (registry.unknown(name), false);
@@ -3246,6 +3260,96 @@ mod tests {
         assert!(labels.contains(&"tool: bash"));
         assert!(labels.contains(&"tool: edit"));
         assert!(profile.calibration.is_none());
+    }
+
+    /// What `tool_search` loads is called by its own name, and the rules decide that call
+    /// under the `mcp__server__tool` name, as they do an `mcp_call`.
+    #[tokio::test]
+    async fn a_tool_search_loads_mcp_tools_whose_calls_are_ruled_on_by_name() {
+        use crate::mcp::{Hub, ToolInfo};
+        use crate::permissions::{Rule, Rules};
+        use fake::{Fake, say};
+
+        let hub = Hub::offline(vec![(
+            "docs",
+            vec![ToolInfo::test("docs", "lookup", "Look things up.")],
+        )])
+        .with_tool_search();
+        let prompt = SystemPrompt {
+            mcp: Some(Arc::new(hub)),
+            ..SystemPrompt::default()
+        };
+        let registry = Registry::for_prompt(&prompt);
+        let schemas = registry.schemas();
+        assert!(schemas.iter().any(|t| t["type"] == "tool_search"));
+        let fake = Fake::new(vec![
+            vec![
+                json!({"type": "tool_search_call", "call_id": "s1", "execution": "client",
+                        "status": "completed", "arguments": {"query": "lookup"}}),
+            ],
+            vec![
+                json!({"type": "function_call", "call_id": "c1", "namespace": "mcp__docs__",
+                        "name": "lookup", "arguments": "{\"q\":\"x\"}"}),
+            ],
+            vec![say("done")],
+        ]);
+        let rules = Rules {
+            deny: vec![Rule::parse("mcp__docs__lookup").unwrap()],
+            ..Rules::default()
+        };
+        let dir = tools::temp_dir();
+        let policy = Policy::new(Mode::Bypass, rules, None, dir.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut history = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "look it up" }],
+        })];
+        let Turn { result, .. } = turn(
+            &fake,
+            &registry,
+            &policy,
+            None,
+            &schemas,
+            "",
+            &mut history,
+            &tx,
+            &Arc::new(AtomicBool::new(false)),
+            &mut Vec::new(),
+            &mut CacheMonitor::default(),
+            None,
+            &mut Sink::Discard,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+        let kinds: Vec<&str> = history.iter().filter_map(|i| i["type"].as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "message",
+                "tool_search_call",
+                "tool_search_output",
+                "function_call",
+                "function_call_output",
+                "message"
+            ]
+        );
+        let found = &history[2];
+        assert_eq!(found["call_id"], "s1");
+        assert_eq!(found["execution"], "client");
+        assert_eq!(found["tools"][0]["type"], "namespace");
+        assert_eq!(found["tools"][0]["name"], "mcp__docs__");
+        assert_eq!(found["tools"][0]["tools"][0]["name"], "lookup");
+        assert_eq!(found["tools"][0]["tools"][0]["defer_loading"], true);
+        let output = history[4]["output"].as_str().unwrap();
+        assert!(output.contains("deny rule mcp__docs__lookup"), "{output}");
+        assert_eq!(history[4]["call_id"], "c1");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

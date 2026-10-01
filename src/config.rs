@@ -33,6 +33,9 @@ pub struct Config {
     pub mcp: bool,
     /// `[mcp.servers.<name>]` from the global file.
     pub mcp_servers: BTreeMap<String, McpServer>,
+    /// `[mcp] tool_search`: offer the Responses `tool_search` tool beside `mcp_search`, so
+    /// the Codex backend loads MCP tools as typed functions. Off by default.
+    pub mcp_tool_search: bool,
     pub permission_mode: Mode,
     pub permissions: Rules,
     /// In `auto`, writes and edits inside the project root happen without asking.
@@ -70,6 +73,7 @@ impl Default for Config {
             skill_sources: Source::ALL.to_vec(),
             mcp: false,
             mcp_servers: BTreeMap::new(),
+            mcp_tool_search: false,
             permission_mode: Mode::Auto,
             permissions: Rules::default(),
             auto_project_writes: true,
@@ -196,6 +200,7 @@ enum McpLayer {
     Enabled(bool),
     Table {
         enabled: Option<bool>,
+        tool_search: Option<bool>,
         #[serde(default)]
         servers: BTreeMap<String, McpServer>,
     },
@@ -411,7 +416,14 @@ impl Config {
         }
         match layer.mcp {
             Some(McpLayer::Enabled(enabled)) => off_only(&mut self.mcp, Some(enabled)),
-            Some(McpLayer::Table { enabled, .. }) => off_only(&mut self.mcp, enabled),
+            Some(McpLayer::Table {
+                enabled,
+                tool_search,
+                ..
+            }) => {
+                off_only(&mut self.mcp, enabled);
+                off_only(&mut self.mcp_tool_search, tool_search);
+            }
             None => {}
         }
     }
@@ -740,6 +752,22 @@ mod tests {
         write(&global, "mcp = true\n");
         write(&project, "[mcp]\nenabled = false\n");
         assert!(!Config::load(Some(&home), &cwd).unwrap().mcp);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tool_search_is_off_unless_the_global_file_turns_it_on() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        let global = home.join(".config/bhai/config.toml");
+        let project = cwd.join(".bhai/config.toml");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().mcp_tool_search);
+        write(&project, "[mcp]\ntool_search = true\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().mcp_tool_search);
+        write(&global, "[mcp]\nenabled = true\ntool_search = true\n");
+        assert!(Config::load(Some(&home), &cwd).unwrap().mcp_tool_search);
+        write(&project, "[mcp]\ntool_search = false\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().mcp_tool_search);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

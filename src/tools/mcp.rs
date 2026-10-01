@@ -1,5 +1,7 @@
 //! `mcp_search` finds MCP tools and shows their schemas; `mcp_call` runs one and needs
-//! approval, decided under its `mcp__server__tool` name.
+//! approval, decided under its `mcp__server__tool` name. `tool_search`, behind
+//! `[mcp] tool_search`, is the Responses API's own: it loads matches as deferred functions,
+//! and a call to one runs as the `mcp_call` it stands for, so it is approved the same way.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +14,7 @@ use crate::mcp::Hub;
 
 pub const SEARCH: &str = "mcp_search";
 pub const CALL: &str = "mcp_call";
+pub const TOOL_SEARCH: &str = "tool_search";
 
 /// Longest argument summary shown in the approval prompt.
 const SUMMARY_ARGS: usize = 160;
@@ -23,6 +26,10 @@ pub struct Search {
 }
 
 pub struct Call {
+    pub hub: Arc<Hub>,
+}
+
+pub struct ToolSearch {
     pub hub: Arc<Hub>,
 }
 
@@ -69,6 +76,114 @@ impl Tool for Search {
             }
         })
     }
+}
+
+impl Tool for ToolSearch {
+    fn name(&self) -> &str {
+        TOOL_SEARCH
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Search the connected MCP servers' tools by keywords or a server \
+        name. The matches are loaded for your next call, and you call them directly by name. \
+        Runs without approval; each call to a loaded tool is approved.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords, a tool name, or a server name."
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Most tools to load; 5 when left out."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        })
+    }
+
+    fn needs_approval(&self) -> bool {
+        false
+    }
+
+    fn describe(&self, args: &Value) -> Result<String, String> {
+        query(args).map(|q| format!("tool_search {q}"))
+    }
+
+    /// The output is the JSON of the `tools` the `tool_search_output` carries.
+    fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
+        Box::pin(async move {
+            let q = match query(args) {
+                Ok(q) => q,
+                Err(e) => return (e, false),
+            };
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_f64)
+                .map(|n| n.max(0.0) as usize);
+            let found = self.hub.search_native(q, limit).await;
+            (Value::Array(found).to_string(), true)
+        })
+    }
+}
+
+/// A `tool_search_call` as the `function_call` to `tool_search` it is run as.
+pub fn search_call(item: &Value) -> Option<Value> {
+    if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
+        return None;
+    }
+    let arguments = match item.get("arguments") {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => "{}".to_string(),
+    };
+    Some(json!({
+        "type": "function_call",
+        "name": TOOL_SEARCH,
+        "call_id": item.get("call_id").cloned().unwrap_or(Value::Null),
+        "arguments": arguments,
+    }))
+}
+
+/// The `tool_search_output` that answers `call_id`. A search that failed loads nothing.
+pub fn search_output(call_id: &str, output: &str) -> Value {
+    let tools = serde_json::from_str::<Vec<Value>>(output).unwrap_or_default();
+    json!({
+        "type": "tool_search_output",
+        "call_id": call_id,
+        "status": "completed",
+        "execution": "client",
+        "tools": tools,
+    })
+}
+
+/// A call to a function `tool_search` loaded, as the `mcp_call` it stands for, or `None`
+/// for a call that names no namespace. One that matches no tool still becomes an
+/// `mcp_call`, which says so.
+pub async fn resolve(hub: &Hub, call: &Value) -> Option<Value> {
+    let namespace = call.get("namespace").and_then(Value::as_str)?;
+    let function = string_arg(call, "name").unwrap_or_default();
+    let name = match hub.resolve_native(namespace, function).await {
+        Some(name) => name,
+        None => format!("{namespace}{function}"),
+    };
+    let raw = string_arg(call, "arguments").unwrap_or_default();
+    let arguments = match raw.trim().is_empty() {
+        true => json!({}),
+        false => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string())),
+    };
+    Some(json!({
+        "type": "function_call",
+        "name": CALL,
+        "call_id": call.get("call_id").cloned().unwrap_or(Value::Null),
+        "arguments": json!({"name": name, "arguments": arguments}).to_string(),
+    }))
 }
 
 fn query(args: &Value) -> Result<&str, String> {
@@ -200,6 +315,76 @@ mod tests {
         let without = Registry::new(Vec::new()).with_mcp(Some(empty));
         assert!(without.get(SEARCH).is_none() && without.get(CALL).is_none());
         assert_eq!(Registry::new(Vec::new()).with_mcp(None).schemas().len(), 4);
+    }
+
+    #[test]
+    fn tool_search_is_offered_only_when_the_session_turned_it_on() {
+        let off = Registry::new(Vec::new()).with_mcp(Some(hub()));
+        assert!(off.get(TOOL_SEARCH).is_none());
+        let on = Arc::new(
+            Hub::offline(vec![("gh", vec![ToolInfo::test("gh", "get_issue", "")])])
+                .with_tool_search(),
+        );
+        let registry = Registry::new(Vec::new()).with_mcp(Some(on));
+        let search = registry.get(TOOL_SEARCH).unwrap();
+        assert!(!search.needs_approval());
+        assert_eq!(search.schema()["type"], "tool_search");
+        assert_eq!(search.schema()["execution"], "client");
+        // `mcp_search` and `mcp_call` stay, for Ollama and for a model that uses them.
+        assert!(registry.get(SEARCH).is_some() && registry.get(CALL).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_loaded_function_runs_as_the_mcp_call_it_stands_for() {
+        let hub = hub();
+        let call = json!({"type": "function_call", "call_id": "c1", "namespace": "mcp__gh__",
+                          "name": "get_issue", "arguments": "{\"n\":1}"});
+        let resolved = resolve(&hub, &call).await.unwrap();
+        assert_eq!(resolved["name"], CALL);
+        assert_eq!(resolved["call_id"], "c1");
+        let args: Value = serde_json::from_str(resolved["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args,
+            json!({"name": "mcp__gh__get_issue", "arguments": {"n": 1}})
+        );
+
+        // An unknown one still goes to `mcp_call`, which says there is no such tool.
+        let unknown = json!({"type": "function_call", "namespace": "mcp__gh__", "name": "nope",
+                             "arguments": "[1]"});
+        let resolved = resolve(&hub, &unknown).await.unwrap();
+        let args: Value = serde_json::from_str(resolved["arguments"].as_str().unwrap()).unwrap();
+        let mcp_call = Call {
+            hub: Arc::clone(&hub),
+        };
+        assert!(
+            mcp_call
+                .describe(&args)
+                .unwrap_err()
+                .contains("no MCP tool")
+        );
+
+        let plain = json!({"type": "function_call", "name": "read", "arguments": "{}"});
+        assert!(resolve(&hub, &plain).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_tool_search_call_is_run_and_answered_in_kind() {
+        let item = json!({"type": "tool_search_call", "call_id": "s1", "execution": "client",
+                          "arguments": {"query": "issue", "limit": 2}});
+        let call = search_call(&item).unwrap();
+        assert_eq!(call["name"], TOOL_SEARCH);
+        let args = crate::tools::parse_arguments(call["arguments"].as_str().unwrap()).unwrap();
+        let search = ToolSearch { hub: hub() };
+        assert_eq!(search.describe(&args).unwrap(), "tool_search issue");
+        let (out, ok) = search.execute(&args).await;
+        assert!(ok, "{out}");
+        let answer = search_output("s1", &out);
+        assert_eq!(answer["type"], "tool_search_output");
+        assert_eq!(answer["tools"][0]["tools"][0]["name"], "get_issue");
+        // A failed search loads nothing rather than sending its error as tools.
+        let failed = search_output("s1", "missing required string field `query`.");
+        assert_eq!(failed["tools"], json!([]));
+        assert!(search_call(&json!({"type": "function_call"})).is_none());
     }
 
     #[test]

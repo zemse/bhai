@@ -225,14 +225,21 @@ impl Entries {
                 Some("reasoning") if !text("summary").is_empty() => {
                     Entry::Reasoning(text("summary"))
                 }
-                Some("function_call") => Entry::Command {
-                    tool: item["name"].as_str().unwrap_or_default().to_string(),
-                    summary: format!(
-                        "{} {}",
-                        item["name"].as_str().unwrap_or_default(),
-                        item["arguments"].as_str().unwrap_or_default()
-                    ),
-                },
+                Some("function_call") => {
+                    // A function `tool_search` loaded is named with its namespace.
+                    let name = format!(
+                        "{}{}",
+                        item["namespace"].as_str().unwrap_or_default(),
+                        item["name"].as_str().unwrap_or_default()
+                    );
+                    Entry::Command {
+                        summary: format!(
+                            "{name} {}",
+                            item["arguments"].as_str().unwrap_or_default()
+                        ),
+                        tool: name,
+                    }
+                }
                 Some("function_call_output") => Entry::Output(
                     item["output"]
                         .as_str()

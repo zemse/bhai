@@ -74,8 +74,12 @@ impl Identity {
         }
     }
 
-    /// A listed `mcp` stands for both `mcp_search` and `mcp_call`.
+    /// A listed `mcp` stands for both `mcp_search` and `mcp_call`. `tool_search` goes with
+    /// `mcp_search`, since it finds the same tools.
     pub fn allows_tool(&self, name: &str) -> bool {
+        if name == tools::mcp::TOOL_SEARCH {
+            return self.allows_tool(tools::mcp::SEARCH);
+        }
         let mcp = [tools::mcp::SEARCH, tools::mcp::CALL].contains(&name);
         self.tools
             .as_ref()
@@ -477,6 +481,8 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         };
         assert!(with_mcp.allows_mcp_server("docs"));
         assert!(!with_mcp.allows_tool("mcp_call"));
+        assert!(with_mcp.allows_tool("tool_search"));
+        assert!(!only_read.allows_tool("tool_search"));
     }
 
     #[test]

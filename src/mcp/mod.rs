@@ -4,6 +4,9 @@
 //! only a child identity allows starts on that child's first MCP call and is then shared.
 //! `/mcp reload <name>` restarts one server from its config as it is now; the prompt keeps
 //! the listing it had at launch, and only `mcp_search` and `mcp_call` see the new catalog.
+//! With `[mcp] tool_search = true` the Codex backend also gets the Responses `tool_search`
+//! tool: what it finds comes back as deferred functions in an `mcp__server__` namespace,
+//! which the model then calls directly with typed arguments.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -21,6 +24,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::{Config, McpServer};
 use crate::identity::Identity;
@@ -42,8 +46,14 @@ const PROMPT_TOOLS: usize = 3;
 /// How much of a name the listing shows. A server names its own tools, and the listing is
 /// one line per server inside the cached prefix, so the text it can put there is bounded.
 const PROMPT_NAME: usize = 64;
-/// Results `mcp_search` returns.
+/// Results `mcp_search` returns, and `tool_search` when it is not given a limit.
 const SEARCH_RESULTS: usize = 5;
+/// Most results one `tool_search` loads.
+const MAX_NATIVE_RESULTS: usize = 16;
+/// Longest function or namespace name the Responses API takes.
+const NATIVE_NAME: usize = 64;
+/// A schema past this is left out of a `tool_search` result rather than loaded.
+const NATIVE_SCHEMA: usize = crate::tools::MAX_OUTPUT / 2;
 /// Bounds on one server's `tools/list`. The server picks the cursors, so one that keeps
 /// handing out a next page would be followed until the startup timeout, with all it sent
 /// held in memory and searched.
@@ -130,6 +140,8 @@ struct Shared {
     timeout: Duration,
     /// Each server's call timeout, by name.
     call_timeouts: Mutex<HashMap<String, Duration>>,
+    /// `[mcp] tool_search`: offer the Responses `tool_search` tool too.
+    tool_search: bool,
 }
 
 /// The servers of a session as one identity sees them: their status, tools, and the
@@ -164,6 +176,7 @@ pub async fn start(config: &Config, roots: &Roots, identity: &Identity) -> Optio
     let mut hub = Hub::connect(servers, identity, &log_dir, START_TIMEOUT).await;
     if let Some(shared) = Arc::get_mut(&mut hub.shared) {
         shared.source = Some((roots.clone(), config.mcp_servers.clone()));
+        shared.tool_search = config.mcp_tool_search;
     }
     Some(Arc::new(hub))
 }
@@ -218,6 +231,7 @@ impl Hub {
             log_dir: log_dir.to_path_buf(),
             timeout,
             call_timeouts: Mutex::new(call_timeouts),
+            tool_search: false,
         });
         Hub {
             peers,
@@ -282,11 +296,26 @@ impl Hub {
             log_dir: PathBuf::new(),
             timeout: START_TIMEOUT,
             call_timeouts: Mutex::default(),
+            tool_search: false,
         });
         Hub {
             root: true,
             ..Hub::view(shared, &Identity::default())
         }
+    }
+
+    /// This offline hub with `tool_search` on.
+    #[cfg(test)]
+    pub fn with_tool_search(mut self) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("an offline hub is not shared yet")
+            .tool_search = true;
+        self
+    }
+
+    /// Whether the session offers the Responses `tool_search` tool beside `mcp_search`.
+    pub fn tool_search(&self) -> bool {
+        self.shared.tool_search
     }
 
     /// Start this view's deferred servers that no one has started yet.
@@ -446,10 +475,17 @@ to reach `{name}` with; restart bhai to use it"
         if !self.has_tools() {
             return String::new();
         }
-        let mut text = String::from(
-            "\n\n# MCP\n\nMCP tools are not in your tool list. Find one with `mcp_search`, \
-then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
-        );
+        let mut text = String::from(match self.tool_search() {
+            true => {
+                "\n\n# MCP\n\nMCP tools are not in your tool list. `tool_search` loads the ones \
+that match, and you then call them directly by name with typed arguments. `mcp_search` and \
+`mcp_call` with the exact `mcp__server__tool` name reach the same tools.\n"
+            }
+            false => {
+                "\n\n# MCP\n\nMCP tools are not in your tool list. Find one with `mcp_search`, \
+then run it with `mcp_call` using the exact `mcp__server__tool` name.\n"
+            }
+        });
         for server in self.servers.iter().filter(|s| !s.tools.is_empty()) {
             let mut names: Vec<String> = server
                 .tools
@@ -477,9 +513,73 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
     /// The best matches for `query`, with their schemas, as `mcp_search` returns them.
     /// Starts this view's deferred servers first.
     pub async fn search(&self, query: &str) -> String {
+        search(&self.all_tools().await, query)
+    }
+
+    /// Every tool this view may call, starting its deferred servers first.
+    async fn all_tools(&self) -> Vec<ToolInfo> {
         let mut tools: Vec<ToolInfo> = self.live().into_iter().flat_map(|s| s.tools).collect();
         tools.extend(self.late_tools().await);
-        search(&tools, query)
+        tools
+    }
+
+    /// The best matches for `query` as a `tool_search_output`'s `tools`: one namespace per
+    /// server, holding its matches as deferred functions.
+    pub async fn search_native(&self, query: &str, limit: Option<usize>) -> Vec<Value> {
+        let limit = limit.unwrap_or(SEARCH_RESULTS).clamp(1, MAX_NATIVE_RESULTS);
+        let tools = self.all_tools().await;
+        let mut namespaces: Vec<(String, Vec<Value>)> = Vec::new();
+        for tool in ranked(&tools, query).into_iter().take(limit) {
+            let (namespace, function) = native_names(tool);
+            let mut description = first_line(&tool.description).to_string();
+            let size = tool.schema.to_string().len();
+            let parameters = match tool.schema.is_object() && size <= NATIVE_SCHEMA {
+                true => tool.schema.clone(),
+                false => {
+                    description.push_str(&format!(
+                        " (its {size}-byte input schema is left out; `mcp_search` shows it)"
+                    ));
+                    serde_json::json!({"type": "object"})
+                }
+            };
+            let function = serde_json::json!({
+                "type": "function",
+                "name": function,
+                "description": description,
+                "strict": false,
+                "defer_loading": true,
+                "parameters": parameters,
+            });
+            match namespaces.iter_mut().find(|(name, _)| *name == namespace) {
+                Some((_, functions)) => functions.push(function),
+                None => namespaces.push((namespace, vec![function])),
+            }
+        }
+        namespaces
+            .into_iter()
+            .map(|(name, tools)| {
+                let server = name
+                    .strip_prefix("mcp__")
+                    .and_then(|s| s.strip_suffix("__"))
+                    .unwrap_or(&name);
+                serde_json::json!({
+                    "type": "namespace",
+                    "name": name,
+                    "description": format!("Tools of the MCP server {}.", listed(server)),
+                    "tools": tools,
+                })
+            })
+            .collect()
+    }
+
+    /// The `mcp__server__tool` name of the tool `tool_search` named `function` in
+    /// `namespace`, or `None` when this view has no such tool.
+    pub async fn resolve_native(&self, namespace: &str, function: &str) -> Option<String> {
+        self.all_tools()
+            .await
+            .into_iter()
+            .find(|t| native_names(t) == (namespace.to_string(), function.to_string()))
+            .map(|t| t.full_name())
     }
 
     /// A tool of a launched server, as the server is now.
@@ -840,8 +940,8 @@ fn split(full_name: &str) -> Option<(&str, &str)> {
     full_name.strip_prefix("mcp__")?.split_once("__")
 }
 
-/// The best matches for `query` among `tools`, with their schemas.
-fn search(tools: &[ToolInfo], query: &str) -> String {
+/// The tools that match `query`, best first.
+fn ranked<'a>(tools: &'a [ToolInfo], query: &str) -> Vec<&'a ToolInfo> {
     let words: Vec<String> = query
         .split(|c: char| c.is_whitespace() || c == ',')
         .filter(|w| !w.is_empty())
@@ -856,6 +956,47 @@ fn search(tools: &[ToolInfo], query: &str) -> String {
         b.0.cmp(&a.0)
             .then_with(|| a.1.full_name().cmp(&b.1.full_name()))
     });
+    hits.into_iter().map(|(_, tool)| tool).collect()
+}
+
+/// The namespace and function name `tool_search` gives `tool`: `mcp__server__` and the
+/// tool's name, each in the charset and length the Responses API takes.
+pub fn native_names(tool: &ToolInfo) -> (String, String) {
+    let around = "mcp____".len();
+    (
+        format!("mcp__{}__", native_name(&tool.server, around)),
+        native_name(&tool.name, 0),
+    )
+}
+
+/// `name` as letters, digits, `_` and `-`, within `NATIVE_NAME` less `around`. A name
+/// that had to change ends in a hash of the original, so two that clean up alike differ.
+fn native_name(name: &str, around: usize) -> String {
+    let max = NATIVE_NAME - around;
+    let clean: String = name
+        .chars()
+        .map(
+            |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                true => c,
+                false => '_',
+            },
+        )
+        .collect();
+    if clean == name && !clean.is_empty() && clean.len() <= max {
+        return clean;
+    }
+    let digest: String = Sha256::digest(name.as_bytes())[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // `clean` is ASCII, so any byte index is a boundary.
+    let keep = clean.len().min(max - digest.len() - 1);
+    format!("{}_{digest}", &clean[..keep])
+}
+
+/// The best matches for `query` among `tools`, with their schemas.
+fn search(tools: &[ToolInfo], query: &str) -> String {
+    let hits = ranked(tools, query);
     if hits.is_empty() {
         let mut servers: Vec<&str> = Vec::new();
         for tool in tools {
@@ -870,7 +1011,7 @@ or a server name to list its tools.",
         );
     }
     let mut out = String::new();
-    for (_, tool) in hits.iter().take(SEARCH_RESULTS) {
+    for tool in hits.iter().take(SEARCH_RESULTS) {
         let _ = writeln!(
             out,
             "{}: {}\ninput schema: {}\n",
@@ -1882,6 +2023,77 @@ mod tests {
         assert_eq!(child.prompt_section(), section);
         hub.shutdown().await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_names_fit_the_api_and_stay_apart() {
+        let names = |server: &str, tool: &str| native_names(&ToolInfo::test(server, tool, ""));
+        assert_eq!(
+            names("chrome-devtools", "take_screenshot"),
+            (
+                "mcp__chrome-devtools__".to_string(),
+                "take_screenshot".to_string()
+            )
+        );
+        let fits = |name: &str| {
+            !name.is_empty()
+                && name.len() <= NATIVE_NAME
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        };
+        let long = "x".repeat(200);
+        for (server, tool) in [
+            ("my.server", "get.issue"),
+            (long.as_str(), long.as_str()),
+            ("é", "工具"),
+            ("s", ""),
+        ] {
+            let (namespace, function) = names(server, tool);
+            assert!(
+                fits(&namespace) && fits(&function),
+                "{namespace} {function}"
+            );
+        }
+        // Two names that clean up alike stay two names.
+        assert_ne!(names("s", "a.b").1, names("s", "a_b").1);
+        assert_ne!(names("s", "a.b").1, names("s", "a/b").1);
+        assert_eq!(names("s", "a.b"), names("s", "a.b"));
+    }
+
+    #[tokio::test]
+    async fn a_native_search_groups_matches_by_server_and_resolves_them_back() {
+        let huge = ToolInfo {
+            schema: serde_json::json!({"pad": "x".repeat(NATIVE_SCHEMA)}),
+            ..ToolInfo::test("gh", "huge.issue", "Huge issue tool\nmore")
+        };
+        let hub = Hub::offline(vec![
+            (
+                "gh",
+                vec![ToolInfo::test("gh", "get_issue", "Get an issue"), huge],
+            ),
+            ("fs", vec![ToolInfo::test("fs", "issue_notes", "Notes")]),
+        ])
+        .with_tool_search();
+        let found = hub.search_native("gh issue", None).await;
+        let names: Vec<&str> = found.iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["mcp__gh__", "mcp__fs__"]);
+        let gh = found[0]["tools"].as_array().unwrap();
+        assert_eq!(gh.len(), 2);
+        assert!(gh.iter().all(|f| f["defer_loading"] == true));
+        let big = gh.iter().find(|f| f["name"] != "get_issue").unwrap();
+        assert_eq!(big["parameters"], serde_json::json!({"type": "object"}));
+        assert!(big["description"].as_str().unwrap().contains("left out"));
+        assert!(!big["description"].as_str().unwrap().contains("more"));
+
+        assert_eq!(hub.search_native("issue", Some(1)).await.len(), 1);
+        let function = big["name"].as_str().unwrap();
+        assert_eq!(
+            hub.resolve_native("mcp__gh__", function).await.as_deref(),
+            Some("mcp__gh__huge.issue")
+        );
+        assert_eq!(hub.resolve_native("mcp__fs__", function).await, None);
+        assert!(hub.prompt_section().contains("`tool_search`"));
     }
 
     #[test]
