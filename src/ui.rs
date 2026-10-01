@@ -452,39 +452,45 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let dim = Style::new().fg(Color::DarkGray);
-    let mut bar = vec![
-        (
-            ALWAYS,
-            Span::styled(" bhai ", Style::new().fg(Color::Black).bg(Color::Cyan)),
+    let window = app.limits.window(&app.model);
+    // The effort rides along with the model, since `/model` can change either.
+    let mut bar = vec![(
+        ALWAYS,
+        Span::styled(
+            match crate::client::Provider::of(&app.model) {
+                crate::client::Provider::Codex => {
+                    format!(" {} {} ({} context)", app.model, app.effort, size(window))
+                }
+                crate::client::Provider::Ollama => {
+                    format!(" {} ({} context)", app.model, size(window))
+                }
+            },
+            dim,
         ),
-        // The effort rides along with the model, since `/model` can change either.
-        (
-            ALWAYS,
-            Span::styled(
-                match crate::client::Provider::of(&app.model) {
-                    crate::client::Provider::Codex => format!(" {} {} ", app.model, app.effort),
-                    crate::client::Provider::Ollama => format!(" {} ", app.model),
-                },
-                dim,
-            ),
-        ),
-    ];
-    // Which branch the work is landing on. A checkout in another terminal moves it, so
-    // it is re-read on the tick rather than read once at startup.
-    if let Some(branch) = app.branch.name() {
-        bar.push((ALWAYS, Span::styled(format!("on {branch} "), dim)));
+    )];
+    // Which branch the work is landing on, after the directory as `dir:branch`. A
+    // checkout in another terminal moves it, so it is re-read on the tick rather than
+    // read once at startup.
+    let dir = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    match app.branch.name() {
+        Some(branch) => segment(&mut bar, Span::styled(format!("{dir}:{branch}"), dim)),
+        None if !dir.is_empty() => segment(&mut bar, Span::styled(dir, dim)),
+        None => {}
     }
     // How full the window is, from what the last call actually read: the number
     // compaction watches, and the only one here that says how much room is left.
     // While the prompt starts with `/compact-then`, the compacted copy it would run on.
     let fork = app.forked();
     if let Some(used) = fork.or(app.last_usage.map(|usage| usage.input)) {
-        let percent = 100.0 * used as f64 / app.limits.window(&app.model) as f64;
+        let percent = 100.0 * used as f64 / window as f64;
         let label = if fork.is_some() { "fork ctx" } else { "ctx" };
-        bar.push((
-            ALWAYS,
-            Span::styled(format!("{label} {percent:.0}% "), headroom(percent)),
-        ));
+        segment(
+            &mut bar,
+            Span::styled(format!("{label}:{percent:.0}%"), headroom(percent)),
+        );
     }
     // What the goal has spent of its budget; only an active one is still spending.
     if let Some(goal) = app.goal() {
@@ -492,11 +498,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             true => String::new(),
             false => format!("{} ", goal.state.label()),
         };
-        bar.push((
-            ALWAYS,
+        segment(
+            &mut bar,
             Span::styled(
                 format!(
-                    "goal {state}{}/{} ",
+                    "goal {state}{}/{}",
                     compact(goal.spent),
                     compact(goal.budget)
                 ),
@@ -505,70 +511,72 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
                     false => dim,
                 },
             ),
-        ));
+        );
     }
     if let Some(field) = &app.cache_break {
-        bar.push((
-            ALWAYS,
+        segment(
+            &mut bar,
             Span::styled(
-                format!("cache break: {field} "),
+                format!("cache break: {field}"),
                 Style::new().fg(Color::Red).bold(),
             ),
-        ));
+        );
     }
     if app.cache_stalled {
-        bar.push((
-            ALWAYS,
-            Span::styled("cache stalled ", Style::new().fg(Color::Yellow).bold()),
-        ));
+        segment(
+            &mut bar,
+            Span::styled("cache stalled", Style::new().fg(Color::Yellow).bold()),
+        );
     }
     if let Some(percent) = app.cache_miss {
-        bar.push((
-            ALWAYS,
+        segment(
+            &mut bar,
             Span::styled(
-                format!("cache miss {percent:.0}% "),
+                format!("cache miss {percent:.0}%"),
                 Style::new().fg(Color::Yellow).bold(),
             ),
-        ));
+        );
     }
     // The copy has never been sent, so nothing of it past the first message is cached.
     if let Some(tokens) = fork {
-        bar.push((
-            ALWAYS,
+        segment(
+            &mut bar,
             Span::styled(
-                format!("fork uncached: ~{} tokens ", compact(tokens)),
+                format!("fork uncached: ~{} tokens", compact(tokens)),
                 Style::new().fg(Color::Yellow),
             ),
-        ));
+        );
     }
     if let Some(left) = app.cache_left().filter(|_| fork.is_none()) {
-        bar.push((
-            ALWAYS,
+        segment(
+            &mut bar,
             Span::styled(
-                format!("cache expires in {} ", clock(left)),
+                format!("cache expires in {}", clock(left)),
                 Style::new().fg(Color::Yellow),
             ),
-        ));
+        );
     }
     if let Some(tokens) = app.cold_tokens().filter(|_| fork.is_none()) {
-        bar.push((
-            ALWAYS,
+        segment(
+            &mut bar,
             Span::styled(
-                format!("cache expired: /clear to save ~{} tokens ", compact(tokens)),
+                format!("cache expired: /clear to save ~{} tokens", compact(tokens)),
                 Style::new().fg(Color::Yellow),
             ),
-        ));
+        );
     }
     if let Some(found) = app.rate_limits {
-        bar.extend(limit_spans(&found).into_iter().map(|span| (ALWAYS, span)));
+        for span in limit_spans(&found) {
+            segment(&mut bar, span);
+        }
     }
     bar.push((
         HINT,
         Span::styled(
             match app.pending.is_some() {
-                true => "  y yes · n no · or click a choice",
+                true => "   y yes · n no · or click a choice",
                 // The rest of the keys live in /help rather than along the bar.
-                false => "  / for commands",
+                false => "   / for commands",
             },
             dim,
         ),
@@ -637,29 +645,45 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// `5h 42% (2h14m) · wk 17% (Fri 09:00) · credits 8.3k/10.0k `: each window's headroom
-/// and when it comes back, coloured by how close it is to its limit, then the credits
-/// left where there are some to count.
+/// A span on the bar, after a ` | ` when it is not the first.
+fn segment(bar: &mut Vec<(u8, Span<'static>)>, span: Span<'static>) {
+    if !bar.is_empty() {
+        bar.push((
+            ALWAYS,
+            Span::styled(" | ", Style::new().fg(Color::DarkGray)),
+        ));
+    }
+    bar.push((ALWAYS, span));
+}
+
+/// A context window's size as the bar names it: `272k`, `1M`, `262.1k`.
+fn size(tokens: u64) -> String {
+    compact(tokens).replace(".0", "")
+}
+
+/// `5h:42% resets@03:10`, `7d:17% resets@Fri 09:00`, `credits:8.3k/10.0k`: each
+/// window's use and the local time it comes back, coloured by how close it is to its
+/// limit, then the credits left where there are some to count. `5h:none` stands in for
+/// a short window the plan does not have.
 fn limit_spans(found: &RateLimits) -> Vec<Span<'static>> {
-    let dim = Style::new().fg(Color::DarkGray);
     let now = chrono::Local::now();
     let mut spans = Vec::new();
-    for (i, window) in found.windows().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("· ", dim));
-        }
-        let mut text = format!("{} {:.0}% ", window.label(), window.used_percent);
-        if let Some(left) = window.resets_in(now) {
-            text.push_str(&format!("({left}) "));
+    // A plan with no 5h cap says so, rather than leaving the reader to wonder.
+    if found.short().is_none() && found.long().is_some() {
+        spans.push(Span::styled("5h:none", Style::new().fg(Color::DarkGray)));
+    }
+    let mut windows: Vec<_> = found.windows().collect();
+    windows.sort_by_key(|w| w.window_minutes.unwrap_or(u64::MAX));
+    for window in windows {
+        let mut text = format!("{}:{:.0}%", window.label(), window.used_percent);
+        if let Some(at) = window.resets_at_clock(now) {
+            text.push_str(&format!(" resets@{at}"));
         }
         spans.push(Span::styled(text, headroom(window.used_percent)));
     }
     if let Some(credits) = found.credits.filter(|c| !c.unlimited) {
-        if !spans.is_empty() {
-            spans.push(Span::styled("· ", dim));
-        }
         spans.push(Span::styled(
-            format!("credits {} ", credits.amount()),
+            format!("credits:{}", credits.amount()),
             headroom(credits.used_percent().unwrap_or(0.0)),
         ));
     }
@@ -3439,6 +3463,14 @@ mod tests {
         }
     }
 
+    /// The local time the windows of [`window`] reset, as the bar prints it.
+    fn reset_clock(app: &App) -> String {
+        let found = app.rate_limits.unwrap();
+        let at = found.windows().next().unwrap().resets_at.unwrap();
+        let at = chrono::TimeZone::timestamp_opt(&chrono::Local, at, 0).unwrap();
+        at.format("%H:%M").to_string()
+    }
+
     /// The bottom row, which is the status bar.
     fn status(terminal: &Terminal<TestBackend>) -> String {
         screen(terminal).lines().next_back().unwrap().to_string()
@@ -3475,11 +3507,12 @@ mod tests {
             }));
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             let bar = status(&terminal);
-            // Each window says what is left of it and when it comes back.
-            let expected = format!("5h {used:.0}% (2h) · wk 17% (2h) ");
+            // Each window says how much of it is used and the time it comes back.
+            let at = reset_clock(&app);
+            let expected = format!("5h:{used:.0}% resets@{at} | 7d:17% resets@{at}");
             assert!(bar.contains(&expected), "{bar}");
-            assert_eq!(status_cell(&terminal, "5h ").fg, colour);
-            assert_eq!(status_cell(&terminal, "wk ").fg, Color::DarkGray);
+            assert_eq!(status_cell(&terminal, "5h:").fg, colour);
+            assert_eq!(status_cell(&terminal, "7d:").fg, Color::DarkGray);
         }
     }
 
@@ -3498,11 +3531,11 @@ mod tests {
         let bar = status(&wide);
         assert!(bar.contains("/ for commands"), "{bar}");
 
-        let mut narrow = Terminal::new(TestBackend::new(50, 10)).unwrap();
+        let mut narrow = Terminal::new(TestBackend::new(85, 10)).unwrap();
         narrow.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = status(&narrow);
         assert!(
-            bar.contains("on side ") && bar.contains("5h 8% (2h) "),
+            bar.contains(":side | ") && bar.contains(" | 5h:8% resets@"),
             "{bar}"
         );
         assert!(!bar.contains("for commands"), "{bar}");
@@ -3524,7 +3557,7 @@ mod tests {
         }));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = status(&terminal);
-        let expected = format!("wk 17% ({}) ", at.format("%a %H:%M"));
+        let expected = format!("5h:none | 7d:17% resets@{}", at.format("%a %H:%M"));
         assert!(bar.contains(&expected), "{bar}");
     }
 
@@ -3535,8 +3568,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = status(&terminal);
-        assert!(bar.contains("on side "), "{bar}");
-        assert!(!bar.contains("ctx "), "nothing read yet");
+        assert!(bar.contains(":side"), "{bar}");
+        assert!(!bar.contains("ctx:"), "nothing read yet");
 
         app.limits = crate::compact::Limits {
             window: Some(100_000),
@@ -3545,9 +3578,12 @@ mod tests {
         app.on_event(Event::Usage(usage(82_000, 0, 10, 0)));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = status(&terminal);
-        assert!(bar.contains("ctx 82% "), "{bar}");
+        assert!(
+            bar.contains("(100k context) | ") && bar.contains(" | ctx:82%"),
+            "{bar}"
+        );
         // Past the point compaction waits for, so it is not drawn as an idle number.
-        assert_eq!(status_cell(&terminal, "ctx ").fg, Color::Yellow);
+        assert_eq!(status_cell(&terminal, "ctx:").fg, Color::Yellow);
     }
 
     #[test]
@@ -3604,7 +3640,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         // No copy yet, so the bar is the full history's.
         assert!(
-            status(&terminal).contains(" ctx 50% "),
+            status(&terminal).contains(" ctx:50%"),
             "{}",
             status(&terminal)
         );
@@ -3612,13 +3648,13 @@ mod tests {
         session.on_agent(crate::agent::AgentEvent::Fork(Some(13_600)));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = status(&terminal);
-        assert!(bar.contains("fork ctx 5% "), "{bar}");
+        assert!(bar.contains("fork ctx:5%"), "{bar}");
         assert!(bar.contains("fork uncached: ~13.6k tokens"), "{bar}");
 
         app.input.set("go on".to_string());
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = status(&terminal);
-        assert!(bar.contains(" ctx 50% ") && !bar.contains("fork"), "{bar}");
+        assert!(bar.contains(" ctx:50%") && !bar.contains("fork"), "{bar}");
     }
 
     #[test]

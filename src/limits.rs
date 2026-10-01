@@ -32,6 +32,9 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// When the last usage fetch was started, unix seconds.
 static LAST_FETCH: AtomicI64 = AtomicI64::new(0);
 
+/// A day in minutes, where a window stops being the short one.
+const DAY: u64 = 24 * 60;
+
 /// The latest usage of each limit window.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct RateLimits {
@@ -174,16 +177,31 @@ impl RateLimits {
     pub fn windows(&self) -> impl Iterator<Item = Window> {
         [self.primary, self.secondary].into_iter().flatten()
     }
+
+    /// The window shorter than a day. Primary is not always it: a plan with no 5h cap
+    /// sends its weekly window as primary and no secondary.
+    pub fn short(&self) -> Option<Window> {
+        self.windows()
+            .find(|w| w.window_minutes.is_some_and(|m| m < DAY))
+            .or(self.primary.filter(|w| w.window_minutes.is_none()))
+    }
+
+    /// The window a day or longer.
+    pub fn long(&self) -> Option<Window> {
+        self.windows()
+            .find(|w| w.window_minutes.is_some_and(|m| m >= DAY))
+            .or(self.secondary.filter(|w| w.window_minutes.is_none()))
+    }
 }
 
 impl Window {
-    /// A short name for the window's length: `5h`, `wk`, `90m`, `24h`.
+    /// A short name for the window's length: `5h`, `7d`, `90m`, `24h`.
     pub fn label(&self) -> String {
         match self.window_minutes {
             None => "?".to_string(),
             Some(m) if m <= 300 && m % 60 != 0 => format!("{m}m"),
             Some(m) if m <= 300 => format!("{}h", m / 60),
-            Some(10080) => "wk".to_string(),
+            Some(m) if m > DAY && m % DAY == 0 => format!("{}d", m / DAY),
             Some(m) if m % 60 == 0 => format!("{}h", m / 60),
             Some(m) => format!("{m}m"),
         }
@@ -194,6 +212,16 @@ impl Window {
     /// what a count of hours stops saying anything about.
     pub fn resets_in(&self, now: DateTime<Local>) -> Option<String> {
         until(self.resets_at?, now)
+    }
+
+    /// The local time the window resets: `03:10`, or `Sat 05:30` past a day off.
+    pub fn resets_at_clock(&self, now: DateTime<Local>) -> Option<String> {
+        let at = Local.timestamp_opt(self.resets_at?, 0).single()?;
+        Some(match (at - now).num_minutes() {
+            ..=0 => "now".to_string(),
+            m if m < DAY as i64 => at.format("%H:%M").to_string(),
+            _ => at.format("%a %H:%M").to_string(),
+        })
     }
 }
 
@@ -514,10 +542,54 @@ mod tests {
         };
         assert_eq!(label(Some(300)), "5h");
         assert_eq!(label(Some(90)), "90m");
-        assert_eq!(label(Some(10080)), "wk");
+        assert_eq!(label(Some(10080)), "7d");
         assert_eq!(label(Some(1440)), "24h");
         assert_eq!(label(Some(1000)), "1000m");
         assert_eq!(label(None), "?");
+    }
+
+    #[test]
+    fn the_short_and_long_windows_go_by_length_not_slot() {
+        let w = |m| Window {
+            used_percent: 0.0,
+            window_minutes: Some(m),
+            resets_at: None,
+        };
+        let both = RateLimits {
+            primary: Some(w(300)),
+            secondary: Some(w(10080)),
+            credits: None,
+        };
+        assert_eq!(both.short(), Some(w(300)));
+        assert_eq!(both.long(), Some(w(10080)));
+        // A plan with no 5h cap sends its week as primary.
+        let week_only = RateLimits {
+            primary: Some(w(10080)),
+            ..RateLimits::default()
+        };
+        assert_eq!(week_only.short(), None);
+        assert_eq!(week_only.long(), Some(w(10080)));
+    }
+
+    #[test]
+    fn a_reset_reads_as_a_clock_time() {
+        let now = Local
+            .timestamp_opt(Local::now().timestamp(), 0)
+            .single()
+            .unwrap();
+        let at = |m: i64| {
+            Window {
+                used_percent: 0.0,
+                window_minutes: None,
+                resets_at: Some((now + chrono::TimeDelta::minutes(m)).timestamp()),
+            }
+            .resets_at_clock(now)
+        };
+        let soon = now + chrono::TimeDelta::minutes(134);
+        assert_eq!(at(134), Some(soon.format("%H:%M").to_string()));
+        let later = now + chrono::TimeDelta::days(3);
+        assert_eq!(at(3 * 24 * 60), Some(later.format("%a %H:%M").to_string()));
+        assert_eq!(at(-5).as_deref(), Some("now"));
     }
 
     #[test]
@@ -595,7 +667,7 @@ mod tests {
                 resets_at: Some(2000),
             })
         );
-        assert_eq!(limits.secondary.unwrap().label(), "wk");
+        assert_eq!(limits.secondary.unwrap().label(), "7d");
         assert_eq!(limits.secondary.unwrap().resets_at, Some(7000));
         let credits = limits.credits.unwrap();
         assert_eq!(

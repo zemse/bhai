@@ -60,7 +60,7 @@ pub const VARIABLES: &[(&str, &str)] = &[
     ),
     (
         "limits",
-        "every rate-limit window with its reset, as `5h 42% (2h14m) · wk 17% (Fri 09:00)`",
+        "every rate-limit window with its reset, as `5h:42% resets@03:10 | 7d:17% resets@Fri 09:00`",
     ),
     ("limit_5h", "the shorter rate-limit window used, as `42%`"),
     ("reset_5h", "when it resets, as `2h14m`"),
@@ -534,8 +534,8 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
     let now = chrono::Local::now();
     set("limits", all_limits(&limits, now));
     for (window, used, reset) in [
-        (limits.primary, "limit_5h", "reset_5h"),
-        (limits.secondary, "limit_week", "reset_week"),
+        (limits.short(), "limit_5h", "reset_5h"),
+        (limits.long(), "limit_week", "reset_week"),
     ] {
         set(
             used,
@@ -604,20 +604,26 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
     values
 }
 
-/// `5h 42% (2h14m) · wk 17% (Fri 09:00)`, in the colour of the window closest to its limit.
+/// `5h:42% resets@03:10 | 7d:17% resets@Fri 09:00`, in the colour of the window closest
+/// to its limit; `5h:none` where the plan has only the long window.
 fn all_limits(found: &RateLimits, now: chrono::DateTime<chrono::Local>) -> Value {
     let mut parts = Vec::new();
     let mut worst: f64 = 0.0;
-    for window in found.windows() {
+    if found.short().is_none() && found.long().is_some() {
+        parts.push("5h:none".to_string());
+    }
+    let mut windows: Vec<_> = found.windows().collect();
+    windows.sort_by_key(|w| w.window_minutes.unwrap_or(u64::MAX));
+    for window in windows {
         worst = worst.max(window.used_percent);
-        let mut text = format!("{} {:.0}%", window.label(), window.used_percent);
-        if let Some(left) = window.resets_in(now) {
-            text.push_str(&format!(" ({left})"));
+        let mut text = format!("{}:{:.0}%", window.label(), window.used_percent);
+        if let Some(at) = window.resets_at_clock(now) {
+            text.push_str(&format!(" resets@{at}"));
         }
         parts.push(text);
     }
     Value {
-        text: parts.join(" · "),
+        text: parts.join(" | "),
         alert: warning(worst),
     }
 }
