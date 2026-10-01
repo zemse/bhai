@@ -521,18 +521,21 @@ impl Client {
         }
         // A token near expiry is refreshed over the network, which is another wait an
         // interrupt has to be able to end.
-        let auth = unless_cancelled(auth::load(&self.http), cancel)
+        let mut auth = unless_cancelled(auth::load(&self.http), cancel)
             .await
             .ok_or(Error::Interrupted)?
             .map_err(Error::Fatal)?;
 
-        let resp = watched(
-            self.request(&auth, body).send(),
-            cancel,
-            "request timed out",
-        )
-        .await?
-        .map_err(|e| Error::Retryable(anyhow!("request failed: {e}")))?;
+        let mut resp = self.send(&auth, body, cancel).await?;
+        // A token revoked early or rotated by another process is not near expiry, so
+        // `load` sent it. Once per call: a second 401 is a real refusal.
+        if resp.status().as_u16() == 401 {
+            auth = unless_cancelled(auth::recover(&self.http, &auth), cancel)
+                .await
+                .ok_or(Error::Interrupted)?
+                .map_err(Error::Fatal)?;
+            resp = self.send(&auth, body, cancel).await?;
+        }
 
         // A debug aid only; a failed write must not fail the call or draw over the TUI.
         if let Some(path) = &self.header_log {
@@ -683,6 +686,17 @@ impl Client {
                 "stream ended before response.completed"
             )))
         }
+    }
+
+    async fn send(
+        &self,
+        auth: &Auth,
+        body: &Value,
+        cancel: &Arc<AtomicBool>,
+    ) -> std::result::Result<reqwest::Response, Error> {
+        watched(self.request(auth, body).send(), cancel, "request timed out")
+            .await?
+            .map_err(|e| Error::Retryable(anyhow!("request failed: {e}")))
     }
 
     fn request(&self, auth: &Auth, body: &Value) -> reqwest::RequestBuilder {

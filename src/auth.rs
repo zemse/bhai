@@ -59,14 +59,27 @@ pub async fn load(http: &reqwest::Client) -> Result<Auth> {
     })?;
 
     let doc = match expires_within(&access, REFRESH_SLACK_SECS) {
-        true => refresh(http, &path).await?,
+        true => refresh(http, &path, None).await?,
         false => doc,
     };
+    auth_from(&doc)
+}
 
-    let access_token = str_at(&doc, &["tokens", "access_token"])
+/// Credentials after the server answered 401 to `rejected`. A token revoked before its
+/// `exp`, or rotated by another process, is not near expiry, so [`load`] would hand it
+/// back. If `auth.json` already holds a different token that is the answer; otherwise the
+/// refresh is forced.
+pub async fn recover(http: &reqwest::Client, rejected: &Auth) -> Result<Auth> {
+    let path = auth_path()?;
+    let doc = refresh(http, &path, Some(&rejected.access_token)).await?;
+    auth_from(&doc)
+}
+
+fn auth_from(doc: &Value) -> Result<Auth> {
+    let access_token = str_at(doc, &["tokens", "access_token"])
         .ok_or_else(|| anyhow!("no access_token after refresh"))?;
-    let account_id = str_at(&doc, &["tokens", "account_id"])
-        .or_else(|| str_at(&doc, &["tokens", "id_token"]).and_then(|jwt| account_id_from(&jwt)));
+    let account_id = str_at(doc, &["tokens", "account_id"])
+        .or_else(|| str_at(doc, &["tokens", "id_token"]).and_then(|jwt| account_id_from(&jwt)));
 
     Ok(Auth {
         access_token,
@@ -87,8 +100,8 @@ fn read_doc(path: &Path) -> Result<Value> {
 /// Refresh the tokens in `path` and return the file as it now stands. Held under
 /// [`REFRESHING`], and the file is re-read inside the lock so a caller that queued
 /// behind another's refresh takes its result instead of spending the token again.
-async fn refresh(http: &reqwest::Client, path: &Path) -> Result<Value> {
-    refresh_with(path, |token| exchange(http, token)).await
+async fn refresh(http: &reqwest::Client, path: &Path, rejected: Option<&str>) -> Result<Value> {
+    refresh_with(path, rejected, |token| exchange(http, token)).await
 }
 
 /// What the token endpoint answered, when it answered at all.
@@ -100,8 +113,9 @@ enum Exchange {
 /// [`refresh`] with the call to the token endpoint passed in. The lock is per process,
 /// so the `codex` CLI or another bhai can spend the refresh token between our read and
 /// the server's answer; a refusal then finds a different refresh token in the file, and
-/// that file is the rotation to adopt.
-async fn refresh_with<F, Fut>(path: &Path, exchange: F) -> Result<Value>
+/// that file is the rotation to adopt. With `rejected` set the token is refreshed whatever
+/// its expiry says, unless the file no longer holds that token.
+async fn refresh_with<F, Fut>(path: &Path, rejected: Option<&str>, exchange: F) -> Result<Value>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<Exchange>>,
@@ -112,7 +126,11 @@ where
         .await;
     let mut doc = read_doc(path)?;
     let access = str_at(&doc, &["tokens", "access_token"]).unwrap_or_default();
-    if !expires_within(&access, REFRESH_SLACK_SECS) {
+    let stale = match rejected {
+        Some(rejected) => access == rejected,
+        None => expires_within(&access, REFRESH_SLACK_SECS),
+    };
+    if !stale {
         return Ok(doc);
     }
     let refresh_token = str_at(&doc, &["tokens", "refresh_token"])
@@ -361,7 +379,7 @@ mod tests {
         let (dir, path) = auth_file(&jwt_expiring_in(-60), "rt-old");
         let fresh = jwt_expiring_in(3600);
 
-        let doc = refresh_with(&path, |sent| {
+        let doc = refresh_with(&path, None, |sent| {
             assert_eq!(sent, "rt-old");
             let fresh = fresh.clone();
             async move {
@@ -387,7 +405,7 @@ mod tests {
             .to_string();
 
         // The `codex` CLI spends the token and writes its rotation while ours is in flight.
-        let doc = refresh_with(&path, |_| {
+        let doc = refresh_with(&path, None, |_| {
             std::fs::write(&path, &rotated).unwrap();
             async {
                 Ok(Exchange::Refused {
@@ -410,7 +428,7 @@ mod tests {
         let (dir, path) = auth_file(&jwt_expiring_in(-60), "rt-old");
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let err = refresh_with(&path, |_| async {
+        let err = refresh_with(&path, None, |_| async {
             Ok(Exchange::Refused {
                 status: 401,
                 body: r#"{"error":"refresh_token_reused"}"#.to_string(),
@@ -420,6 +438,46 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("already spent"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_refreshed_though_it_is_not_near_expiry() {
+        let live = jwt_expiring_in(3600);
+        let (dir, path) = auth_file(&live, "rt-old");
+        let fresh = jwt_expiring_in(7200);
+
+        let doc = refresh_with(&path, Some(&live), |sent| {
+            assert_eq!(sent, "rt-old");
+            let fresh = fresh.clone();
+            async move {
+                Ok(Exchange::Tokens(
+                    json!({ "access_token": fresh, "refresh_token": "rt-new" }),
+                ))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(token(&doc, "access_token"), Some(fresh));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_the_file_has_moved_past_is_not_refreshed() {
+        let (dir, path) = auth_file(&jwt_expiring_in(3600), "rt-theirs");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let doc = refresh_with(&path, Some("the-rejected-one"), |_| async {
+            panic!("the refresh token must not be spent again");
+            #[allow(unreachable_code)]
+            Ok(Exchange::Tokens(json!({})))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(token(&doc, "refresh_token").as_deref(), Some("rt-theirs"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         std::fs::remove_dir_all(&dir).unwrap();
     }
