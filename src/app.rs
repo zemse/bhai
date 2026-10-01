@@ -299,8 +299,14 @@ pub struct App {
     /// Its answer, once the task it runs on has one.
     designing: Option<Designed>,
     pub quit: bool,
+    /// When a first quit key was pressed; a second one within `QUIT_WINDOW` quits.
+    quit_armed: Option<Instant>,
+    /// The draft ctrl+c last cleared, which ctrl+z puts back.
+    cleared: Option<String>,
     session: Arc<Session>,
 }
+
+const QUIT_WINDOW: Duration = Duration::from_secs(1);
 
 impl App {
     pub fn new(session: Arc<Session>) -> Self {
@@ -379,6 +385,8 @@ impl App {
             designer: None,
             designing: None,
             quit: false,
+            quit_armed: None,
+            cleared: None,
             session,
         }
     }
@@ -490,11 +498,26 @@ impl App {
             KeyCode::Char('c') if ctrl => {
                 if self.busy() {
                     self.interrupt();
+                } else if !self.input.is_empty() {
+                    self.cleared = Some(self.input.take());
+                } else {
+                    self.confirm_quit();
+                }
+            }
+            KeyCode::Char('d') if ctrl && self.input.is_empty() => {
+                if self.busy() {
+                    self.confirm_quit();
                 } else {
                     self.quit = true;
                 }
             }
-            KeyCode::Char('d') if ctrl && self.input.is_empty() => self.quit = true,
+            KeyCode::Char('z') if ctrl => {
+                if let Some(draft) = self.cleared.take()
+                    && self.input.is_empty()
+                {
+                    self.input.set(draft);
+                }
+            }
             // The panel's rows, in order, and then back out to the transcript.
             KeyCode::Char('o') if ctrl => self.cycle_child(),
             KeyCode::Esc if self.inside.is_some() => self.leave_child(),
@@ -2036,6 +2059,19 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
 
     /// Whether there is anything to stop: a turn, or a child still running after the
     /// turn that started it has ended.
+    /// Quit on the second call within `QUIT_WINDOW`; the first only says so.
+    fn confirm_quit(&mut self) {
+        let now = Instant::now();
+        match self.quit_armed {
+            Some(at) if now.duration_since(at) <= QUIT_WINDOW => self.quit = true,
+            _ => {
+                self.quit_armed = Some(now);
+                self.follow = true;
+                self.note(Entry::Info("press again to quit".to_string()));
+            }
+        }
+    }
+
     fn busy(&self) -> bool {
         self.working || self.session.child_running()
     }
@@ -3295,6 +3331,51 @@ mod tests {
         let mut app = App::detached();
         app.trust_gate = gate();
         app.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn ctrl_c_clears_a_draft_and_quits_on_a_second_press() {
+        let ctrl = |c| key(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut app = App::detached();
+        type_text(&mut app, "half a thought");
+        app.on_key(ctrl('c'));
+        assert!(!app.quit);
+        assert_eq!(app.input.value(), "");
+        // ctrl+z puts it back, once.
+        app.on_key(ctrl('z'));
+        assert_eq!(app.input.value(), "half a thought");
+        app.on_key(ctrl('z'));
+        assert_eq!(app.input.value(), "half a thought");
+
+        // Empty: the first press only arms, the second inside the window quits.
+        app.on_key(ctrl('c'));
+        assert_eq!(app.input.value(), "");
+        app.on_key(ctrl('c'));
+        assert!(!app.quit);
+        app.on_key(ctrl('c'));
+        assert!(app.quit);
+
+        // Outside the window it arms again.
+        let mut app = App::detached();
+        app.on_key(ctrl('c'));
+        app.quit_armed = Some(Instant::now() - QUIT_WINDOW * 2);
+        app.on_key(ctrl('c'));
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn ctrl_d_quits_at_once_when_idle_and_asks_mid_turn() {
+        let ctrl_d = key(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let mut app = App::detached();
+        app.on_key(ctrl_d);
+        assert!(app.quit);
+
+        let mut app = App::detached();
+        app.working = true;
+        app.on_key(ctrl_d);
+        assert!(!app.quit);
+        app.on_key(ctrl_d);
         assert!(app.quit);
     }
 
