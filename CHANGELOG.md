@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A test runs /export-debug in a child process with a fake auth.json (via CODEX_HOME) and a secret env var, and checks that neither credential reaches the written file.
 - `POST /approve` and `POST /reject` take an optional `id` (the approval's id from `/state` or `/events`); an approval other than that one is left unanswered and the request is a 409. Every `/events` frame carries an SSE `id:` counting the events since the connection opened, those a lagging consumer missed included, so a jump in it is a gap.
 - `BHAI_MODE=ask|auto` sets the permission mode for a run where `--mode` is not given, over the config file's `permission_mode`; `--mode` still wins. `BHAI_MODE=bypass` is refused with an error, so the environment cannot turn the safeties off. `BHAI_MODEL` and `BHAI_EFFORT` already worked the same way.
 - Esc while busy asks "esc again to interrupt" and only interrupts on a second press within a second; ctrl+c still interrupts at once.

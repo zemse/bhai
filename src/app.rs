@@ -2639,6 +2639,67 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The export reads no auth file and no environment. Setting either in this process
+    /// would need `set_var`, so the test runs itself again as a child with `CODEX_HOME`
+    /// at a seeded auth.json and a secret in its environment, and the child checks the
+    /// file it writes from a bundle gathered the way `/export-debug` gathers it.
+    #[test]
+    fn credentials_in_auth_json_and_the_environment_stay_out_of_the_export() {
+        const NAME: &str = "credentials_in_auth_json_and_the_environment_stay_out_of_the_export";
+        let Ok(secret) = std::env::var("BHAI_TEST_SECRET_TOKEN") else {
+            let codex = std::env::temp_dir().join(format!("bhai-codex-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&codex).unwrap();
+            std::fs::write(
+                codex.join("auth.json"),
+                r#"{"tokens":{"access_token":"auth-json-access-7f3a91c2d4e8","refresh_token":"auth-json-refresh-0b6e52f1a9c7"}}"#,
+            )
+            .unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &format!("app::tests::{NAME}"), "--nocapture"])
+                .env("CODEX_HOME", &codex)
+                .env("BHAI_TEST_SECRET_TOKEN", "env-secret-token-58d0c3e7b2a4")
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(&codex).unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        };
+        let codex = crate::auth::codex_home().unwrap();
+        let auth = std::fs::read_to_string(codex.join("auth.json")).unwrap();
+        assert!(
+            auth.contains("auth-json-access-7f3a91c2d4e8"),
+            "the seed is what auth reads"
+        );
+
+        let (mut app, _user, _control) = connected();
+        app.session_id = "abc123".to_string();
+        let held = crate::auth::Auth {
+            access_token: "auth-json-access-7f3a91c2d4e8".to_string(),
+            account_id: Some("acct".to_string()),
+        };
+        app.entries().push(Entry::Output(format!("{held:?}")));
+        let bundle = app.debug_bundle();
+        let dir = std::env::temp_dir().join(format!("bhai-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = crate::debug::export(&bundle, &dir).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert!(text.contains("<redacted>"), "{text}");
+        for leaked in [
+            "auth-json-access-7f3a91c2d4e8",
+            "auth-json-refresh-0b6e52f1a9c7",
+            &secret,
+        ] {
+            assert!(!text.contains(leaked), "{leaked} is in the export");
+        }
+    }
+
     #[tokio::test]
     async fn model_on_its_own_opens_the_picker() {
         let (mut app, _user, _control) = connected();
