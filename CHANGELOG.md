@@ -6,6 +6,8 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `bypass` no longer prints an `auto-allowed: <call> (bypass mode)` line under every
+  call it lets through. `ask` and `auto` still say which rule allowed one.
 - A selection over an assistant message copies the markdown that drew it: a heading
   with its `#`s, a list item with its bullet, part of a bold run or a link as the whole
   of it. A table cut across rows, or a code block a selection runs out of, comes whole,

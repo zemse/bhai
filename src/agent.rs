@@ -1882,7 +1882,8 @@ async fn execute(
                     false => &reason,
                 },
             );
-            if tool.needs_approval() {
+            // In `bypass` every call is allowed, so the line would say only that.
+            if tool.needs_approval() && policy.mode() != Mode::Bypass {
                 let _ = tx.send(AgentEvent::Info(format!(
                     "auto-allowed: {summary} ({reason})"
                 )));
