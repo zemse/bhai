@@ -514,13 +514,13 @@ impl Judge {
             let elapsed = started.elapsed();
             match answered {
                 Ok((answer, usage)) => {
-                    add(&mut spent, usage);
+                    spent += usage;
                     self.record(&request, Some(&answer), "", usage, elapsed);
                     verdict = Some(answer);
                     break;
                 }
                 Err(e) => {
-                    add(&mut spent, e.usage());
+                    spent += e.usage();
                     self.record(&request, None, &e.to_string(), e.usage(), elapsed);
                     misshapen += usize::from(matches!(e, Failed::Shape { .. }));
                     // Fail closed: only a misshapen answer is worth asking again for, and
@@ -557,10 +557,7 @@ impl Judge {
     }
 
     fn spend(&self, usage: Usage) {
-        add(
-            &mut self.total.lock().unwrap_or_else(|e| e.into_inner()),
-            usage,
-        );
+        *self.total.lock().unwrap_or_else(|e| e.into_inner()) += usage;
     }
 
     /// Append one JSONL line; a failed write must never fail the call.
@@ -987,13 +984,6 @@ fn clip(text: &str, max: usize) -> String {
     }
 }
 
-fn add(total: &mut Usage, usage: Usage) {
-    total.input += usage.input;
-    total.cached += usage.cached;
-    total.output += usage.output;
-    total.reasoning += usage.reasoning;
-}
-
 /// A scripted judge for tests.
 #[cfg(test)]
 pub mod fake {
@@ -1047,6 +1037,7 @@ pub mod fake {
                 let usage = Usage {
                     input: 700,
                     cached: 600,
+                    cache_write: 0,
                     output: 12,
                     reasoning: 0,
                 };

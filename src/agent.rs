@@ -1515,7 +1515,7 @@ async fn turn(
                     };
                     if let Some(path) = usage_log
                         && let Err(e) =
-                            profile::log_usage(path, &usage, &hit, sent, stalls.as_ref())
+                            profile::log_usage(path, Some(&usage), &hit, sent, stalls.as_ref())
                     {
                         let _ = tx.send(AgentEvent::Error(format!("usage log: {e:#}")));
                     }
@@ -1571,6 +1571,15 @@ async fn turn(
                 };
             }
         };
+        // A call that completed without a usage block is logged as unknown, and leaves
+        // the last call's counts, which the compaction trigger reads, where they were.
+        if finished.is_none()
+            && stalls.is_some()
+            && let Some(path) = usage_log
+            && let Err(e) = profile::log_usage(path, None, &Hit::default(), sent, stalls.as_ref())
+        {
+            let _ = tx.send(AgentEvent::Error(format!("usage log: {e:#}")));
+        }
         if let Some(usage) = finished {
             let call = Call {
                 usage,
@@ -2053,7 +2062,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
         while let Some(event) = rx_child.recv().await {
             let event = match event {
                 AgentEvent::Usage(u) => {
-                    add_usage(&mut usage, u);
+                    usage += u;
                     attribute(child.children, child.id, u);
                     AgentEvent::ChildUsage(u)
                 }
@@ -2181,13 +2190,6 @@ pub async fn run_child(child: Child<'_>) -> Finished {
         usage,
         result,
     }
-}
-
-fn add_usage(total: &mut Usage, usage: Usage) {
-    total.input += usage.input;
-    total.cached += usage.cached;
-    total.output += usage.output;
-    total.reasoning += usage.reasoning;
 }
 
 fn attribute(children: &Children, id: &str, usage: Usage) {
@@ -2605,6 +2607,8 @@ pub mod fake {
     pub const REFUSE: &str = "fake.refuse";
     /// Leads a script step that ends on `end_turn: false`.
     pub const CONTINUES: &str = "fake.continues";
+    /// Leads a script step whose call completes with no usage block.
+    pub const UNMETERED: &str = "fake.unmetered";
 
     /// Answers each call with the next scripted output and remembers the tool names
     /// every call was offered. Each call's request body is built and checked as the
@@ -2710,6 +2714,7 @@ pub mod fake {
     pub const USAGE: Usage = Usage {
         input: 10,
         cached: 4,
+        cache_write: 0,
         output: 2,
         reasoning: 0,
     };
@@ -2792,6 +2797,11 @@ pub mod fake {
                     false => self.script.lock().unwrap().pop_front(),
                 };
                 let mut next = next.ok_or_else(|| anyhow!("the script ran out"))?;
+                let unmetered =
+                    next.first().and_then(|item| item["type"].as_str()) == Some(UNMETERED);
+                if unmetered {
+                    next.remove(0);
+                }
                 let continues =
                     next.first().and_then(|item| item["type"].as_str()) == Some(CONTINUES);
                 if continues {
@@ -2819,7 +2829,10 @@ pub mod fake {
                     }
                     _ => {}
                 }
-                on_delta(Delta::Usage(self.usage));
+                on_delta(Delta::Stalls(crate::client::Stalls::default()));
+                if !unmetered {
+                    on_delta(Delta::Usage(self.usage));
+                }
                 if continues {
                     on_delta(Delta::Continues);
                 }
@@ -3738,6 +3751,68 @@ mod tests {
 
     /// Everything the loop says until the next turn ends, for a turn nobody started:
     /// the one a detached child's report opens.
+    #[tokio::test]
+    async fn a_call_with_no_usage_is_logged_as_unknown_and_counts_nothing() {
+        use crate::permissions::Rules;
+        use fake::{Fake, say};
+
+        let dir = tools::temp_dir();
+        let log = dir.join("usage.jsonl");
+        let mut unmetered = fake::step(fake::UNMETERED);
+        unmetered.push(say("no usage"));
+        let fake = Fake::new(vec![unmetered, vec![say("metered")]]);
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            SystemPrompt::default(),
+            Arc::new(Policy::new(
+                Mode::Bypass,
+                Rules::default(),
+                None,
+                dir.clone(),
+            )),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::new(Cancel::default()),
+            Some(log.clone()),
+            None,
+            None,
+            Limits::default(),
+        ));
+        tx_user.send("one".to_string()).await.unwrap();
+        let events = settle(&mut rx).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Usage(_))),
+            "{events:?}"
+        );
+        tx_user.send("two".to_string()).await.unwrap();
+        let events = settle(&mut rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Usage(u) if *u == fake::USAGE)),
+            "{events:?}"
+        );
+
+        let lines: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0]["input"].is_null(), "{}", lines[0]);
+        assert!(lines[0]["stalls"].is_object(), "{}", lines[0]);
+        assert_eq!(lines[1]["input"], fake::USAGE.input);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     async fn settle(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {

@@ -1669,6 +1669,7 @@ mod tests {
         Usage {
             input,
             cached,
+            cache_write: 0,
             output,
             reasoning,
         }
@@ -3414,6 +3415,7 @@ mod tests {
         goal.charge(&Usage {
             input: 12_000,
             cached: 2_000,
+            cache_write: 0,
             output: 500,
             reasoning: 0,
         });

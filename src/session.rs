@@ -265,6 +265,7 @@ pub struct State {
     pub queued: Vec<String>,
     pub input_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_write_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     /// Model calls finished, children not included.
@@ -533,6 +534,7 @@ impl Session {
             queued: inner.queue.iter().map(Waiting::shown).collect(),
             input_tokens: inner.total.input,
             cached_tokens: inner.total.cached,
+            cache_write_tokens: inner.total.cache_write,
             output_tokens: inner.total.output,
             reasoning_tokens: inner.total.reasoning,
             calls: inner.calls,
@@ -1058,13 +1060,13 @@ impl Session {
                 reason,
             },
             AgentEvent::Usage(usage) => {
-                add(&mut inner.total, usage);
+                inner.total += usage;
                 inner.last_usage = Some(usage);
                 inner.last_call = Some(inner.sending.take().unwrap_or_else(Instant::now));
                 Event::Usage(usage)
             }
             AgentEvent::ChildUsage(usage) => {
-                add(&mut inner.children, usage);
+                inner.children += usage;
                 Event::ChildUsage(usage)
             }
             AgentEvent::ChildStarted {
@@ -1428,13 +1430,6 @@ fn said(event: AgentEvent) -> Option<Event> {
 pub fn compact_then(text: &str) -> Option<&str> {
     let rest = text.trim_start().strip_prefix("/compact-then")?;
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
-}
-
-fn add(total: &mut Usage, usage: Usage) {
-    total.input += usage.input;
-    total.cached += usage.cached;
-    total.output += usage.output;
-    total.reasoning += usage.reasoning;
 }
 
 /// Watch the agent's task and say so if it stopped on a panic. Nothing else reports it:
@@ -2276,6 +2271,7 @@ mod tests {
         let usage = |input, cached, output, reasoning| Usage {
             input,
             cached,
+            cache_write: input - cached,
             output,
             reasoning,
         };
@@ -2284,6 +2280,7 @@ mod tests {
         let state = session.state();
         assert_eq!((state.input_tokens, state.output_tokens), (7, 3));
         assert_eq!((state.cached_tokens, state.reasoning_tokens), (2, 1));
+        assert_eq!(state.cache_write_tokens, 5);
         assert_eq!(state.last_usage, Some(usage(4, 2, 2, 0)));
         session.on_agent(AgentEvent::Call(CallTokens::default()));
         assert_eq!(session.state().calls, 1);
@@ -2305,6 +2302,7 @@ mod tests {
         let usage = |input, cached| Usage {
             input,
             cached,
+            cache_write: 0,
             output: 5,
             reasoning: 0,
         };

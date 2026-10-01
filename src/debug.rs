@@ -377,6 +377,7 @@ mod tests {
                 queued: Vec::new(),
                 input_tokens: 400,
                 cached_tokens: 300,
+                cache_write_tokens: 0,
                 output_tokens: 20,
                 reasoning_tokens: 5,
                 calls: 2,

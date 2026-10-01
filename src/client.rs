@@ -169,7 +169,8 @@ pub enum Delta {
     /// Text of a message in the `commentary` phase: a preamble the model writes before
     /// it carries on, not its answer.
     Commentary(String),
-    /// How the call's stream paced itself, sent just before its [`Delta::Usage`].
+    /// How the call's stream paced itself, sent when it completes and just before its
+    /// [`Delta::Usage`], which a call that reported no usage does not send.
     Stalls(Stalls),
     Usage(Usage),
     /// The request about to be sent breaks the prompt cache, or `None` when it is clean.
@@ -198,6 +199,8 @@ pub struct Usage {
     pub input: u64,
     /// Input tokens served from the prompt cache.
     pub cached: u64,
+    /// Input tokens written to the prompt cache, where the backend reports them.
+    pub cache_write: u64,
     pub output: u64,
     /// Output tokens spent on reasoning.
     pub reasoning: u64,
@@ -210,25 +213,38 @@ impl Usage {
         self.cached = self.cached.min(self.input);
     }
 
-    /// Read the counts from a `response.completed` event; missing fields count as zero.
-    pub fn from_completed(event: &Value) -> Self {
+    /// Read the counts from a `response.completed` event. A missing field counts as zero,
+    /// but a missing usage block is `None`: that call's cost is unknown, not free.
+    pub fn from_completed(event: &Value) -> Option<Self> {
+        let usage = event.pointer("/response/usage").filter(|u| u.is_object())?;
         let count = |path: &str| {
-            event
-                .pointer(&format!("/response/usage/{path}"))
+            usage
+                .pointer(&format!("/{path}"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
         };
-        Self {
+        Some(Self {
             input: count("input_tokens"),
             cached: count("input_tokens_details/cached_tokens"),
+            cache_write: count("input_tokens_details/cache_write_tokens"),
             output: count("output_tokens"),
             reasoning: count("output_tokens_details/reasoning_tokens"),
-        }
+        })
     }
 
     /// Percent of the input that was a cache hit, when there was any input.
     pub fn cache_rate(&self) -> Option<f64> {
         (self.input > 0).then(|| self.cached as f64 * 100.0 / self.input as f64)
+    }
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, other: Self) {
+        self.input += other.input;
+        self.cached += other.cached;
+        self.cache_write += other.cache_write;
+        self.output += other.output;
+        self.reasoning += other.reasoning;
     }
 }
 
@@ -825,7 +841,7 @@ impl Client {
                         {
                             items = output.clone();
                         }
-                        usage = Some(Usage::from_completed(&event));
+                        usage = Usage::from_completed(&event);
                     }
                     // The same token in band, as the WebSocket transport carries it.
                     "response.metadata" if routed => {
@@ -858,8 +874,8 @@ impl Client {
         }
 
         if completed {
+            on_delta(Delta::Stalls(gaps.stalls()));
             if let Some(usage) = usage {
-                on_delta(Delta::Stalls(gaps.stalls()));
                 on_delta(Delta::Usage(usage));
             }
             if continues {
@@ -1267,12 +1283,13 @@ mod tests {
                 "total_tokens":1280}}}"#,
         )
         .unwrap();
-        let usage = Usage::from_completed(&event);
+        let usage = Usage::from_completed(&event).unwrap();
         assert_eq!(
             usage,
             Usage {
                 input: 1200,
                 cached: 900,
+                cache_write: 0,
                 output: 80,
                 reasoning: 64,
             }
@@ -1465,9 +1482,28 @@ mod tests {
     }
 
     #[test]
-    fn missing_usage_counts_as_zero() {
-        let usage = Usage::from_completed(&json!({"type": "response.completed"}));
+    fn a_missing_usage_block_is_unknown_and_a_missing_field_is_zero() {
+        for usage in [json!(null), json!("n/a")] {
+            let event = json!({"type": "response.completed", "response": {"usage": usage}});
+            assert_eq!(Usage::from_completed(&event), None);
+        }
+        assert_eq!(
+            Usage::from_completed(&json!({"type": "response.completed"})),
+            None
+        );
+        let usage =
+            Usage::from_completed(&json!({"response": {"usage": {"input_tokens": 0}}})).unwrap();
         assert_eq!(usage, Usage::default());
         assert_eq!(usage.cache_rate(), None);
+    }
+
+    #[test]
+    fn cache_writes_are_read_when_sent() {
+        let event = json!({"response": {"usage": {
+            "input_tokens": 1000,
+            "input_tokens_details": {"cached_tokens": 200, "cache_write_tokens": 800},
+        }}});
+        let usage = Usage::from_completed(&event).unwrap();
+        assert_eq!((usage.cached, usage.cache_write), (200, 800));
     }
 }

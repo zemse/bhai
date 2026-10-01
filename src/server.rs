@@ -720,6 +720,7 @@ mod tests {
             let _ = tx_agent.send(AgentEvent::Usage(Usage {
                 input: 5,
                 cached: 4,
+                cache_write: 0,
                 output: 2,
                 reasoning: 1,
             }));

@@ -1974,6 +1974,7 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             totals: Usage {
                 input: state.input_tokens,
                 cached: state.cached_tokens,
+                cache_write: state.cache_write_tokens,
                 output: state.output_tokens,
                 reasoning: state.reasoning_tokens,
             },
@@ -3748,6 +3749,7 @@ mod tests {
         let usage = Usage {
             input: 10,
             cached: 0,
+            cache_write: 0,
             output: 500,
             reasoning: 480,
         };

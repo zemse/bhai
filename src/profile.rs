@@ -682,11 +682,12 @@ pub fn export(profile: &Profile, dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Append one JSONL line for a finished model call. `stalls` is `None` for a backend
-/// that does not time its stream.
+/// Append one JSONL line for a finished model call. `usage` is `None` for a call the
+/// backend reported no usage for, whose counts are written as null rather than zero.
+/// `stalls` is `None` for a backend that does not time its stream.
 pub fn log_usage(
     path: &Path,
-    usage: &Usage,
+    usage: Option<&Usage>,
     hit: &Hit,
     items: usize,
     stalls: Option<&Stalls>,
@@ -696,10 +697,11 @@ pub fn log_usage(
     }
     let line = json!({
         "timestamp": chrono::Local::now().to_rfc3339(),
-        "input": usage.input,
-        "cached": usage.cached,
-        "output": usage.output,
-        "reasoning": usage.reasoning,
+        "input": usage.map(|u| u.input),
+        "cached": usage.map(|u| u.cached),
+        "cache_write": usage.map(|u| u.cache_write),
+        "output": usage.map(|u| u.output),
+        "reasoning": usage.map(|u| u.reasoning),
         "history_items": items,
         "expected_cached": hit.expected_cached,
         "hit_ratio": hit.hit_ratio,
@@ -752,6 +754,7 @@ mod tests {
         Usage {
             input,
             cached: 0,
+            cache_write: 0,
             output,
             reasoning,
         }
@@ -989,6 +992,7 @@ mod tests {
             totals: Usage {
                 input: 300,
                 cached: 200,
+                cache_write: 0,
                 output: 30,
                 reasoning: 7,
             },
@@ -1021,10 +1025,11 @@ mod tests {
         let usage = Usage {
             input: 10,
             cached: 8,
+            cache_write: 2,
             output: 3,
             reasoning: 1,
         };
-        log_usage(&log, &usage, &Hit::default(), 4, None).unwrap();
+        log_usage(&log, Some(&usage), &Hit::default(), 4, None).unwrap();
         let hit = Hit {
             expected_cached: Some(8),
             hit_ratio: Some(1.0),
@@ -1036,14 +1041,16 @@ mod tests {
             over_100ms: 2,
             over_250ms: 1,
         };
-        log_usage(&log, &usage, &hit, 6, Some(&stalls)).unwrap();
+        log_usage(&log, Some(&usage), &hit, 6, Some(&stalls)).unwrap();
+        log_usage(&log, None, &Hit::default(), 7, Some(&stalls)).unwrap();
         let lines: Vec<Value> = std::fs::read_to_string(&log)
             .unwrap()
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert_eq!(lines[1]["cached"], 8);
+        assert_eq!(lines[1]["cache_write"], 2);
         assert_eq!(lines[1]["history_items"], 6);
         assert!(lines[0]["expected_cached"].is_null());
         assert_eq!(lines[1]["expected_cached"], 8);
@@ -1051,6 +1058,10 @@ mod tests {
         assert!(lines[0]["stalls"].is_null());
         assert_eq!(lines[1]["stalls"]["over_250ms"], 1);
         assert_eq!(lines[1]["stalls"]["longest_ms"], 300);
+        for key in ["input", "cached", "cache_write", "output", "reasoning"] {
+            assert!(lines[2][key].is_null(), "{key} of an unmetered call");
+        }
+        assert_eq!(lines[2]["history_items"], 7);
         let _ = std::fs::remove_dir_all(dir);
     }
 

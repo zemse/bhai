@@ -266,6 +266,7 @@ fn usage(event: &Value) -> Usage {
     Usage {
         input: count("prompt_eval_count"),
         cached: 0,
+        cache_write: 0,
         output: count("eval_count"),
         reasoning: 0,
     }
@@ -626,6 +627,7 @@ mod tests {
             Usage {
                 input: 812,
                 cached: 0,
+                cache_write: 0,
                 output: 44,
                 reasoning: 0,
             }

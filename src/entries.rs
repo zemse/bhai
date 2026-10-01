@@ -580,6 +580,7 @@ mod tests {
         Usage {
             input,
             cached,
+            cache_write: 0,
             output,
             reasoning,
         }
