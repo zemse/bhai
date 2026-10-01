@@ -138,7 +138,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "mcp",
         args: "",
-        help: "the MCP servers and their tools",
+        help: "the MCP servers and their tools, /mcp reload <server> to restart one",
     },
     Command {
         name: "as",

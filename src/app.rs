@@ -1571,9 +1571,11 @@ impl App {
             self.statusline_command(rest.trim());
             return;
         }
-        if message.starts_with("/mcp") {
+        if let Some(rest) = message.strip_prefix("/mcp")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
             self.follow = true;
-            self.note(Entry::Info(crate::mcp::report(self.mcp.as_deref())));
+            self.mcp_command(rest.trim());
             return;
         }
         if message.starts_with("/workflows") {
@@ -1959,6 +1961,30 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             session.publish(match limits::fetch_now().await {
                 Ok(body) => Event::Info(limits::report(&body, chrono::Local::now())),
                 Err(e) => Event::Error(format!("could not read usage: {e:#}")),
+            });
+        });
+    }
+
+    /// `/mcp` shows the servers; `/mcp reload <name>` restarts one.
+    fn mcp_command(&mut self, args: &str) {
+        let mut words = args.split_whitespace();
+        let (Some("reload"), Some(name), None) = (words.next(), words.next(), words.next()) else {
+            match args.is_empty() {
+                true => self.note(Entry::Info(crate::mcp::report(self.mcp.as_deref()))),
+                false => self.note(Entry::Error("usage: /mcp [reload <server>]".to_string())),
+            }
+            return;
+        };
+        let Some(hub) = self.mcp.clone() else {
+            self.note(Entry::Info(crate::mcp::report(None)));
+            return;
+        };
+        let name = name.to_string();
+        let session = Arc::clone(&self.session);
+        tokio::spawn(async move {
+            session.publish(match hub.reload(&name).await {
+                Ok(line) => Event::Info(line),
+                Err(e) => Event::Error(e),
             });
         });
     }
@@ -2904,6 +2930,27 @@ mod tests {
         ] {
             assert!(!text.contains(leaked), "{leaked} is in the export");
         }
+    }
+
+    #[test]
+    fn mcp_reports_and_takes_only_reload() {
+        let mut app = App::detached();
+        let last = |app: &mut App| match app.entries().list.last() {
+            Some(Entry::Info(text) | Entry::Error(text)) => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        app.input.set("/mcp".to_string());
+        app.submit();
+        assert!(last(&mut app).starts_with("mcp: off"));
+        for wrong in ["/mcp restart x", "/mcp reload", "/mcp reload a b"] {
+            app.input.set(wrong.to_string());
+            app.submit();
+            assert_eq!(last(&mut app), "usage: /mcp [reload <server>]", "{wrong}");
+        }
+        // With MCP off there is nothing to reload, which the report says.
+        app.input.set("/mcp reload x".to_string());
+        app.submit();
+        assert!(last(&mut app).starts_with("mcp: off"));
     }
 
     #[tokio::test]

@@ -2,8 +2,10 @@
 //! tool list; the model finds them with `mcp_search` and runs them with `mcp_call`, so
 //! the tool list and prompt prefix stay fixed however many servers there are. A server
 //! only a child identity allows starts on that child's first MCP call and is then shared.
+//! `/mcp reload <name>` restarts one server from its config as it is now; the prompt keeps
+//! the listing it had at launch, and only `mcp_search` and `mcp_call` see the new catalog.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -20,7 +22,7 @@ use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, McpServer};
 use crate::identity::Identity;
 use crate::instructions::Roots;
 
@@ -105,12 +107,21 @@ impl Drop for Group {
 /// A connected server, and its process group when it is a stdio one.
 type Running = (Service, Option<Group>);
 
+/// Launched servers restarted by `/mcp reload`, with all their tools.
+type Reloaded = HashMap<String, (Status, Option<Peer<RoleClient>>)>;
+
 /// What every view of a session's hub shares.
 struct Shared {
-    /// Taken on shutdown; `None` after it.
-    services: Mutex<Option<Vec<Running>>>,
+    /// Taken on shutdown; `None` after it. Each by its server's name.
+    services: Mutex<Option<Vec<(String, Running)>>>,
     /// Servers started at launch, with all their tools.
     launched: Vec<Status>,
+    /// Launched servers as they came back from a reload, which stand in for them.
+    reloaded: Mutex<Reloaded>,
+    /// Held for a whole reload, so two of one server cannot interleave.
+    reloading: tokio::sync::Mutex<()>,
+    /// The config the servers came from, read again on a reload.
+    source: Option<(Roots, BTreeMap<String, McpServer>)>,
     /// Servers the launch identity did not allow, which a child may start.
     deferred: Vec<Server>,
     /// Deferred servers started so far, with all their tools.
@@ -118,7 +129,7 @@ struct Shared {
     log_dir: PathBuf,
     timeout: Duration,
     /// Each server's call timeout, by name.
-    call_timeouts: HashMap<String, Duration>,
+    call_timeouts: Mutex<HashMap<String, Duration>>,
 }
 
 /// The servers of a session as one identity sees them: their status, tools, and the
@@ -150,9 +161,11 @@ pub async fn start(config: &Config, roots: &Roots, identity: &Identity) -> Optio
     }
     let servers = servers::load(roots, &config.mcp_servers);
     let log_dir = roots.cwd.join(".bhai").join("debug");
-    Some(Arc::new(
-        Hub::connect(servers, identity, &log_dir, START_TIMEOUT).await,
-    ))
+    let mut hub = Hub::connect(servers, identity, &log_dir, START_TIMEOUT).await;
+    if let Some(shared) = Arc::get_mut(&mut hub.shared) {
+        shared.source = Some((roots.clone(), config.mcp_servers.clone()));
+    }
+    Some(Arc::new(hub))
 }
 
 impl Hub {
@@ -190,18 +203,21 @@ impl Hub {
         for (status, service) in futures_util::future::join_all(starts).await {
             if let Some(service) = service {
                 peers.push((status.name.clone(), service.0.peer().clone()));
-                services.push(service);
+                services.push((status.name.clone(), service));
             }
             launched.push(status);
         }
         let shared = Arc::new(Shared {
             services: Mutex::new(Some(services)),
             launched,
+            reloaded: Mutex::default(),
+            reloading: tokio::sync::Mutex::default(),
+            source: None,
             deferred,
             late: tokio::sync::Mutex::default(),
             log_dir: log_dir.to_path_buf(),
             timeout,
-            call_timeouts,
+            call_timeouts: Mutex::new(call_timeouts),
         });
         Hub {
             peers,
@@ -215,17 +231,7 @@ impl Hub {
         let servers = shared
             .launched
             .iter()
-            .map(|server| {
-                let mut server = server.clone();
-                if !identity.allows_mcp_server(&server.name) {
-                    server.tools.clear();
-                } else {
-                    server
-                        .tools
-                        .retain(|t| identity.allows_mcp_tool(&server.name, &t.name));
-                }
-                server
-            })
+            .map(|server| visible(server, identity))
             .collect();
         let deferred = shared
             .deferred
@@ -268,11 +274,14 @@ impl Hub {
         let shared = Arc::new(Shared {
             services: Mutex::new(Some(Vec::new())),
             launched,
+            reloaded: Mutex::default(),
+            reloading: tokio::sync::Mutex::default(),
+            source: None,
             deferred: Vec::new(),
             late: tokio::sync::Mutex::default(),
             log_dir: PathBuf::new(),
             timeout: START_TIMEOUT,
-            call_timeouts: HashMap::new(),
+            call_timeouts: Mutex::default(),
         });
         Hub {
             root: true,
@@ -296,26 +305,107 @@ impl Hub {
         let starts = pending
             .into_iter()
             .map(|server| start_one(server, &self.shared.log_dir, self.shared.timeout));
-        for (mut status, service) in futures_util::future::join_all(starts).await {
-            let mut peer = None;
-            if let Some(service) = service {
-                let mut services = self
-                    .shared
-                    .services
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                match services.as_mut() {
-                    Some(services) => {
-                        peer = Some(service.0.peer().clone());
-                        services.push(service);
-                    }
-                    None => {
-                        status.state = State::Failed("the session is closing".to_string());
-                        status.tools.clear();
-                    }
-                }
+        for (status, service) in futures_util::future::join_all(starts).await {
+            late.push(self.shared.keep(status, service));
+        }
+    }
+
+    /// Restart `name` from the config as it is now, so a server that failed, or that
+    /// `bhai mcp approve` has since accepted, can be used without restarting bhai. The
+    /// definition and the tool catalog are checked against their approvals again. Returns
+    /// the line that says how it came back.
+    pub async fn reload(&self, name: &str) -> Result<String, String> {
+        let Some((roots, bhai)) = &self.shared.source else {
+            return Err("mcp: this session has no config to reload from".to_string());
+        };
+        self.reload_from(name, servers::load(roots, bhai)).await
+    }
+
+    /// `reload`, with `servers` as the config.
+    async fn reload_from(&self, name: &str, servers: Vec<Server>) -> Result<String, String> {
+        let Some(server) = servers.into_iter().find(|s| s.name == name) else {
+            return Err(format!("mcp: no server `{name}` is configured"));
+        };
+        if !self.shared.launched.iter().any(|s| s.name == name) {
+            return Err(format!(
+                "mcp: `{name}` was added after bhai started, so the prompt does not list it; \
+restart bhai to use it"
+            ));
+        }
+        let _reloading = self.shared.reloading.lock().await;
+        // A deferred server lives in `late`, held across the restart as on a first start.
+        let mut late = match self.shared.deferred.iter().any(|s| s.name == name) {
+            true => Some(self.shared.late.lock().await),
+            false => None,
+        };
+        self.shared.close(name).await;
+        self.shared
+            .call_timeouts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                name.to_string(),
+                server.tool_timeout.unwrap_or(CALL_TIMEOUT),
+            );
+        let (status, service) = match server.skip.clone() {
+            Some(reason) => (skipped(&server, reason), None),
+            None => start_one(&server, &self.shared.log_dir, self.shared.timeout).await,
+        };
+        let (status, peer) = self.shared.keep(status, service);
+        let line = match &status.state {
+            State::Connected => format!(
+                "mcp server {name} reloaded: connected, {} tools",
+                visible(&status, &self.identity).tools.len()
+            ),
+            State::Failed(why) => format!("mcp server {name} reloaded: failed: {why}"),
+            State::Skipped(why) => format!("mcp server {name} reloaded: skipped: {why}"),
+        };
+        match late.as_mut() {
+            Some(late) => {
+                late.retain(|(s, _)| s.name != name);
+                late.push((status, peer));
             }
-            late.push((status, peer));
+            None => {
+                self.shared
+                    .reloaded
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(name.to_string(), (status, peer));
+            }
+        }
+        Ok(line)
+    }
+
+    /// This view's launched servers as they are now: a reloaded one as it came back.
+    fn live(&self) -> Vec<Status> {
+        let reloaded = self
+            .shared
+            .reloaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.servers
+            .iter()
+            .map(|server| match reloaded.get(&server.name) {
+                Some((status, _)) => visible(status, &self.identity),
+                None => server.clone(),
+            })
+            .collect()
+    }
+
+    /// The connection to a launched server, the new one if it was reloaded.
+    fn peer(&self, server: &str) -> Option<Peer<RoleClient>> {
+        let reloaded = self
+            .shared
+            .reloaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match reloaded.get(server) {
+            Some((_, peer)) => peer.clone(),
+            None => self
+                .peers
+                .iter()
+                .find(|(name, _)| name == server)
+                .map(|(_, peer)| peer.clone()),
         }
     }
 
@@ -331,7 +421,7 @@ impl Hub {
             .collect()
     }
 
-    /// Every tool of every connected server.
+    /// Every tool of every server connected at launch, which is what the prompt lists.
     pub fn tools(&self) -> impl Iterator<Item = &ToolInfo> {
         self.servers.iter().flat_map(|s| s.tools.iter())
     }
@@ -378,13 +468,17 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
     /// The best matches for `query`, with their schemas, as `mcp_search` returns them.
     /// Starts this view's deferred servers first.
     pub async fn search(&self, query: &str) -> String {
-        let mut tools: Vec<ToolInfo> = self.tools().cloned().collect();
+        let mut tools: Vec<ToolInfo> = self.live().into_iter().flat_map(|s| s.tools).collect();
         tools.extend(self.late_tools().await);
         search(&tools, query)
     }
 
-    pub fn find(&self, full_name: &str) -> Option<&ToolInfo> {
-        self.tools().find(|t| t.full_name() == full_name)
+    /// A tool of a launched server, as the server is now.
+    pub fn find(&self, full_name: &str) -> Option<ToolInfo> {
+        self.live()
+            .into_iter()
+            .flat_map(|s| s.tools)
+            .find(|t| t.full_name() == full_name)
     }
 
     /// Whether `full_name` may be a tool of this view: a known one, or one of a deferred
@@ -402,13 +496,10 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
     /// server starts that server first.
     pub async fn call(&self, full_name: &str, arguments: Value) -> (String, bool) {
         let found = match self.find(full_name) {
-            Some(tool) => Some((
-                tool.clone(),
-                self.peers
-                    .iter()
-                    .find(|(name, _)| *name == tool.server)
-                    .map(|(_, peer)| peer.clone()),
-            )),
+            Some(tool) => {
+                let peer = self.peer(&tool.server);
+                Some((tool, peer))
+            }
             None => self.find_late(full_name).await,
         };
         let Some((tool, peer)) = found else {
@@ -428,6 +519,8 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
         let timeout = self
             .shared
             .call_timeouts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&tool.server)
             .copied()
             .unwrap_or(CALL_TIMEOUT);
@@ -484,17 +577,14 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
             .unwrap_or_else(|e| e.into_inner())
             .take()
             .unwrap_or_default();
-        futures_util::future::join_all(services.into_iter().map(|(service, group)| async move {
-            let _ = service.cancel().await;
-            drop(group);
-        }))
-        .await;
+        futures_util::future::join_all(services.into_iter().map(|(_, running)| close(running)))
+            .await;
     }
 
     /// What `/mcp` prints.
     pub fn report(&self) -> String {
-        let connected = self
-            .servers
+        let servers = self.live();
+        let connected = servers
             .iter()
             .filter(|s| s.state == State::Connected)
             .count();
@@ -502,28 +592,23 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
         let mut out = format!(
             "mcp: {connected} of {} servers connected, {} tools, listing ~{listing} tok \
 (schemas load on demand through mcp_search)",
-            self.servers.len(),
-            self.tools().count()
+            servers.len(),
+            servers.iter().map(|s| s.tools.len()).sum::<usize>()
         );
         let late = self.shared.late.try_lock().ok();
-        for server in &self.servers {
+        for server in &servers {
             let started = late
                 .iter()
                 .flat_map(|late| late.iter())
                 .find(|(status, _)| status.name == server.name)
                 .map(|(status, _)| status);
-            let (status, note) = match started {
-                Some(status) => (status, ", for a child"),
-                None => (server, ""),
-            };
-            let state = match &status.state {
-                State::Connected => format!("connected  {} tools{note}", status.tools.len()),
-                State::Failed(why) => format!("failed     {why}"),
-                State::Skipped(why) => format!("skipped    {why}"),
+            let state = match started {
+                Some(status) => state_line(status, ", for a child"),
+                None => state_line(server, ""),
             };
             let _ = write!(out, "\n  {}  ({})  {state}", server.name, server.source);
         }
-        if self.servers.is_empty() {
+        if servers.is_empty() {
             out.push_str("\n  no servers configured");
         }
         out
@@ -604,6 +689,77 @@ pub fn report(hub: Option<&Hub>) -> String {
     match hub {
         Some(hub) => hub.report(),
         None => "mcp: off (set `mcp = true` in ~/.config/bhai/config.toml)".to_string(),
+    }
+}
+
+impl Shared {
+    /// Keep a started server's connection with the others, or mark it failed when the
+    /// session is already closing.
+    fn keep(
+        &self,
+        mut status: Status,
+        service: Option<Running>,
+    ) -> (Status, Option<Peer<RoleClient>>) {
+        let Some(service) = service else {
+            return (status, None);
+        };
+        let mut services = self.services.lock().unwrap_or_else(|e| e.into_inner());
+        match services.as_mut() {
+            Some(services) => {
+                let peer = service.0.peer().clone();
+                services.push((status.name.clone(), service));
+                (status, Some(peer))
+            }
+            None => {
+                status.state = State::Failed("the session is closing".to_string());
+                status.tools.clear();
+                (status, None)
+            }
+        }
+    }
+
+    /// Close the running connection to `name`, if there is one.
+    async fn close(&self, name: &str) {
+        let closing: Vec<Running> = {
+            let mut services = self.services.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(services) = services.as_mut() else {
+                return;
+            };
+            let (gone, kept) = std::mem::take(services)
+                .into_iter()
+                .partition(|(server, _)| server == name);
+            *services = kept;
+            gone.into_iter().map(|(_, running)| running).collect()
+        };
+        futures_util::future::join_all(closing.into_iter().map(close)).await;
+    }
+}
+
+/// End one connection; a stdio server's process group goes with it.
+async fn close((service, group): Running) {
+    let _ = service.cancel().await;
+    drop(group);
+}
+
+/// `server` as `identity` sees it: only the tools it allows.
+fn visible(server: &Status, identity: &Identity) -> Status {
+    let mut server = server.clone();
+    if !identity.allows_mcp_server(&server.name) {
+        server.tools.clear();
+    } else {
+        server
+            .tools
+            .retain(|t| identity.allows_mcp_tool(&server.name, &t.name));
+    }
+    server
+}
+
+/// How a server stands, as its `/mcp` line ends.
+fn state_line(status: &Status, note: &str) -> String {
+    match &status.state {
+        State::Connected => format!("connected  {} tools{note}", status.tools.len()),
+        State::Failed(why) => format!("failed     {why}"),
+        State::Skipped(why) => format!("skipped    {why}"),
     }
 }
 
@@ -1515,6 +1671,182 @@ mod tests {
         let (out, ok) = other.call("mcp__fake__echo", serde_json::json!({})).await;
         assert!(!ok, "{out}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reload_restarts_one_server_and_leaves_the_prompt_as_it_was() {
+        if !python() {
+            return;
+        }
+        let alive = |pid: &str| {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let dir = temp_dir();
+        let hub = Hub::connect(
+            vec![fake("good", "grandchild"), fake("flaky", "exit")],
+            &Identity::default(),
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(matches!(hub.servers[1].state, State::Failed(_)));
+        let section = hub.prompt_section();
+        let log = std::fs::read_to_string(dir.join("mcp-good.log")).unwrap();
+        let old = log
+            .lines()
+            .find_map(|l| l.strip_prefix("grandchild "))
+            .unwrap_or_else(|| panic!("{log}"))
+            .to_string();
+        let config = || vec![fake("good", ""), fake("flaky", "")];
+
+        // A server that failed at launch comes back, for search and call alike.
+        let line = hub.reload_from("flaky", config()).await.unwrap();
+        assert_eq!(line, "mcp server flaky reloaded: connected, 2 tools");
+        assert_eq!(hub.prompt_section(), section);
+        let out = hub.search("flaky echo").await;
+        assert!(out.starts_with("mcp__flaky__echo: "), "{out}");
+        let args = serde_json::json!({"message": "hi"});
+        let (out, ok) = hub.call("mcp__flaky__echo", args.clone()).await;
+        assert_eq!((out.as_str(), ok), ("echo: hi", true));
+        let report = hub.report();
+        assert!(
+            report.starts_with("mcp: 2 of 2 servers connected, 4 tools"),
+            "{report}"
+        );
+        // A child made after the reload sees it too.
+        let child = hub.narrowed(&Identity::default());
+        let (out, ok) = child.call("mcp__flaky__echo", args.clone()).await;
+        assert_eq!((out.as_str(), ok), ("echo: hi", true));
+
+        // A running server is closed, with its group, before the new one starts.
+        hub.reload_from("good", config()).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive(&old) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive(&old), "grandchild {old} outlived the reload");
+        let (out, ok) = hub.call("mcp__good__echo", args).await;
+        assert_eq!((out.as_str(), ok), ("echo: hi", true));
+        assert_eq!(
+            hub.shared.services.lock().unwrap().as_ref().unwrap().len(),
+            2
+        );
+
+        let missing = hub.reload_from("nope", config()).await.unwrap_err();
+        assert_eq!(missing, "mcp: no server `nope` is configured");
+        let mut added = config();
+        added.push(fake("added", ""));
+        let late = hub.reload_from("added", added).await.unwrap_err();
+        assert!(late.contains("restart bhai"), "{late}");
+        assert_eq!(hub.prompt_section(), section);
+        hub.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reload_checks_the_approvals_again() {
+        if !python() {
+            return;
+        }
+        let dir = temp_dir();
+        let pin = servers::Pin::test(&dir.join("catalogs.json"));
+        let pinned = |mode: &str| Server {
+            pin: Some(pin.clone()),
+            ..fake("fake", mode)
+        };
+        let hub = Hub::connect(
+            vec![pinned("")],
+            &Identity::default(),
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
+        let section = hub.prompt_section();
+
+        // Its tools changed while bhai ran: the new connection is closed, not used.
+        let line = hub
+            .reload_from("fake", vec![pinned("drift")])
+            .await
+            .unwrap();
+        assert!(
+            line.starts_with("mcp server fake reloaded: failed: its tools changed"),
+            "{line}"
+        );
+        assert!(hub.find("mcp__fake__echo").is_none());
+        let (out, ok) = hub
+            .call("mcp__fake__echo", serde_json::json!({"message": "hi"}))
+            .await;
+        assert!(!ok && out.contains("No MCP tool"), "{out}");
+        assert!(hub.report().contains("failed     its tools changed"));
+        assert!(
+            hub.shared
+                .services
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+
+        // Its definition changed since it was approved, which `load` marks as a skip.
+        let changed = Server {
+            skip: Some("changed since it was approved".to_string()),
+            ..pinned("")
+        };
+        let line = hub.reload_from("fake", vec![changed]).await.unwrap();
+        assert_eq!(
+            line,
+            "mcp server fake reloaded: skipped: changed since it was approved"
+        );
+        // Back as it was approved, it is used again.
+        let line = hub.reload_from("fake", vec![pinned("")]).await.unwrap();
+        assert_eq!(line, "mcp server fake reloaded: connected, 2 tools");
+        assert!(hub.find("mcp__fake__echo").is_some());
+        assert_eq!(hub.prompt_section(), section);
+        hub.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reload_of_a_child_server_replaces_the_running_one() {
+        if !python() {
+            return;
+        }
+        let dir = temp_dir();
+        let parent = Identity {
+            mcp: vec!["!*".to_string()],
+            ..Identity::default()
+        };
+        let hub = Hub::connect(
+            vec![fake("fake", "")],
+            &parent,
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        let child = hub.narrowed(&Identity::default());
+        let args = serde_json::json!({"message": "hi"});
+        let (_, ok) = child.call("mcp__fake__echo", args.clone()).await;
+        assert!(ok);
+        let section = child.prompt_section();
+        hub.reload_from("fake", vec![fake("fake", "")])
+            .await
+            .unwrap();
+        assert_eq!(hub.shared.late.lock().await.len(), 1);
+        assert_eq!(
+            hub.shared.services.lock().unwrap().as_ref().unwrap().len(),
+            1
+        );
+        let (out, ok) = child.call("mcp__fake__echo", args).await;
+        assert_eq!((out.as_str(), ok), ("echo: hi", true));
+        assert_eq!(child.prompt_section(), section);
+        hub.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
