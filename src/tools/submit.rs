@@ -52,6 +52,13 @@ impl Contract {
         Ok(Self { schema })
     }
 
+    /// Whether the backend can enforce this schema while it samples: it takes strict
+    /// function schemas only when every object is closed and lists all its properties
+    /// as required, and has no array bounds. Any other contract is checked here alone.
+    pub fn strict(&self) -> bool {
+        strict_node(&self.schema)
+    }
+
     /// What is wrong with `value`, as bounded paths and never the values at them.
     pub fn check(&self, value: &Value) -> Vec<String> {
         let mut errors = Errors::default();
@@ -152,6 +159,38 @@ fn compile(schema: &Value, at: &str) -> Result<(), String> {
         compile(items, &format!("{at}/*"))?;
     }
     Ok(())
+}
+
+fn strict_node(schema: &Value) -> bool {
+    if schema.get("minItems").is_some() || schema.get("maxItems").is_some() {
+        return false;
+    }
+    if schema.get("type").and_then(Value::as_str) == Some("object") {
+        let properties = schema.get("properties").and_then(Value::as_object);
+        let names = |list: Option<&Vec<Value>>| -> std::collections::BTreeSet<String> {
+            list.into_iter()
+                .flatten()
+                .filter_map(|n| n.as_str().map(str::to_string))
+                .collect()
+        };
+        let all: std::collections::BTreeSet<String> = properties
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k.clone())
+            .collect();
+        let required = names(schema.get("required").and_then(Value::as_array));
+        if schema.get("additionalProperties") != Some(&Value::Bool(false)) || required != all {
+            return false;
+        }
+        if !properties
+            .into_iter()
+            .flatten()
+            .all(|(_, p)| strict_node(p))
+        {
+            return false;
+        }
+    }
+    schema.get("items").is_none_or(strict_node)
 }
 
 #[derive(Default)]
@@ -322,7 +361,7 @@ impl Tool for Submit {
         schema of `output`; a result that does not match it is refused with what is wrong, \
         so fix that and call again. A plain answer is not a result: only an accepted call \
         is. Once it is accepted, end your turn.",
-            "strict": false,
+            "strict": self.contract.strict(),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -393,6 +432,50 @@ mod tests {
             }, "required": ["risky", "severity"], "additionalProperties": false}"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn only_a_closed_fully_required_contract_is_sent_strict() {
+        let strict = |text: &str| Contract::parse(text).unwrap().strict();
+        assert!(!contract().strict());
+        let closed = r#"{"type": "object", "properties": {"a": {"type": "string"},
+            "b": {"type": "array", "items": {"type": "object", "properties": {"c": {"type": "integer"}},
+            "required": ["c"], "additionalProperties": false}}},
+            "required": ["a", "b"], "additionalProperties": false}"#;
+        assert!(strict(closed));
+        assert!(!strict(
+            &closed.replace(r#""required": ["c"]"#, r#""required": []"#)
+        ));
+        assert!(!strict(
+            &closed.replace(r#""required": ["a", "b"]"#, r#""required": ["a"]"#)
+        ));
+        assert!(!strict(&closed.replace(
+            r#""additionalProperties": false}}},"#,
+            r#""additionalProperties": true}}},"#
+        )));
+        assert!(!strict(&closed.replace(
+            r#""type": "array","#,
+            r#""type": "array", "minItems": 1,"#
+        )));
+        assert!(!strict(r#"{"type": "object"}"#));
+    }
+
+    #[test]
+    fn the_tool_is_strict_only_when_the_contract_is() {
+        let tool = |contract: Contract| {
+            Submit {
+                contract: Arc::new(contract),
+                accepted: Default::default(),
+            }
+            .schema()
+        };
+        assert_eq!(tool(contract())["strict"], json!(false));
+        let closed = Contract::parse(
+            r#"{"type": "object", "properties": {"a": {"type": "string"}},
+            "required": ["a"], "additionalProperties": false}"#,
+        )
+        .unwrap();
+        assert_eq!(tool(closed)["strict"], json!(true));
     }
 
     #[test]
