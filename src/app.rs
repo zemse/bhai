@@ -301,6 +301,8 @@ pub struct App {
     pub quit: bool,
     /// When a first quit key was pressed; a second one within `QUIT_WINDOW` quits.
     quit_armed: Option<Instant>,
+    /// When a first esc was pressed mid-turn; a second one within `QUIT_WINDOW` interrupts.
+    esc_armed: Option<Instant>,
     /// The draft ctrl+c last cleared, which ctrl+z puts back.
     cleared: Option<String>,
     session: Arc<Session>,
@@ -386,6 +388,7 @@ impl App {
             designing: None,
             quit: false,
             quit_armed: None,
+            esc_armed: None,
             cleared: None,
             session,
         }
@@ -521,7 +524,7 @@ impl App {
             // The panel's rows, in order, and then back out to the transcript.
             KeyCode::Char('o') if ctrl => self.cycle_child(),
             KeyCode::Esc if self.inside.is_some() => self.leave_child(),
-            KeyCode::Esc if self.busy() => self.interrupt(),
+            KeyCode::Esc if self.busy() => self.confirm_interrupt(),
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
             KeyCode::Char('y') if ctrl => self.copy(),
@@ -2072,6 +2075,19 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         }
     }
 
+    /// Interrupt on the second esc within `QUIT_WINDOW`; the first only says so.
+    fn confirm_interrupt(&mut self) {
+        let now = Instant::now();
+        match self.esc_armed.take() {
+            Some(at) if now.duration_since(at) <= QUIT_WINDOW => self.interrupt(),
+            _ => {
+                self.esc_armed = Some(now);
+                self.follow = true;
+                self.note(Entry::Info("esc again to interrupt".to_string()));
+            }
+        }
+    }
+
     fn busy(&self) -> bool {
         self.working || self.session.child_running()
     }
@@ -3362,6 +3378,32 @@ mod tests {
         app.quit_armed = Some(Instant::now() - QUIT_WINDOW * 2);
         app.on_key(ctrl('c'));
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn esc_mid_turn_asks_and_interrupts_on_a_second_press_inside_the_window() {
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        let mut app = App::detached();
+        app.working = true;
+        app.on_key(esc);
+        assert!(app.esc_armed.is_some());
+        let asked = |app: &App| {
+            app.session
+                .entries()
+                .list
+                .iter()
+                .filter(|e| matches!(e, Entry::Info(t) if t == "esc again to interrupt"))
+                .count()
+        };
+        assert_eq!(asked(&app), 1);
+        app.on_key(esc);
+        assert!(app.esc_armed.is_none(), "the second press spends it");
+
+        // Outside the window it asks again instead of interrupting.
+        app.esc_armed = Some(Instant::now() - QUIT_WINDOW * 2);
+        app.on_key(esc);
+        assert!(app.esc_armed.is_some());
+        assert_eq!(asked(&app), 2);
     }
 
     #[test]
