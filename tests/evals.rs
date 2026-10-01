@@ -117,7 +117,7 @@ echo '{"type":"turn_end"}'
     let log = r["log"].as_str().unwrap();
     let stderr = std::fs::read_to_string(log.replace(".jsonl", ".stderr")).unwrap();
     assert!(
-        stderr.contains("args: exec - --json --mode auto --model ollama:tiny --no-global"),
+        stderr.contains("args: exec - --json --mode auto --trust --model ollama:tiny --no-global"),
         "{stderr}"
     );
     assert!(

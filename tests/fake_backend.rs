@@ -55,15 +55,32 @@ impl Fake {
 
 async fn responses(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: String) -> Response {
     let body = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let cwd = working_directory(&body);
     fake.seen.lock().unwrap().push(Seen {
         path: "/codex/responses",
         headers,
         body,
     });
     match fake.replies.lock().unwrap().pop_front() {
-        Some(sse) => ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response(),
+        Some(sse) => {
+            let sse = sse.replace(CWD, &cwd);
+            ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
         None => (StatusCode::BAD_REQUEST, "the fake has no reply queued").into_response(),
     }
+}
+
+/// Stands in for the working directory in a queued reply, which the fake fills in from
+/// the request, since a write takes an absolute path.
+const CWD: &str = "{cwd}";
+
+/// The `Working directory:` line of the system prompt in `body`.
+fn working_directory(body: &Value) -> String {
+    let text = body["instructions"].as_str().unwrap_or_default();
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("- Working directory: "))
+        .unwrap_or_default()
+        .to_string()
 }
 
 async fn usage(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
@@ -156,6 +173,33 @@ fn runs(call_id: &str, command: &str) -> String {
     ])
 }
 
+/// The model asking to write `content` to `path`.
+fn writes(call_id: &str, path: &str, content: &str) -> String {
+    sse(&[
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "write",
+                "call_id": call_id,
+                "arguments": json!({ "path": path, "content": content }).to_string()
+            }
+        }),
+        completed(),
+    ])
+}
+
+/// A `home` and a `codex` home under `dir`, the latter holding a login the fake accepts.
+fn logged_in(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let (home, codex) = (dir.join("home"), dir.join("codex"));
+    for d in [&home, &codex] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let auth = json!({ "tokens": { "access_token": ACCESS_TOKEN, "account_id": ACCOUNT } });
+    std::fs::write(codex.join("auth.json"), auth.to_string()).unwrap();
+    (home, codex)
+}
+
 /// A bhai `--serve 0 --headless` in a scratch home and project, killed on drop.
 struct Bhai {
     child: Child,
@@ -175,12 +219,9 @@ impl Drop for Bhai {
 impl Bhai {
     async fn start(backend: &str) -> Bhai {
         let dir = std::env::temp_dir().join(format!("bhai-fake-{}", uuid::Uuid::new_v4()));
-        let (home, codex, project) = (dir.join("home"), dir.join("codex"), dir.join("project"));
-        for d in [&home, &codex, &project] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        let auth = json!({ "tokens": { "access_token": ACCESS_TOKEN, "account_id": ACCOUNT } });
-        std::fs::write(codex.join("auth.json"), auth.to_string()).unwrap();
+        let (home, codex) = logged_in(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_bhai"))
             .args(["--serve", "0", "--headless"])
@@ -542,4 +583,76 @@ async fn a_transient_failure_is_retried_and_says_so() {
     events.until("turn_end").await;
     assert_eq!(events.text(), "second time");
     assert_eq!(fake.responses().len(), 2);
+}
+
+/// `evals/run.py` running the real `bhai exec` on the fake, through a write: the runner's
+/// fresh workspace is an untrusted project, so this fails unless the runner trusts it.
+#[tokio::test]
+async fn the_eval_runner_trusts_its_workspace_so_bhai_exec_can_write() {
+    let found = std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !found {
+        eprintln!("skipped: python3 is not available");
+        return;
+    }
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        let hello = format!("{CWD}/hello.txt");
+        replies.push_back(writes("call_w", &hello, "Hello, world!\n"));
+        replies.push_back(says("wrote it"));
+    }
+    let backend = serve_fake(fake.clone()).await;
+    let dir = std::env::temp_dir().join(format!("bhai-fake-eval-{}", uuid::Uuid::new_v4()));
+    let (home, codex) = logged_in(&dir);
+    let out = dir.join("out");
+    let ran = timeout(
+        WAIT,
+        Command::new("python3")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/evals/run.py"))
+            .args(["--agent", "bhai", "--bhai", env!("CARGO_BIN_EXE_bhai")])
+            .arg("--out")
+            .arg(&out)
+            .arg("write-greeting")
+            .env("HOME", &home)
+            .env("CODEX_HOME", &codex)
+            .env("BHAI_TEST_BASE_URL", &backend)
+            .env_remove("BHAI_MODEL")
+            .env_remove("BHAI_MODE")
+            .env_remove("BHAI_EFFORT")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("run.py did not finish")
+    .unwrap();
+    let said = String::from_utf8_lossy(&ran.stderr).into_owned();
+    assert!(ran.status.success(), "run.py exited {}: {said}", ran.status);
+
+    let results = std::fs::read_to_string(out.join("results.jsonl")).unwrap();
+    let r: Value = serde_json::from_str(results.trim()).unwrap();
+    let log = std::fs::read_to_string(out.join("write-greeting.bhai.1.jsonl")).unwrap();
+    let stderr = std::fs::read_to_string(out.join("write-greeting.bhai.1.stderr")).unwrap();
+    assert_eq!(r["reward"], 1.0, "{r}\n{log}\n{stderr}");
+    assert_eq!(r["exit"], 0, "{r}");
+    assert_eq!(r["tokens"]["input"], 240, "{r}");
+    // Trusted, `auto` stays `auto` and the write needs no approval.
+    assert!(stderr.contains("trusted this project"), "{stderr}");
+    assert!(!log.contains(r#""type":"approval""#), "{log}");
+    assert!(!log.contains(r#""type":"tool_rejected""#), "{log}");
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    let outputs = items(&sent[1].body, "function_call_output");
+    assert!(
+        outputs.iter().any(|o| o["call_id"] == "call_w"),
+        "{outputs:?}"
+    );
+    // The trial's entry is gone from the trust store again.
+    let store = home.join(".config/bhai/trust.json");
+    let entries: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+    assert_eq!(entries, json!({}), "{store:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

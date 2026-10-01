@@ -14,7 +14,10 @@ Each trial copies `environment/` into a fresh temp dir, runs the agent there, th
 that times out, no reward file, or a verifier that times out is a reward of 0.
 
 The agent runs on this machine with no sandbox: `bhai exec --mode auto` and codex's
-`workspace-write` sandbox are the only fences. Live runs spend quota, so smoke-test with
+`workspace-write` sandbox are the only fences. A fresh temp dir is an untrusted project,
+where bhai holds `auto` back to `ask` and so refuses every write, so bhai runs with
+`--trust`. That records the workspace in `~/.config/bhai/trust.json`, and the trial
+removes the entry again once bhai has exited. Live runs spend quota, so smoke-test with
 `--bhai-model ollama:<name>` and one trial.
 
     evals/run.py --agent oracle                    # checks the verifiers, no model call
@@ -143,7 +146,7 @@ def agent_command(args, agent, task, work):
     if agent == "oracle":
         return ["bash", str(task["path"] / "solution" / "solve.sh")]
     if agent == "bhai":
-        cmd = [args.bhai, "exec", "-", "--json", "--mode", "auto"]
+        cmd = [args.bhai, "exec", "-", "--json", "--mode", "auto", "--trust"]
         if args.bhai_model:
             cmd += ["--model", args.bhai_model]
         return cmd + args.bhai_arg
@@ -152,6 +155,21 @@ def agent_command(args, agent, task, work):
     if args.codex_model:
         cmd += ["--model", args.codex_model]
     return cmd + args.codex_arg + ["-"]
+
+
+def forget_trust(work):
+    """Remove the entry `bhai --trust` made for `work` from bhai's trust store. The store
+    keys each project by its canonical path."""
+    store = Path.home() / ".config" / "bhai" / "trust.json"
+    try:
+        entries = json.loads(store.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(entries, dict) or entries.pop(os.path.realpath(work), None) is None:
+        return
+    staged = store.with_name(f".{store.name}.{os.getpid()}.tmp")
+    staged.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n")
+    os.replace(staged, store)
 
 
 def tokens(agent, log):
@@ -230,6 +248,8 @@ def trial(args, agent, task, n, out):
             stderr=stderr,
         )
     wall = time.monotonic() - start
+    if agent == "bhai":
+        forget_trust(work)
 
     reward = 0.0
     verifier_timed_out = False
