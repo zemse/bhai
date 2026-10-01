@@ -11,6 +11,10 @@ use crate::config::Config;
 /// pays for.
 const MAX_FILE: usize = 64 * 1024;
 
+/// Past this many bytes of instruction files together, `load` warns. Nothing is dropped:
+/// which file to give up is the user's call.
+const WARN_TOTAL: usize = 32 * 1024;
+
 /// Project instruction files looked for in each directory, in this order.
 const PROJECT_FILES: [&str; 5] = [
     "AGENTS.md",
@@ -52,7 +56,8 @@ pub struct File {
 #[derive(Debug, Default)]
 pub struct Loaded {
     pub files: Vec<File>,
-    /// Files and imports refused for leaving their root, like `skipped ./CLAUDE.md (outside project)`.
+    /// Files and imports refused for leaving their root, like `skipped ./CLAUDE.md (outside project)`,
+    /// then the warning when the files together run past `WARN_TOTAL`.
     pub skipped: Vec<String>,
 }
 
@@ -139,6 +144,14 @@ pub fn load(config: &Config, roots: &Roots) -> Loaded {
             .collect();
         loaded.files.push(file);
         loaded.files.extend(imported);
+    }
+    let total: usize = loaded.files.iter().map(|f| f.content.len()).sum();
+    if total > WARN_TOTAL {
+        loaded.skipped.push(format!(
+            "instruction files total {} KiB, over the {} KiB they should be together",
+            total / 1024,
+            WARN_TOTAL / 1024
+        ));
     }
     loaded
 }
@@ -436,6 +449,29 @@ mod tests {
             [
                 "skipped ~/repo/AGENTS.md (64 KiB, over the 64 KiB an instruction file may be)",
                 "skipped ./big.md (64 KiB, over the 64 KiB an instruction file may be)",
+            ]
+        );
+    }
+
+    /// Each file is under the cap, but together they are past the budget, so all load and
+    /// the total is said once, after anything skipped.
+    #[test]
+    fn files_past_the_total_budget_load_with_a_warning() {
+        let f = Fixture::new();
+        let half = "x".repeat(WARN_TOTAL / 2);
+        f.write("home/repo/AGENTS.md", &half);
+        f.write("home/repo/sub/CLAUDE.md", &half);
+        assert!(load(&project_only(), &f.roots).skipped.is_empty());
+
+        f.write("home/repo/sub/AGENT.md", &"x".repeat(MAX_FILE + 1));
+        f.write("home/repo/sub/.claude/CLAUDE.md", "one more byte");
+        let loaded = load(&project_only(), &f.roots);
+        assert_eq!(loaded.files.len(), 3);
+        assert_eq!(
+            loaded.skipped,
+            [
+                "skipped ./AGENT.md (64 KiB, over the 64 KiB an instruction file may be)",
+                "instruction files total 32 KiB, over the 32 KiB they should be together",
             ]
         );
     }
