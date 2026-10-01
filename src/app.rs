@@ -190,6 +190,9 @@ pub struct App {
     pub lines: Vec<String>,
     /// How each of those lines joins the one above it, so a copy can undo the wrapping.
     pub joins: Vec<Join>,
+    /// Chars at the start of each of those lines that the renderer drew rather than the
+    /// text has: the entry's mark and indent, a code block's indent. A copy leaves them.
+    pub margins: Vec<usize>,
     /// The transcript's text area, filled in by the renderer.
     pub transcript_area: Option<Rect>,
     /// The selected span of the transcript, drawn reversed and copied by `ctrl+y`.
@@ -300,6 +303,7 @@ impl App {
             drag_at: None,
             lines: Vec::new(),
             joins: Vec::new(),
+            margins: Vec::new(),
             transcript_area: None,
             selection: None,
             anchor: None,
@@ -837,8 +841,9 @@ impl App {
         std::mem::replace(&mut self.selection, selection) != selection || scrolled
     }
 
-    /// The selected transcript text, trailing spaces trimmed. Rows the wrap broke go
-    /// back on one line: only the newlines the text itself has survive the copy.
+    /// The selected transcript text, trailing spaces and the renderer's margins trimmed.
+    /// Rows the wrap broke go back on one line: only the newlines the text itself has
+    /// survive the copy.
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
         let (from, to) = selection.range();
@@ -847,7 +852,12 @@ impl App {
                 let chars = self.lines[line].chars();
                 let range = selection.on_line(line, self.lines[line].chars().count());
                 let range = range.unwrap_or(0..0);
-                let part: String = chars.skip(range.start).take(range.len()).collect();
+                let margin = self.margins.get(line).copied().unwrap_or(0);
+                let start = range.start.max(margin);
+                let part: String = chars
+                    .skip(start)
+                    .take(range.end.saturating_sub(start))
+                    .collect();
                 (line, part.trim_end().to_string())
             })
             .collect();

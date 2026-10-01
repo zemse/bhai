@@ -82,8 +82,9 @@ pub enum Join {
 }
 
 impl Join {
-    /// `part` appended to what is copied so far, with the break undone: a row the wrap
-    /// made loses the indent the renderer put in front of it.
+    /// `part` appended to what is copied so far, with the break undone. The indent the
+    /// renderer drew is already off `part`, so a split word, a key say, comes back whole
+    /// and a split line of code keeps the spaces it has.
     pub fn append(self, text: &mut String, part: &str) {
         match self {
             Join::Newline => {
@@ -94,7 +95,7 @@ impl Join {
                 text.push(' ');
                 text.push_str(part.trim_start());
             }
-            Join::Split => text.push_str(part.trim_start()),
+            Join::Split => text.push_str(part),
         }
     }
 }

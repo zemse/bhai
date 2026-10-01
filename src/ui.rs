@@ -549,6 +549,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let entries = app.entries();
     let mut spans = Vec::with_capacity(entries.list.len());
     let mut joins: Vec<Join> = Vec::new();
+    let mut margins: Vec<usize> = Vec::new();
     let mut folds = HashMap::new();
     for (index, entry) in entries.list.iter().enumerate() {
         let start = lines.len();
@@ -575,6 +576,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         let rows = entry_lines(entry, width, expanded, retryable, result);
         lines.extend(rows.lines);
         joins.extend(rows.joins);
+        margins.extend(rows.margins);
         if rows.folded || owner != index {
             folds.insert(index, owner);
         }
@@ -597,6 +599,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     app.transcript_area = Some(text_area);
     app.lines = lines.iter().map(plain).collect();
     app.joins = joins;
+    app.margins = margins;
     app.rehover();
 
     if let Some(selection) = app.selection {
@@ -830,11 +833,13 @@ fn shell_status(result: &Entry) -> Option<(String, Color)> {
     }
 }
 
-/// What an entry draws: its rows, how each one joins the row above it, and whether it
-/// has rows a click folds away.
+/// What an entry draws: its rows, how each one joins the row above it, how many chars
+/// in front of each are drawn rather than text, and whether it has rows a click folds
+/// away.
 struct Rows {
     lines: Vec<Line<'static>>,
     joins: Vec<Join>,
+    margins: Vec<usize>,
     folded: bool,
 }
 
@@ -851,7 +856,9 @@ fn entry_lines(
     if let Entry::Assistant(text) = entry {
         let lead = MESSAGE_MARK.chars().count();
         let indent = " ".repeat(lead);
-        let (rendered, mut joins) = markdown::render(text, width.saturating_sub(lead).max(4));
+        let (rendered, mut joins, margins) =
+            markdown::render(text, width.saturating_sub(lead).max(4));
+        let mut margins: Vec<usize> = margins.into_iter().map(|m| m + lead).collect();
         let mut lines: Vec<Line> = rendered
             .into_iter()
             .enumerate()
@@ -871,12 +878,15 @@ fn entry_lines(
         if lines.is_empty() {
             lines.push(Line::from(MESSAGE_MARK));
             joins.push(Join::Newline);
+            margins.push(lead);
         }
         lines.push(Line::from(""));
         joins.push(Join::Newline);
+        margins.push(0);
         return Rows {
             lines,
             joins,
+            margins,
             folded: false,
         };
     }
@@ -951,6 +961,9 @@ fn entry_lines(
             _ => join,
         });
     }
+    // Every row so far is the entry's text behind its mark or indent; the notes below
+    // are the harness's, so a copy takes them whole.
+    let mut margins = vec![lead; lines.len()];
     // A finished shell command says how it ended on the row below, and what that row
     // hides, counting the command's own folded rows in with what it printed.
     if let Some(result) = result {
@@ -1003,9 +1016,11 @@ fn entry_lines(
     }
     lines.push(Line::from(""));
     joins.push(Join::Newline);
+    margins.resize(lines.len(), 0);
     Rows {
         lines,
         joins,
+        margins,
         folded: hidden > 0 || printed > 0,
     }
 }
@@ -2398,6 +2413,29 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(app.max_scroll > 0);
         assert_eq!(app.selected_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn a_copy_leaves_the_indent_the_transcript_draws() {
+        let key = "ab".repeat(60);
+        let mut app = App::detached();
+        app.entries().push(Entry::Assistant(format!(
+            "run this:\n\n```\nfn main() {{\n    go();\n}}\n```\n\n{key}"
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(40, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.on_key(ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        ));
+
+        let text = app.selected_text().unwrap();
+        assert!(
+            text.contains("run this:\n\nfn main() {\n    go();\n}\n\n"),
+            "{text:?}"
+        );
+        // Split across three rows, the key comes back as one run of chars.
+        assert!(text.trim_end().ends_with(&format!("\n{key}")), "{text:?}");
     }
 
     #[test]

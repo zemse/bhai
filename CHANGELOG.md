@@ -6,6 +6,9 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A transcript copy leaves out what the renderer drew in front of the text: the `⏺ `
+  and `› ` marks, the indent under them, a code block's indent and a wrapped list
+  item's. A word the wrap split mid-word, a key say, comes back whole.
 - Every turn ends with a dim `✻ 9m 54s chabāyā · 12:58 PM khatam` line in the
   transcript: how long it ran from start to its end, and the local time it ended. Each
   turn picks one of 52 Hinglish pairs, Delhi and Mumbai slang among them: the working

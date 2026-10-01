@@ -18,8 +18,9 @@ const DIM: Style = Style::new().fg(Color::DarkGray);
 const CODE_INDENT: &str = "  ";
 
 /// Renders `text` into lines no wider than `width` chars, each with how it joins the one
-/// above so a copy of a selection can undo the wrapping done here.
-pub fn render(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Join>) {
+/// above and how many chars in front of it are layout, so a copy of a selection can undo
+/// the wrapping and the indenting done here.
+pub fn render(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Join>, Vec<usize>) {
     let text = &crate::wrap::readable(text);
     let mut renderer = Renderer {
         width: width.max(1),
@@ -33,7 +34,7 @@ pub fn render(text: &str, width: usize) -> (Vec<Line<'static>>, Vec<Join>) {
         renderer.event(event);
     }
     renderer.flush();
-    (renderer.lines, renderer.joins)
+    (renderer.lines, renderer.joins, renderer.margins)
 }
 
 /// A block that prefixes every line inside it: a list item or a block quote.
@@ -49,6 +50,8 @@ struct Renderer {
     lines: Vec<Line<'static>>,
     /// How each line joins the one above it.
     joins: Vec<Join>,
+    /// Chars at the start of each line that are layout rather than text.
+    margins: Vec<usize>,
     /// Inline content of the block being built.
     inline: Vec<Cell>,
     styles: Vec<Style>,
@@ -240,6 +243,7 @@ impl Renderer {
                 Line::from(Span::styled(trimmed, DIM))
             });
             self.joins.push(Join::Newline);
+            self.margins.push(0);
         }
     }
 
@@ -296,7 +300,7 @@ impl Renderer {
                     0 => Join::Newline,
                     _ => Join::Split,
                 };
-                self.emit(row, join);
+                self.emit_code(row, join);
             }
         }
         self.gap = true;
@@ -319,7 +323,7 @@ impl Renderer {
         for line in lines {
             let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, PLAIN)).collect();
             row.extend(line.chars().map(|c| (c, PLAIN)));
-            self.emit(row, Join::Newline);
+            self.emit_code(row, Join::Newline);
         }
         true
     }
@@ -425,8 +429,24 @@ impl Renderer {
         if let Some(style) = style {
             spans.push(Span::styled(run, style));
         }
+        // A row the wrap continued sits under the text it continues, not under a marker.
+        let margin = match join {
+            Join::Newline => 0,
+            _ => self.prefix_width(),
+        };
         self.lines.push(Line::from(spans));
         self.joins.push(join);
+        self.margins.push(margin);
+    }
+
+    /// A row of a code block: what a copy takes is the code, without the indent it is
+    /// drawn behind or the containers it sits in.
+    fn emit_code(&mut self, cells: Vec<Cell>, join: Join) {
+        let margin = self.prefix_width() + CODE_INDENT.len();
+        self.emit(cells, join);
+        if let Some(last) = self.margins.last_mut() {
+            *last = margin;
+        }
     }
 }
 
