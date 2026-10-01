@@ -53,6 +53,7 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/reject", post(reject))
         .route("/interrupt", post(interrupt))
         .route("/retry", post(retry))
+        .route("/goal", post(goal))
         .route("/mode", post(mode))
         .route("/model", post(model))
         .route("/context", get(context))
@@ -131,6 +132,14 @@ struct ModeBody {
 struct ModelBody {
     model: Option<String>,
     effort: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GoalBody {
+    /// What follows `/goal`: an objective, `pause`, `resume`, `budget <n>`, `clear`, or
+    /// nothing to have it shown.
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -423,6 +432,15 @@ async fn retry(State(session): State<Arc<Session>>) -> Response {
     match session.retry() {
         Ok(()) => ok(),
         Err(e) => error(StatusCode::CONFLICT, &e.to_string()),
+    }
+}
+
+/// `/goal`, which is how a headless run is set working on its own. What came of it is in
+/// the event stream, and the goal as it stands in `/state`.
+async fn goal(State(session): State<Arc<Session>>, Json(body): Json<GoalBody>) -> Response {
+    match session.set_goal(&body.text) {
+        Ok(()) => ok(),
+        Err(e) => error(StatusCode::BAD_REQUEST, &e),
     }
 }
 
@@ -1075,6 +1093,30 @@ mod tests {
         assert_eq!(
             (&state["model"], &state["effort"]),
             (&json!("test-model"), &json!("xhigh"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_goal_is_set_over_http_and_a_bad_budget_refused() {
+        let (base, _) = start().await;
+        let http = reqwest::Client::new();
+        assert_eq!(
+            post(
+                &http,
+                format!("{base}/goal"),
+                json!({"text": "budget lots"})
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(
+                &http,
+                format!("{base}/goal"),
+                json!({"text": "make it pass"})
+            )
+            .await,
+            StatusCode::OK
         );
     }
 

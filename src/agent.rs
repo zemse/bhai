@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
 use crate::client::{self, Client, Delta, Usage};
 use crate::compact::{self, Limits};
+use crate::goal::{self, Goal};
 use crate::identity::Identity;
 use crate::judge::{self, Judge, Undecided, Verdict};
 use crate::limits::RateLimits;
@@ -32,6 +33,9 @@ use crate::workflow::{self, Workflow};
 /// is otherwise unbounded: a long task keeps going until it is done, interrupted, or
 /// stuck on failing calls.
 const MAX_ERROR_ROUNDS: usize = 3;
+
+/// How long an idle session with a goal active waits before opening a turn on it.
+const GOAL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Everything the agent tells the UI.
 #[derive(Debug)]
@@ -138,8 +142,10 @@ pub enum AgentEvent {
     /// with it.
     Titled(String),
     /// A turn started on its own, on the reports of children that finished while the
-    /// session was idle; the string says what they were doing.
+    /// session was idle or on the goal; the string says on what.
     Resumed(String),
+    /// The goal as it now stands, credits included; `None` once there is none.
+    Goal(Option<Goal>),
     /// The agent is done with this turn and is waiting for input.
     TurnEnd,
 }
@@ -175,6 +181,8 @@ enum Next {
     /// A child detached in an earlier turn finished while the session was idle. Its
     /// report opens a turn of its own, so the model reads it without being asked.
     Landed(ChildResult),
+    /// The session is idle with a goal active: a turn on it.
+    Goal,
     Retry,
     Compact,
     /// The cache of an idle conversation is about to lapse: compact a copy of it.
@@ -204,6 +212,8 @@ pub enum Control {
         workflow: Arc<Workflow>,
         input: String,
     },
+    /// Set, pause, resume, re-budget or clear the goal, or show it, for `/goal`.
+    Goal(goal::Command),
     /// Talk to this model from the next call on, for `/model`. `window` is the model's
     /// context window where the backend says, so compaction still knows when to run.
     Model {
@@ -634,6 +644,7 @@ pub(crate) async fn run_with(
     // turn that started them, so a `/model` switch that rebuilt the fan-out cap would
     // hand the session a second set of slots while the first set is still running.
     let slots = Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING));
+    let goal: goal::Shared = Arc::default();
     // Built again when `/model` switches, so a child starts on the model its parent is
     // on. What tools there are does not depend on the model, so the schemas hold.
     let build = |model: &Arc<dyn Model>| {
@@ -657,7 +668,9 @@ pub(crate) async fn run_with(
                 current: Arc::clone(model),
             });
         }
-        registry
+        registry.with_goal(tools::goal::Goal {
+            goal: Arc::clone(&goal),
+        })
     };
     let mut registry = build(&model);
     let tools = registry.schemas();
@@ -689,6 +702,13 @@ pub(crate) async fn run_with(
             model.seed(&prompt.text, &tools, &history);
         }
     }
+    // A goal never starts working again on its own, so one that was active when the
+    // session ended waits for `/goal resume`.
+    *lock_goal(&goal) = writer.as_ref().and_then(|w| w.goal.clone()).map(|mut was| {
+        was.pause("the session was resumed");
+        was
+    });
+    let mut shown: Option<Goal> = None;
     let mut calls: Vec<Call> = Vec::new();
     let mut monitor = CacheMonitor::default();
 
@@ -701,6 +721,16 @@ pub(crate) async fn run_with(
     let mut forked_at: Option<Instant> = None;
 
     loop {
+        // Woken while idle, so the goal's spend takes in the detached children's too.
+        let wake = !cancel.load(Ordering::Relaxed) && {
+            let total = children_spent(&children);
+            lock_goal(&goal).as_mut().is_some_and(|g| {
+                g.settle(total);
+                g.active()
+            })
+        };
+        announce(&goal, &mut shown, &tx);
+        persist(&goal, writer.as_mut(), &tx);
         // Only a backend with a prompt cache has one to lapse, and only a conversation
         // with something to fold is worth the summary call. An interrupt holds until the
         // next message, and would cut the call off.
@@ -820,6 +850,10 @@ pub(crate) async fn run_with(
                         }
                         continue;
                     }
+                    Control::Goal(command) => {
+                        steer_goal(&goal, command, &children, &tx);
+                        continue;
+                    }
                     Control::Compact(prompt) => {
                         asked = prompt;
                         Next::Compact
@@ -835,6 +869,9 @@ pub(crate) async fn run_with(
             // A message already typed is the turn to run, and it picks up every waiting
             // report on its way past `delivered`.
             Some(result) = rx_results.recv() => Next::Landed(result),
+            // Behind the user and the children, and a moment late, so a prompt the session
+            // hands in as the last turn ends is the next turn rather than the goal.
+            _ = tokio::time::sleep(GOAL_GRACE), if wake => Next::Goal,
             // Last: anything the user or a child does first moves the history on.
             _ = tokio::time::sleep_until(fork_at.unwrap_or_else(Instant::now).into()),
                 if fork_at.is_some() => Next::Fork,
@@ -931,15 +968,19 @@ pub(crate) async fn run_with(
         let from = history.len();
         // A retry runs the turn the history already describes, so nothing is added to it
         // and the judge keeps the budget and the log of the attempt that failed.
-        let (landed, message) = match next {
-            Next::Landed(result) => (Some(result), None),
-            Next::Turn(message) => (None, Some(message)),
+        let (landed, message, on_goal) = match next {
+            Next::Landed(result) => (Some(result), None, None),
+            Next::Turn(message) => (None, Some(message), None),
+            Next::Goal => match lock_goal(&goal).clone().filter(Goal::active) {
+                Some(goal) => (None, None, Some(goal)),
+                None => continue,
+            },
             // A retry adds nothing: it runs the turn the history already describes.
-            Next::Retry | Next::Compact | Next::Fork | Next::Forked(_) => (None, None),
+            Next::Retry | Next::Compact | Next::Fork | Next::Forked(_) => (None, None, None),
         };
         // Just before what opens the turn, which is where the API takes an update.
         let mut update_at = None;
-        if (landed.is_some() || message.is_some())
+        if (landed.is_some() || message.is_some() || on_goal.is_some())
             && let Some(update) = effort_change(model.as_ref(), &history)
         {
             update_at = Some(history.len());
@@ -952,7 +993,10 @@ pub(crate) async fn run_with(
             // Sent before the report, so the session is marked working and what the user
             // types now queues behind this turn rather than racing it.
             if resume {
-                let _ = tx.send(AgentEvent::Resumed(result.description.clone()));
+                let _ = tx.send(AgentEvent::Resumed(format!(
+                    "on a child's report: {}",
+                    result.description
+                )));
             }
             let mut what = vec![land(result, resume, &mut history, &tx)];
             what.extend(delivered(Some(&mut rx_results), resume, &mut history, &tx));
@@ -966,6 +1010,20 @@ pub(crate) async fn run_with(
             if let Some(judge) = &judge {
                 judge.resumed(&what.join(", "));
             }
+        }
+        if let Some(on) = &on_goal {
+            let _ = tx.send(AgentEvent::Resumed(format!(
+                "on the goal: {}",
+                on.objective
+            )));
+            if let Some(judge) = &judge {
+                judge.on_goal(&on.objective);
+            }
+            history.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": on.prompt() }],
+            }));
         }
         if let Some(message) = &message {
             // The judge decides against the task just given, with a fresh budget.
@@ -1000,6 +1058,14 @@ pub(crate) async fn run_with(
 
         // The turn holds the history, so mid-turn requests see it as the turn started.
         let (before, calls_before) = (history.clone(), calls.clone());
+        // Every call while the goal is active is charged to it, but only a turn nobody
+        // typed is stopped by its budget: the user's own question is answered.
+        let budget = Budget {
+            goal: &goal,
+            children: &children,
+            hard: message.is_none(),
+        };
+        let charged = lock_goal(&goal).as_ref().is_some_and(Goal::active);
         let result = {
             let turn = turn(
                 model.as_ref(),
@@ -1019,6 +1085,7 @@ pub(crate) async fn run_with(
                 Some(&mut rx_results),
                 // The user is watching this one and can interrupt it.
                 None,
+                charged.then_some(&budget),
             );
             tokio::pin!(turn);
             loop {
@@ -1032,6 +1099,11 @@ pub(crate) async fn run_with(
                         Control::Compact(prompt) => {
                             compact_next = true;
                             asked = prompt;
+                        }
+                        // The goal is shared with the turn, which reads it between steps.
+                        Control::Goal(command) => {
+                            steer_goal(&goal, command, &children, &tx);
+                            announce(&goal, &mut shown, &tx);
                         }
                         // The session refuses either while a turn runs, so neither can
                         // happen; a switch mid-call would answer with the wrong model.
@@ -1060,6 +1132,21 @@ pub(crate) async fn run_with(
                 }
             }
         };
+        // A goal stops on an interrupt or a failure rather than carrying on past either,
+        // and on a turn of its own that cost nothing, which would otherwise loop.
+        {
+            let total = children_spent(&children);
+            if let Some(g) = lock_goal(&goal).as_mut() {
+                g.settle(total);
+                if result.result.is_err() {
+                    g.pause("the turn failed");
+                } else if cancel.load(Ordering::Relaxed) {
+                    g.pause("interrupted");
+                } else if on_goal.as_ref().is_some_and(|on| on.spent == g.spent) {
+                    g.pause("its last turn spent no tokens");
+                }
+            }
+        }
         if let Err(e) = result.result {
             // A refused request that carried a new update may be refusing the update, and
             // one left in the history would go out with every request after it.
@@ -1116,8 +1203,115 @@ pub(crate) async fn run_with(
             // Earlier calls index the old history and read the old prefix.
             (calls, monitor, compact_next) = (Vec::new(), CacheMonitor::default(), false);
         }
+        announce(&goal, &mut shown, &tx);
+        persist(&goal, writer.as_mut(), &tx);
         sync(writer.as_ref(), &tx);
         let _ = tx.send(AgentEvent::TurnEnd);
+    }
+}
+
+fn lock_goal(goal: &goal::Shared) -> std::sync::MutexGuard<'_, Option<Goal>> {
+    goal.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What every child of the session has cost so far, as a goal counts it.
+fn children_spent(children: &Children) -> u64 {
+    children
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|c| c.input_tokens.saturating_sub(c.cached_tokens) + c.output_tokens)
+        .sum()
+}
+
+/// Apply `/goal`; a plain `/goal` says where the goal stands.
+fn steer_goal(
+    goal: &goal::Shared,
+    command: goal::Command,
+    children: &Children,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    let total = children_spent(children);
+    let mut goal = lock_goal(goal);
+    if command == goal::Command::Show {
+        let _ = tx.send(AgentEvent::Info(match goal.as_mut() {
+            Some(goal) => {
+                goal.settle(total);
+                goal.line()
+            }
+            None => format!("no goal. {}", goal::USAGE),
+        }));
+    }
+    if let Err(e) = goal::apply(&mut goal, command, total) {
+        let _ = tx.send(AgentEvent::Error(e));
+    }
+}
+
+/// Tell the consumers the goal as it now stands, with a notice when more than its spend
+/// moved.
+fn announce(goal: &goal::Shared, shown: &mut Option<Goal>, tx: &mpsc::UnboundedSender<AgentEvent>) {
+    let now = lock_goal(goal).clone();
+    if now == *shown {
+        return;
+    }
+    let moved = match (&now, &*shown) {
+        (Some(now), Some(was)) => {
+            (&now.objective, now.budget, now.state, &now.note)
+                != (&was.objective, was.budget, was.state, &was.note)
+        }
+        _ => true,
+    };
+    if moved {
+        let _ = tx.send(AgentEvent::Info(match &now {
+            Some(goal) => goal.line(),
+            None => "goal cleared".to_string(),
+        }));
+    }
+    let _ = tx.send(AgentEvent::Goal(now.clone()));
+    *shown = now;
+}
+
+/// Record the goal in the session file, so a resume knows what it had spent.
+fn persist(
+    goal: &goal::Shared,
+    writer: Option<&mut Writer>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    let now = lock_goal(goal).clone();
+    if let Some(writer) = writer
+        && let Err(e) = writer.goal(&now)
+    {
+        let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+    }
+}
+
+/// The goal a turn charges its calls to, and whether running it out stops the turn.
+struct Budget<'a> {
+    goal: &'a goal::Shared,
+    children: &'a Children,
+    hard: bool,
+}
+
+impl Budget<'_> {
+    /// Charge one call, handing back the goal as it now stands.
+    fn charge(&self, usage: &Usage) -> Option<Goal> {
+        let mut goal = lock_goal(self.goal);
+        let goal = goal.as_mut()?;
+        goal.charge(usage);
+        Some(goal.clone())
+    }
+
+    /// Whether the turn has to stop before its next call: the budget is spent, the
+    /// children's calls counted.
+    fn spent(&self) -> bool {
+        if !self.hard {
+            return false;
+        }
+        let total = children_spent(self.children);
+        lock_goal(self.goal).as_mut().is_some_and(|goal| {
+            goal.settle(total);
+            goal.state == goal::State::Spent
+        })
     }
 }
 
@@ -1191,6 +1385,8 @@ async fn turn(
     mut results: Option<&mut mpsc::UnboundedReceiver<ChildResult>>,
     // Steps this turn may take, for one nobody is watching; `None` for no bound.
     limit: Option<usize>,
+    // The goal its calls are charged to, while one is active.
+    budget: Option<&Budget<'_>>,
 ) -> Turn {
     let mut error_rounds = 0usize;
     let mut truncated = false;
@@ -1198,6 +1394,14 @@ async fn turn(
     let mut step = 0usize;
     loop {
         step += 1;
+        // Checked before each call rather than after, so the tool results of the last
+        // one are in the history and nothing is left half done.
+        if budget.is_some_and(Budget::spent) {
+            let _ = tx.send(AgentEvent::Info(
+                "stopped: the goal's token budget is spent".to_string(),
+            ));
+            return Turn::ended(step - 1, truncated);
+        }
         // The last step is spent answering, not calling: a bound that cuts the turn off
         // mid-tool throws away everything it found, so it is told to finish first.
         if let Some(limit) = limit {
@@ -1272,6 +1476,9 @@ async fn turn(
                         let _ = tx.send(AgentEvent::Error(format!("usage log: {e:#}")));
                     }
                     let _ = tx.send(AgentEvent::Usage(usage));
+                    if let Some(now) = budget.and_then(|b| b.charge(&usage)) {
+                        let _ = tx.send(AgentEvent::Goal(Some(now)));
+                    }
                     if hit.hit_ratio.is_none() {
                         return;
                     }
@@ -1764,6 +1971,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             // A child has no `agent` tool, so it has no children to hear back from.
             None,
             Some(CHILD_STEPS),
+            None,
         )
         .await;
         (result, history)
@@ -1797,6 +2005,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::TurnEnd
                 // A child has no children, so it never resumes on one's report.
                 | AgentEvent::Resumed(_)
+                // Nor a goal, which is the session's.
+                | AgentEvent::Goal(_)
                 // What is typed into its pane comes by its mailbox, and shows there as
                 // it is posted.
                 | AgentEvent::Steered(_)
@@ -2766,6 +2976,7 @@ mod tests {
             None,
             Some(&mut results),
             None,
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -3193,7 +3404,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::Resumed(what) if what == "clean up")),
+                .any(|e| matches!(e, AgentEvent::Resumed(what) if what == "on a child's report: clean up")),
             "{events:?}"
         );
         let bodies = fake.bodies.lock().unwrap().clone();
@@ -3357,6 +3568,207 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    /// A session on `fake` that nobody has typed into, with `controls` waiting for it.
+    /// The senders are handed back, since a session whose input has closed ends.
+    fn goal_session(
+        fake: &fake::Fake,
+        controls: Vec<Control>,
+    ) -> (
+        mpsc::UnboundedReceiver<AgentEvent>,
+        mpsc::Sender<String>,
+        mpsc::Sender<Control>,
+        Arc<Cancel>,
+    ) {
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(8);
+        for control in controls {
+            tx_control.try_send(control).unwrap();
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(Cancel::default());
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            SystemPrompt::default(),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        (rx, tx_user, tx_control, cancel)
+    }
+
+    fn set_goal(objective: &str) -> Control {
+        Control::Goal(goal::Command::Set(objective.to_string()))
+    }
+
+    fn parent_calls(fake: &fake::Fake) -> Vec<String> {
+        fake.bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| c == "parent")
+            .map(|(_, body)| body["input"].to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_goal_opens_turns_on_its_own_until_the_model_ends_it() {
+        use fake::{Fake, call, say};
+
+        let fake = Fake::new(vec![
+            vec![call("read", json!({"path": "/etc/hosts"}))],
+            // The turn ends without the goal ending, so another opens on it.
+            vec![say("not yet")],
+            vec![call(
+                "goal",
+                json!({"status": "complete", "reason": "read it"}),
+            )],
+            vec![say("done")],
+            vec![say("should not run")],
+        ]);
+        let (mut rx, _user, _control, _cancel) =
+            goal_session(&fake, vec![set_goal("read the hosts file")]);
+        let first = settle(&mut rx).await;
+        assert!(
+            first.iter().any(
+                |e| matches!(e, AgentEvent::Resumed(what) if what == "on the goal: read the hosts file")
+            ),
+            "{first:?}"
+        );
+        let second = settle(&mut rx).await;
+        assert!(
+            info(&second)
+                .iter()
+                .any(|i| i.starts_with("goal complete: read the hosts file (24 of")),
+            "{second:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let calls = parent_calls(&fake);
+        assert_eq!(calls.len(), 4, "an ended goal opens no more turns");
+        assert!(calls[0].contains(goal::CONTINUE), "{}", calls[0]);
+        // Each turn on it says what it has spent so far: two calls of 8.
+        assert!(calls[2].contains("Spent 16 of"), "{}", calls[2]);
+        assert!(fake.offered.lock().unwrap()[0].contains(&"goal".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_goal_stops_mid_turn_once_its_budget_is_spent() {
+        use fake::{Fake, call};
+
+        let fake = Fake::new(vec![vec![call("read", json!({"path": "/etc/hosts"}))]; 10]);
+        let (mut rx, _user, _control, _cancel) = goal_session(
+            &fake,
+            vec![
+                set_goal("keep reading"),
+                Control::Goal(goal::Command::Budget(20)),
+            ],
+        );
+        let events = settle(&mut rx).await;
+        let notices = info(&events);
+        assert!(
+            notices.contains(&"stopped: the goal's token budget is spent"),
+            "{events:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|i| i.starts_with("goal budget spent: keep reading (24 of 20 tokens)")),
+            "{events:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            parent_calls(&fake).len(),
+            3,
+            "8 a call, so the third spends it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_goal_waits_for_the_user_rather_than_starting_again() {
+        use fake::Fake;
+
+        let fake = Fake::new(vec![fake::step(fake::HANG), fake::step(fake::HANG)]);
+        let (mut rx, _user, _control, cancel) = goal_session(&fake, vec![set_goal("wait")]);
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Text(_)) {
+                break;
+            }
+        }
+        cancel.stop();
+        let events = settle(&mut rx).await;
+        assert!(
+            info(&events)
+                .iter()
+                .any(|i| i.starts_with("goal paused: wait") && i.contains("interrupted")),
+            "{events:?}"
+        );
+        // As the next `Session::submit` would: the interrupt no longer holds, the pause does.
+        cancel.clear();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(parent_calls(&fake).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_users_own_turn_goes_before_the_goal_and_is_charged_but_not_cut() {
+        use fake::{Fake, call, say};
+
+        let fake = Fake::new(vec![
+            vec![call("read", json!({"path": "/etc/hosts"}))],
+            vec![call("read", json!({"path": "/etc/hosts"}))],
+            vec![say("here it is")],
+            vec![say("should not run")],
+        ]);
+        let (mut rx, user, _control, _cancel) = goal_session(
+            &fake,
+            vec![set_goal("tidy"), Control::Goal(goal::Command::Budget(10))],
+        );
+        user.send("what is in hosts?".to_string()).await.unwrap();
+        let events = settle(&mut rx).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Resumed(_))),
+            "{events:?}"
+        );
+        let notices = info(&events);
+        assert!(
+            !notices.iter().any(|i| i.starts_with("stopped:")),
+            "{events:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|i| i.starts_with("goal budget spent: tidy (16 of 10 tokens)")),
+            "{events:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(parent_calls(&fake).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_goal_turn_that_cost_nothing_pauses_rather_than_looping() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![vec![say("hm")], vec![say("hm")]]).with_usage(Usage::default());
+        let (mut rx, _user, _control, _cancel) = goal_session(&fake, vec![set_goal("think")]);
+        let events = settle(&mut rx).await;
+        assert!(
+            info(&events)
+                .iter()
+                .any(|i| i.contains("its last turn spent no tokens")),
+            "{events:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(parent_calls(&fake).len(), 1);
     }
 
     /// A turn run again on the history as it stands, as `Session::retry` asks for it.
@@ -4200,9 +4612,9 @@ mod tests {
         // to the history like any other, so the cache is not broken by it either.
         let events = settle(&mut rx).await;
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::Resumed(what) if what == "look")),
+            events.iter().any(
+                |e| matches!(e, AgentEvent::Resumed(what) if what == "on a child's report: look")
+            ),
             "{events:?}"
         );
         assert!(

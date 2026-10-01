@@ -396,6 +396,16 @@ impl Judge {
         state.spent = 0;
     }
 
+    /// A turn the agent started on its own, on the goal the user set. The goal is the
+    /// task, so it joins the ledger once, and each turn on it gets a fresh budget.
+    pub fn on_goal(&self, objective: &str) {
+        let same = self.lock().task == clip(objective, TASK_CLIP);
+        match same {
+            true => self.lock().spent = 0,
+            false => self.start_turn(objective),
+        }
+    }
+
     /// A turn the agent started on its own, on a child's report. The task is still the
     /// user's, so only the budget starts again: following up a report the agent asked
     /// for is the same piece of work, not a new one.

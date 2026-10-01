@@ -385,6 +385,7 @@ mod tests {
                 judge: Usage::default(),
                 last_cache_break: None,
                 rate_limits: None,
+                goal: None,
                 pending: None,
                 entries: Vec::new(),
                 seq: 0,

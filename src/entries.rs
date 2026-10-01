@@ -93,9 +93,7 @@ impl Entries {
             }
             // Nothing was typed: the reports themselves follow, as the tool results
             // they are, so this only says why the agent started working again.
-            Event::Resumed(what) => {
-                self.push(Entry::Info(format!("resumed on a child's report: {what}")))
-            }
+            Event::Resumed(what) => self.push(Entry::Info(format!("resumed {what}"))),
             Event::Queued { .. } => {}
             Event::Text(delta) => self.append(delta, Stream::Assistant),
             Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),
@@ -202,6 +200,10 @@ impl Entries {
                     // the user said, so it is not shown as one.
                     None => match reported(&text("content")) {
                         Some(report) => Entry::Output(report),
+                        // A goal turn's opening is the harness's, not the user's.
+                        None if text("content").starts_with(crate::goal::CONTINUE) => {
+                            Entry::Info("resumed on the goal".to_string())
+                        }
                         None => Entry::User(text("content")),
                     },
                 },

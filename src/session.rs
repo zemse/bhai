@@ -158,6 +158,8 @@ pub enum Event {
     /// A compacted copy of the history is ready for `/compact-then`, and a call on it
     /// would read this many tokens; `None` once it no longer stands for the history.
     Fork(Option<u64>),
+    /// The goal as it now stands, credits included; `None` once there is none.
+    Goal(Option<crate::goal::Goal>),
     /// The permission mode changed.
     Mode(Mode),
     /// `/model` switched the session to this model and reasoning effort.
@@ -272,6 +274,8 @@ pub struct State {
     pub last_cache_break: Option<CacheBreak>,
     /// The latest rate-limit headroom, once the backend has reported it.
     pub rate_limits: Option<RateLimits>,
+    /// What `/goal` set, and what it has spent.
+    pub goal: Option<crate::goal::Goal>,
     pub pending: Option<Approval>,
     /// Transcript entries with token attribution, as the hover badges show them.
     pub entries: Vec<EntryTokens>,
@@ -400,6 +404,7 @@ struct Inner {
     rate_limits: Option<RateLimits>,
     /// The tokens a call on the compacted copy would read, while there is one.
     fork: Option<u64>,
+    goal: Option<crate::goal::Goal>,
     next_id: u64,
     /// Calls waiting on the user, oldest first. Parallel workflow steps each park one,
     /// so there can be several; only the front is on screen.
@@ -534,6 +539,7 @@ impl Session {
                 .map_or_else(Usage::default, |j| j.total()),
             last_cache_break: inner.last_cache_break.clone(),
             rate_limits: inner.rate_limits,
+            goal: inner.goal.clone(),
             pending: inner.pending.front().map(|(approval, _)| approval.clone()),
             entries: self.entries().attributed(),
             seq,
@@ -582,6 +588,20 @@ impl Session {
     /// The tokens a call on the compacted copy would read, while there is one.
     pub fn fork(&self) -> Option<u64> {
         self.lock().fork
+    }
+
+    /// The goal `/goal` set, as the agent last reported it.
+    pub fn goal(&self) -> Option<crate::goal::Goal> {
+        self.lock().goal.clone()
+    }
+
+    /// `/goal` with what followed it. The agent takes it even mid-turn, and opens a turn on
+    /// an active goal once it is idle; it says what came of it in the transcript.
+    pub fn set_goal(&self, text: &str) -> Result<(), String> {
+        let command = crate::goal::Command::parse(text)?;
+        self.tx_control
+            .try_send(Control::Goal(command))
+            .map_err(|_| SubmitError::Closed.to_string())
     }
 
     /// Put `waiting` at the back of the queue, with the state locked.
@@ -1110,6 +1130,10 @@ impl Session {
                 inner.last_call = None;
                 inner.last_usage = None;
                 Event::Cleared
+            }
+            AgentEvent::Goal(goal) => {
+                inner.goal = goal.clone();
+                Event::Goal(goal)
             }
             AgentEvent::Fork(tokens) => {
                 inner.fork = tokens;

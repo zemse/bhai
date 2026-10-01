@@ -11,6 +11,7 @@ use serde_json::Value;
 pub mod agent;
 pub mod bash;
 pub mod edit;
+pub mod goal;
 pub mod mcp;
 pub mod models;
 pub mod read;
@@ -108,6 +109,13 @@ impl Registry {
     /// The `models` tool, which only a session that can delegate has a use for.
     pub fn with_models(mut self, models: models::Models) -> Self {
         self.tools.push(Box::new(models));
+        self
+    }
+
+    /// `goal`, for the main agent. Added past the identity's narrowing, since without it
+    /// a goal can only end on its budget.
+    pub fn with_goal(mut self, goal: goal::Goal) -> Self {
+        self.tools.push(Box::new(goal));
         self
     }
 

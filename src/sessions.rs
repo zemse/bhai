@@ -118,6 +118,8 @@ pub struct Writer {
     /// The session file, locked and appended to for as long as this writer lives. It
     /// opens with the first record, which is also when the header goes out.
     file: Option<std::fs::File>,
+    /// The `/goal` as last recorded, which a resume picks up.
+    pub goal: Option<crate::goal::Goal>,
 }
 
 impl Writer {
@@ -128,6 +130,7 @@ impl Writer {
             header,
             last: None,
             file: None,
+            goal: None,
         }
     }
 
@@ -151,6 +154,7 @@ impl Writer {
             header: loaded.header.clone(),
             last: loaded.last.clone(),
             file: Some(file),
+            goal: loaded.goal.clone(),
         })
     }
 
@@ -179,6 +183,16 @@ impl Writer {
             "effort": effort,
             "prefix": prefix,
         }))
+    }
+
+    /// Record the goal, when it is not what was last recorded.
+    pub fn goal(&mut self, goal: &Option<crate::goal::Goal>) -> Result<()> {
+        if self.goal == *goal {
+            return Ok(());
+        }
+        self.write(json!({ "type": "goal", "goal": goal }))?;
+        self.goal = goal.clone();
+        Ok(())
     }
 
     /// Record a compaction: `items` replace the history so far on load.
@@ -279,6 +293,8 @@ pub struct Loaded {
     pub model: String,
     pub effort: String,
     pub items: Vec<Value>,
+    /// The goal as last recorded.
+    pub goal: Option<crate::goal::Goal>,
     /// The id of the last record kept.
     pub last: Option<String>,
     /// Bytes of the file that hold the header and the records kept.
@@ -303,6 +319,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
     let mut warnings = Vec::new();
     // The model the session ends on, which a `/model` record later in the file moves.
     let (mut model, mut effort) = (header.model.clone(), header.effort.clone());
+    let mut goal = None;
     while let Some(line) = lines.next() {
         let record = serde_json::from_str::<Value>(line)
             .ok()
@@ -346,6 +363,9 @@ pub fn load(path: &Path) -> Result<Loaded> {
                 });
             }
             (model, effort) = (switched, to);
+        } else if kind == Some("goal") {
+            goal = serde_json::from_value(record.get("goal").cloned().unwrap_or_default())
+                .with_context(|| format!("{}: goal record {id} is not a goal", path.display()))?;
         } else {
             let Some(item) = record.get("item") else {
                 bail!("{}: record {id} has no item", path.display());
@@ -372,6 +392,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
         effort,
         last: records.last().map(|(id, _)| id.clone()),
         items: items.into_iter().map(|(item, _)| item).collect(),
+        goal,
         len,
         warnings,
     })
@@ -819,6 +840,31 @@ mod tests {
             .count();
         assert_eq!(reasoning, 1, "only what the model now in use produced");
         assert_eq!(loaded.items.len(), 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_goal_last_recorded_is_what_a_resume_reads() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+        let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
+        let mut goal = crate::goal::Goal::new("ship it", 1_000, 0);
+        writer.goal(&Some(goal.clone())).unwrap();
+        // The same goal again writes nothing.
+        writer.goal(&Some(goal.clone())).unwrap();
+        goal.pause("interrupted");
+        writer.goal(&Some(goal.clone())).unwrap();
+        writer.append(&items()[1]).unwrap();
+        drop(writer);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.goal, Some(goal));
+        assert_eq!(loaded.items.len(), 6);
+        let records = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(records.matches(r#""type":"goal""#).count(), 2);
+
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        writer.goal(&None).unwrap();
+        assert_eq!(load(&path).unwrap().goal, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 

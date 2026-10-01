@@ -16,6 +16,7 @@ mod debug;
 mod diff;
 mod entries;
 mod frontmatter;
+mod goal;
 mod identity;
 mod input;
 mod instructions;
@@ -1128,6 +1129,8 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             }
             AgentEvent::Judging(Some(call)) => println!("[judging] {call}"),
             AgentEvent::Resumed(what) => println!("\n[resumed] {what}"),
+            AgentEvent::Goal(Some(goal)) => println!("[goal] {}", goal.line()),
+            AgentEvent::Goal(None) => {}
             AgentEvent::Steered(text) => println!("\n[user] {text}"),
             AgentEvent::Titled(name) => println!("[title] {name}"),
             // A probe prints what the model says, and the prompt behind it is a tui

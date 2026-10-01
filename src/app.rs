@@ -1504,6 +1504,16 @@ impl App {
             self.note(Entry::Info(skills_report(&self.skills)));
             return;
         }
+        if let Some(rest) = message.strip_prefix("/goal")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            // What came of it arrives as a notice from the agent.
+            if let Err(e) = self.session.set_goal(rest) {
+                self.note(Entry::Error(e));
+            }
+            return;
+        }
         if let Some(rest) = message.strip_prefix("/queue")
             && (rest.is_empty() || rest.starts_with(' '))
         {
@@ -1739,6 +1749,11 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             return None;
         }
         crate::session::compact_then(self.input.value()).and(self.session.fork())
+    }
+
+    /// The goal `/goal` set, for the bar.
+    pub fn goal(&self) -> Option<crate::goal::Goal> {
+        self.session.goal()
     }
 
     /// What the working row says the turn is doing.

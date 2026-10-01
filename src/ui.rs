@@ -349,6 +349,27 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!("{label} {percent:.0}% "), headroom(percent)),
         ));
     }
+    // What the goal has spent of its budget; only an active one is still spending.
+    if let Some(goal) = app.goal() {
+        let state = match goal.active() {
+            true => String::new(),
+            false => format!("{} ", goal.state.label()),
+        };
+        bar.push((
+            ALWAYS,
+            Span::styled(
+                format!(
+                    "goal {state}{}/{} ",
+                    compact(goal.spent),
+                    compact(goal.budget)
+                ),
+                match goal.active() {
+                    true => Style::new().fg(Color::Cyan),
+                    false => dim,
+                },
+            ),
+        ));
+    }
     if let Some(field) = &app.cache_break {
         bar.push((
             ALWAYS,
@@ -3186,6 +3207,53 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = status(&terminal);
         assert!(bar.contains(" ctx 50% ") && !bar.contains("fork"), "{bar}");
+    }
+
+    #[test]
+    fn status_bar_shows_what_the_goal_has_spent() {
+        let (tx_user, _) = tokio::sync::mpsc::channel(1);
+        let (tx_control, _) = tokio::sync::mpsc::channel(1);
+        let session = crate::session::Session::new(
+            "m".to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+            None,
+        );
+        let mut app = App::new(std::sync::Arc::clone(&session));
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!status(&terminal).contains("goal"), "{}", status(&terminal));
+
+        let mut goal = crate::goal::Goal::new("ship it", 50_000, 0);
+        goal.charge(&Usage {
+            input: 12_000,
+            cached: 2_000,
+            output: 500,
+            reasoning: 0,
+        });
+        session.on_agent(crate::agent::AgentEvent::Goal(Some(goal.clone())));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            status(&terminal).contains("goal 10.5k/50.0k "),
+            "{}",
+            status(&terminal)
+        );
+
+        goal.pause("interrupted");
+        session.on_agent(crate::agent::AgentEvent::Goal(Some(goal)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            status(&terminal).contains("goal paused 10.5k/50.0k "),
+            "{}",
+            status(&terminal)
+        );
+        session.on_agent(crate::agent::AgentEvent::Goal(None));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!status(&terminal).contains("goal"), "{}", status(&terminal));
     }
 
     #[test]
