@@ -15,6 +15,7 @@ mod config;
 mod debug;
 mod diff;
 mod entries;
+mod environment;
 mod external;
 mod frontmatter;
 mod goal;

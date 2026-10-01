@@ -999,10 +999,15 @@ pub(crate) async fn run_with(
             Next::Retry | Next::Compact | Next::Fork | Next::Forked(_) => (None, None, None),
         };
         // Just before what opens the turn, which is where the API takes an update.
-        let mut update_at = None;
-        if (landed.is_some() || message.is_some() || on_goal.is_some())
-            && let Some(update) = effort_change(model.as_ref(), &history)
+        let opens = landed.is_some() || message.is_some() || on_goal.is_some();
+        if opens
+            && let Some(context) =
+                crate::environment::update(&history, &crate::environment::Environment::current())
         {
+            history.push(context);
+        }
+        let mut update_at = None;
+        if opens && let Some(update) = effort_change(model.as_ref(), &history) {
             update_at = Some(history.len());
             history.push(update);
         }
@@ -3663,8 +3668,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // The user message, the `agent` call's result, and the report that landed later.
-        assert_eq!(items, [0, 2, 4]);
+        // The user message, the `agent` call's result, and the report that landed later,
+        // after the environment context.
+        assert_eq!(items, [1, 3, 5]);
         let sent: Vec<usize> = events
             .iter()
             .filter_map(|e| match e {
@@ -3674,7 +3680,7 @@ mod tests {
             .collect();
         // Two calls for the turn that started the child, one for the turn its report
         // opened.
-        assert_eq!(sent, [1, 3, 5]);
+        assert_eq!(sent, [2, 4, 6]);
         let output = events
             .iter()
             .find_map(|e| match e {
@@ -3997,6 +4003,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
+            .filter(|item| !crate::environment::is_context(item))
             .map(|item| item["content"][0]["text"].as_str().unwrap())
             .collect();
         assert_eq!(said, ["go", TURN_ABORTED, "again"]);
@@ -5016,8 +5023,9 @@ mod tests {
         let summarised = parent[17]["input"].as_array().unwrap();
         let folded = parent[18]["input"].as_array().unwrap();
         assert!(folded.len() < summarised.len());
+        assert!(crate::environment::is_context(&folded[0]));
         assert_eq!(
-            folded[1],
+            folded[2],
             compact::user_message("Summary of earlier conversation:\nthe summary")
         );
         let last = parent[19]["input"].as_array().unwrap();
@@ -5068,7 +5076,8 @@ mod tests {
         session(&Fake::new(vec![vec![say("one")]]), fresh, "first").await;
 
         let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
-        assert_eq!(loaded.items.len(), 2);
+        // The environment context, the message and the answer.
+        assert_eq!(loaded.items.len(), 3);
         let resumed = Saved {
             writer: Writer::resume(&dir, &loaded).unwrap(),
             history: loaded.items.clone(),
@@ -5080,10 +5089,11 @@ mod tests {
         assert_eq!(*fake.breaks.lock().unwrap(), []);
         let bodies = fake.bodies.lock().unwrap();
         let input = bodies[0].1["input"].as_array().unwrap();
-        assert_eq!(&input[..2], loaded.items.as_slice());
+        assert_eq!(&input[..3], loaded.items.as_slice());
 
+        // The context read back from the file is still current, so it is not sent again.
         let reloaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
-        assert_eq!(reloaded.items.len(), 4);
+        assert_eq!(reloaded.items.len(), 5);
         assert!(reloaded.warnings.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5213,6 +5223,7 @@ mod tests {
             bodies[4].as_array().unwrap(),
             &[
                 input[0].clone(),
+                input[1].clone(),
                 summary,
                 text("second"),
                 say("two"),
@@ -5229,7 +5240,13 @@ mod tests {
         let summary = compact::user_message("Summary of earlier conversation:\nsummary two");
         assert_eq!(
             loaded.items,
-            [input[0].clone(), summary, text("third"), say("three")]
+            [
+                input[0].clone(),
+                input[1].clone(),
+                summary,
+                text("third"),
+                say("three")
+            ]
         );
         assert!(loaded.warnings.is_empty());
         let fake = Fake::new(vec![vec![say("four")]]);
@@ -5260,7 +5277,7 @@ mod tests {
         drive(&tx_user, &mut rx, &cancel, "fourth", &[]).await;
         assert_eq!(*fake.breaks.lock().unwrap(), []);
         let input = fake.bodies.lock().unwrap()[0].1["input"].clone();
-        assert_eq!(&input.as_array().unwrap()[..4], loaded.items.as_slice());
+        assert_eq!(&input.as_array().unwrap()[..5], loaded.items.as_slice());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5344,15 +5361,15 @@ mod tests {
         let bodies = fake.bodies.lock().unwrap();
         // The summary call extends the history, so it reads it from the cache.
         let summary = bodies[2].1["input"].as_array().unwrap();
-        assert_eq!(summary[..3], *bodies[1].1["input"].as_array().unwrap());
-        assert_eq!(summary.len(), 5);
+        assert_eq!(summary[..4], *bodies[1].1["input"].as_array().unwrap());
+        assert_eq!(summary.len(), 6);
         let third = bodies[3].1["input"].as_array().unwrap();
         assert_eq!(
-            third[1]["content"][0]["text"],
+            third[2]["content"][0]["text"],
             "Summary of earlier conversation:\nthe summary"
         );
-        assert_eq!(third.len(), 5);
-        assert_eq!(third[4]["content"][0]["text"], "third");
+        assert_eq!(third.len(), 6);
+        assert_eq!(third[5]["content"][0]["text"], "third");
     }
 
     #[tokio::test(start_paused = true)]
@@ -5377,8 +5394,8 @@ mod tests {
         assert_eq!(*fake.breaks.lock().unwrap(), []);
         let bodies = fake.bodies.lock().unwrap();
         let third = bodies[3].1["input"].as_array().unwrap();
-        assert_eq!(third[..3], *bodies[1].1["input"].as_array().unwrap());
-        assert_eq!(third.len(), 5);
+        assert_eq!(third[..4], *bodies[1].1["input"].as_array().unwrap());
+        assert_eq!(third.len(), 6);
     }
 
     #[tokio::test]
@@ -5446,10 +5463,10 @@ mod tests {
         // The summary call itself only appends, so it reads the cached prefix.
         let input = bodies[3].1["input"].as_array().unwrap();
         assert_eq!(
-            input[1]["content"][0]["text"],
+            input[2]["content"][0]["text"],
             "Summary of earlier conversation:\nshort"
         );
-        assert_eq!(input.len(), 5);
+        assert_eq!(input.len(), 6);
         // What the user asked for rode along with the request for the summary.
         let request = bodies[2].1["input"].as_array().unwrap().last().unwrap();
         let text = request["content"][0]["text"].as_str().unwrap();
@@ -5850,8 +5867,10 @@ mod tests {
 
         let bodies = fake.bodies.lock().unwrap();
         let sent = bodies[1].1["input"].as_array().unwrap();
-        assert_eq!(sent[0], crate::client::effort_update("high"));
-        assert_eq!(sent[1]["content"][0]["text"], "second");
+        // The environment context went with the rest, so it is told again too.
+        assert!(crate::environment::is_context(&sent[0]));
+        assert_eq!(sent[1], crate::client::effort_update("high"));
+        assert_eq!(sent[2]["content"][0]["text"], "second");
     }
 
     /// A session that misses the cache on every judged call, one call per script step,
@@ -6008,15 +6027,15 @@ mod tests {
         assert_eq!(*fake.breaks.lock().unwrap(), []);
         let input = fake.bodies.lock().unwrap()[1].1["input"].clone();
         let input = input.as_array().unwrap();
-        assert_eq!(input[1], bash);
-        assert_eq!(input[2]["type"], "function_call_output");
-        assert_eq!(input[2]["call_id"], bash["call_id"]);
-        assert_eq!(input[2]["output"], expected.as_str());
+        assert_eq!(input[2], bash);
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], bash["call_id"]);
+        assert_eq!(input[3]["output"], expected.as_str());
         // The command was cut off halfway, which the next turn is told before the message.
-        assert_eq!(input[3]["content"][0]["text"], TURN_ABORTED);
-        assert_eq!(input[4]["content"][0]["text"], "again");
+        assert_eq!(input[4]["content"][0]["text"], TURN_ABORTED);
+        assert_eq!(input[5]["content"][0]["text"], "again");
         let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
-        assert_eq!(&loaded.items[..5], &input[..5]);
+        assert_eq!(&loaded.items[..6], &input[..6]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

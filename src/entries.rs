@@ -217,6 +217,7 @@ impl Entries {
                         None => Entry::User(text("content")),
                     },
                 },
+                Some("message") if crate::environment::is_context(item) => continue,
                 Some("message") if crate::client::is_commentary(item) => {
                     Entry::Commentary(text("content"))
                 }
@@ -915,5 +916,17 @@ mod tests {
             shown,
             [("user", "hi"), ("info", "interrupted"), ("user", "again")]
         );
+    }
+
+    #[test]
+    fn a_restored_environment_context_is_not_shown() {
+        let mut app = intro();
+        let message = |text: &str| serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]});
+        let context =
+            crate::environment::update(&[], &crate::environment::Environment::default()).unwrap();
+        app.restore(&[context, message("hi")]);
+        let shown: Vec<_> = app.list[1..].iter().map(|e| (e.kind(), e.text())).collect();
+        assert_eq!(shown, [("user", "hi")]);
+        assert_eq!(app.attribution.items.get(&1), Some(&1));
     }
 }

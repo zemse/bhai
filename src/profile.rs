@@ -718,6 +718,7 @@ fn classify(entry: &Value) -> (&'static str, Option<String>) {
     let field = |key: &str| entry.get(key).and_then(Value::as_str);
     match field("type") {
         Some("message") if field("role") == Some("user") => ("user message", None),
+        Some("message") if field("role") == Some("developer") => ("developer message", None),
         Some("message") => ("assistant message", None),
         Some("reasoning") => ("reasoning", None),
         Some("function_call") => ("function_call", field("name").map(str::to_string)),

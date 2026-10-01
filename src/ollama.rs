@@ -65,7 +65,11 @@ pub fn messages(instructions: &str, input: &[Value]) -> Vec<Value> {
         let text = crate::tokens::item_text(item).unwrap_or_default();
         match field("type") {
             Some("message") => out.push(json!({
-                "role": field("role").unwrap_or("user"),
+                // Ollama has no developer role; a system message is the nearest.
+                "role": match field("role") {
+                    Some("developer") => "system",
+                    role => role.unwrap_or("user"),
+                },
                 "content": text,
             })),
             Some("function_call") => {
@@ -558,6 +562,20 @@ mod tests {
         // The result is paired with its tool by name, since Ollama has no call ids.
         assert_eq!(messages[3]["tool_name"], "bash");
         assert_eq!(messages[3]["content"], "Cargo.toml");
+    }
+
+    #[test]
+    fn a_developer_message_goes_over_as_a_system_one() {
+        let context =
+            crate::environment::update(&[], &crate::environment::Environment::default()).unwrap();
+        let messages = messages("be brief", &[context]);
+        assert_eq!(messages[1]["role"], "system");
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with(crate::environment::OPEN)
+        );
     }
 
     #[test]

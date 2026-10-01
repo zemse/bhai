@@ -154,8 +154,9 @@ pub fn evict(history: &mut [Value], excess: u64, tokenizer: &dyn Tokenizer) -> u
     freed
 }
 
-/// The history after a summary: the first user message, the summary, and the last
-/// user turn onward. `None` when there is no earlier turn to fold.
+/// The history after a summary: the environment it told the model, the first user
+/// message, the summary, and the last user turn onward. `None` when there is no earlier
+/// turn to fold.
 pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
     let mut users = history
         .iter()
@@ -164,10 +165,12 @@ pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
         .map(|(index, _)| index);
     let first = users.next()?;
     let last = users.next_back().filter(|&last| last > first)?;
-    let mut folded = vec![
-        history[first].clone(),
-        user_message(&format!("{SUMMARY_PREFIX}\n{}", summary.trim())),
-    ];
+    let mut folded: Vec<Value> = crate::environment::restated(history).into_iter().collect();
+    folded.push(history[first].clone());
+    folded.push(user_message(&format!(
+        "{SUMMARY_PREFIX}\n{}",
+        summary.trim()
+    )));
     folded.extend_from_slice(&history[last..]);
     Some(folded)
 }
@@ -309,5 +312,29 @@ mod tests {
         // A single turn has nothing earlier to fold.
         assert_eq!(fold(&history[..5], "s"), None);
         assert_eq!(fold(&[], "s"), None);
+    }
+
+    #[test]
+    fn fold_restates_the_environment_it_folds_away() {
+        use crate::environment::{Environment, restated, update};
+
+        let env = |date: &str| Environment {
+            cwd: "/w".to_string(),
+            shell: "bash".to_string(),
+            current_date: date.to_string(),
+            timezone: "UTC".to_string(),
+        };
+        let mut history = vec![update(&[], &env("2026-10-01")).unwrap()];
+        turn(&mut history, "one", 1);
+        history.extend(update(&history, &env("2026-10-02")));
+        turn(&mut history, "two", 1);
+        history.extend(update(&history, &env("2026-10-03")));
+        turn(&mut history, "three", 1);
+        let folded = fold(&history, "s").unwrap();
+        // One whole item in front, as current as the last diff, and nothing left to send.
+        assert_eq!(folded[0], update(&[], &env("2026-10-03")).unwrap());
+        assert_eq!(folded[0], restated(&history).unwrap());
+        assert_eq!(folded[1], user_message("one"));
+        assert_eq!(update(&folded, &env("2026-10-03")), None);
     }
 }
