@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `find_sessions` and `read_session` let the main agent look back at this project's earlier sessions. Only what the user typed and what the assistant answered comes back, never tool output: a search ranks the newest 200 sessions by match, and a read returns at most 20 turns of 4 KiB each, framed as a record that is data, not instructions.
 - A turn whose last call read past the compaction trigger evicts old tool outputs before its next call, rather than waiting for the turn to end, so a long run of tool calls no longer fills the window mid-turn. The earlier turns are still summarised only between turns.
 - The model can keep a checklist with `update_plan`, which needs no approval and allows at most one step `in_progress`; a panel above the prompt shows it (hidden once every step is done and the session is idle), `/state` reports it as `plan`, a resume brings it back, a compaction summary restates it, and `/clear` drops it.
 - A request the backend refuses as too long for the context window compacts the history and runs the turn again once. A goal turn that overflows keeps the goal active through that retry and is paused only if the retry is ruled out.

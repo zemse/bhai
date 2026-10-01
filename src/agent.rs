@@ -669,6 +669,10 @@ pub(crate) async fn run_with(
     let slots = Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING));
     let goal: goal::Shared = Arc::default();
     let plan: crate::plan::Shared = Arc::default();
+    // The file this session is saved as, which a resume names after the session it continues.
+    let own = saved
+        .as_ref()
+        .map_or_else(|| session_id.clone(), |s| s.writer.header.session.clone());
     // Built again when `/model` switches, so a child starts on the model its parent is
     // on. What tools there are does not depend on the model, so the schemas hold.
     let build = |model: &Arc<dyn Model>| {
@@ -691,6 +695,11 @@ pub(crate) async fn run_with(
             registry = registry.with_models(tools::models::Models {
                 current: Arc::clone(model),
             });
+        }
+        if let Some(delegation) = &delegation
+            && prompt.identity.allows_tool(tools::history::FIND)
+        {
+            registry = registry.with_history(delegation.sessions.clone(), own.clone());
         }
         registry
             .with_goal(tools::goal::Goal {
@@ -3843,6 +3852,10 @@ mod tests {
         assert_eq!(narrowed.len(), 2, "{offered:?}");
         assert!(narrowed.iter().all(|names| *names == &["bash", "read"]));
         assert_eq!(full.len(), 3, "{offered:?}");
+        // The parent can look back at earlier sessions; a child cannot.
+        for name in [tools::history::FIND, tools::history::READ] {
+            assert!(full.iter().all(|names| names.contains(&name.to_string())));
+        }
 
         // The report reached the parent on its own, as the turn it opened.
         assert!(

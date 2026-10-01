@@ -612,6 +612,14 @@ fn newest(dir: &Path) -> Option<PathBuf> {
         .map(|(p, _)| p)
 }
 
+/// The `limit` most recently written session files under `dir`, newest first, read from
+/// the directory alone.
+pub fn recent(dir: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut files = files(dir);
+    files.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    files.into_iter().take(limit).map(|(p, _)| p).collect()
+}
+
 /// Every session file under `dir` with the time it was last written.
 fn files(dir: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
     let Ok(entries) = std::fs::read_dir(dir) else {

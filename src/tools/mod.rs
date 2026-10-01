@@ -12,6 +12,7 @@ pub mod agent;
 pub mod bash;
 pub mod edit;
 pub mod goal;
+pub mod history;
 pub mod mcp;
 pub mod models;
 pub mod plan;
@@ -21,7 +22,7 @@ pub mod submit;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 7] = [
+pub const NAMES: [&str; 9] = [
     bash::NAME,
     read::NAME,
     write::NAME,
@@ -29,6 +30,8 @@ pub const NAMES: [&str; 7] = [
     skill::NAME,
     agent::NAME,
     models::NAME,
+    history::FIND,
+    history::READ,
 ];
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
@@ -124,6 +127,17 @@ impl Registry {
     /// touches nothing but the checklist.
     pub fn with_plan(mut self, plan: plan::UpdatePlan) -> Self {
         self.tools.push(Box::new(plan));
+        self
+    }
+
+    /// `find_sessions` and `read_session` over the sessions in `dir`, for the main agent.
+    /// `current` is the session itself, which a search leaves out.
+    pub fn with_history(mut self, dir: std::path::PathBuf, current: String) -> Self {
+        self.tools.push(Box::new(history::FindSessions {
+            dir: dir.clone(),
+            current,
+        }));
+        self.tools.push(Box::new(history::ReadSession { dir }));
         self
     }
 
