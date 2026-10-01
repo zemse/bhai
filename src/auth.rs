@@ -87,6 +87,11 @@ pub async fn recover(http: &reqwest::Client, rejected: &Auth) -> Result<Auth> {
 fn auth_from(doc: &Value) -> Result<Auth> {
     let access_token = str_at(doc, &["tokens", "access_token"])
         .ok_or_else(|| anyhow!("no access_token after refresh"))?;
+    for key in ["access_token", "refresh_token", "id_token"] {
+        if let Some(token) = str_at(doc, &["tokens", key]) {
+            crate::redact::register(&token);
+        }
+    }
     let account_id = str_at(doc, &["tokens", "account_id"])
         .or_else(|| str_at(doc, &["tokens", "id_token"]).and_then(|jwt| account_id_from(&jwt)));
 
@@ -312,6 +317,23 @@ mod tests {
         let shown = format!("{auth:?}");
         assert!(!shown.contains("secret-token"), "{shown}");
         assert!(shown.contains("acct"), "{shown}");
+    }
+
+    #[test]
+    fn every_codex_token_is_registered_for_redaction() {
+        let doc = serde_json::json!({"tokens": {
+            "access_token": "auth-redact-access-91c2",
+            "refresh_token": "auth-redact-refresh-5e7d",
+            "id_token": "auth-redact-id-3b8f0a",
+        }});
+        auth_from(&doc).unwrap();
+        for token in [
+            "auth-redact-access-91c2",
+            "auth-redact-refresh-5e7d",
+            "auth-redact-id-3b8f0a",
+        ] {
+            assert_eq!(crate::redact::apply(token), "[REDACTED]", "{token}");
+        }
     }
 
     #[test]

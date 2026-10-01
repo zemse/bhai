@@ -73,7 +73,7 @@ impl Tool for Read {
                 read(path, offset, limit.unwrap_or(DEFAULT_LIMIT))
             });
             match result {
-                Ok(output) => (truncate(&output), true),
+                Ok(output) => (truncate(&crate::redact::apply(&output)), true),
                 Err(e) => (e, false),
             }
         })
@@ -224,6 +224,17 @@ mod tests {
         assert!(range(&json!({"offset": 0})).is_err());
         assert!(range(&json!({"limit": "5"})).is_err());
         assert_eq!(range(&json!({"limit": 5})).unwrap(), (1, Some(5)));
+    }
+
+    #[tokio::test]
+    async fn registered_secrets_are_redacted_from_a_read() {
+        crate::redact::register("read-test-secret-value");
+        let path = super::super::temp_dir().join("secret.txt");
+        std::fs::write(&path, "key=read-test-secret-value\n").unwrap();
+        let (out, ok) = Read.execute(&json!({"path": path.to_str().unwrap()})).await;
+        assert!(ok, "{out}");
+        assert!(out.contains("key=[REDACTED]"), "{out}");
+        assert!(!out.contains("read-test-secret-value"), "{out}");
     }
 
     #[tokio::test]

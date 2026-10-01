@@ -264,6 +264,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_known_secret_in_the_result_is_redacted() {
+        static CANCELLED: AtomicBool = AtomicBool::new(false);
+        let Some(server) = crate::mcp::fake_server("x", "") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("bhai-mcp-call-{}", uuid::Uuid::new_v4()));
+        let hub = Hub::connect(
+            vec![server],
+            &crate::identity::Identity::default(),
+            &dir,
+            Duration::from_secs(10),
+        )
+        .await;
+        crate::redact::register("mcp-call-secret-6d2b");
+        let call = Call { hub: Arc::new(hub) };
+        let live = Live {
+            progress: &|_| {},
+            cancel: &CANCELLED,
+        };
+        let args =
+            json!({"name": "mcp__x__echo", "arguments": {"message": "mcp-call-secret-6d2b"}});
+        let (out, ok) = call.execute_live(&args, live).await;
+        assert!(ok && out.contains("[REDACTED]"), "{out}");
+        assert!(!out.contains("mcp-call-secret-6d2b"), "{out}");
+        call.hub.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_search_trims_a_server_schema_too_big_to_read() {
         let huge = ToolInfo {
             schema: json!({"pad": "x".repeat(60_000)}),

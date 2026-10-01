@@ -249,14 +249,21 @@ impl Kept {
         self.newlines + usize::from(self.last.is_some_and(|b| b != b'\n'))
     }
 
-    fn bytes(&self) -> Vec<u8> {
-        let mut out = self.head.clone();
-        if self.dropped > 0 {
-            let marker = format!("\n\n[... {} bytes trimmed ...]\n\n", self.dropped);
-            out.extend_from_slice(marker.as_bytes());
+    /// The text kept, known secrets blanked, a value the gap cut in two included.
+    fn text(&self) -> String {
+        let tail: Vec<u8> = self.tail.iter().copied().collect();
+        if self.dropped == 0 {
+            let all = [self.head.as_slice(), &tail].concat();
+            return crate::redact::apply(&String::from_utf8_lossy(&all)).into_owned();
         }
-        out.extend(self.tail.iter().copied());
-        out
+        let (head, tail) = crate::redact::apply_around_gap(
+            &String::from_utf8_lossy(&self.head),
+            &String::from_utf8_lossy(&tail),
+        );
+        format!(
+            "{head}\n\n[... {} bytes trimmed ...]\n\n{tail}",
+            self.dropped
+        )
     }
 }
 
@@ -362,8 +369,8 @@ pub(crate) fn kill_group(group: Option<u32>) {
 
 /// What the command printed: stdout, then stderr.
 fn body(stdout: &Kept, stderr: &Kept) -> String {
-    let mut body = String::from_utf8_lossy(&stdout.bytes()).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr.bytes()).into_owned();
+    let mut body = stdout.text();
+    let stderr = stderr.text();
     if !stderr.is_empty() {
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
@@ -522,6 +529,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_secrets_are_redacted_from_stdout_and_stderr() {
+        crate::redact::register("bash-test-secret-value");
+        let out = run(
+            "echo out bash-test-secret-value; echo err bash-test-secret-value >&2",
+            None,
+            quiet(),
+        )
+        .await;
+        assert!(out.contains("out [REDACTED]"), "{out}");
+        assert!(out.contains("err [REDACTED]"), "{out}");
+        assert!(!out.contains("bash-test-secret-value"), "{out}");
+    }
+
+    #[tokio::test]
     async fn merges_stderr_into_the_output() {
         let out = run("echo oops >&2", None, quiet()).await;
         assert!(out.contains("oops"), "{out}");
@@ -626,15 +647,37 @@ mod tests {
             kept.push(&b"x".repeat(100));
         }
         kept.push(b"tail");
-        let out = kept.bytes();
+        let out = kept.text();
         assert!(out.len() < KEEP * 3, "{}", out.len());
-        assert!(out.ends_with(b"tail"), "the last bytes are kept");
+        assert!(out.ends_with("tail"), "the last bytes are kept");
         assert!(kept.dropped > 0);
-        assert!(String::from_utf8_lossy(&out).contains(&format!("{} bytes trimmed", kept.dropped)));
+        assert!(out.contains(&format!("{} bytes trimmed", kept.dropped)));
         // Under the cap nothing is touched.
         let mut small = Kept::default();
         small.push(b"a\nb\n");
-        assert_eq!(small.bytes(), b"a\nb\n");
+        assert_eq!(small.text(), "a\nb\n");
+    }
+
+    #[test]
+    fn a_secret_cut_by_the_gap_leaves_no_piece_behind() {
+        crate::redact::register("bash-test-gap-secret-e41c");
+        let mut kept = Kept::default();
+        kept.push(&b"x".repeat(KEEP - 9));
+        kept.push(b"bash-test-gap-secret-e41c");
+        kept.push(&b"y".repeat(KEEP - 11));
+        assert!(kept.dropped > 0);
+        let out = kept.text();
+        assert!(
+            out.contains("x[REDACTED]\n\n[..."),
+            "{}",
+            &out[KEEP - 20..KEEP + 40]
+        );
+        assert!(
+            out.contains("...]\n\n[REDACTED]y"),
+            "{}",
+            &out[out.len() - KEEP - 40..]
+        );
+        assert!(!out.contains("bash-test") && !out.contains("e41c"));
     }
 
     #[tokio::test]

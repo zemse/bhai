@@ -23,9 +23,11 @@ const SECRET_PARTS: [&str; 10] = [
 /// `[bash] pass_env`: names let through whatever they look like.
 static PASS: OnceLock<Vec<String>> = OnceLock::new();
 
-/// Named once for the process, like the code theme.
+/// Named once for the process, like the code theme. What is then withheld is also
+/// registered for redaction, so the two lists cannot drift apart.
 pub fn set_pass(names: &[String]) {
     let _ = PASS.set(names.to_vec());
+    crate::redact::register_withheld_env();
 }
 
 fn looks_secret(name: &str) -> bool {
@@ -118,5 +120,31 @@ mod tests {
             withheld_from(vars(), &["NPM_TOKEN".to_string()]),
             names(&["GITHUB_TOKEN"])
         );
+    }
+
+    /// `set_var` is unsafe, so the test runs itself again as a child with the secret set.
+    #[test]
+    fn withheld_values_are_redacted_once_the_pass_list_is_set() {
+        const NAME: &str =
+            "childenv::tests::withheld_values_are_redacted_once_the_pass_list_is_set";
+        if std::env::var_os("BHAI_TEST_CHILD").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("BHAI_TEST_CHILD", "1")
+                .env("BHAI_TEST_REDACT_TOKEN", "childenv-withheld-4c1e9a")
+                .env("BHAI_TEST_REDACT_PLAIN", "childenv-plain-value")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        set_pass(&[]);
+        let out = crate::redact::apply("childenv-withheld-4c1e9a childenv-plain-value");
+        assert_eq!(out, "[REDACTED] childenv-plain-value");
     }
 }

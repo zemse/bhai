@@ -424,7 +424,10 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n",
         }
         match tokio::time::timeout(timeout, peer.call_tool(params)).await {
             Ok(Ok(result)) => render(&result),
-            Ok(Err(e)) => (format!("MCP call failed: {e}"), false),
+            Ok(Err(e)) => (
+                crate::redact::apply(&format!("MCP call failed: {e}")).into_owned(),
+                false,
+            ),
             Err(_) => (
                 format!(
                     "MCP server `{}` did not answer in {}s.",
@@ -744,6 +747,7 @@ async fn http(server: &Server, url: &str) -> Result<Service> {
     let mut headers = HashMap::new();
     for (name, value) in &server.headers.0 {
         let name = HeaderName::try_from(name).with_context(|| format!("bad header `{name}`"))?;
+        crate::redact::register_header(value);
         let value = HeaderValue::from_str(value)
             .with_context(|| format!("bad value for header `{name}`"))?;
         headers.insert(name, value);
@@ -806,7 +810,8 @@ fn render(result: &CallToolResult) -> (String, bool) {
         parts.push(structured.to_string());
     }
     let ok = result.is_error != Some(true);
-    (crate::tools::truncate(&parts.join("\n")), ok)
+    let text = crate::redact::apply(&parts.join("\n")).into_owned();
+    (crate::tools::truncate(&text), ok)
 }
 
 fn first_line(text: &str) -> &str {
@@ -840,6 +845,27 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         std::env::temp_dir().join(format!("bhai-mcp-hub-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn a_secret_across_the_truncation_cut_is_redacted_whole() {
+        crate::redact::register("mcp-render-secret-0f9e2d");
+        let half = crate::tools::MAX_OUTPUT / 2;
+        // The cut falls at `half`, five bytes into the secret.
+        let text = format!(
+            "{}mcp-render-secret-0f9e2d{}",
+            "a".repeat(half - 5),
+            "b".repeat(half * 2)
+        );
+        let result = CallToolResult::success(vec![ContentBlock::text(text)]);
+        let (out, ok) = render(&result);
+        let around = &out[half - 20..half + 40];
+        assert!(ok && out.contains("bytes trimmed"), "{around}");
+        assert!(out.contains("a[REDA"), "{around}");
+        assert!(
+            !out.contains("mcp-r") && !out.contains("0f9e2d"),
+            "{around}"
+        );
     }
 
     #[tokio::test]
@@ -970,6 +996,7 @@ mod tests {
         let args = serde_json::json!({"message": "hi"});
         let (out, ok) = hub.call("mcp__web__echo", args).await;
         assert_eq!((out.as_str(), ok), ("echo: hi", true));
+        assert_eq!(crate::redact::apply("Bearer s3cret"), "[REDACTED]");
 
         // A rejected header must not be named in the failure.
         let State::Failed(why) = &hub.servers[1].state else {

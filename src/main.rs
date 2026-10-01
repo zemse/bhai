@@ -31,6 +31,7 @@ mod palette;
 mod permissions;
 mod profile;
 mod prompt;
+mod redact;
 mod server;
 mod session;
 mod sessions;
