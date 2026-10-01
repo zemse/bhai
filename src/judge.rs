@@ -579,13 +579,9 @@ impl Judge {
             "latency_ms": elapsed.as_millis(),
         });
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            let _ = crate::sessions::private_dir(dir);
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
+        if let Ok(mut file) = crate::sessions::private_append(path) {
             use std::io::Write;
             let _ = writeln!(file, "{line}");
         }

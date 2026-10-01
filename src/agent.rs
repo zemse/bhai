@@ -3473,6 +3473,14 @@ mod tests {
         assert_eq!(lines[1]["outcome"], "blocked");
         assert_eq!(lines[1]["by"], "rule");
         assert_eq!(lines[1]["reason"], "deny rule Bash(rm:*)");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&log), 0o600);
+            assert_eq!(mode(log.parent().unwrap()), 0o700);
+        }
         // The write ran, so the log is not claiming something that did not happen.
         assert!(repo.join("notes.txt").exists());
     }

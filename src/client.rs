@@ -824,11 +824,7 @@ fn debug_log(line: &str) {
     let Ok(path) = std::env::var("BHAI_DEBUG_SSE") else {
         return;
     };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(mut file) = crate::sessions::private_append(std::path::Path::new(&path)) {
         use std::io::Write;
         let _ = writeln!(file, "{line}");
     }
