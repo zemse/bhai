@@ -134,6 +134,8 @@ pub struct Source {
 pub struct Copied {
     pub at: Instant,
     pub chars: usize,
+    /// The chars asked for, more than `chars` when the copy was cut.
+    pub of: usize,
     pub cell: Position,
 }
 
@@ -847,12 +849,13 @@ impl App {
         else {
             return false;
         };
-        let chars = code.chars().count();
+        let of = code.chars().count();
         match clipboard::copy(code) {
-            Ok(()) => {
+            Ok(chars) => {
                 self.copied = Some(Copied {
                     at: Instant::now(),
                     chars,
+                    of,
                     cell: Position::new(x, y),
                 })
             }
@@ -1116,9 +1119,9 @@ impl App {
         if text.is_empty() {
             return;
         }
-        let chars = text.chars().count();
+        let of = text.chars().count();
         match clipboard::copy(&text) {
-            Ok(()) => self.note(Entry::Info(format!("copied {chars} chars"))),
+            Ok(chars) => self.note(Entry::Info(clipboard::said(chars, of))),
             Err(err) => self.note(Entry::Error(format!("copy failed: {err}"))),
         }
     }
@@ -1134,12 +1137,13 @@ impl App {
         if text.is_empty() {
             return false;
         }
-        let chars = text.chars().count();
+        let of = text.chars().count();
         match clipboard::copy(&text) {
-            Ok(()) => {
+            Ok(chars) => {
                 self.copied = Some(Copied {
                     at: Instant::now(),
                     chars,
+                    of,
                     cell: at,
                 })
             }
@@ -3299,6 +3303,21 @@ mod tests {
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.selection, None, "esc clears it");
         assert_eq!(app.copy_text(), "", "back to the empty input");
+    }
+
+    #[test]
+    fn ctrl_y_says_when_the_copy_was_cut_short() {
+        let mut app = App::detached();
+        app.input.set("a".repeat(100_001));
+        app.on_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(clipboard::last_copied().map(|t| t.len()), Some(100_000));
+        match app.entries().list.last() {
+            Some(Entry::Info(text)) => assert_eq!(
+                text,
+                "copied 100000 of 100001 chars (OSC 52 caps at 100 KB)"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// A transcript taller than the view it is drawn in, with a row above it so both

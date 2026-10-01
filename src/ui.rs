@@ -67,7 +67,7 @@ fn render_copied(frame: &mut Frame, app: &App) {
     let Some(copied) = app.copied.filter(|c| c.at.elapsed() < COPIED_FOR) else {
         return;
     };
-    let text = format!(" copied {} chars ", copied.chars);
+    let text = format!(" {} ", crate::clipboard::said(copied.chars, copied.of));
     let screen = frame.area();
     let width = (text.chars().count() as u16).min(screen.width);
     // Under the pointer, or over it at the last row, and never off the right edge.

@@ -1,4 +1,5 @@
-//! The system clipboard: a platform command when one is installed, else OSC 52.
+//! The system clipboard: a platform command when one is installed, else OSC 52. Over
+//! ssh OSC 52 goes first, since a command there fills the remote machine's clipboard.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -23,24 +24,60 @@ const READERS: &[&[&str]] = &[&["pbpaste"]];
 #[cfg(not(target_os = "macos"))]
 const READERS: &[&[&str]] = &[&["wl-paste"], &["xclip", "-o", "-selection", "clipboard"]];
 
+/// The most text OSC 52 carries, in bytes before base64. Terminals drop an escape
+/// longer than they allow whole, so the text is cut to fit instead.
+const MAX_OSC52: usize = 100_000;
+
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Put `text` on the clipboard, by a platform command or, when none runs, by the
-/// OSC 52 escape, which is what reaches the clipboard over ssh.
+/// Put `text` on the clipboard, by a platform command or by the OSC 52 escape, which
+/// is what reaches the local clipboard over ssh. Returns how many chars it took, fewer
+/// than `text` has when OSC 52 had to cut it.
 #[cfg(not(test))]
-pub fn copy(text: &str) -> Result<()> {
-    if WRITERS.iter().any(|argv| write(argv, text).is_ok()) {
-        return Ok(());
+pub fn copy(text: &str) -> Result<usize> {
+    let command = || WRITERS.iter().any(|argv| write(argv, text).is_ok());
+    if over_ssh(|name| std::env::var_os(name)) {
+        // With no tty to write the escape to, the remote clipboard is better than none.
+        return terminal(text).or_else(|err| match command() {
+            true => Ok(text.chars().count()),
+            false => Err(err),
+        });
     }
-    terminal(text)
+    match command() {
+        true => Ok(text.chars().count()),
+        false => terminal(text),
+    }
 }
 
 /// Under test the machine's own clipboard is left alone: a drag copies as it ends, and
-/// a test run must not walk over whatever the developer had on it.
+/// a test run must not walk over whatever the developer had on it. It cuts the text as
+/// the OSC 52 path does, so a caller can be tested on what it says about a cut.
 #[cfg(test)]
-pub fn copy(text: &str) -> Result<()> {
+pub fn copy(text: &str) -> Result<usize> {
+    let text = clip(text);
     LAST.with(|last| *last.borrow_mut() = Some(text.to_string()));
-    Ok(())
+    Ok(text.chars().count())
+}
+
+/// What to tell the user once `copied` of the `of` chars asked for went on the clipboard.
+pub fn said(copied: usize, of: usize) -> String {
+    match copied < of {
+        true => format!("copied {copied} of {of} chars (OSC 52 caps at 100 KB)"),
+        false => format!("copied {copied} chars"),
+    }
+}
+
+/// Whether bhai runs in an ssh session, by the variables sshd sets.
+#[cfg_attr(test, allow(dead_code))]
+fn over_ssh(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["SSH_CONNECTION", "SSH_TTY"]
+        .iter()
+        .any(|name| var(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// The longest prefix of `text` OSC 52 carries, cut on a char boundary.
+fn clip(text: &str) -> &str {
+    &text[..text.floor_char_boundary(MAX_OSC52)]
 }
 
 #[cfg(test)]
@@ -85,13 +122,15 @@ fn write(argv: &[&str], text: &str) -> Result<()> {
 }
 
 /// Write the escape to the terminal itself rather than through the TUI's buffer.
+/// Returns how many chars of `text` it carried.
 #[cfg_attr(test, allow(dead_code))]
-fn terminal(text: &str) -> Result<()> {
+fn terminal(text: &str) -> Result<usize> {
+    let text = clip(text);
     let sequence = sequence(text, std::env::var_os("TMUX").is_some());
     let mut tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
     tty.write_all(sequence.as_bytes())?;
     tty.flush()?;
-    Ok(())
+    Ok(text.chars().count())
 }
 
 /// The OSC 52 copy escape, in tmux's passthrough form when asked for it.
@@ -149,6 +188,46 @@ mod tests {
         assert_eq!(
             sequence("foo", true),
             "\x1bPtmux;\x1b\x1b]52;c;Zm9v\x07\x1b\\"
+        );
+    }
+
+    #[test]
+    fn ssh_is_told_by_either_variable_sshd_sets() {
+        fn env(
+            set: &'static [(&'static str, &'static str)],
+        ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+            move |name| {
+                set.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.into())
+            }
+        }
+        assert!(over_ssh(env(&[(
+            "SSH_CONNECTION",
+            "10.0.0.2 51234 10.0.0.1 22"
+        )])));
+        assert!(over_ssh(env(&[("SSH_TTY", "/dev/pts/3")])));
+        assert!(!over_ssh(env(&[])));
+        // Set but empty is not a session.
+        assert!(!over_ssh(env(&[("SSH_CONNECTION", ""), ("SSH_TTY", "")])));
+    }
+
+    #[test]
+    fn osc52_text_is_cut_to_the_cap_on_a_char_boundary() {
+        assert_eq!(clip("short"), "short");
+        let exact = "a".repeat(MAX_OSC52);
+        assert_eq!(clip(&exact), exact);
+        // A two-byte char straddling the cap is left out rather than split.
+        let straddle = format!("{}é", "a".repeat(MAX_OSC52 - 1));
+        assert_eq!(clip(&straddle), "a".repeat(MAX_OSC52 - 1));
+    }
+
+    #[test]
+    fn a_cut_copy_says_how_much_of_the_text_it_took() {
+        assert_eq!(said(14, 14), "copied 14 chars");
+        assert_eq!(
+            said(100_000, 100_001),
+            "copied 100000 of 100001 chars (OSC 52 caps at 100 KB)"
         );
     }
 }
