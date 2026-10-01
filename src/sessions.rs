@@ -192,6 +192,15 @@ impl Writer {
         }))
     }
 
+    /// Push what was appended to disk, which `flush` does not: it only reaches the OS,
+    /// so a power loss could still drop the tail. Nothing to do before the first record.
+    pub fn sync(&self) -> Result<()> {
+        match &self.file {
+            Some(file) => Ok(file.sync_data()?),
+            None => Ok(()),
+        }
+    }
+
     /// Append `record` with its id and parent, flushed before returning.
     fn write(&mut self, mut record: Value) -> Result<()> {
         let id = uuid::Uuid::new_v4().simple().to_string();
@@ -666,6 +675,17 @@ mod tests {
         let mut writer = Writer::resume(&dir, &loaded).unwrap();
         writer.append(&items()[0]).unwrap();
         assert_eq!(load(&path).unwrap().items.len(), 6);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_sync_is_fine_before_and_after_the_first_record() {
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("s1"));
+        writer.sync().unwrap();
+        writer.append(&items()[0]).unwrap();
+        writer.sync().unwrap();
+        assert_eq!(load(&path(&dir, "s1")).unwrap().items.len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

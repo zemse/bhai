@@ -900,6 +900,7 @@ pub(crate) async fn run_with(
                 let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
             }
             (calls, monitor) = (Vec::new(), CacheMonitor::default());
+            sync(writer.as_ref(), &tx);
             let _ = tx.send(AgentEvent::TurnEnd);
             continue;
         };
@@ -1092,6 +1093,7 @@ pub(crate) async fn run_with(
             // Earlier calls index the old history and read the old prefix.
             (calls, monitor, compact_next) = (Vec::new(), CacheMonitor::default(), false);
         }
+        sync(writer.as_ref(), &tx);
         let _ = tx.send(AgentEvent::TurnEnd);
     }
 }
@@ -1596,6 +1598,13 @@ impl Compaction<'_> {
 /// error, but it is the harness's failure rather than the agent's, so it never becomes the
 /// reason a child had no answer.
 pub const TRANSCRIPT_ERROR: &str = "transcript: ";
+
+/// Turn end is the point a user trusts the transcript is saved, so reach the disk here.
+fn sync(writer: Option<&Writer>, tx: &mpsc::UnboundedSender<AgentEvent>) {
+    if let Some(Err(e)) = writer.map(Writer::sync) {
+        let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+    }
+}
 
 fn record(sink: &mut Sink<'_>, items: &[Value], tx: &mpsc::UnboundedSender<AgentEvent>) {
     let result = match sink {
