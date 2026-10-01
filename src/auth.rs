@@ -26,10 +26,19 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// twice would leave whichever write lands second holding a token the server has rotated.
 static REFRESHING: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Auth {
     pub access_token: String,
     pub account_id: Option<String>,
+}
+
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Auth")
+            .field("access_token", &"<redacted>")
+            .field("account_id", &self.account_id)
+            .finish()
+    }
 }
 
 pub fn codex_home() -> Result<PathBuf> {
@@ -293,6 +302,17 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_the_access_token() {
+        let auth = Auth {
+            access_token: "secret-token".into(),
+            account_id: Some("acct".into()),
+        };
+        let shown = format!("{auth:?}");
+        assert!(!shown.contains("secret-token"), "{shown}");
+        assert!(shown.contains("acct"), "{shown}");
+    }
 
     #[test]
     fn a_refreshed_file_is_renamed_into_place_and_leaves_no_temp_behind() {
