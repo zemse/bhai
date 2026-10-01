@@ -1504,6 +1504,15 @@ async fn turn(
                 Delta::Truncated => AgentEvent::Info(
                     "cut off at the model's output limit; the answer is what it had".to_string(),
                 ),
+                Delta::Retrying {
+                    attempt,
+                    of,
+                    delay,
+                    reason,
+                } => AgentEvent::Info(format!(
+                    "retrying ({attempt}/{of}) in {:.1}s: {reason}",
+                    delay.as_secs_f64()
+                )),
             });
         };
 

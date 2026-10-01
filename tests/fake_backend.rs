@@ -490,3 +490,56 @@ async fn a_commentary_preamble_on_end_turn_false_does_not_end_the_turn() {
         "{messages:?}"
     );
 }
+
+/// A stream that fails in band with `code`.
+fn fails(code: &str) -> String {
+    sse(&[json!({
+        "type": "response.failed",
+        "response": { "error": { "code": code, "message": format!("failed: {code}") } }
+    })])
+}
+
+#[tokio::test]
+async fn a_context_overflow_is_not_sent_again() {
+    let fake = Arc::new(Fake::default());
+    fake.replies
+        .lock()
+        .unwrap()
+        .push_back(fails("context_length_exceeded"));
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    let (status, answer) = bhai.post("/prompt", json!({ "text": "go" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let failed = events.until("turn_failed").await;
+    assert_eq!(
+        failed["data"], "failed: context_length_exceeded",
+        "{failed}"
+    );
+    assert_eq!(fake.responses().len(), 1);
+    assert!(!events.kinds().contains(&"info"), "{:#?}", events.got);
+}
+
+#[tokio::test]
+async fn a_transient_failure_is_retried_and_says_so() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(fails("server_is_overloaded"));
+        replies.push_back(says("second time"));
+    }
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    let (status, answer) = bhai.post("/prompt", json!({ "text": "go" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let info = events.until("info").await;
+    let said = info["data"].as_str().unwrap_or_default();
+    assert!(said.starts_with("retrying (2/3) in "), "{info}");
+    assert!(said.contains("failed: server_is_overloaded"), "{info}");
+    events.until("turn_end").await;
+    assert_eq!(events.text(), "second time");
+    assert_eq!(fake.responses().len(), 2);
+}

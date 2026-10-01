@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- A failed model call is classified by its error `code`/`type` before its HTTP status: `context_length_exceeded`, `insufficient_quota`, `usage_not_included`, `usage_limit_reached` (even as a 429) and the policy codes fail at once instead of being sent twice more. Known overload codes still retry. A retry now waits the server's `Retry-After` (or `retry-after-ms`) when it is 30s or less, and otherwise fails naming the wait. Its own backoff is jittered to 80-120%, and every retry shows an info line `retrying (2/3) in 0.5s: <reason>`.
 - Bash, read and MCP output has the values bhai knows are secret (withheld environment values, the Codex tokens, MCP header values) replaced with `[REDACTED]` before it enters history, before any truncation, so a value straddling the cut leaves no piece behind. Base64 and other encodings still get past it.
 - A reply with no tool call no longer ends the turn when the backend says `end_turn: false`: the model is sampled again, up to 8 times in a row. Commentary-phase text gets its own entry, drawn dimmer than the answer and kept on resume.
 - A stdio MCP server runs as the leader of its own process group, and the whole group is killed on shutdown or when its start fails. The real server that `npx`, `uvx` or `docker run` starts underneath is no longer left running.

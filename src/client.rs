@@ -36,6 +36,30 @@ pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often a wait inside [`IDLE_TIMEOUT`] looks at the cancel flag.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 const MAX_ATTEMPTS: usize = 3;
+/// The wait before the first retry; each one after waits three times as long.
+const BACKOFF: Duration = Duration::from_millis(500);
+/// The longest `Retry-After` slept inside a turn. Asked for more, the call fails and
+/// says so rather than holding the turn silent for minutes.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
+/// Error codes that fail the same way however often they are sent: the context is too
+/// long, the plan is out of quota, or a policy refused it.
+const TERMINAL_CODES: [&str; 7] = [
+    "context_length_exceeded",
+    "insufficient_quota",
+    "usage_not_included",
+    "usage_limit_reached",
+    "cyber_policy",
+    "bio_policy",
+    "misalignment_policy_violation",
+];
+/// Error codes the backend uses for a load it expects to pass.
+const TRANSIENT_CODES: [&str; 5] = [
+    "server_is_overloaded",
+    "slow_down",
+    "rate_limit_exceeded",
+    "server_error",
+    "websocket_connection_limit_reached",
+];
 /// How long a finished call waits on a usage fetch still out, before leaving it.
 const USAGE_WAIT: Duration = Duration::from_secs(2);
 
@@ -153,6 +177,14 @@ pub enum Delta {
     /// The backend said the turn is not over (`end_turn: false`), so an answer with no
     /// tool call is not the last word and the model is sampled again.
     Continues,
+    /// The call failed with `reason` and is sent again, as attempt `attempt` of `of`,
+    /// once `delay` is up.
+    Retrying {
+        attempt: usize,
+        of: usize,
+        delay: Duration,
+        reason: String,
+    },
 }
 
 /// Token counts for one model call, as `response.completed` reports them.
@@ -426,30 +458,45 @@ impl Client {
             on_delta(Delta::Cache(found));
         }
 
-        let mut backoff = Duration::from_millis(500);
-        let mut last_err = None;
-        for attempt in 1..=MAX_ATTEMPTS {
-            match self.attempt(self.provider(), &body, on_delta, cancel).await {
+        let mut backoff = BACKOFF;
+        let mut attempt = 1;
+        loop {
+            let (e, asked) = match self.attempt(self.provider(), &body, on_delta, cancel).await {
                 Ok(items) => return Ok(items),
                 Err(Error::Interrupted) => bail!("interrupted"),
                 Err(Error::Fatal(e)) => return Err(e),
-                Err(Error::Retryable(e)) => {
-                    last_err = Some(e);
-                    if attempt < MAX_ATTEMPTS {
-                        // An interrupt during the backoff means stop now, not once the
-                        // sleep the user cannot see is over.
-                        if unless_cancelled(tokio::time::sleep(backoff), cancel)
-                            .await
-                            .is_none()
-                        {
-                            bail!("interrupted");
-                        }
-                        backoff *= 3;
-                    }
-                }
+                Err(Error::Retryable(e)) => (e, None),
+                Err(Error::RetryAfter(e, after)) => (e, Some(after)),
+            };
+            if attempt == MAX_ATTEMPTS {
+                return Err(e);
             }
+            let delay = match asked {
+                Some(after) if after > RETRY_AFTER_CAP => {
+                    return Err(anyhow!(
+                        "{e} (the backend asked to wait {}s before another try)",
+                        after.as_secs()
+                    ));
+                }
+                Some(after) => after,
+                None => jitter(backoff, random_unit()),
+            };
+            attempt += 1;
+            on_delta(Delta::Retrying {
+                attempt,
+                of: MAX_ATTEMPTS,
+                delay,
+                reason: format!("{e:#}"),
+            });
+            // An interrupt during the backoff means stop now, not once the sleep is over.
+            if unless_cancelled(tokio::time::sleep(delay), cancel)
+                .await
+                .is_none()
+            {
+                bail!("interrupted");
+            }
+            backoff *= 3;
         }
-        Err(last_err.unwrap_or_else(|| anyhow!("request failed")))
     }
 
     /// One call outside the conversation: no tools, its own `prompt_cache_key` suffix,
@@ -500,7 +547,7 @@ impl Client {
         {
             Ok(items) => items,
             Err(Error::Interrupted) => bail!("interrupted"),
-            Err(Error::Retryable(e) | Error::Fatal(e)) => return Err(e),
+            Err(Error::Retryable(e) | Error::RetryAfter(e, _) | Error::Fatal(e)) => return Err(e),
         };
         Ok((output_text(&items), usage))
     }
@@ -575,18 +622,22 @@ impl Client {
 
         let status = resp.status();
         if !status.is_success() {
+            let after = retry_after(resp.headers());
             let body = resp.text().await.unwrap_or_default();
+            let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let error = parsed.get("error").unwrap_or(&Value::Null);
             let msg = api_error_message(&body).unwrap_or(body);
-            return Err(if status.as_u16() == 401 {
-                Error::Fatal(anyhow!(
+            let failed = anyhow!("{status}: {msg}");
+            return Err(match classify(Some(status.as_u16()), error) {
+                Class::Unauthorized => Error::Fatal(anyhow!(
                     "unauthorized ({status}): {msg}. Run `codex login`."
-                ))
-            } else if status.as_u16() == 429 || status.as_u16() >= 500 {
-                Error::Retryable(anyhow!("{status}: {msg}"))
-            } else if status.as_u16() == 400 {
-                Error::Fatal(BadRequest(format!("{status}: {msg}")).into())
-            } else {
-                Error::Fatal(anyhow!("{status}: {msg}"))
+                )),
+                Class::Retry => match after {
+                    Some(after) => Error::RetryAfter(failed, after),
+                    None => Error::Retryable(failed),
+                },
+                Class::BadRequest => Error::Fatal(BadRequest(format!("{status}: {msg}")).into()),
+                Class::Fatal => Error::Fatal(failed),
             });
         }
 
@@ -693,18 +744,14 @@ impl Client {
                         }
                     }
                     "response.failed" => {
-                        let msg = event
-                            .pointer("/response/error/message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("response failed");
-                        return Err(Error::Retryable(anyhow!("{msg}")));
+                        let error = event.pointer("/response/error").unwrap_or(&Value::Null);
+                        return Err(failed_in_band(error, "response failed"));
                     }
+                    // The error object is nested on some deployments and the event itself
+                    // on others.
                     "error" => {
-                        let msg = event
-                            .pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("stream error");
-                        return Err(Error::Retryable(anyhow!("{msg}")));
+                        let error = event.get("error").unwrap_or(&event);
+                        return Err(failed_in_band(error, "stream error"));
                     }
                     _ => {}
                 }
@@ -869,8 +916,92 @@ fn output_text(items: &[Value]) -> String {
 
 pub(crate) enum Error {
     Retryable(anyhow::Error),
+    /// Retryable, once the wait the backend asked for is up.
+    RetryAfter(anyhow::Error, Duration),
     Fatal(anyhow::Error),
     Interrupted,
+}
+
+/// What a failed call should lead to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Class {
+    Retry,
+    Fatal,
+    /// The request itself was refused; see [`BadRequest`].
+    BadRequest,
+    Unauthorized,
+}
+
+/// Classify a failure by its HTTP status, `None` for one reported inside the stream,
+/// and the error object the backend sent with it. A known code decides before the
+/// status: ChatGPT's spent usage limit is a 429, and sending it again cannot help.
+pub(crate) fn classify(status: Option<u16>, error: &Value) -> Class {
+    if status == Some(401) {
+        return Class::Unauthorized;
+    }
+    let codes = ["code", "type"].map(|key| error.get(key).and_then(Value::as_str));
+    let known = |table: &[&str]| codes.iter().flatten().any(|code| table.contains(code));
+    if known(&TERMINAL_CODES) {
+        return Class::Fatal;
+    }
+    if known(&TRANSIENT_CODES) {
+        return Class::Retry;
+    }
+    if codes.contains(&Some("invalid_prompt")) {
+        return Class::BadRequest;
+    }
+    match status {
+        None => Class::Retry,
+        Some(429) => Class::Retry,
+        Some(code) if code >= 500 => Class::Retry,
+        Some(400) => Class::BadRequest,
+        Some(_) => Class::Fatal,
+    }
+}
+
+/// The error for a `response.failed` or `error` event carrying `error`.
+fn failed_in_band(error: &Value, fallback: &str) -> Error {
+    let msg = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback);
+    match classify(None, error) {
+        Class::Retry => Error::Retryable(anyhow!("{msg}")),
+        Class::BadRequest => Error::Fatal(BadRequest(msg.to_string()).into()),
+        Class::Fatal | Class::Unauthorized => Error::Fatal(anyhow!("{msg}")),
+    }
+}
+
+/// The wait a failed response asks for: `retry-after-ms`, else `retry-after` in seconds.
+/// The HTTP-date form of `retry-after` is not read.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let number = |name: &str| {
+        headers
+            .get(name)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+    };
+    number("retry-after-ms")
+        .map(|ms| ms / 1000.0)
+        .or_else(|| number("retry-after"))
+        .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+}
+
+/// `base` scaled into 80-120% by `unit`, a number in `[0, 1)`, so children that failed
+/// on the same 5xx do not all retry at the same moment.
+fn jitter(base: Duration, unit: f64) -> Duration {
+    base.mul_f64(0.8 + 0.4 * unit.clamp(0.0, 1.0))
+}
+
+/// A random number in `[0, 1)`, off the low 48 bits of a v4 uuid, all of them random;
+/// the version and variant bits sit above them.
+fn random_unit() -> f64 {
+    const BITS: u32 = 48;
+    (uuid::Uuid::new_v4().as_u128() & ((1 << BITS) - 1)) as f64 / (1u64 << BITS) as f64
 }
 
 /// Set `BHAI_DEBUG_SSE=/path/to/file` to append every raw stream event, for when the
@@ -1082,6 +1213,93 @@ mod tests {
             (child.effort(), child.effort_in_force()),
             ("xhigh", "xhigh")
         );
+    }
+
+    #[test]
+    fn a_failure_is_classified_by_its_code_before_its_status() {
+        let code = |c: &str| json!({ "code": c, "message": "m" });
+        let typed = |t: &str| json!({ "type": t, "message": "m" });
+        let cases: [(Option<u16>, Value, Class); 17] = [
+            (Some(401), code("server_error"), Class::Unauthorized),
+            (Some(429), Value::Null, Class::Retry),
+            (Some(429), typed("usage_limit_reached"), Class::Fatal),
+            (Some(429), code("rate_limit_exceeded"), Class::Retry),
+            (Some(429), code("insufficient_quota"), Class::Fatal),
+            (Some(500), Value::Null, Class::Retry),
+            (Some(503), code("server_is_overloaded"), Class::Retry),
+            (Some(400), Value::Null, Class::BadRequest),
+            (Some(400), code("context_length_exceeded"), Class::Fatal),
+            (Some(400), code("invalid_prompt"), Class::BadRequest),
+            (Some(403), Value::Null, Class::Fatal),
+            (Some(404), code("anything"), Class::Fatal),
+            (None, Value::Null, Class::Retry),
+            (None, code("server_error"), Class::Retry),
+            (None, code("context_length_exceeded"), Class::Fatal),
+            (None, code("cyber_policy"), Class::Fatal),
+            (None, typed("usage_not_included"), Class::Fatal),
+        ];
+        for (status, error, want) in cases {
+            assert_eq!(classify(status, &error), want, "{status:?} {error}");
+        }
+    }
+
+    #[test]
+    fn an_in_band_terminal_code_is_not_sent_again() {
+        let failed = json!({ "code": "context_length_exceeded", "message": "too long" });
+        let Error::Fatal(e) = failed_in_band(&failed, "x") else {
+            panic!("retried");
+        };
+        assert_eq!(e.to_string(), "too long");
+        assert!(!bad_request(&e));
+        let refused = json!({ "code": "invalid_prompt", "message": "no" });
+        assert!(matches!(failed_in_band(&refused, "x"), Error::Fatal(e) if bad_request(&e)));
+        let overloaded = json!({ "type": "error", "code": "slow_down" });
+        assert!(matches!(
+            failed_in_band(&overloaded, "stream error"),
+            Error::Retryable(e) if e.to_string() == "stream error"
+        ));
+    }
+
+    #[test]
+    fn retry_after_is_read_in_milliseconds_or_seconds() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut map = HeaderMap::new();
+            for (k, v) in pairs {
+                map.insert(*k, HeaderValue::from_static(v));
+            }
+            map
+        };
+        assert_eq!(retry_after(&headers(&[])), None);
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", "2")])),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", "1.5")])),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            retry_after(&headers(&[("retry-after-ms", "250"), ("retry-after", "9")])),
+            Some(Duration::from_millis(250))
+        );
+        let date = [("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")];
+        assert_eq!(retry_after(&headers(&date)), None);
+        assert_eq!(retry_after(&headers(&[("retry-after", "-1")])), None);
+    }
+
+    #[test]
+    fn jitter_stays_within_a_fifth_of_the_backoff() {
+        let base = Duration::from_millis(1000);
+        assert_eq!(jitter(base, 0.0), Duration::from_millis(800));
+        assert_eq!(jitter(base, 0.5), Duration::from_millis(1000));
+        assert!(jitter(base, 0.999_999) < Duration::from_millis(1200));
+        for _ in 0..1000 {
+            let unit = random_unit();
+            assert!((0.0..1.0).contains(&unit), "{unit}");
+        }
+        // Two draws in a row are not the same number.
+        assert_ne!(random_unit(), random_unit());
     }
 
     #[test]
