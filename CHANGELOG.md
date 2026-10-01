@@ -6,6 +6,10 @@ carries the shape of what is there.
 
 ## 2026-10-01
 
+- `/compact` sent while a turn runs queues instead of failing with `a turn is already
+  running`, and runs once that turn ends. Prompts queued ahead of it still join the
+  running turn; those queued after it wait for the compaction. `/events` carries its
+  start as `compacting`.
 - `bypass` no longer prints an `auto-allowed: <call> (bypass mode)` line under every
   call it lets through. `ask` and `auto` still say which rule allowed one.
 - A selection over an assistant message copies the markdown that drew it: a heading

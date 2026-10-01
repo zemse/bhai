@@ -874,7 +874,9 @@ async fn headless_workflow(
                     Some(id),
                 );
             }
-            session::Event::Info(message) => println!("{message}"),
+            session::Event::Info(message) | session::Event::Compacting(message) => {
+                println!("{message}")
+            }
             session::Event::ToolStart { summary, .. } => println!("$ {summary}"),
             session::Event::ToolOutput(output) => println!("{output}"),
             session::Event::Error(message) => eprintln!("[error] {message}"),

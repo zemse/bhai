@@ -1101,6 +1101,13 @@ impl App {
                     self.queued.remove(0);
                 }
             }
+            // The same for a `/compact`, which starts a turn of its own.
+            Event::Compacting(_) => {
+                self.working = true;
+                if !self.queued.is_empty() {
+                    self.queued.remove(0);
+                }
+            }
             // The same, between the steps of the turn already running.
             Event::Steered(_) => {
                 self.follow = true;
@@ -1310,12 +1317,12 @@ impl App {
         if let Some(rest) = message.strip_prefix("/compact") {
             let asked = rest.trim();
             self.follow = true;
-            match self
+            // `Event::Compacting` says when it starts, which waits for a running turn.
+            if let Err(e) = self
                 .session
                 .compact(Some(asked.to_string()).filter(|a| !a.is_empty()))
             {
-                Ok(()) => self.working = true,
-                Err(e) => self.note(Entry::Error(e.to_string())),
+                self.note(Entry::Error(e.to_string()));
             }
             return;
         }

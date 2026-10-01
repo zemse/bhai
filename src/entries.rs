@@ -141,7 +141,9 @@ impl Entries {
             Event::CacheStalled(misses) => self.push(Entry::Info(format!(
                 "cache missed {misses} calls in a row; the prefix may no longer be served"
             ))),
-            Event::Info(message) => self.push(Entry::Info(message.clone())),
+            Event::Info(message) | Event::Compacting(message) => {
+                self.push(Entry::Info(message.clone()))
+            }
             Event::Compacted {
                 notice, summary, ..
             } => {

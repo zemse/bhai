@@ -112,6 +112,9 @@ pub enum Event {
     Streaming(bool),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
+    /// `/compact` started, from the prompt box or from the front of the queue; the
+    /// string says what it keeps.
+    Compacting(String),
     /// The judge is deciding that call, or `None` once it has.
     Judging(Option<String>),
     /// History was compacted; earlier history indexes no longer hold. `summary` is what
@@ -260,6 +263,26 @@ impl Prompt {
     }
 }
 
+/// What waits behind the running turn.
+#[derive(Debug, Clone, PartialEq)]
+enum Waiting {
+    Prompt(Prompt),
+    /// `/compact`, with what the summary should keep. It runs as a turn of its own, so
+    /// it waits for the running one to end, and what was typed after it waits too.
+    Compact(Option<String>),
+}
+
+impl Waiting {
+    /// As it was typed.
+    fn shown(&self) -> String {
+        match self {
+            Waiting::Prompt(prompt) => prompt.shown.clone(),
+            Waiting::Compact(None) => "/compact".to_string(),
+            Waiting::Compact(Some(asked)) => format!("/compact {asked}"),
+        }
+    }
+}
+
 /// A plain prompt shows exactly what it sends.
 impl From<String> for Prompt {
     fn from(text: String) -> Self {
@@ -319,8 +342,8 @@ impl fmt::Display for SubmitError {
 #[derive(Default)]
 struct Inner {
     working: bool,
-    /// Prompts typed while a turn ran, oldest first.
-    queue: VecDeque<Prompt>,
+    /// What was typed while a turn ran, oldest first.
+    queue: VecDeque<Waiting>,
     total: Usage,
     calls: u64,
     children: Usage,
@@ -427,7 +450,7 @@ impl Session {
             identity: self.identity.clone(),
             mode: self.policy.mode(),
             working: inner.working,
-            queued: inner.queue.iter().map(|p| p.shown.clone()).collect(),
+            queued: inner.queue.iter().map(Waiting::shown).collect(),
             input_tokens: inner.total.input,
             cached_tokens: inner.total.cached,
             output_tokens: inner.total.output,
@@ -451,11 +474,7 @@ impl Session {
         let prompt = prompt.into();
         let mut inner = self.lock();
         if inner.working {
-            let text = prompt.shown.clone();
-            inner.queue.push_back(prompt);
-            let position = inner.queue.len();
-            self.publish(Event::Queued { position, text });
-            return Ok(Submitted::Queued { position });
+            return Ok(self.enqueue(&mut inner, Waiting::Prompt(prompt)));
         }
         // Cleared here, not when the agent picks the message up, so an interrupt that
         // lands in between still stops the turn.
@@ -494,9 +513,18 @@ impl Session {
         self.lock().fork
     }
 
+    /// Put `waiting` at the back of the queue, with the state locked.
+    fn enqueue(&self, inner: &mut Inner, waiting: Waiting) -> Submitted {
+        let text = waiting.shown();
+        inner.queue.push_back(waiting);
+        let position = inner.queue.len();
+        self.publish(Event::Queued { position, text });
+        Submitted::Queued { position }
+    }
+
     /// The prompts waiting for the running turn, for `/queue`, as they were typed.
     pub fn queued(&self) -> Vec<String> {
-        self.lock().queue.iter().map(|p| p.shown.clone()).collect()
+        self.lock().queue.iter().map(Waiting::shown).collect()
     }
 
     /// Drop every queued prompt, for `/queue clear`. Returns how many there were.
@@ -508,33 +536,48 @@ impl Session {
         dropped
     }
 
-    /// Every prompt waiting, as what is sent and what is shown, for the agent to read
-    /// before its next model call. Nothing is handed over once the turn is interrupted,
-    /// so the queue outlives the interrupt.
+    /// Every prompt waiting ahead of the first `/compact`, as what is sent and what is
+    /// shown, for the agent to read before its next model call. Nothing is handed over
+    /// once the turn is interrupted, so the queue outlives the interrupt.
     pub fn take_queued(&self) -> Vec<(String, String)> {
         let mut inner = self.lock();
         if self.cancel.stopped() {
             return Vec::new();
         }
-        inner.queue.drain(..).map(|p| (p.text, p.shown)).collect()
+        let mut taken = Vec::new();
+        while let Some(Waiting::Prompt(_)) = inner.queue.front() {
+            if let Some(Waiting::Prompt(p)) = inner.queue.pop_front() {
+                taken.push((p.text, p.shown));
+            }
+        }
+        taken
     }
 
-    /// Take every waiting prompt back out of the queue, as typed, to be edited.
+    /// Take everything waiting back out of the queue, as typed, to be edited.
     pub fn unqueue(&self) -> Vec<String> {
-        self.lock().queue.drain(..).map(|p| p.shown).collect()
+        self.lock().queue.drain(..).map(|w| w.shown()).collect()
     }
 
     /// Hand the next queued prompt to the agent, with the state locked. A prompt the
     /// agent will not take keeps its place rather than being lost.
     fn start_queued(&self, inner: &mut Inner) {
-        let Some(prompt) = inner.queue.pop_front() else {
-            return;
+        let prompt = match inner.queue.pop_front() {
+            None => return,
+            Some(Waiting::Compact(asked)) => {
+                if let Err(asked) = self.start_compact(inner, asked) {
+                    inner.queue.push_front(Waiting::Compact(asked));
+                    inner.working = false;
+                }
+                return;
+            }
+            Some(Waiting::Prompt(prompt)) => prompt,
         };
         self.cancel.clear();
         if let Err(e) = self.tx_user.try_send(prompt.text.clone()) {
-            inner
-                .queue
-                .push_front(Prompt::shown_as(e.into_inner(), prompt.shown));
+            inner.queue.push_front(Waiting::Prompt(Prompt::shown_as(
+                e.into_inner(),
+                prompt.shown,
+            )));
             inner.working = false;
             return;
         }
@@ -746,13 +789,26 @@ impl Session {
         Ok(notice)
     }
 
-    /// Summarise the history now, as a turn of its own, unless one is already running.
-    /// `asked` is what the user wants the summary to keep, from `/compact <prompt>`.
-    pub fn compact(&self, asked: Option<String>) -> Result<(), SubmitError> {
+    /// Summarise the history as a turn of its own, now or once the running turn and
+    /// everything queued before it are done. `asked` is what the user wants the summary
+    /// to keep, from `/compact <prompt>`.
+    pub fn compact(&self, asked: Option<String>) -> Result<Submitted, SubmitError> {
         let mut inner = self.lock();
         if inner.working {
-            return Err(SubmitError::Busy);
+            return Ok(self.enqueue(&mut inner, Waiting::Compact(asked)));
         }
+        self.start_compact(&mut inner, asked)
+            .map_err(|_| SubmitError::Closed)?;
+        Ok(Submitted::Started)
+    }
+
+    /// Hand `/compact` to the agent, with the state locked; `asked` comes back if the
+    /// agent will not take it.
+    fn start_compact(
+        &self,
+        inner: &mut Inner,
+        asked: Option<String>,
+    ) -> Result<(), Option<String>> {
         self.cancel.clear();
         let notice = match &asked {
             Some(asked) => format!("compacting history, keeping {asked}"),
@@ -760,9 +816,12 @@ impl Session {
         };
         self.tx_control
             .try_send(Control::Compact(asked))
-            .map_err(|_| SubmitError::Closed)?;
+            .map_err(|e| match e.into_inner() {
+                Control::Compact(asked) => asked,
+                _ => None,
+            })?;
         inner.start();
-        self.publish(Event::Info(notice));
+        self.publish(Event::Compacting(notice));
         Ok(())
     }
 
@@ -1402,6 +1461,46 @@ mod tests {
             json,
             serde_json::json!({"type": "compacted", "data": {"notice": "compacted history", "freed": 7}})
         );
+    }
+
+    #[test]
+    fn compact_sent_while_a_turn_runs_waits_for_it_to_end() {
+        let (tx_user, mut rx_user) = mpsc::channel(4);
+        let (tx_control, mut rx_control) = mpsc::channel(4);
+        let session = Session::new(
+            "m".to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            Arc::new(Cancel::default()),
+            Arc::new(Policy::default()),
+            None,
+        );
+        session.submit("a".to_string()).unwrap();
+        assert_eq!(rx_user.try_recv().unwrap(), "a");
+        session.submit("b".to_string()).unwrap();
+        assert_eq!(
+            session.compact(Some("the plan".to_string())),
+            Ok(Submitted::Queued { position: 2 })
+        );
+        session.submit("c".to_string()).unwrap();
+        assert_eq!(session.queued(), ["b", "/compact the plan", "c"]);
+
+        // The running turn takes what was typed before the compact, not what came after.
+        assert_eq!(session.take_queued(), [("b".to_string(), "b".to_string())]);
+        assert!(session.take_queued().is_empty());
+        assert!(rx_control.try_recv().is_err());
+
+        session.on_agent(AgentEvent::TurnEnd);
+        assert!(matches!(
+            rx_control.try_recv(),
+            Ok(Control::Compact(Some(asked))) if asked == "the plan"
+        ));
+        assert!(session.state().working);
+        assert_eq!(session.queued(), ["c"]);
+        session.on_agent(AgentEvent::TurnEnd);
+        assert_eq!(rx_user.try_recv().unwrap(), "c");
     }
 
     #[test]
