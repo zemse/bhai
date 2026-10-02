@@ -55,6 +55,8 @@ mod frontmatter;
 mod goal;
 #[path = "../../src/identity.rs"]
 mod identity;
+#[path = "../../src/images.rs"]
+mod images;
 #[path = "../../src/input.rs"]
 mod input;
 #[path = "../../src/instructions.rs"]
