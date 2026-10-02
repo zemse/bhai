@@ -1574,8 +1574,9 @@ mod tests {
     #[tokio::test]
     async fn the_kept_list_shows_a_tail_and_leaves_the_output_to_the_poll() {
         crate::redact::register("bash-kept-secret-55e1");
-        let command = "printf 'a bash-kept-secret-55e1\\n'; sleep 30";
+        let command = "printf 'a bash-kept-secret-55e1\\n'; sleep 0.5; printf 'later\\n'; sleep 30";
         let out = start(command, None, YIELD_MIN, false, quiet()).await;
+        assert!(!out.contains("later"), "{out}");
         let id = session_id(&out);
         let row = kept().into_iter().find(|r| r.id == id).unwrap();
         assert_eq!(
@@ -1584,14 +1585,24 @@ mod tests {
         );
         assert!(row.group.is_some());
         assert_eq!(row.tail, "a [REDACTED]\n");
-        assert_eq!(
-            kept().into_iter().find(|r| r.id == id).unwrap().tail,
-            row.tail
-        );
+        let begun = Instant::now();
+        while !kept()
+            .iter()
+            .any(|r| r.id == id && r.tail.ends_with("later\n"))
+        {
+            assert!(begun.elapsed() < Duration::from_secs(5), "never printed");
+            tokio::time::sleep(TICK).await;
+        }
+        let tail = kept().into_iter().find(|r| r.id == id).unwrap().tail;
+        assert_eq!(tail, "a [REDACTED]\nlater\n");
+        // Listing it consumed nothing: the poll still reads what was printed after the
+        // start yielded.
+        let out = write(id, "", YIELD_MIN, quiet()).await;
+        assert!(matches!(outcome(&out), Some(Outcome::Running(_))), "{out}");
+        assert!(out.contains("later\n"), "{out}");
         let out = write(id, "\u{3}", Duration::from_secs(5), quiet()).await;
-        assert!(kept().iter().all(|r| r.id != id));
-        // The poll still reads what was printed since the start yielded.
         assert!(!matches!(outcome(&out), Some(Outcome::Running(_))), "{out}");
+        assert!(kept().iter().all(|r| r.id != id));
     }
 
     #[tokio::test]
