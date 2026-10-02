@@ -485,6 +485,54 @@ async fn a_prompt_reaches_the_backend_and_its_answer_reaches_events() {
 }
 
 #[tokio::test]
+async fn request_controls_are_sent_on_every_call_only_when_the_config_sets_them() {
+    let fake = Arc::new(Fake::default());
+    fake.replies
+        .lock()
+        .unwrap()
+        .extend([says("aside"), says("one"), says("two")]);
+    let config = "reasoning_context = \"all_turns\"\nverbosity = \"low\"\n";
+    let bhai = Bhai::start_in(&serve_fake(fake.clone()).await, &[], Some(config)).await;
+    let mut events = bhai.events().await;
+
+    bhai.post("/prompt", json!({ "text": "/btw why?" })).await;
+    events.until("turn_end").await;
+    for text in ["first", "second"] {
+        bhai.post("/prompt", json!({ "text": text })).await;
+        events.until("turn_end").await;
+    }
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 3, "{sent:#?}");
+    for seen in &sent {
+        assert_eq!(
+            seen.body["reasoning"]["context"], "all_turns",
+            "{}",
+            seen.body
+        );
+        assert_eq!(seen.body["reasoning"]["summary"], "auto", "{}", seen.body);
+        assert_eq!(seen.body["text"]["verbosity"], "low", "{}", seen.body);
+    }
+    // The second turn extends the first, so the cache guard saw no break.
+    let state = bhai.state().await;
+    assert!(state["last_cache_break"].is_null(), "{state}");
+}
+
+#[tokio::test]
+async fn request_controls_are_left_out_by_default() {
+    let fake = Arc::new(Fake::default());
+    fake.replies.lock().unwrap().push_back(says("ok"));
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+    bhai.post("/prompt", json!({ "text": "hi" })).await;
+    events.until("turn_end").await;
+
+    let body = &fake.responses()[0].body;
+    assert!(body.get("text").is_none(), "{body}");
+    assert!(body["reasoning"].get("context").is_none(), "{body}");
+}
+
+#[tokio::test]
 async fn fast_asks_for_the_priority_tier_only_while_it_is_on() {
     let fake = Arc::new(Fake::default());
     for text in ["one", "two", "three"] {

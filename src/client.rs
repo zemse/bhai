@@ -68,6 +68,8 @@ const USAGE_WAIT: Duration = Duration::from_secs(2);
 const TURN_STATE: &str = "x-codex-turn-state";
 /// The `service_tier` `/fast` asks for, as openai/codex's fast mode sends it.
 pub const FAST_TIER: &str = "priority";
+/// The `text.verbosity` values the Responses API takes.
+pub const VERBOSITIES: [&str; 3] = ["low", "medium", "high"];
 
 /// The `reasoning.effort` values the Responses API takes. The models catalog also lists
 /// `ultra` for some models, which the API refuses.
@@ -192,6 +194,10 @@ pub struct Choice {
     pub effort: Option<String>,
     /// Where the Ollama server is, when the model is one of its own.
     pub ollama_url: Option<String>,
+    /// `reasoning.context` for Codex requests, such as `all_turns`; left out when unset.
+    pub reasoning_context: Option<String>,
+    /// `text.verbosity` for Codex requests; left out when unset.
+    pub verbosity: Option<String>,
 }
 
 /// What the UI is told while a turn streams.
@@ -356,6 +362,16 @@ pub struct Client {
     /// `/fast`: conversation calls ask for [`FAST_TIER`]. Shared by clones and children,
     /// so a switch reaches the calls left in a running turn.
     fast: Arc<AtomicBool>,
+    /// `reasoning.context` and `text.verbosity`, set from the config.
+    controls: Controls,
+}
+
+/// Request fields the config may add to Codex calls. Unset, a request is what it was
+/// before they existed, so the cached prefix keeps its shape.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Controls {
+    pub reasoning_context: Option<String>,
+    pub verbosity: Option<String>,
 }
 
 impl Client {
@@ -383,6 +399,10 @@ impl Client {
             header_log: None,
             turn_state: Arc::default(),
             fast: Arc::default(),
+            controls: Controls {
+                reasoning_context: choice.reasoning_context.clone(),
+                verbosity: choice.verbosity.clone(),
+            },
         })
     }
 
@@ -693,13 +713,16 @@ impl Client {
         })];
         let provider = Provider::of(model);
         let body = match provider {
-            Provider::Codex => request_body(
-                model,
-                effort,
-                &format!("{}-{key}", self.session_id),
-                instructions,
-                &[],
-                &input,
+            Provider::Codex => with_controls(
+                request_body(
+                    model,
+                    effort,
+                    &format!("{}-{key}", self.session_id),
+                    instructions,
+                    &[],
+                    &input,
+                ),
+                &self.controls,
             ),
             Provider::Ollama => {
                 ollama::request_body(model, instructions, &[], &input, self.window(model))
@@ -732,13 +755,16 @@ impl Client {
     fn body(&self, instructions: &str, tools: &[Value], input: &[Value]) -> Value {
         match self.provider() {
             Provider::Codex => with_tier(
-                request_body(
-                    &self.model,
-                    &self.effort,
-                    &self.cache_key,
-                    instructions,
-                    tools,
-                    input,
+                with_controls(
+                    request_body(
+                        &self.model,
+                        &self.effort,
+                        &self.cache_key,
+                        instructions,
+                        tools,
+                        input,
+                    ),
+                    &self.controls,
                 ),
                 self.fast(),
             ),
@@ -1125,6 +1151,17 @@ pub fn request_body(
 pub fn with_tier(mut body: Value, fast: bool) -> Value {
     if fast {
         body["service_tier"] = json!(FAST_TIER);
+    }
+    body
+}
+
+/// `body` with whichever of `controls` are set.
+pub fn with_controls(mut body: Value, controls: &Controls) -> Value {
+    if let Some(context) = &controls.reasoning_context {
+        body["reasoning"]["context"] = json!(context);
+    }
+    if let Some(verbosity) = &controls.verbosity {
+        body["text"] = json!({ "verbosity": verbosity });
     }
     body
 }
@@ -1648,6 +1685,44 @@ mod tests {
 
         assert!(!client.set_fast(false));
         assert!(child.body("i", &[], &[]).get("service_tier").is_none());
+    }
+
+    #[test]
+    fn request_controls_are_sent_only_when_set_and_only_to_codex() {
+        let plain = Client::new(&Choice::default())
+            .unwrap()
+            .with_overrides(Some("gpt-5.5".to_string()), None)
+            .body("i", &[], &[]);
+        // Off by default, so the request keeps the shape its cached prefix was written in.
+        assert!(plain.get("text").is_none(), "{plain}");
+        assert_eq!(plain["reasoning"].as_object().unwrap().len(), 2, "{plain}");
+
+        let choice = Choice {
+            reasoning_context: Some("all_turns".to_string()),
+            verbosity: Some("low".to_string()),
+            ..Choice::default()
+        };
+        let client = Client::new(&choice)
+            .unwrap()
+            .with_overrides(Some("gpt-5.5".to_string()), None);
+        let body = client.body("i", &[], &[]);
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["text"], json!({ "verbosity": "low" }));
+        // A child and a switch are the same session, so they send the same shape.
+        let child = client.for_child(&crate::identity::Identity::default());
+        assert_eq!(child.body("i", &[], &[])["text"]["verbosity"], "low");
+        let switched = client.switch("gpt-5.4", "high");
+        assert_eq!(
+            switched.body("i", &[], &[])["reasoning"]["context"],
+            "all_turns"
+        );
+
+        let ollama = Client::new(&choice)
+            .unwrap()
+            .with_overrides(Some("ollama:gemma4:e2b".to_string()), None)
+            .body("i", &[], &[]);
+        assert!(ollama.get("text").is_none() && ollama.get("reasoning").is_none());
     }
 
     #[test]

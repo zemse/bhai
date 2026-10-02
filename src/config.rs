@@ -64,6 +64,7 @@ pub struct Config {
     /// When history is compacted: `context_window` and `compact_at`.
     pub limits: Limits,
     /// `model`, `effort` and `ollama_url`: which backend the session talks to.
+    /// `reasoning_context` and `verbosity`: Codex request fields, sent only when set.
     pub choice: crate::client::Choice,
     /// `statusline`: the status bar's template, or `None` for the built-in bar. Not
     /// checked here: a bar that does not parse is no reason to refuse to start.
@@ -186,6 +187,8 @@ struct Layer {
     model: Option<String>,
     effort: Option<String>,
     ollama_url: Option<String>,
+    reasoning_context: Option<String>,
+    verbosity: Option<String>,
     context_window: Option<u64>,
     compact_at: Option<f64>,
     statusline: Option<String>,
@@ -307,6 +310,14 @@ impl Config {
         {
             return Err(bad(format!("compact_at {at} is not in (0, 1]")));
         }
+        if let Some(verbosity) = &layer.verbosity
+            && !crate::client::VERBOSITIES.contains(&verbosity.as_str())
+        {
+            return Err(bad(format!(
+                "verbosity {verbosity} is not one of {}",
+                crate::client::VERBOSITIES.join(", ")
+            )));
+        }
         if let Some(theme) = &layer.code_theme
             && !crate::syntax::themes().contains(theme)
         {
@@ -389,6 +400,8 @@ impl Config {
                 (&mut self.choice.model, &layer.model),
                 (&mut self.choice.effort, &layer.effort),
                 (&mut self.choice.ollama_url, &layer.ollama_url),
+                (&mut self.choice.reasoning_context, &layer.reasoning_context),
+                (&mut self.choice.verbosity, &layer.verbosity),
             ] {
                 if value.is_some() {
                     *field = value.clone();
@@ -783,6 +796,7 @@ mod tests {
                 model: Some("ollama:gemma4:e2b".to_string()),
                 effort: Some("low".to_string()),
                 ollama_url: Some("http://box:11434".to_string()),
+                ..Default::default()
             }
         );
         std::fs::remove_dir_all(dir).unwrap();
@@ -1065,6 +1079,28 @@ compact_at = 0.9
         let err = format!("{:#}", Config::load(None, &dir).unwrap_err());
         assert!(err.contains("solarised-lite"), "{err}");
         assert!(err.contains(crate::syntax::DEFAULT_THEME), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn request_controls_come_from_the_global_file_only() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        assert_eq!(Config::load(None, &cwd).unwrap().choice.verbosity, None);
+        write(
+            &home.join(".config/bhai/config.toml"),
+            "reasoning_context = \"all_turns\"\nverbosity = \"low\"\n",
+        );
+        write(&cwd.join(".bhai/config.toml"), "verbosity = \"high\"\n");
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert_eq!(
+            config.choice.reasoning_context.as_deref(),
+            Some("all_turns")
+        );
+        assert_eq!(config.choice.verbosity.as_deref(), Some("low"));
+        write(&cwd.join(".bhai/config.toml"), "verbosity = \"terse\"\n");
+        let err = format!("{:#}", Config::load(Some(&home), &cwd).unwrap_err());
+        assert!(err.contains("terse") && err.contains("medium"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

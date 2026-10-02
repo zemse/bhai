@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- `reasoning_context = "all_turns"` and `verbosity = "low"|"medium"|"high"` in the global config add `reasoning.context` and `text.verbosity` to every Codex request, including /btw and summary calls. Unset (the default), neither is sent, so the request body and its cached prefix stay as they were. A project file cannot set them, and a bad verbosity value fails config load.
 - `bhai mcp login <server>` signs in to a hosted MCP server over OAuth and keeps the login at 0600 by server url, so Notion, Linear and other servers that need OAuth start with a token that refreshes before it lapses; `bhai mcp logout <server>` forgets it.
 - A `/btw` or a summarising compaction answered at a tier other than priority now turns `/fast` off and says so, the same way a turn's reply does.
 - `cargo bench` runs Criterion benches for a cold and a tail redraw of a 2800-entry transcript, wrapping a 1 MiB line, and `profile::build` over 10k history items. It fails when a median goes past its ceiling in `benches/ceilings/ceilings.toml`.
