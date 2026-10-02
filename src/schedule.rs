@@ -193,6 +193,8 @@ fn interval(text: &str) -> Result<Duration, String> {
         };
         total = n
             .checked_mul(unit.num_seconds())
+            // Duration::seconds panics above i64::MAX / 1000.
+            .filter(|s| *s <= MAX_INTERVAL.num_seconds())
             .and_then(|s| total.checked_add(&Duration::seconds(s)))
             .filter(|t| *t <= MAX_INTERVAL)
             .ok_or_else(|| format!("`{text}` is longer than {}", Span(MAX_INTERVAL)))?;
@@ -548,6 +550,9 @@ mod tests {
             "every 0m",
             "in 367d",
             "in 99999999999999999w",
+            "in 10000000000000000s",
+            "in 100000000000000h",
+            "every 1h99999999999999999s",
             "cron * * * *",
             "cron 60 * * * *",
             "cron * 24 * * *",
