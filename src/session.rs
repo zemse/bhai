@@ -441,7 +441,7 @@ fn fast_notice(on: bool, was: Option<Option<RateLimits>>, now: Option<RateLimits
                 ),
             };
             format!(
-                "fast: on. Calls ask for the priority tier, which spends the plan's usage faster than the standard one; a plan that does not take it fails the next call, and /fast off goes back. {measure}"
+                "fast: on. Calls ask for the priority tier, which spends the plan's usage faster than the standard one; a reply that says it was served at another tier turns fast off. {measure}"
             )
         }
         (false, None) => "fast: off.".to_string(),

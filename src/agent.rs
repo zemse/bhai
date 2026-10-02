@@ -1781,6 +1781,13 @@ async fn turn(
                 Delta::Truncated => AgentEvent::Info(
                     "cut off at the model's output limit; the answer is what it had".to_string(),
                 ),
+                // The client has already turned fast off; this tells the session so.
+                Delta::Downgraded(tier) => {
+                    let _ = tx.send(AgentEvent::Info(format!(
+                        "fast: the backend answered at the `{tier}` tier, not priority, so fast is off; /fast on asks again."
+                    )));
+                    AgentEvent::Fast(false)
+                }
                 Delta::Retrying {
                     attempt,
                     of,
@@ -2674,9 +2681,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::Cleared
                 | AgentEvent::Fork(_)
                 // A child's effort is its own request's, never an update.
-                | AgentEvent::Effort(_)
-                // The tier is the session's switch, which a child only follows.
-                | AgentEvent::Fast(_) => continue,
+                | AgentEvent::Effort(_) => continue,
                 // An approval is modal, so it is answered where every other one is,
                 // with the tag saying which child is asking.
                 AgentEvent::Approval {
@@ -2727,6 +2732,9 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::CacheHit(_)
                 | AgentEvent::CacheStalled(_)
                 | AgentEvent::RateLimits(_)
+                // The tier is the session's one switch, so a reply that turned it off in
+                // a child turned it off for the session.
+                | AgentEvent::Fast(_)
                 // A child has no `agent` tool, so these are only ever its own, passed
                 // along as they are.
                 | AgentEvent::ChildStarted { .. }

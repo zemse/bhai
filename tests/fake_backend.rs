@@ -144,6 +144,17 @@ fn completed() -> Value {
 
 /// The model saying `text`, in two deltas.
 fn says(text: &str) -> String {
+    says_then(text, completed())
+}
+
+/// The model saying `text`, as a reply served at the `service_tier` named `tier`.
+fn says_at(text: &str, tier: &str) -> String {
+    let mut done = completed();
+    done["response"]["service_tier"] = json!(tier);
+    says_then(text, done)
+}
+
+fn says_then(text: &str, done: Value) -> String {
     let (head, tail) = text.split_at(text.len() / 2);
     sse(&[
         json!({ "type": "response.output_text.delta", "delta": head }),
@@ -156,7 +167,7 @@ fn says(text: &str) -> String {
                 "content": [{ "type": "output_text", "text": text }]
             }
         }),
-        completed(),
+        done,
     ])
 }
 
@@ -512,6 +523,48 @@ async fn fast_asks_for_the_priority_tier_only_while_it_is_on() {
         .collect();
     assert_eq!(notices.len(), 2, "{notices:?}");
     assert!(notices[0].contains("priority tier"), "{}", notices[0]);
+}
+
+#[tokio::test]
+async fn a_reply_at_the_default_tier_turns_fast_off() {
+    let fake = Arc::new(Fake::default());
+    fake.replies.lock().unwrap().extend([
+        says_at("one", "priority"),
+        says_at("two", "default"),
+        says("three"),
+    ]);
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    bhai.post("/fast", json!({ "on": true })).await;
+    assert_eq!(events.until("fast").await["data"], true);
+    bhai.post("/prompt", json!({ "text": "first" })).await;
+    events.until("turn_end").await;
+    assert_eq!(bhai.state().await["fast"], true);
+
+    bhai.post("/prompt", json!({ "text": "second" })).await;
+    assert_eq!(events.until("fast").await["data"], false);
+    events.until("turn_end").await;
+    assert_eq!(bhai.state().await["fast"], false);
+    bhai.post("/prompt", json!({ "text": "third" })).await;
+    events.until("turn_end").await;
+
+    let tiers: Vec<Value> = fake
+        .responses()
+        .iter()
+        .map(|seen| seen.body["service_tier"].clone())
+        .collect();
+    assert_eq!(tiers, [json!("priority"), json!("priority"), Value::Null]);
+    let said = events
+        .got
+        .iter()
+        .filter(|e| e["type"] == "info")
+        .filter_map(|e| e["data"].as_str())
+        .find(|text| text.contains("`default` tier"));
+    assert!(
+        said.is_some_and(|text| text.contains("fast is off")),
+        "{said:?}"
+    );
 }
 
 #[tokio::test]

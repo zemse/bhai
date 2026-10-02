@@ -216,6 +216,9 @@ pub enum Delta {
     /// The backend said the turn is not over (`end_turn: false`), so an answer with no
     /// tool call is not the last word and the model is sampled again.
     Continues,
+    /// A call that asked for [`FAST_TIER`] says it was served at this tier instead, so
+    /// the client has turned `/fast` off. Sent once, by the call that turned it off.
+    Downgraded(String),
     /// The call failed with `reason` and is sent again, as attempt `attempt` of `of`,
     /// once `delay` is up.
     Retrying {
@@ -469,6 +472,19 @@ impl Client {
     /// Whether conversation calls ask for [`FAST_TIER`].
     pub fn fast(&self) -> bool {
         self.fast.load(Ordering::Relaxed)
+    }
+
+    /// The tier a call that asked for [`FAST_TIER`] was `served` at instead, having
+    /// turned fast off. A reply that names no tier proves nothing, so fast stays on; of
+    /// several calls in flight, only the first to turn it off reports it.
+    fn downgraded(&self, body: &Value, served: Option<String>) -> Option<String> {
+        let served = served.filter(|tier| tier != FAST_TIER)?;
+        (body.get("service_tier").and_then(Value::as_str) == Some(FAST_TIER)
+            && self
+                .fast
+                .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok())
+        .then_some(served)
     }
 
     /// Where this client's Ollama server is, for asking it what it has pulled.
@@ -831,6 +847,7 @@ impl Client {
         // whole call, and usage reported for an attempt that was sent again is counted
         // twice.
         let mut usage: Option<Usage> = None;
+        let mut served: Option<String> = None;
         // Ids of the messages in the `commentary` phase. The phase is on the item when it
         // is added, not on its text deltas.
         let mut commentary: Vec<String> = Vec::new();
@@ -910,6 +927,10 @@ impl Client {
                             items = output.clone();
                         }
                         usage = Usage::from_completed(&event);
+                        served = event
+                            .pointer("/response/service_tier")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
                     }
                     // The same token in band, as the WebSocket transport carries it.
                     "response.metadata" if routed => {
@@ -948,6 +969,9 @@ impl Client {
             }
             if continues {
                 on_delta(Delta::Continues);
+            }
+            if let Some(tier) = self.downgraded(body, served) {
+                on_delta(Delta::Downgraded(tier));
             }
             if let Some(task) = usage_fetch
                 && let Ok(Ok(Ok(body))) = tokio::time::timeout(USAGE_WAIT, task).await
@@ -1624,6 +1648,27 @@ mod tests {
 
         assert!(!client.set_fast(false));
         assert!(child.body("i", &[], &[]).get("service_tier").is_none());
+    }
+
+    #[test]
+    fn a_reply_at_another_tier_turns_fast_off_once() {
+        let client = Client::new(&Choice::default())
+            .unwrap()
+            .with_overrides(Some("gpt-5.5".to_string()), None);
+        client.set_fast(true);
+        let fast = client.body("i", &[], &[]);
+        let plain = request_body("m", "e", "k", "i", &[], &[]);
+        let tier = |t: &str| Some(t.to_string());
+
+        assert_eq!(client.downgraded(&fast, tier(FAST_TIER)), None);
+        assert_eq!(client.downgraded(&fast, None), None);
+        // A call sent before fast went on asked for no tier, so its reply says nothing.
+        assert_eq!(client.downgraded(&plain, tier("default")), None);
+        assert!(client.fast());
+
+        assert_eq!(client.downgraded(&fast, tier("default")), tier("default"));
+        assert!(!client.fast());
+        assert_eq!(client.downgraded(&fast, tier("default")), None);
     }
 
     #[test]
