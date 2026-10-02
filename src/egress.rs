@@ -437,7 +437,19 @@ impl State {
     /// Check one request against the rules, put in its secrets and send it on.
     async fn forward(&self, request: Request<Incoming>, origin: &str) -> Response<Body> {
         let (mut parts, body) = request.into_parts();
-        let path = parts.uri.path().to_string();
+        let raw = parts.uri.path();
+        // The URL sent upstream is parsed again, which turns `\` into `/` and resolves
+        // dot segments, so the path checked is the parsed one and it must be the raw one.
+        let path = match Url::parse(&format!("{origin}{raw}")) {
+            Ok(url) if url.path() == raw => url.path().to_string(),
+            Ok(url) => {
+                return reply(
+                    StatusCode::FORBIDDEN,
+                    format!("bhai egress: {raw} resolves to {}", url.path()),
+                );
+            }
+            Err(e) => return reply(StatusCode::BAD_REQUEST, format!("bhai egress: {raw}: {e}")),
+        };
         if let Some(why) = self.denied(parts.method.as_str(), origin, &path) {
             return reply(StatusCode::FORBIDDEN, why);
         }
@@ -928,6 +940,40 @@ mod tests {
             .unwrap();
         let response = anonymous.get(format!("{origin}/ok")).send().await.unwrap();
         assert_eq!(response.status(), 407);
+    }
+
+    /// Send `target` to the proxy byte for byte, since reqwest and curl normalise it.
+    async fn raw_get(proxy: &Proxy, target: &str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let url = Url::parse(var(proxy, "HTTPS_PROXY")).unwrap();
+        let auth = BASE64.encode(format!("{}:{}", url.username(), url.password().unwrap()));
+        let mut stream = TcpStream::connect(("127.0.0.1", proxy.port)).await.unwrap();
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Proxy-Authorization: Basic {auth}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn a_path_that_parses_somewhere_else_is_refused_as_sent() {
+        let port = plain_upstream().await;
+        let origin = format!("http://127.0.0.1:{port}");
+        let allow = [format!("GET {origin}/ok")];
+        let proxy = spawn(&settings(&allow, &[]), reqwest::Client::new())
+            .await
+            .unwrap();
+
+        let response = raw_get(&proxy, &format!("{origin}/ok/a")).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        for path in [r"/ok/x\..\..\admin", r"/ok\..\admin", "/ok/%2e%2e/admin"] {
+            let response = raw_get(&proxy, &format!("{origin}{path}")).await;
+            assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
+            assert!(!response.contains("GET /admin"), "{path}: {response}");
+        }
     }
 
     #[tokio::test]
