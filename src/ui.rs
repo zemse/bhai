@@ -1723,7 +1723,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
         options.push(Line::from(vec![
             key("[a]", Color::Cyan),
             Span::raw(format!(" always allow this exact {what}: {rule}")),
-            confirm_hint(app.armed == Some('a')),
+            confirm_hint(app.armed.is_some_and(|(k, _)| k == 'a')),
         ]));
     }
     if let Some(rule) = &pending.offers.prefix {
@@ -1736,7 +1736,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
         options.push(Line::from(vec![
             key("[p]", Color::Cyan),
             Span::raw(format!(" {what}: {rule}")),
-            confirm_hint(app.armed == Some('p')),
+            confirm_hint(app.armed.is_some_and(|(k, _)| k == 'p')),
         ]));
     }
 
@@ -2746,7 +2746,7 @@ mod tests {
         let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
         app.on_key(a);
         assert!(app.pending.is_some());
-        assert_eq!(app.armed, Some('a'));
+        assert_eq!(app.armed, Some(('a', None)));
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
@@ -2754,7 +2754,48 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(app.armed, None, "another key disarms");
         app.on_key(a);
+        settle_armed(&mut app);
         app.on_key(a);
+        assert!(app.pending.is_none());
+    }
+
+    /// Draw the armed hint and let it stand long enough to have been read.
+    fn settle_armed(app: &mut App) {
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        app.drawn();
+        if let Some((_, Some(at))) = &mut app.armed {
+            *at -= Duration::from_secs(1);
+        }
+    }
+
+    #[test]
+    fn a_typed_word_does_not_arm_and_confirm_a_remember_key() {
+        let mut app = App::detached();
+        app.pending = Some(Approval {
+            offers: Offers {
+                exact: None,
+                prefix: Some("Bash(ls:*)".to_string()),
+            },
+            ..approval(None)
+        });
+        settle(&mut app);
+        // "support" while a prefix rule is offered: p arms, the next p must not confirm.
+        for c in "sup".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(app.pending.is_some(), "no frame showed the hint");
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.drawn();
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(
+            app.pending.is_some(),
+            "the hint has not been up long enough"
+        );
+        settle_armed(&mut app);
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
         assert!(app.pending.is_none());
     }
 
@@ -2765,7 +2806,7 @@ mod tests {
         app.pending = Some(approval(Some("ls")));
         settle(&mut app);
         app.on_key(a);
-        assert_eq!(app.armed, Some('a'));
+        assert_eq!(app.armed, Some(('a', None)));
         // Answered elsewhere, and the next call takes its place under the same keys.
         app.pending = Some(Approval {
             id: 8,

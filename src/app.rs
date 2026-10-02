@@ -255,8 +255,9 @@ pub struct App {
     /// The approval last drawn, and when that frame reached the screen (`None` until it
     /// has), so a key typed before or as it appears is not taken for the answer.
     pub approval_shown: Option<(u64, Option<Instant>)>,
-    /// The remember key pressed once, which a second press confirms.
-    pub armed: Option<char>,
+    /// The remember key pressed once, and when the frame asking for it again reached the
+    /// screen; a second press counts only once that frame has settled.
+    pub armed: Option<(char, Option<Instant>)>,
     /// The trust question, until it is answered.
     pub trust_gate: Option<TrustGate>,
     /// sudo asking for a password, the front one on screen.
@@ -1486,6 +1487,9 @@ impl App {
         if let Some((_, at @ None)) = &mut self.approval_shown {
             *at = Some(Instant::now());
         }
+        if let Some((_, at @ None)) = &mut self.armed {
+            *at = Some(Instant::now());
+        }
     }
 
     /// Move on what moves by itself; returns whether any of it shows, so an idle session
@@ -2427,7 +2431,9 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     /// Keys while an approval is up. The answers that allow something wait until the
     /// command's end has been on screen and `APPROVAL_SETTLE` has passed since the box
     /// reached the screen, so a steer being typed does not approve; `a` and `p` save a
-    /// permanent rule, so a typed one asks for a second press. A click skips the second
+    /// permanent rule, so a typed one asks for a second press, which counts only once the
+    /// frame asking for it has settled the same way: a steer word like "apply" would
+    /// otherwise arm and confirm in one batch of keys. A click skips the second
     /// press but not the wait: the second click of a double click lands on the next
     /// approval when one comes up in the same place.
     fn approval_key(&mut self, code: KeyCode, ctrl: bool, clicked: bool) {
@@ -2456,14 +2462,15 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
                 } else {
                     Remember::Prefix
                 };
-                if clicked || armed == Some(c) {
+                let confirms = matches!(armed, Some((k, Some(at))) if k == c && at.elapsed() >= APPROVAL_SETTLE);
+                if clicked || confirms {
                     self.answer(Answer::Accept(Some(remember)));
                 } else if self
                     .pending
                     .as_ref()
                     .is_some_and(|p| p.offers.get(remember).is_some())
                 {
-                    self.armed = Some(c);
+                    self.armed = Some((c, None));
                 }
             }
             KeyCode::Char('r' | 'n') | KeyCode::Esc => self.answer(Answer::Reject),
