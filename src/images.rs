@@ -366,21 +366,39 @@ mod tests {
         assert_eq!(cache.bytes, CACHE_BYTES);
     }
 
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+            }
+        }
+        !crc
+    }
+
+    /// A 1x1 PNG whose header claims `width` x `height`, its CRC kept valid so the
+    /// decoder gets as far as the size.
+    fn claiming(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = png(1, 1);
+        // The IHDR chunk type and data sit at 12..29, its CRC at 29..33.
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        let crc = crc32(&bytes[12..29]);
+        bytes[29..33].copy_from_slice(&crc.to_be_bytes());
+        bytes
+    }
+
     #[test]
     fn a_decompression_bomb_is_refused_before_it_is_decoded() {
-        // Under a kilobyte of PNG that would decode to 16384 x 16384 RGBA, a gigabyte.
-        let bytes = png(1, 1);
-        let mut header = bytes.clone();
-        // IHDR width and height sit at bytes 16..24; the CRC after them goes stale, and
-        // the decoder must refuse on the size before it gets there.
-        header[16..20].copy_from_slice(&16_384u32.to_be_bytes());
-        header[20..24].copy_from_slice(&16_384u32.to_be_bytes());
-        let why = prepare(&header).unwrap_err();
-        assert!(why.contains("could not be decoded"), "{why}");
+        assert_eq!(crc32(b"IEND"), 0xae42_6082);
+        assert_eq!(claiming(1, 1), png(1, 1));
+        // 8192 x 8192 RGBA is 256 MiB: past the cap, under the image crate's own 512 MiB.
+        let why = prepare(&claiming(8192, 8192)).unwrap_err();
+        assert!(why.contains("Memory limit exceeded"), "{why}");
 
-        let mut wide = bytes;
-        wide[16..20].copy_from_slice(&40_000u32.to_be_bytes());
-        assert!(prepare(&wide).is_err());
+        let why = prepare(&claiming(40_000, 1)).unwrap_err();
+        assert!(why.contains("Image size exceeds limit"), "{why}");
     }
 
     #[test]
