@@ -1816,6 +1816,9 @@ fn attention(event: &session::Event, root: &std::path::Path) -> Option<String> {
             Some(format!("bhai · {dir}: {tool} needs approval"))
         }
         session::Event::TurnEnd => Some(format!("bhai · {dir}: done")),
+        session::Event::Scheduled { spec, text, .. } => {
+            Some(format!("bhai · {dir}: `{spec}` fired: {text}"))
+        }
         _ => None,
     }
 }
@@ -1918,6 +1921,17 @@ mod tests {
         assert_eq!(
             attention(&session::Event::TurnEnd, root).as_deref(),
             Some("bhai · bhai: done")
+        );
+        let fired = session::Event::Scheduled {
+            id: "abc123".to_string(),
+            spec: "in 20m".to_string(),
+            text: "check CI".to_string(),
+            missed: false,
+            queued: true,
+        };
+        assert_eq!(
+            attention(&fired, root).as_deref(),
+            Some("bhai · bhai: `in 20m` fired: check CI")
         );
         assert_eq!(
             attention(&session::Event::Text("hi".to_string()), root),

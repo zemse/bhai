@@ -111,6 +111,18 @@ pub const COMMANDS: &[Command] = &[
         help: "work on its own until done, /goal <objective>, pause, resume, budget <n>, clear",
     },
     Command {
+        name: "remind",
+        args: " <when> <prompt>",
+        help: "send a prompt later: at 17:30, in 20m, every 2h, cron <5 fields>",
+    },
+    // No args hint, though it takes `cancel|pause|resume <id>`: the list is the usual
+    // way in.
+    Command {
+        name: "schedule",
+        args: "",
+        help: "the schedules /remind set, /schedule cancel|pause|resume <id>",
+    },
+    Command {
         name: "queue",
         args: " [clear]",
         help: "prompts waiting behind the turn",

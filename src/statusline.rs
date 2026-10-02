@@ -77,6 +77,7 @@ pub const VARIABLES: &[(&str, &str)] = &[
     ("credits_reset", "when the allowance resets, as `Thu 05:30`"),
     ("working", "`working` while a turn runs"),
     ("queued", "prompts waiting behind the turn, as `2 queued`"),
+    ("scheduled", "schedules still to fire, as `2 scheduled`"),
     ("session", "the first 8 characters of the session id"),
     ("time", "the local time, as `14:05`"),
     ("version", "bhai's version"),
@@ -594,6 +595,13 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
         Value::plain(match app.queued.len() {
             0 => String::new(),
             n => format!("{n} queued"),
+        }),
+    );
+    set(
+        "scheduled",
+        Value::plain(match app.scheduled() {
+            0 => String::new(),
+            n => format!("{n} scheduled"),
         }),
     );
     set(

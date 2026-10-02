@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-03
 
+- Schedules: `/remind <when> <prompt>` sets one and `/schedule` lists, cancels, pauses and resumes them. The status bar counts the ones still to fire (`$scheduled` in a template). A fire rings the notifier, shows on `/events` as `scheduled`, and is marked in the transcript when it starts a turn. The debug server has `GET /schedules`, `POST /schedule` and `POST /schedule/cancel`, behind the same token.
 - Schedules: a project's schedules are kept in `~/.config/bhai/schedules/`, one store per project root, never in the project, so a cloned repo cannot start a turn at launch. A recurring schedule lasts at most 30 days and fires at most 1000 times; a stored row past those limits is left alone and named.
 - A repeated local time (the hour clocks fall back through) now fires on its first pass under the machine's real time zone too. Before, chrono's Local made it fire on the second pass, and a per-minute cron went silent for that hour.
 

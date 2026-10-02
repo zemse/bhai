@@ -140,6 +140,15 @@ pub enum Event {
     Sending(u64),
     /// A model call is on the wire, or is over; what the tokens a second readout times.
     Streaming(bool),
+    /// A schedule fell due and its prompt goes to the session now: a turn of its own, or
+    /// `queued` behind the running one. `missed` is a slot that passed while no bhai ran.
+    Scheduled {
+        id: String,
+        spec: String,
+        text: String,
+        missed: bool,
+        queued: bool,
+    },
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
     /// The model call failed and is sent again; what it streamed is dropped from the
@@ -725,6 +734,11 @@ impl Session {
         let position = inner.queue.len();
         self.publish(Event::Queued { position, text });
         Submitted::Queued { position }
+    }
+
+    /// Whether a turn is running, so what is submitted now would queue.
+    pub fn working(&self) -> bool {
+        self.lock().working
     }
 
     /// The prompts waiting for the running turn, for `/queue`, as they were typed.

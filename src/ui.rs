@@ -537,6 +537,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             ),
         );
     }
+    match app.scheduled() {
+        0 => {}
+        n => segment(&mut bar, Span::styled(format!("{n} scheduled"), dim)),
+    }
     if let Some(field) = &app.cache_break {
         segment(
             &mut bar,
@@ -3901,6 +3905,49 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let bar = status(&terminal);
         assert!(bar.contains(" ctx:50%") && !bar.contains("fork"), "{bar}");
+    }
+
+    #[tokio::test]
+    async fn status_bar_counts_the_schedules_still_to_fire() {
+        let (tx_user, _) = tokio::sync::mpsc::channel(1);
+        let (tx_control, _) = tokio::sync::mpsc::channel(1);
+        let session = crate::session::Session::new(
+            "m".to_string(),
+            "medium".to_string(),
+            "general".to_string(),
+            tx_user,
+            tx_control,
+            std::sync::Arc::default(),
+            std::sync::Arc::default(),
+            None,
+        );
+        let mut app = App::new(std::sync::Arc::clone(&session));
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            !status(&terminal).contains("scheduled"),
+            "{}",
+            status(&terminal)
+        );
+        let dir = crate::tools::temp_dir();
+        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+        let store = session.schedules().unwrap();
+        store.remind("in 20m a").unwrap();
+        let paused = store.remind("every 1h b").unwrap();
+        store.pause(&paused.id, true).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            status(&terminal).contains(" 1 scheduled "),
+            "{}",
+            status(&terminal)
+        );
+        store.pause(&paused.id, false).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            status(&terminal).contains(" 2 scheduled "),
+            "{}",
+            status(&terminal)
+        );
     }
 
     #[test]

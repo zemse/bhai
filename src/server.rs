@@ -65,6 +65,9 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/children", get(children))
         .route("/steer", post(steer))
         .route("/children/{id}/interrupt", post(interrupt_child))
+        .route("/schedules", get(schedules))
+        .route("/schedule", post(schedule))
+        .route("/schedule/cancel", post(cancel_schedule))
         .layer(middleware::from_fn(move |request, next| {
             let token = token.clone();
             async move { local_only(&token, request, next).await }
@@ -146,6 +149,23 @@ struct GoalBody {
     /// nothing to have it shown.
     #[serde(default)]
     text: String,
+}
+
+/// What `/remind` sets, with the bounds a recurring one may be given.
+#[derive(Deserialize)]
+struct ScheduleBody {
+    /// `at 17:30`, `in 20m`, `every 2h` or `cron <5 fields>`.
+    spec: String,
+    text: String,
+    /// How many times a recurring one fires.
+    times: Option<u32>,
+    /// How long a recurring one lives, as an interval such as `2d`.
+    lasts: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CancelBody {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -533,6 +553,67 @@ async fn context(State(session): State<Arc<Session>>) -> Response {
     match session.context().await {
         Some(profile) => Json(profile).into_response(),
         None => error(StatusCode::SERVICE_UNAVAILABLE, "the agent is not running"),
+    }
+}
+
+/// Why there are no schedules to hand.
+fn no_schedules() -> Response {
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "schedules are off here: there is no home directory to keep them in",
+    )
+}
+
+/// Every schedule, and a line for each row of the store that is not one.
+async fn schedules(State(session): State<Arc<Session>>) -> Response {
+    let Some(store) = session.schedules() else {
+        return no_schedules();
+    };
+    match store.list() {
+        Ok((rows, unreadable)) => {
+            Json(json!({ "schedules": rows, "unreadable": unreadable })).into_response()
+        }
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
+}
+
+/// `/remind`, set by the user; the model's own go through its tool.
+async fn schedule(State(session): State<Arc<Session>>, Json(body): Json<ScheduleBody>) -> Response {
+    let Some(store) = session.schedules() else {
+        return no_schedules();
+    };
+    let new = (|| {
+        if body.text.trim().is_empty() {
+            return Err(crate::schedules::REMIND_USAGE.to_string());
+        }
+        Ok(crate::schedules::New {
+            spec: body.spec.parse()?,
+            text: body.text.trim().to_string(),
+            origin: crate::schedules::Origin::User,
+            times: body.times,
+            lasts: body
+                .lasts
+                .as_deref()
+                .map(crate::schedule::interval)
+                .transpose()?,
+        })
+    })();
+    match new.and_then(|new| store.add(new)) {
+        Ok(row) => Json(json!({ "ok": true, "schedule": row })).into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+async fn cancel_schedule(
+    State(session): State<Arc<Session>>,
+    Json(body): Json<CancelBody>,
+) -> Response {
+    let Some(store) = session.schedules() else {
+        return no_schedules();
+    };
+    match store.cancel(body.id.trim()) {
+        Ok(row) => Json(json!({ "ok": true, "cancelled": row })).into_response(),
+        Err(e) => error(StatusCode::NOT_FOUND, &e),
     }
 }
 
@@ -1245,5 +1326,74 @@ mod tests {
         assert_eq!(post(&http, url("a1"), json!({})).await, StatusCode::OK);
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!cancel.stopped(), "the turn was not interrupted");
+    }
+
+    #[tokio::test]
+    async fn schedules_are_set_listed_and_cancelled_over_http() {
+        let (base, session) = quiet().await;
+        let http = reqwest::Client::new();
+        let set = json!({"spec": "every 2h", "text": "poll", "times": 3, "lasts": "1d"});
+        // A session whose schedules do not run has none to set.
+        assert_eq!(
+            post(&http, format!("{base}/schedule"), set.clone()).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let dir = crate::tools::temp_dir();
+        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+
+        let added: Value = http
+            .post(format!("{base}/schedule"))
+            .header(TOKEN_HEADER, TOKEN)
+            .json(&set)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let row = &added["schedule"];
+        assert_eq!(
+            (&row["spec"], &row["fires_left"]),
+            (&json!("every 2h"), &json!(3))
+        );
+        let id = row["id"].as_str().unwrap().to_string();
+        for bad in [
+            json!({"spec": "soon", "text": "x"}),
+            json!({"spec": "in 20m check", "text": "x"}),
+            json!({"spec": "in 20m", "text": "  "}),
+            json!({"spec": "every 1h", "text": "x", "lasts": "60d"}),
+            json!({"spec": "every 1h", "text": "x", "times": 0}),
+        ] {
+            assert_eq!(
+                post(&http, format!("{base}/schedule"), bad.clone()).await,
+                StatusCode::BAD_REQUEST,
+                "{bad}"
+            );
+        }
+
+        let listed = get_json(&http, format!("{base}/schedules")).await;
+        assert_eq!(listed["schedules"].as_array().unwrap().len(), 1, "{listed}");
+        assert_eq!(listed["schedules"][0]["id"], id.as_str());
+        assert_eq!(listed["unreadable"], json!([]));
+
+        let cancel = json!({ "id": id });
+        assert_eq!(
+            post(&http, format!("{base}/schedule/cancel"), cancel.clone()).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post(&http, format!("{base}/schedule/cancel"), cancel).await,
+            StatusCode::NOT_FOUND
+        );
+        let listed = get_json(&http, format!("{base}/schedules")).await;
+        assert_eq!(listed["schedules"], json!([]));
+        // Without the token, as every other route.
+        let status = http
+            .get(format!("{base}/schedules"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_ne!(status.as_u16(), 200);
     }
 }

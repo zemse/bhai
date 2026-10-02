@@ -11,6 +11,7 @@
 //! a recurring one skips to its next slot and says so, rather than firing a backlog.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use chrono::{DateTime, Duration, Local, Utc};
@@ -36,6 +37,9 @@ pub const TEXT_MAX: usize = 8192;
 /// The longest the runner sleeps before reading the store again: another process may
 /// have added a row, and tokio's clock stops while the machine sleeps.
 const NAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub const REMIND_USAGE: &str = "/remind <when> <prompt>, where <when> is at 17:30, at 2026-10-04 09:00, in 20m, every 2h or cron <5 fields>";
+pub const SCHEDULE_USAGE: &str = "/schedule [list] | cancel <id> | pause <id> | resume <id>";
 
 /// Where the time comes from; tests put paused tokio time behind it.
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
@@ -145,6 +149,9 @@ pub struct Schedules {
     clock: Clock,
     /// Wakes the runner when a row changes here, so it never sleeps past a new one.
     poke: Notify,
+    /// Rows that will fire, as of the last read; another process's change shows once the
+    /// runner next reads the store.
+    active: AtomicUsize,
 }
 
 impl Schedules {
@@ -157,6 +164,7 @@ impl Schedules {
             path: config_dir.join(DIR).join(format!("{name}.json")),
             clock: Arc::new(Utc::now),
             poke: Notify::new(),
+            active: AtomicUsize::new(0),
         }
     }
 
@@ -171,6 +179,20 @@ impl Schedules {
     /// The store's file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// How many schedules will fire, for the status bar: not paused, not unreadable.
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    /// Note how many of `rows` will fire by `now`.
+    fn count(&self, rows: &[Value], now: DateTime<Utc>) {
+        let active = rows
+            .iter()
+            .filter(|row| checked(row, now).is_ok_and(|row| !row.paused))
+            .count();
+        self.active.store(active, Ordering::Relaxed);
     }
 
     /// Held across every read-modify-write, by this process and any other in the project.
@@ -224,6 +246,7 @@ impl Schedules {
         let mut rows = self.load()?;
         let done = change(&mut rows)?;
         self.save(&rows)?;
+        self.count(&rows, self.now());
         self.poke.notify_one();
         Ok(done)
     }
@@ -286,11 +309,58 @@ impl Schedules {
         })
     }
 
+    /// `/remind <spec> <text>`: a schedule the user set, firing `text`.
+    pub fn remind(&self, text: &str) -> Result<Row, String> {
+        let (spec, text) = Spec::split(text)?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(format!(
+                "`{spec}` has nothing to say when it fires: {REMIND_USAGE}"
+            ));
+        }
+        self.add(New {
+            spec,
+            text: text.to_string(),
+            origin: Origin::User,
+            times: None,
+            lasts: None,
+        })
+    }
+
+    /// `/schedule` with what followed it: `list` (or nothing), `cancel <id>`, `pause <id>`
+    /// or `resume <id>`. Returns what to show.
+    pub fn command(&self, rest: &str) -> Result<String, String> {
+        let (verb, id) = rest
+            .trim()
+            .split_once(char::is_whitespace)
+            .map_or((rest.trim(), ""), |(verb, id)| (verb, id.trim()));
+        let now = self.now();
+        match (verb, id) {
+            ("" | "list", "") => {
+                let (rows, bad) = self.list()?;
+                Ok(report(&rows, &bad, now))
+            }
+            ("cancel" | "pause" | "resume", "") => Err(SCHEDULE_USAGE.to_string()),
+            ("cancel", id) => self
+                .cancel(id)
+                .map(|row| format!("cancelled {}", describe(&row, now))),
+            ("pause", id) => self
+                .pause(id, true)
+                .map(|row| format!("paused {}", describe(&row, now))),
+            ("resume", id) => self
+                .pause(id, false)
+                .map(|row| format!("resumed {}", describe(&row, now))),
+            _ => Err(SCHEDULE_USAGE.to_string()),
+        }
+    }
+
     /// Every row that is a schedule, and a line for each row that is not.
     pub fn list(&self) -> Result<(Vec<Row>, Vec<String>), String> {
         let now = self.now();
         let mut found = (Vec::new(), Vec::new());
-        for (at, row) in self.load()?.iter().enumerate() {
+        let rows = self.load()?;
+        self.count(&rows, now);
+        for (at, row) in rows.iter().enumerate() {
             match checked(row, now) {
                 Ok(row) => found.0.push(row),
                 Err(why) => found.1.push(self.skipped(at, &why)),
@@ -411,6 +481,7 @@ impl Schedules {
         if changed {
             self.save(&kept)?;
         }
+        self.count(&kept, now);
         Ok(pass)
     }
 }
@@ -430,6 +501,13 @@ pub async fn run(session: Weak<Session>, schedules: Arc<Schedules>) {
                     hub.publish(Event::Info(format!("schedules: {note}")));
                 }
                 for fire in pass.fires {
+                    hub.publish(Event::Scheduled {
+                        id: fire.row.id.clone(),
+                        spec: fire.row.spec.to_string(),
+                        text: fire.row.text.clone(),
+                        missed: fire.missed,
+                        queued: hub.working(),
+                    });
                     // Queued behind a running turn, or started; only a closed agent fails.
                     if hub.submit(fire.prompt()).is_err() {
                         return;
@@ -503,6 +581,47 @@ fn checked(row: &Value, now: DateTime<Utc>) -> Result<Row, String> {
         }
     }
     Ok(row)
+}
+
+/// What `/schedule list` shows.
+pub fn report(rows: &[Row], bad: &[String], now: DateTime<Utc>) -> String {
+    let mut out = match rows.len() {
+        0 => "schedules: none. /remind <when> <prompt> sets one".to_string(),
+        n => format!("schedules: {n}"),
+    };
+    for row in rows {
+        out.push_str(&format!("\n  {}", describe(row, now)));
+    }
+    for line in bad {
+        out.push_str(&format!("\n  {line}"));
+    }
+    out
+}
+
+/// One row on a line: its id, spec, next fire, how it ends, and its prompt.
+pub fn describe(row: &Row, now: DateTime<Utc>) -> String {
+    let mut out = format!("{} `{}`", row.id, row.spec);
+    match row.paused {
+        true => out.push_str(" paused"),
+        false if row.next <= now => out.push_str(" due now"),
+        false => out.push_str(&format!(" next {}", local(row.next))),
+    }
+    if let Some(n) = row.fires_left {
+        out.push_str(&format!(", {n} fire(s) left"));
+    }
+    if let Some(end) = row.expires {
+        out.push_str(&format!(", ends {}", local(end)));
+    }
+    if row.origin == Origin::Model {
+        out.push_str(", set by the model");
+    }
+    let text: String = row.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let clipped: String = text.chars().take(60).collect();
+    match clipped.len() < text.len() {
+        true => out.push_str(&format!(": {clipped}…")),
+        false => out.push_str(&format!(": {text}")),
+    }
+    out
 }
 
 /// Where schedule `id` is among the rows.
@@ -619,8 +738,13 @@ mod tests {
         assert!(!text.contains("late"), "{text}");
         assert!(text.ends_with("\n\ncheck CI"), "{text}");
         let shown = session.entries().list.clone();
+        let at = shown
+            .iter()
+            .position(|e| matches!(e, crate::entries::Entry::User(t) if t == "(scheduled `in 20m`) check CI"))
+            .unwrap_or_else(|| panic!("{shown:?}"));
+        // Marked right above the prompt it started a turn with.
         assert!(
-            shown.iter().any(|e| matches!(e, crate::entries::Entry::User(t) if t == "(scheduled `in 20m`) check CI")),
+            matches!(&shown[at - 1], crate::entries::Entry::Info(t) if *t == format!("schedule {} fired", row.id)),
             "{shown:?}"
         );
         let (rows, bad) = schedules(&dir).list().unwrap();
@@ -636,9 +760,16 @@ mod tests {
         assert_eq!(session.submit("busy".to_string()), Ok(Submitted::Started));
         assert_eq!(rx.recv().await.unwrap().text, "busy");
         session.run_schedules(store);
+        let mut events = session.subscribe();
         tokio::time::sleep(std::time::Duration::from_secs(5 * 60 + 1)).await;
         assert_eq!(session.queued(), ["(scheduled `in 5m`) look again"]);
         assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Scheduled { queued: true, missed: false, ref spec, .. }) if spec == "in 5m"
+        ));
+        // It may land mid-answer, so only the queue and the prompt say it was scheduled.
+        assert!(!infos(&session).iter().any(|i| i.contains("fired")));
     }
 
     #[tokio::test(start_paused = true)]
@@ -863,6 +994,82 @@ mod tests {
             row[field] = value;
             assert!(checked(&row, base()).is_err(), "{field}: {row}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remind_and_the_schedule_command_set_list_pause_and_cancel() {
+        let dir = crate::tools::temp_dir();
+        let store = schedules(&dir);
+        assert_eq!(store.active(), 0);
+        let row = store.remind("in 20m  check CI ").unwrap();
+        assert_eq!((row.text.as_str(), row.origin), ("check CI", Origin::User));
+        assert!(
+            store
+                .remind("in 20m")
+                .unwrap_err()
+                .contains("nothing to say")
+        );
+        assert!(store.remind("soon check CI").is_err());
+        let polled = store.remind("every 2h poll the queue").unwrap();
+        assert_eq!(store.active(), 2);
+
+        let list = store.command("").unwrap();
+        assert_eq!(list, store.command(" list ").unwrap());
+        assert!(list.starts_with("schedules: 2"), "{list}");
+        assert!(
+            list.contains(&format!("{} `in 20m` next ", row.id))
+                && list.ends_with(": poll the queue"),
+            "{list}"
+        );
+        assert!(list.contains(", ends "), "{list}");
+
+        let paused = store.command(&format!("pause {}", polled.id)).unwrap();
+        assert!(paused.starts_with(&format!("paused {} `every 2h` paused", polled.id)));
+        assert_eq!(store.active(), 1);
+        assert!(store.command(&format!("resume {}", polled.id)).is_ok());
+        assert_eq!(store.active(), 2);
+        assert!(
+            store
+                .command(&format!("cancel {}", row.id))
+                .unwrap()
+                .starts_with("cancelled ")
+        );
+        assert_eq!(store.active(), 1);
+        assert_eq!(
+            store.command(&format!("cancel {}", row.id)).unwrap_err(),
+            format!("no schedule {}", row.id)
+        );
+        for bad in ["cancel", "drop x", "list x"] {
+            assert_eq!(store.command(bad).unwrap_err(), SCHEDULE_USAGE, "{bad}");
+        }
+        store.command(&format!("cancel {}", polled.id)).unwrap();
+        assert!(
+            store
+                .command("list")
+                .unwrap()
+                .starts_with("schedules: none")
+        );
+    }
+
+    #[test]
+    fn a_row_is_one_line_with_a_long_prompt_cut() {
+        let row = Row {
+            id: "abc123".to_string(),
+            spec: "every 5m".parse().unwrap(),
+            text: format!("look\n{}", "x".repeat(100)),
+            origin: Origin::Model,
+            created: base(),
+            next: base() - Duration::minutes(1),
+            fires_left: Some(3),
+            expires: None,
+            paused: false,
+        };
+        let line = describe(&row, base());
+        assert!(
+            line.starts_with("abc123 `every 5m` due now, 3 fire(s) left, set by the model: look x"),
+            "{line}"
+        );
+        assert!(line.ends_with("x…") && !line.contains('\n'), "{line}");
     }
 
     #[tokio::test(start_paused = true)]

@@ -173,7 +173,7 @@ impl fmt::Display for Span {
 }
 
 /// `20m`, `2h`, `1d`, `1h30m`: whole numbers, each with a unit of s, m, h, d or w.
-fn interval(text: &str) -> Result<Duration, String> {
+pub fn interval(text: &str) -> Result<Duration, String> {
     if text.is_empty() {
         return Err(format!("no interval given: {USAGE}"));
     }

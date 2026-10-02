@@ -97,6 +97,18 @@ impl Entries {
             // they are, so this only says why the agent started working again.
             Event::Resumed(what) => self.push(Entry::Info(format!("resumed {what}"))),
             Event::Queued { .. } => {}
+            // Only one that starts a turn is marked here, right above its prompt: one
+            // that queues may land mid-answer, and its prompt says it was scheduled.
+            Event::Scheduled {
+                id,
+                missed,
+                queued: false,
+                ..
+            } => self.push(Entry::Info(match missed {
+                true => format!("schedule {id} fired late"),
+                false => format!("schedule {id} fired"),
+            })),
+            Event::Scheduled { queued: true, .. } => {}
             Event::Text(delta) => self.append(delta, Stream::Assistant),
             Event::Commentary(delta) => self.append(delta, Stream::Commentary),
             Event::Reasoning(delta) => self.append(delta, Stream::Reasoning),

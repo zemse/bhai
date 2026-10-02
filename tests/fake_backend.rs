@@ -1694,6 +1694,11 @@ async fn a_schedule_missed_while_bhai_was_down_fires_at_startup_framed_as_late()
     .await;
     let mut events = bhai.events().await;
 
+    let fired = events.until("scheduled").await;
+    assert_eq!(
+        fired["data"],
+        json!({"id": "late01", "spec": "in 1h", "text": "check the deploy", "missed": true, "queued": false})
+    );
     let user = events.until("user").await;
     let shown = user["data"].as_str().unwrap();
     assert!(shown.starts_with("(missed `in 1h`, due "), "{shown}");
@@ -1736,4 +1741,49 @@ async fn a_schedule_missed_while_bhai_was_down_fires_at_startup_framed_as_late()
         let mode = std::fs::metadata(&store).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
+}
+
+#[tokio::test]
+async fn a_schedule_set_over_http_is_listed_kept_and_cancelled_without_a_model_call() {
+    let fake = Arc::new(Fake::default());
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let (status, added) = bhai
+        .post("/schedule", json!({"spec": "in 20m", "text": "check CI"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    let id = added["schedule"]["id"].as_str().unwrap().to_string();
+    let (status, refused) = bhai
+        .post("/schedule", json!({"spec": "in 10s", "text": "too soon"}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("1 minute minimum"),
+        "{refused}"
+    );
+
+    let listed: Value = bhai
+        .http
+        .get(format!("{}/schedules", bhai.base))
+        .header("x-bhai-token", &bhai.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = listed["schedules"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{listed}");
+    assert_eq!(rows[0]["text"], "check CI");
+    assert_eq!(rows[0]["origin"], "user");
+    // Kept outside the project, where a clone cannot plant one.
+    assert!(!bhai.project().join(".bhai/schedules.json").exists());
+
+    let (status, _) = bhai.post("/schedule/cancel", json!({ "id": id })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, gone) = bhai.post("/schedule/cancel", json!({ "id": id })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{gone}");
+    assert!(fake.responses().is_empty());
 }

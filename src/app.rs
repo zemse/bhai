@@ -1875,6 +1875,34 @@ impl App {
             }
             return;
         }
+        if let Some(rest) = message.strip_prefix("/remind")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            let result = match rest.trim() {
+                "" => Err(crate::schedules::REMIND_USAGE.to_string()),
+                rest => self.with_schedules(|s| {
+                    let row = s.remind(rest)?;
+                    Ok(format!("set {}", crate::schedules::describe(&row, s.now())))
+                }),
+            };
+            self.note(match result {
+                Ok(text) => Entry::Info(text),
+                Err(e) => Entry::Error(e),
+            });
+            return;
+        }
+        if let Some(rest) = message.strip_prefix("/schedule")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            let result = self.with_schedules(|s| s.command(rest));
+            self.note(match result {
+                Ok(text) => Entry::Info(text),
+                Err(e) => Entry::Error(e),
+            });
+            return;
+        }
         if let Some(rest) = message.strip_prefix("/queue")
             && (rest.is_empty() || rest.starts_with(' '))
         {
@@ -1902,6 +1930,25 @@ impl App {
         if let Err(e) = self.session.submit(prompt.with_images(images)) {
             self.note(Entry::Error(e.to_string()));
         }
+    }
+
+    /// Run `f` on the project's schedules, which only run with a home directory to keep
+    /// them in.
+    fn with_schedules(
+        &self,
+        f: impl FnOnce(&crate::schedules::Schedules) -> Result<String, String>,
+    ) -> Result<String, String> {
+        match self.session.schedules() {
+            Some(schedules) => f(&schedules),
+            None => Err(
+                "schedules are off here: there is no home directory to keep them in".to_string(),
+            ),
+        }
+    }
+
+    /// Schedules that will fire, for the status bar.
+    pub fn scheduled(&self) -> usize {
+        self.session.schedules().map_or(0, |s| s.active())
     }
 
     /// `/statusline` on its own shows the template and the variables; `set <template>`
@@ -3116,6 +3163,57 @@ mod tests {
         app.input.set("/allow not a rule".to_string());
         app.submit();
         assert!(last(&mut app).contains("expected a tool name"));
+    }
+
+    #[tokio::test]
+    async fn remind_sets_a_schedule_and_schedule_lists_and_cancels_it() {
+        let mut app = App::detached();
+        let last = |app: &mut App| app.entries().list.last().cloned();
+        app.input.set("/remind in 20m check CI".to_string());
+        app.submit();
+        assert!(
+            matches!(last(&mut app), Some(Entry::Error(e)) if e.starts_with("schedules are off here"))
+        );
+        let dir = crate::tools::temp_dir();
+        app.session
+            .run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+        app.input.set("/remind".to_string());
+        app.submit();
+        assert!(
+            matches!(last(&mut app), Some(Entry::Error(e)) if e == crate::schedules::REMIND_USAGE)
+        );
+        app.input.set("/remind in 20m check CI".to_string());
+        app.submit();
+        let Some(Entry::Info(set)) = last(&mut app) else {
+            panic!("{:?}", last(&mut app));
+        };
+        let id = set
+            .strip_prefix("set ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("{set}"))
+            .to_string();
+        assert!(
+            set.starts_with(&format!("set {id} `in 20m` next ")) && set.ends_with(": check CI"),
+            "{set}"
+        );
+        assert_eq!(app.scheduled(), 1);
+        // Set, not sent: nothing reached the model.
+        assert!(app.session.queued().is_empty() && !app.working);
+
+        app.input.set("/schedule".to_string());
+        app.submit();
+        assert!(
+            matches!(last(&mut app), Some(Entry::Info(t)) if t.starts_with("schedules: 1") && t.contains(&id))
+        );
+        app.input.set(format!("/schedule cancel {id}"));
+        app.submit();
+        assert!(matches!(last(&mut app), Some(Entry::Info(t)) if t.starts_with("cancelled ")));
+        assert_eq!(app.scheduled(), 0);
+        app.input.set("/schedule drop".to_string());
+        app.submit();
+        assert!(
+            matches!(last(&mut app), Some(Entry::Error(e)) if e == crate::schedules::SCHEDULE_USAGE)
+        );
     }
 
     /// Only the listing: `clean` would act on the checkout the tests run in.
