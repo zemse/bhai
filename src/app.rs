@@ -231,6 +231,8 @@ pub struct App {
     attachments: Attachments,
     /// The `/` menu's highlighted row, while the menu is open.
     pub menu: Option<usize>,
+    /// The project's files, for the `@` rows of the menu.
+    pub files: crate::files::Finder,
     /// Submitted prompts, for `ctrl+p` and `ctrl+n`.
     pub history: History,
     pub working: bool,
@@ -370,6 +372,7 @@ impl App {
             input: Editor::default(),
             attachments: Attachments::default(),
             menu: None,
+            files: crate::files::Finder::new(std::env::current_dir().unwrap_or_default()),
             history: History::default(),
             working: false,
             queued: Vec::new(),
@@ -567,8 +570,12 @@ impl App {
                 KeyCode::Tab => return self.accept_menu(false),
                 // Enter belongs to the menu only where the whole prompt is the command
                 // it is offering. Mid-sentence it sends what was typed, as it would with
-                // no menu open, and tab is what completes the name.
-                KeyCode::Enter if key.modifiers.is_empty() && self.menu_alone() => {
+                // no menu open, and tab is what completes the name. A half typed path is
+                // never worth sending, so enter always takes a file row.
+                KeyCode::Enter
+                    if key.modifiers.is_empty()
+                        && (self.menu_alone() || self.finding().is_some()) =>
+                {
                     return self.accept_menu(true);
                 }
                 KeyCode::Esc => {
@@ -760,9 +767,23 @@ impl App {
     /// The menu rows for what is typed; empty whenever the menu is shut.
     pub fn menu_items(&self) -> Vec<Item> {
         match self.menu {
-            Some(_) => commands::matches(self.input.before(), &self.skills),
+            Some(_) => self.offered(),
             None => Vec::new(),
         }
+    }
+
+    /// The rows the word at the cursor would offer: commands and skills for a `/word`,
+    /// files for an `@path`. A word starts with one or the other, never both.
+    fn offered(&self) -> Vec<Item> {
+        match self.finding() {
+            Some(typed) => self.files.matches(typed),
+            None => commands::matches(self.input.before(), &self.skills),
+        }
+    }
+
+    /// The path being typed after an `@`, when it is.
+    fn finding(&self) -> Option<&str> {
+        crate::files::typing(self.input.before())
     }
 
     /// The tail of the highlighted row, drawn grey from the cursor on and filled in by
@@ -782,7 +803,10 @@ impl App {
     /// Open the menu on anything that matches, keeping the highlighted row in range.
     /// An edit that matches nothing shuts it, and the next one can open it again.
     fn refresh_menu(&mut self) {
-        let rows = commands::matches(self.input.before(), &self.skills).len();
+        if self.finding().is_some() {
+            self.files.want();
+        }
+        let rows = self.offered().len();
         self.menu = (rows > 0).then(|| self.menu.unwrap_or(0).min(rows - 1));
     }
 
@@ -802,7 +826,7 @@ impl App {
         let Some(item) = self.menu.and_then(|row| items.get(row)) else {
             return;
         };
-        let Some(typed) = commands::typing(self.input.before()) else {
+        let Some(typed) = item.typed(self.input.before()) else {
             return;
         };
         let more = item.takes_input();
@@ -1505,6 +1529,12 @@ impl App {
         #[cfg(feature = "dictation")]
         {
             changed |= self.heard();
+        }
+        // The walk runs on a thread of its own; an `@` typed before it finished has
+        // its rows now.
+        if self.files.poll() && self.finding().is_some() {
+            self.refresh_menu();
+            changed = true;
         }
         let designed = self
             .designing
@@ -4220,6 +4250,58 @@ mod tests {
         assert_eq!(app.input.value(), "/qu", "esc keeps what was typed");
         type_text(&mut app, "e");
         assert_eq!(app.menu, Some(0), "the next keystroke opens it again");
+    }
+
+    #[test]
+    fn an_at_word_offers_the_project_files_and_enter_writes_the_path() {
+        let mut app = App::detached();
+        app.files = crate::files::tests::finder();
+        type_text(&mut app, "mail me@sr");
+        assert_eq!(app.menu, None, "an email address is not a path");
+
+        let mut app = App::detached();
+        app.files = crate::files::tests::finder();
+        type_text(&mut app, "look at @bash");
+        assert_eq!(app.menu, Some(0));
+        let names: Vec<_> = app.menu_items().iter().map(|i| i.name.clone()).collect();
+        assert_eq!(names, ["src/tools/bash.rs"]);
+        // Mid-sentence, enter still takes the row: a half typed path is not a prompt.
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input.value(), "look at @src/tools/bash.rs ");
+        assert_eq!(app.menu, None);
+        assert!(
+            app.entries()
+                .list
+                .iter()
+                .all(|e| !matches!(e, Entry::User(..)))
+        );
+
+        // Tab completes the same way, and the grey tail is the rest of the path.
+        type_text(&mut app, "and @src/ma");
+        assert_eq!(app.suggestion(), "in.rs");
+        app.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.input.value(),
+            "look at @src/tools/bash.rs and @src/main.rs "
+        );
+    }
+
+    #[test]
+    fn the_file_rows_arrive_on_a_tick_once_the_walk_is_done() {
+        let mut app = App::detached();
+        let root = std::env::temp_dir().join(format!("bhai-at-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("plan.md"), "").unwrap();
+        app.files = crate::files::Finder::new(root);
+        // The keystroke starts the walk and does not wait for it.
+        type_text(&mut app, "@pl");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.menu.is_none() {
+            assert!(Instant::now() < deadline, "the rows never came");
+            app.tick();
+            std::thread::yield_now();
+        }
+        assert_eq!(app.menu_items()[0].name, "plan.md");
     }
 
     #[test]

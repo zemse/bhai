@@ -24,6 +24,7 @@ htmlize = { version = "1.1.0", features = ["unescape"] }
 http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
+ignore = "0.4.31"
 libc = "0.2.189"
 lol_html = "2.9.0"
 merman-ascii = "0.7.0"

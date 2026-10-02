@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- `@` in the prompt opens a file finder in the `/` menu. It lists the project's files as git sees them (gitignore honoured, hidden files left out), walked off the UI thread and capped at 20000. The list filters as you type, and enter or tab writes `@path`.
 - Dictation records each take into its own private directory (0o700, log 0o600), and quitting or a hangup, interrupt, terminate or panic while whisper transcribes kills the transcriber's process group and deletes the recording.
 - A `Fetch(domain:*)` rule (or an imported `WebFetch(domain:*)`) now covers every fetch. Any other `*` in a domain rule is now refused, where before it was accepted and matched no host.
 - The egress proxy checks a request's path the way the upstream URL parses it, and refuses one whose raw path parses to a different path (a `\` or a dot segment), so a path-scoped rule can no longer be stepped out of.

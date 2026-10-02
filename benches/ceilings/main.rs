@@ -47,6 +47,8 @@ mod entries;
 mod environment;
 #[path = "../../src/external.rs"]
 mod external;
+#[path = "../../src/files.rs"]
+mod files;
 #[path = "../../src/frontmatter.rs"]
 mod frontmatter;
 #[path = "../../src/goal.rs"]

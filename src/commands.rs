@@ -195,19 +195,30 @@ pub struct Item {
     pub help: String,
     /// A skill row: accepting it writes a prompt for the agent, not a command.
     pub skill: bool,
+    /// An `@` finder row: `name` is a path, and accepting it writes `@path`.
+    pub file: bool,
 }
 
 impl Item {
-    /// The text `/` plus the name, as it goes into the input.
+    /// The text `/` (or `@` for a file) plus the name, as it goes into the input.
     pub fn label(&self) -> String {
-        format!("/{}", self.name)
+        let mark = if self.file { '@' } else { '/' };
+        format!("{mark}{}", self.name)
+    }
+
+    /// The word this row is offered for, at the end of `before`, without its mark.
+    pub fn typed<'a>(&self, before: &'a str) -> Option<&'a str> {
+        match self.file {
+            true => crate::files::typing(before),
+            false => typing(before),
+        }
     }
 
     /// What completing this row would add to what has been typed, for the grey tail
     /// drawn past the cursor. Empty once the name is there in full, and when the case
     /// differs, since tab would rewrite what is already on screen.
     pub fn completion(&self, before: &str) -> String {
-        let Some(typed) = typing(before) else {
+        let Some(typed) = self.typed(before) else {
             return String::new();
         };
         self.name
@@ -218,7 +229,7 @@ impl Item {
 
     /// Whether accepting the row should leave the input open for more typing.
     pub fn takes_input(&self) -> bool {
-        self.skill || !self.args.is_empty()
+        self.skill || self.file || !self.args.is_empty()
     }
 }
 
@@ -247,6 +258,7 @@ pub fn matches(before: &str, skills: &[Skill]) -> Vec<Item> {
             args: c.args.to_string(),
             help: c.help.to_string(),
             skill: false,
+            file: false,
         });
     let found = skills
         .iter()
@@ -256,6 +268,7 @@ pub fn matches(before: &str, skills: &[Skill]) -> Vec<Item> {
             args: " [input]".to_string(),
             help: first_sentence(&s.description),
             skill: true,
+            file: false,
         });
     let mut items: Vec<Item> = commands.chain(found).collect();
     // An exactly typed name goes first, so enter on `/workflow` does not run `/workflows`.
@@ -294,6 +307,7 @@ pub fn help() -> String {
         "\nkeys",
         "\n  enter send · alt+enter or ctrl+j newline · shift+tab permission mode",
         "\n  ctrl+c interrupt, clear the draft (ctrl+z restores), then quit on a second press · ctrl+d quit on an empty prompt",
+        "\n  @<path> finds a file in the project and writes its path",
         "\n  !<command> runs a shell command yourself, shown here and not told to the model",
         "\n  up and down walk the prompt history · ctrl+r searches it · tab takes the grey completion",
         "\n  up on an empty prompt takes the queued messages back to edit",

@@ -56,6 +56,7 @@ mod egress;
 pub mod entries;
 mod environment;
 mod external;
+mod files;
 mod frontmatter;
 pub mod goal;
 pub mod identity;
