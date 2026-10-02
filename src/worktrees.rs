@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -393,6 +394,26 @@ impl Place {
             _ => None,
         }));
         out.join("\n")
+    }
+}
+
+/// The session's place, until [`settle`] has settled it.
+static SESSION: Mutex<Option<Place>> = Mutex::new(None);
+
+/// Make `place` the one [`settle`] settles, by a quit or by a signal.
+pub fn settle_at_exit(place: Place) {
+    *SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(place);
+}
+
+/// As the session quits or bhai dies of a signal: settle every worktree its children
+/// made, and say on stderr which were kept and how to take their work. Only the first
+/// call settles; one that comes while it runs waits for it to finish.
+pub fn settle() {
+    let mut session = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(place) = session.take() {
+        for line in place.quit() {
+            eprintln!("bhai: {line}");
+        }
     }
 }
 
@@ -926,6 +947,75 @@ mod tests {
             )),
             "{listed}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Where `signalled` points its process at.
+    const SIGNALLED: &str = "BHAI_TEST_WORKTREE_SIGNALLED";
+
+    /// Run by `a_signal_settles_the_worktrees_before_bhai_dies` in a process of its own,
+    /// which leases two worktrees, changes one, says so and waits to be signalled. Without
+    /// the variable it does nothing.
+    #[test]
+    fn signalled() {
+        let Some(dir) = std::env::var_os(SIGNALLED) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            crate::tools::bash::kill_all_on_signal().unwrap();
+            let place = Place::new(&dir);
+            settle_at_exit(place.clone());
+            let leases = [
+                place.lease("s", "c1").unwrap(),
+                place.lease("s", "c2").unwrap(),
+            ];
+            std::fs::write(leases[1].entry().path.join("a.txt"), "changed\n").unwrap();
+            std::fs::write(dir.join("ready"), "").unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            drop(leases);
+        });
+    }
+
+    #[test]
+    fn a_signal_settles_the_worktrees_before_bhai_dies() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let dir = repo();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "worktrees::tests::signalled", "--nocapture"])
+            .env(SIGNALLED, &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let begun = std::time::Instant::now();
+        while !dir.join("ready").exists() {
+            assert!(begun.elapsed().as_secs() < 20, "the child never got ready");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let place = Place::new(&dir);
+        let entries = place.load().unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        #[allow(unsafe_code)]
+        // SAFETY: only sends a signal, to the child started above.
+        unsafe {
+            libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGTERM);
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.signal(), Some(libc::SIGTERM));
+
+        assert!(!entries[0].path.exists());
+        assert!(!branches(&dir).contains(&entries[0].branch));
+        let kept_entry = Entry {
+            kept: true,
+            ..entries[1].clone()
+        };
+        assert_eq!(place.load().unwrap(), vec![kept_entry]);
+        assert!(entries[1].path.join("a.txt").is_file());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let line = format!("bhai: {}", kept(&entries[1], "1 uncommitted change"));
+        assert!(stderr.contains(&line), "{stderr}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

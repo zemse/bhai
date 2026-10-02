@@ -979,6 +979,7 @@ const PANIC_WAIT: Duration = Duration::from_millis(100);
 
 /// Make a hangup, an interrupt or a terminate end every session before bhai dies of it,
 /// as it still does: the sessions' process groups would outlive it, holding their ports.
+/// The session's worktrees are settled after, as quitting settles them.
 pub fn kill_all_on_signal() -> io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     for kind in [
@@ -992,6 +993,7 @@ pub fn kill_all_on_signal() -> io::Result<()> {
                 kill_all();
                 #[cfg(feature = "dictation")]
                 crate::dictation::kill_all();
+                crate::worktrees::settle();
                 die_of(kind.as_raw_value());
             }
         });
