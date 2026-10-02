@@ -47,7 +47,7 @@ name = "ceilings"
 harness = false
 
 [lints.rust]
-# `deny` rather than `forbid`: `kill_group` in tools/bash.rs allows its one `killpg`.
+# `deny` rather than `forbid`: tools/bash.rs allows its `killpg` and terminal setup one by one.
 unsafe_code = "deny"
 
 [lints.clippy]

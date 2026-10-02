@@ -628,8 +628,9 @@ async fn mcp_login(
     Ok(())
 }
 
-/// Stop the MCP servers, if any were started.
+/// Stop the MCP servers, if any were started, and the shell sessions.
 async fn shutdown(hub: Option<Arc<mcp::Hub>>) {
+    tools::bash::kill_all();
     if let Some(hub) = hub {
         hub.shutdown().await;
     }

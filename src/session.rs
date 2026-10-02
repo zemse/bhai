@@ -967,7 +967,7 @@ impl Session {
     /// call and shown as a note, so it never reaches the model's history.
     pub fn shell(self: &Arc<Self>, command: &str) {
         use crate::permissions::Decision;
-        use crate::tools::{Tool, bash};
+        use crate::tools::bash;
         let args = serde_json::json!({ "command": command });
         if let Decision::Deny(reason) = self.policy.check(bash::NAME, &args, true) {
             self.policy
@@ -981,7 +981,7 @@ impl Session {
             session
                 .policy
                 .audit(bash::NAME, &command, "ran", "you", "typed after !");
-            let (output, _) = bash::Bash.execute(&args).await;
+            let output = bash::typed(&command).await;
             session.publish(Event::Info(format!("$ {command}\n{}", output.trim_end())));
         });
     }

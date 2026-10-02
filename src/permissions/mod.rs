@@ -90,6 +90,9 @@ pub enum Reserved {
     Asked(String),
     /// A command the tokenizer could not read, by the word that runs code in it.
     RunsCode(String),
+    /// Input typed into a session that is not a plain shell, or that holds keys which
+    /// edit the line, by the session's command: nothing here can tell what it runs.
+    Typed(String),
     /// The judge does not run here at all: this is not `auto`, or the project is not
     /// trusted. Neither reaches the agent, since `auto` implies a trusted project and
     /// every other mode prompts.
@@ -106,6 +109,9 @@ impl Reserved {
             Reserved::Asked(rule) => format!("the user's rule {rule} keeps this one for them"),
             Reserved::RunsCode(word) => {
                 format!("the permission checker cannot read a command holding `{word}`")
+            }
+            Reserved::Typed(command) => {
+                format!("only the user may approve what is typed into `{command}`")
             }
             Reserved::Untrusted => "this project is not trusted".to_string(),
         }
@@ -723,6 +729,7 @@ impl Checker<'_> {
                 None => Decision::Ask,
             },
             patch::NAME => self.check_patch(args, needs_approval),
+            crate::tools::stdin::NAME => self.check_typing(tool, &Typing::of(args)),
             _ => self.check_other(tool, needs_approval),
         }
     }
@@ -765,6 +772,31 @@ impl Checker<'_> {
             return Decision::Allow(String::new());
         }
         self.fallback(find(&self.allow()).map(|r| rule_reason(&r)))
+    }
+
+    /// Typing into a running command is a new command, and a poll only reads. What a
+    /// shell is given is also every command it holds, so the stricter answer stands: a
+    /// `Bash(...)` deny or ask rule and a protected path rule on it as they would on
+    /// `bash`, while an allow for the typing alone is not enough, since nothing here
+    /// knows where the shell has `cd`'d to.
+    fn check_typing(&self, tool: &str, typing: &Typing) -> Decision {
+        let own = self.check_other(tool, !matches!(typing, Typing::Nothing));
+        let Typing::Shell { entered, .. } = typing else {
+            return own;
+        };
+        if entered.trim().is_empty() {
+            return own;
+        }
+        let bash = self.check_bash(entered, None);
+        let rank = |d: &Decision| match d {
+            Decision::Deny(_) => 2,
+            Decision::Ask => 1,
+            Decision::Allow(_) => 0,
+        };
+        match rank(&bash) > rank(&own) {
+            true => bash,
+            false => own,
+        }
     }
 
     fn check_path(&self, tool: &str, path: &Path, needs_approval: bool) -> Decision {
@@ -1032,12 +1064,35 @@ impl Checker<'_> {
                     }
                 })
             }
+            crate::tools::stdin::NAME => self.judgeable_typing(tool, &Typing::of(args)),
             // An MCP server the user has not approved is never connected, so an
             // `mcp_call` that gets this far names one they did approve.
             _ => match self.rules.ask.iter().find(|r| r.applies_to(tool)) {
                 Some(rule) => Err(Reserved::Asked(rule.text.clone())),
                 None => Ok(()),
             },
+        }
+    }
+
+    /// What a shell is given reaches the judge only as `bash` running it would, and only
+    /// once it is whole commands; anything else typed is the user's, since nothing says
+    /// what the program does with it.
+    fn judgeable_typing(&self, tool: &str, typing: &Typing) -> Result<(), Reserved> {
+        if let Some(rule) = self.rules.ask.iter().find(|r| r.applies_to(tool)) {
+            return Err(Reserved::Asked(rule.text.clone()));
+        }
+        match typing {
+            Typing::Nothing | Typing::Interrupt => Ok(()),
+            Typing::Shell { entered, open } => {
+                if !entered.trim().is_empty() {
+                    self.judgeable("bash", &json!({ "command": entered }))?;
+                }
+                match open {
+                    Some(command) => Err(Reserved::Typed(command.clone())),
+                    None => Ok(()),
+                }
+            }
+            Typing::Into(command) => Err(Reserved::Typed(command.clone())),
         }
     }
 
@@ -1137,6 +1192,68 @@ impl Checker<'_> {
             (_, Some(reason)) => Decision::Allow(reason),
             (Mode::Bypass, None) => Decision::Allow("bypass mode".to_string()),
             (Mode::Ask | Mode::Auto, None) => Decision::Ask,
+        }
+    }
+}
+
+/// What a `write_stdin` call types, as the rules read it.
+#[derive(Debug, Clone, PartialEq)]
+enum Typing {
+    /// Nothing: a poll.
+    Nothing,
+    /// Ctrl-c and nothing else.
+    Interrupt,
+    /// Input for an interactive shell: `entered`, every line given to it since it last
+    /// finished a command, read as one script, and an unfinished line after it left out
+    /// until it is entered. `open` holds the shell's command when the last entered line
+    /// leaves it inside a quote, a continuation or a heredoc, so it runs nothing yet and
+    /// nothing here can say what the line that closes it will make of it.
+    Shell {
+        entered: String,
+        open: Option<String>,
+    },
+    /// Anything else, by the session's command.
+    Into(String),
+}
+
+impl Typing {
+    fn of(args: &Value) -> Typing {
+        let chars = args
+            .get("chars")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let session = args
+            .get("session_id")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+            .and_then(|id| crate::tools::bash::input_line(id, chars));
+        match session {
+            Some((command, unrun)) => Typing::read(&command, &unrun, chars),
+            None => Typing::read("", chars, chars),
+        }
+    }
+
+    /// `chars` typed into `command`, which leaves `unrun` as what the shell has been given
+    /// since it last finished a command, `chars` included. A key that edits or completes
+    /// the line, a tab among them, makes what runs something other than what was typed.
+    fn read(command: &str, unrun: &str, chars: &str) -> Typing {
+        match chars {
+            "" => return Typing::Nothing,
+            "\u{3}" => return Typing::Interrupt,
+            _ => {}
+        }
+        let plain = !unrun
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\r');
+        if !plain || !bash::is_shell(command) {
+            return Typing::Into(command.to_string());
+        }
+        let typed = bash::as_typed(unrun);
+        let entered = typed.rfind('\n').map_or(0, |at| at + 1);
+        let open = (bash::finished(&typed) < entered).then(|| command.to_string());
+        Typing::Shell {
+            entered: typed[..entered].to_string(),
+            open,
         }
     }
 }
@@ -1809,6 +1926,218 @@ mod tests {
         let ask = policy(Mode::Bypass, &[], &[], &["Skill"]);
         assert_eq!(ask.check("skill", &args, false), Decision::Ask);
         assert_eq!(Policy::default().check("skill", &args, false), allowed(""));
+    }
+
+    #[test]
+    fn typing_into_a_session_is_asked_about_and_a_poll_is_not() {
+        let poll = json!({ "session_id": 1 });
+        let typed = json!({ "session_id": 1, "chars": "y\n" });
+        let p = policy(Mode::Auto, &[], &[], &[]);
+        assert_eq!(p.check("write_stdin", &poll, false), allowed(""));
+        assert_eq!(p.check("write_stdin", &typed, false), Decision::Ask);
+        let allow = policy(Mode::Auto, &["write_stdin"], &[], &[]);
+        assert_eq!(
+            allow.check("write_stdin", &typed, false),
+            allowed("rule write_stdin")
+        );
+        let deny = policy(Mode::Bypass, &[], &["write_stdin"], &[]);
+        assert!(matches!(
+            deny.check("write_stdin", &poll, false),
+            Decision::Deny(_)
+        ));
+        let bypass = policy(Mode::Bypass, &[], &[], &[]);
+        assert!(matches!(
+            bypass.check("write_stdin", &typed, false),
+            Decision::Allow(_)
+        ));
+    }
+
+    #[test]
+    fn a_line_typed_into_a_shell_is_read_as_the_commands_it_holds() {
+        let shell = |line: &str| Typing::read("bash -i", line, line);
+        let entered = |text: &str| Typing::Shell {
+            entered: text.to_string(),
+            open: None,
+        };
+        assert_eq!(shell(""), Typing::Nothing);
+        assert_eq!(shell("\u{3}"), Typing::Interrupt);
+        assert_eq!(shell("cat .env\n"), entered("cat .env\n"));
+        // A line not yet entered runs nothing, so it waits for the write that enters it.
+        assert_eq!(shell("ls\r\ngit pu"), entered("ls\n\n"));
+        assert_eq!(shell("git pu"), entered(""));
+        // The start of the line an earlier write left is part of what runs.
+        assert_eq!(
+            Typing::read("bash", "cat .env\n", "nv\n"),
+            entered("cat .env\n")
+        );
+        // A line that leaves the shell inside a quote, a continuation or a heredoc runs
+        // nothing yet, and only the user can say what the line closing it is for.
+        for text in [
+            "echo \"\n",
+            "echo a \\\n",
+            "cat <<EOF\nx\n",
+            "ls\necho 'a\n",
+        ] {
+            assert_eq!(
+                shell(text),
+                Typing::Shell {
+                    entered: text.to_string(),
+                    open: Some("bash -i".to_string()),
+                },
+                "{text:?}"
+            );
+        }
+        assert_eq!(shell("cat <<EOF\nx\nEOF\n"), entered("cat <<EOF\nx\nEOF\n"));
+        // A tab completes and an escape edits, so the line is not what was typed.
+        let tab = Typing::Into("bash -i".to_string());
+        assert_eq!(shell("cat .e\t\n"), tab);
+        assert_eq!(shell("cat .x\u{1b}[Denv\n"), tab);
+        // Anything but a plain shell, including no session at all.
+        assert_eq!(
+            Typing::read("python3", "x\n", "x\n"),
+            Typing::Into("python3".to_string())
+        );
+        assert_eq!(Typing::read("", "x\n", "x\n"), Typing::Into(String::new()));
+    }
+
+    /// Each write in turn into a session running `bash`, as `write_stdin` makes them: the
+    /// decision on each, with what the shell has not yet run carried to the next.
+    fn type_into_bash(p: &Policy, writes: &[&str]) -> Vec<Decision> {
+        let mut unrun = String::new();
+        writes
+            .iter()
+            .map(|chars| {
+                let typing = Typing::read("bash", &format!("{unrun}{chars}"), chars);
+                unrun = crate::tools::bash::unrun(&unrun, chars);
+                let rules = p.rules();
+                p.checker(&rules, p.mode())
+                    .check_typing("write_stdin", &typing)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_command_split_across_lines_answers_to_a_deny_rule_as_a_whole() {
+        let bypass = policy(Mode::Bypass, &[], &["Bash(rm:*)"], &[]);
+        let denied = Decision::Deny("deny rule Bash(rm:*)".to_string());
+        // An open quote joins the lines, so the middle one is `rm` at the front of a
+        // command, not inside a word.
+        for writes in [
+            &["echo \"\n\"; rm -rf x; echo \"\n\"\n"][..],
+            &["echo \"\n", "\"; rm -rf x; echo \"\n", "\"\n"],
+            &["echo '\n", "'; rm -rf x; echo '\n", "'\n"],
+            // A backslash at the end of a line continues it.
+            &["echo a \\\n", "; rm -rf x\n"],
+            &["echo a \\\n; rm -rf x\n"],
+            // `\r` is enter on a terminal too.
+            &["echo \"\r", "\"; rm -rf x\r"],
+            // A line ending inside `$(` waits for the `)`.
+            &["echo $(\n", "true); rm -rf x\n"],
+        ] {
+            let decisions = type_into_bash(&bypass, writes);
+            assert_eq!(decisions.last(), Some(&denied), "{writes:?}: {decisions:?}");
+        }
+        // Inside a quoted heredoc `rm` is data, once the heredoc is whole; past its end
+        // it is a command again.
+        let heredoc = type_into_bash(&bypass, &["cat <<'EOF'\n", "x\n", "rm -rf x\nEOF\n"]);
+        assert!(
+            heredoc.iter().all(|d| matches!(d, Decision::Allow(_))),
+            "{heredoc:?}"
+        );
+        // While open it is read word by word, which only ever asks more.
+        let open = type_into_bash(&bypass, &["cat <<'EOF'\n", "rm -rf x\n"]);
+        assert_eq!(open[1], denied);
+        let past = type_into_bash(&bypass, &["cat <<'EOF'\n", "x\nEOF\nrm -rf x\n"]);
+        assert_eq!(past.last(), Some(&denied), "{past:?}");
+        // A finished command leaves what is carried, and a ctrl-c drops it.
+        let after = type_into_bash(&bypass, &["echo \"\n", "\u{3}", "ls\n", "rm x\n"]);
+        assert!(matches!(after[2], Decision::Allow(_)), "{after:?}");
+        assert_eq!(after[3], denied);
+    }
+
+    #[test]
+    fn a_line_left_inside_a_quote_is_only_the_users_to_approve() {
+        let dir = std::env::temp_dir().join(format!("bhai-open-{}", uuid::Uuid::new_v4()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let p = Policy::new(Mode::Auto, Rules::default(), None, repo.clone())
+            .with_trust(Trust::new(&dir.join("config"), &repo));
+        p.trust().unwrap();
+        let judgeable = |unrun: &str, chars: &str| {
+            let rules = p.rules();
+            p.checker(&rules, p.mode())
+                .judgeable_typing("write_stdin", &Typing::read("bash", unrun, chars))
+        };
+        let typed = Err(Reserved::Typed("bash".to_string()));
+        assert_eq!(judgeable("echo \"\n", "echo \"\n"), typed);
+        assert_eq!(judgeable("cat <<'EOF'\n", "cat <<'EOF'\n"), typed);
+        assert_eq!(judgeable("echo a \\\n", "echo a \\\n"), typed);
+        // Once closed, it is judged as the whole command.
+        assert!(judgeable("echo \"\nx\"\n", "x\"\n").is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_line_typed_into_a_shell_answers_to_the_bash_rules() {
+        let shell = |line: &str| Typing::read("bash", line, line);
+        let check = |p: &Policy, line: &str| {
+            let rules = p.rules();
+            p.checker(&rules, p.mode())
+                .check_typing("write_stdin", &shell(line))
+        };
+        let bypass = policy(Mode::Bypass, &[], &["Bash(git push:*)"], &["Bash(rm:*)"]);
+        assert_eq!(
+            check(&bypass, "git push\n"),
+            Decision::Deny("deny rule Bash(git push:*)".to_string())
+        );
+        assert_eq!(check(&bypass, "ls\nrm -rf x\n"), Decision::Ask);
+        assert!(matches!(check(&bypass, "git status\n"), Decision::Allow(_)));
+
+        // An allow rule for typing does not carry a line `bash` would ask about.
+        let allow = policy(Mode::Auto, &["write_stdin"], &[], &[]);
+        assert_eq!(check(&allow, "cat .env\n"), Decision::Ask);
+        assert_eq!(check(&allow, "ls\n"), allowed("rule write_stdin"));
+        // Nor does a line `bash` would allow carry the typing.
+        let auto = policy(Mode::Auto, &[], &[], &[]);
+        assert_eq!(check(&auto, "ls\n"), Decision::Ask);
+    }
+
+    #[test]
+    fn typing_reaches_the_judge_only_as_the_command_would() {
+        let dir = std::env::temp_dir().join(format!("bhai-typed-{}", uuid::Uuid::new_v4()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let rules = Rules {
+            ask: rules(&["Bash(git push:*)"]),
+            ..Rules::default()
+        };
+        let p = Policy::new(Mode::Auto, rules, None, repo.clone())
+            .with_trust(Trust::new(&dir.join("config"), &repo));
+        p.trust().unwrap();
+        let judgeable = |command: &str, line: &str| {
+            let rules = p.rules();
+            p.checker(&rules, p.mode())
+                .judgeable_typing("write_stdin", &Typing::read(command, line, line))
+        };
+        assert!(judgeable("bash", "cargo test\n").is_ok());
+        assert!(judgeable("bash", "\u{3}").is_ok());
+        assert_eq!(
+            judgeable("bash", "cat .env\n"),
+            Err(Reserved::Protected(".env".to_string()))
+        );
+        assert_eq!(
+            judgeable("bash", "ls\ngit push\n"),
+            Err(Reserved::Asked("Bash(git push:*)".to_string()))
+        );
+        assert_eq!(
+            judgeable("bash", "eval \"$X\"\n"),
+            Err(Reserved::RunsCode("eval".to_string()))
+        );
+        assert_eq!(
+            judgeable("python3", "print(1)\n"),
+            Err(Reserved::Typed("python3".to_string()))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

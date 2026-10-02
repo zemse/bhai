@@ -92,6 +92,10 @@ impl Identity {
         if name == tools::image_gen::NAME {
             return self.allows_tool(tools::write::NAME);
         }
+        // It only reaches what `bash` started.
+        if name == tools::stdin::NAME {
+            return self.allows_tool(tools::bash::NAME);
+        }
         let mcp = [tools::mcp::SEARCH, tools::mcp::CALL].contains(&name);
         self.tools
             .as_ref()
@@ -443,12 +447,14 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         assert!(!claude.allows_tool("apply_patch"));
         assert!(!claude.allows_tool("image_gen"), "it follows `write`");
         assert!(bhai.allows_tool("image_gen") == bhai.allows_tool("write"));
+        assert!(claude.allows_tool("write_stdin"));
 
         let mcp = identity("---\nname: m\ntools: read, mcp, mcp_call, mcp__x__y\n---\n");
         assert_eq!(
             mcp.tools,
             Some(vec!["read".into(), "mcp".into(), "mcp_call".into()])
         );
+        assert!(!mcp.allows_tool("write_stdin"));
 
         let open = identity("---\nname: open\ntools:\n---\n");
         assert_eq!(open.tools, None);

@@ -702,6 +702,195 @@ fn is_short_flag(arg: &str, flag: char) -> bool {
     arg.starts_with('-') && !arg.starts_with("--") && arg.contains(flag)
 }
 
+/// Flags that leave a shell reading its commands from its input.
+const SHELL_FLAGS: &[&str] = &[
+    "-i",
+    "-l",
+    "-il",
+    "-li",
+    "-s",
+    "--login",
+    "--norc",
+    "--noprofile",
+];
+
+/// Text typed into a terminal as the shell reads it: the terminal turns a carriage
+/// return into a newline.
+pub fn as_typed(text: &str) -> String {
+    text.replace('\r', "\n")
+}
+
+/// Where the shell has finished reading `typed` (from [`as_typed`]) as whole commands:
+/// just past the last newline it reached outside any quote, `$(...)`, line continuation
+/// or heredoc body. A line ending inside one of those runs nothing yet; the shell joins
+/// it to the next, so whatever is typed after it is the same command.
+///
+/// Compound commands (`if ... fi`, `{ ... }`) are not tracked: they do not change how a
+/// line splits into words, so each line of one is still read as the commands it holds.
+pub fn finished(typed: &str) -> usize {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Ctx {
+        /// `(` or `$(`, and whether it was `((`, whose `<<` is a shift.
+        Paren(bool),
+        Double,
+        Single,
+        /// `$'...'`, where a backslash escapes a quote.
+        Ansi,
+        Backtick,
+    }
+    let bytes: Vec<char> = typed.chars().collect();
+    let mut stack: Vec<Ctx> = Vec::new();
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
+    let mut done = 0;
+    let mut offset = 0;
+    let mut i = 0;
+    let at_word_start =
+        |i: usize| i == 0 || bytes[i - 1].is_whitespace() || ";|&()".contains(bytes[i - 1]);
+    while i < bytes.len() {
+        let c = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        let mut step = 1;
+        match stack.last().copied() {
+            Some(Ctx::Single) => {
+                if c == '\'' {
+                    stack.pop();
+                }
+            }
+            Some(Ctx::Ansi) => match c {
+                '\\' => step = 2,
+                '\'' => {
+                    stack.pop();
+                }
+                _ => {}
+            },
+            Some(Ctx::Backtick) => match c {
+                '\\' => step = 2,
+                '`' => {
+                    stack.pop();
+                }
+                _ => {}
+            },
+            Some(Ctx::Double) => match c {
+                '\\' => step = 2,
+                '"' => {
+                    stack.pop();
+                }
+                '`' => stack.push(Ctx::Backtick),
+                '$' if next == Some('(') => {
+                    stack.push(Ctx::Paren(bytes.get(i + 2) == Some(&'(')));
+                    step = 2;
+                }
+                _ => {}
+            },
+            ctx @ (None | Some(Ctx::Paren(_))) => match c {
+                '\\' => step = 2,
+                '\'' => stack.push(Ctx::Single),
+                '"' => stack.push(Ctx::Double),
+                '`' => stack.push(Ctx::Backtick),
+                '$' if next == Some('\'') => {
+                    stack.push(Ctx::Ansi);
+                    step = 2;
+                }
+                '$' if next == Some('(') => {
+                    stack.push(Ctx::Paren(bytes.get(i + 2) == Some(&'(')));
+                    step = 2;
+                }
+                '(' => stack.push(Ctx::Paren(next == Some('('))),
+                // A `)` with nothing open is a `case` pattern's.
+                ')' if ctx.is_some() => {
+                    stack.pop();
+                }
+                '#' if at_word_start(i) => {
+                    while bytes.get(i + step).is_some_and(|c| *c != '\n') {
+                        step += 1;
+                    }
+                }
+                '<' if next == Some('<')
+                    && bytes.get(i + 2) != Some(&'<')
+                    && !stack.contains(&Ctx::Paren(true)) =>
+                {
+                    step = 2;
+                    let strip = bytes.get(i + step) == Some(&'-');
+                    if strip {
+                        step += 1;
+                    }
+                    while bytes.get(i + step).is_some_and(|c| *c == ' ' || *c == '\t') {
+                        step += 1;
+                    }
+                    let mut delimiter = String::new();
+                    let mut quote = None;
+                    while let Some(&c) = bytes.get(i + step) {
+                        if quote.is_none() && (c.is_whitespace() || ";|&<>()".contains(c)) {
+                            break;
+                        }
+                        match (quote, c) {
+                            (None, '\'' | '"') => quote = Some(c),
+                            (Some(q), c) if q == c => quote = None,
+                            (None, '\\') => {}
+                            _ => delimiter.push(c),
+                        }
+                        step += 1;
+                    }
+                    if !delimiter.is_empty() {
+                        heredocs.push((delimiter, strip));
+                    }
+                }
+                '\n' => {
+                    // The bodies of the heredocs this line opened come next, a line each
+                    // until the one that closes it.
+                    let mut at = i + 1;
+                    for (delimiter, strip) in std::mem::take(&mut heredocs) {
+                        loop {
+                            let Some(len) = bytes[at..].iter().position(|c| *c == '\n') else {
+                                return done;
+                            };
+                            let line: String = bytes[at..at + len].iter().collect();
+                            at += len + 1;
+                            let line = match strip {
+                                true => line.trim_start_matches('\t'),
+                                false => line.as_str(),
+                            };
+                            if line == delimiter {
+                                break;
+                            }
+                        }
+                    }
+                    step = at - i;
+                    if ctx.is_none() {
+                        done = offset + bytes[i..at].iter().map(|c| c.len_utf8()).sum::<usize>();
+                    }
+                }
+                _ => {}
+            },
+        }
+        let step = step.min(bytes.len() - i);
+        offset += bytes[i..i + step]
+            .iter()
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+        i += step;
+    }
+    done
+}
+
+/// Whether `command` is an interactive shell and nothing else, so each line typed into
+/// it is a command of its own.
+pub fn is_shell(command: &str) -> bool {
+    let commands = parse(command).unwrap_or_default();
+    let [c] = commands.as_slice() else {
+        return false;
+    };
+    match c.words.as_slice() {
+        [program, flags @ ..] => {
+            !c.piped
+                && c.writes.is_empty()
+                && SHELLS.contains(&basename(program))
+                && flags.iter().all(|f| SHELL_FLAGS.contains(&f.as_str()))
+        }
+        [] => false,
+    }
+}
+
 /// Whether any word, or anything a redirection would write, names a protected path or
 /// may glob into one.
 pub fn mentions_protected(command: &Command) -> bool {
@@ -1321,6 +1510,70 @@ mod tests {
             "grep -r --exclude=.env x src",
         ] {
             assert!(!protected(input), "{input}");
+        }
+    }
+
+    #[test]
+    fn the_shell_finishes_a_command_only_at_a_newline_outside_every_construct() {
+        let finished_all = |text: &str| finished(text) == text.len();
+        for whole in [
+            "",
+            "ls\n",
+            "echo \"a\nb\"\n",
+            "echo 'it''s'\n",
+            "echo $'it\\'s'; ls\n",
+            "echo \"$(echo \")\")\"\n",
+            "echo `ls`\n",
+            "echo a \\\nb\n",
+            "cat <<EOF\nx\nEOF\n",
+            "cat <<-'E O'\n\tx\n\tE O\n",
+            "echo $((1<<2))\n",
+            "echo a #'\n",
+            "case x in a) ls;; esac\n",
+            "(cd /tmp\nls)\n",
+            "ls\nécho 'ü'\n",
+        ] {
+            assert!(finished_all(whole), "{whole:?}: {}", finished(whole));
+        }
+        for (text, at) in [
+            ("ls\necho \"\n", 3),
+            ("ls\necho 'a\n", 3),
+            ("ls\necho $'\\'\n", 3),
+            ("echo a \\\n", 0),
+            ("cat <<EOF\nx\n", 0),
+            ("cat <<EOF; ls\nEOF", 0),
+            ("echo $(\n", 0),
+            ("echo `\n", 0),
+            ("echo a#'\n", 0),
+            ("ls\ngit pu", 3),
+        ] {
+            assert_eq!(finished(text), at, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_bare_interactive_shell_reads_typed_lines_as_commands() {
+        for shell in [
+            "bash",
+            "/bin/zsh -i",
+            "bash --norc --noprofile",
+            "sh -l",
+            "fish",
+        ] {
+            assert!(is_shell(shell), "{shell}");
+        }
+        for other in [
+            "python3",
+            "bash script.sh",
+            "bash -c 'read x'",
+            "bash -i | tee log",
+            "bash -i > log",
+            "env X=1 bash",
+            "bash; python3",
+            "npm run dev",
+            "",
+        ] {
+            assert!(!is_shell(other), "{other}");
         }
     }
 }

@@ -4662,10 +4662,12 @@ mod tests {
             .iter()
             .partition(|names| !names.contains(&"agent".to_string()));
         assert_eq!(narrowed.len(), 2, "{offered:?}");
+        // `write_stdin` comes with `bash`, since it only reaches what `bash` started.
         assert!(
             narrowed
                 .iter()
-                .all(|names| *names == &["bash", "read", "view_image"])
+                .all(|names| *names == &["bash", "read", "view_image", "write_stdin"]),
+            "{narrowed:?}"
         );
         assert_eq!(full.len(), 3, "{offered:?}");
         // The parent can look back at earlier sessions and save a note; a child cannot.

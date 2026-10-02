@@ -21,6 +21,7 @@ pub mod patch;
 pub mod plan;
 pub mod read;
 pub mod skill;
+pub mod stdin;
 pub mod submit;
 pub mod view_image;
 pub mod web;
@@ -193,7 +194,8 @@ pub trait Tool: Send + Sync {
     }
     /// Run the call; returns the output and whether it counts as a success.
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)>;
-    /// Run the call while reporting output as it arrives; only `bash` streams.
+    /// Run the call while reporting output as it arrives; only `bash` and `write_stdin`
+    /// stream.
     fn execute_live<'a>(
         &'a self,
         args: &'a Value,
@@ -261,6 +263,7 @@ impl Registry {
             Box::new(edit::Edit),
             Box::new(patch::ApplyPatch),
             Box::new(view_image::ViewImage),
+            Box::new(stdin::WriteStdin),
         ];
         if !skills.is_empty() {
             tools.push(Box::new(skill::Skill { skills }));
@@ -555,12 +558,20 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["bash", "read", "write", "edit", "apply_patch", "view_image"]
+            [
+                "bash",
+                "read",
+                "write",
+                "edit",
+                "apply_patch",
+                "view_image",
+                "write_stdin"
+            ]
         );
     }
 
     #[test]
-    fn only_read_view_image_and_skill_skip_approval() {
+    fn only_read_view_image_skill_and_write_stdin_skip_approval() {
         let skill = crate::skills::Skill {
             name: "s".to_string(),
             description: String::new(),
@@ -568,13 +579,15 @@ mod tests {
             source: "~/.claude/skills".to_string(),
         };
         let registry = Registry::new(vec![skill]);
-        assert_eq!(registry.schemas().len(), 7);
+        assert_eq!(registry.schemas().len(), 8);
         for name in ["bash", "write", "edit", "apply_patch"] {
             assert!(registry.get(name).unwrap().needs_approval(), "{name}");
         }
         assert!(!registry.get("read").unwrap().needs_approval());
         assert!(!registry.get("view_image").unwrap().needs_approval());
         assert!(!registry.get("skill").unwrap().needs_approval());
+        // The policy asks about what it types; a poll is not asked about.
+        assert!(!registry.get("write_stdin").unwrap().needs_approval());
         assert!(Registry::new(Vec::new()).get("skill").is_none());
     }
 
