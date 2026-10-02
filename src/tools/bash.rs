@@ -920,18 +920,28 @@ pub fn kept() -> Vec<Running> {
 /// Whether the command has exited. A proc a poll holds is still being waited on, so it
 /// counts as running until that poll says otherwise.
 fn exited(proc: &tokio::sync::Mutex<Proc>) -> bool {
-    let Ok(mut proc) = proc.try_lock() else {
+    let Ok(proc) = proc.try_lock() else {
         return false;
     };
-    if proc.status.is_none()
-        && let Ok(Some(status)) = proc.child.try_wait()
-    {
-        // Reaped here, so the next poll must not wait on it again, nor kill a group
-        // whose id may be reused.
-        proc.status = Some(status);
-        proc.drained_by = Some(tokio::time::Instant::now() + DRAIN);
+    proc.status.is_some() || proc.child.id().is_some_and(zombie)
+}
+
+/// Whether child `pid` has exited, left unreaped: while it is a zombie its pid, and so
+/// the process group id the session kills by, cannot be handed to another process.
+#[allow(unsafe_code)]
+fn zombie(pid: u32) -> bool {
+    // SAFETY: `siginfo_t` is plain data that `waitid` fills, and `WNOWAIT` leaves the
+    // child to be reaped by its own `wait`.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(
+            libc::P_PID,
+            libc::id_t::from(pid),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) == 0
+            && info.si_pid() != 0
     }
-    proc.status.is_some()
 }
 
 /// The text of `shared.recent`, decoded as a poll would and with known secrets blanked,
@@ -1593,6 +1603,13 @@ mod tests {
             assert!(begun.elapsed() < Duration::from_secs(5), "never exited");
             tokio::time::sleep(TICK).await;
         }
+        // Listing it leaves it unreaped, so its group id cannot go to another process
+        // while the session still holds it.
+        let group = kept().into_iter().find(|r| r.id == id).unwrap().group;
+        assert!(
+            zombie(group.unwrap()),
+            "the leader was reaped by the listing"
+        );
         let out = write(id, "", Duration::from_secs(5), quiet()).await;
         assert!(out.starts_with("exit code: 0\ndone\n"), "{out}");
         assert_eq!(session(id), None);
