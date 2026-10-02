@@ -685,6 +685,32 @@ pub async fn run(
 /// `run` with the model given.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with(
+    model: Arc<dyn Model>,
+    session_id: String,
+    prompt: SystemPrompt,
+    policy: Arc<Policy>,
+    judge: Option<Arc<Judge>>,
+    namer: Option<Arc<dyn Name>>,
+    rx_user: mpsc::Receiver<UserInput>,
+    inbox: Option<Inbox>,
+    rx_control: mpsc::Receiver<Control>,
+    tx: mpsc::UnboundedSender<AgentEvent>,
+    cancel: Arc<Cancel>,
+    usage_log: Option<PathBuf>,
+    delegation: Option<Delegation>,
+    saved: Option<Saved>,
+    limits: Limits,
+) {
+    run_configured(
+        model, session_id, prompt, policy, judge, namer, rx_user, inbox, rx_control, tx, cancel,
+        usage_log, delegation, saved, limits, None,
+    )
+    .await;
+}
+
+/// The shared loop, optionally using a host's complete registry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_configured(
     mut model: Arc<dyn Model>,
     session_id: String,
     prompt: SystemPrompt,
@@ -700,6 +726,7 @@ pub(crate) async fn run_with(
     delegation: Option<Delegation>,
     saved: Option<Saved>,
     mut limits: Limits,
+    registry_factory: Option<crate::runtime::RegistryFactory>,
 ) {
     // The loop reads the turn's flag; the `agent` tool needs the whole signal, so it can
     // hand each detached child a flag that an interrupt latches.
@@ -731,6 +758,9 @@ pub(crate) async fn run_with(
     // Built again when `/model` switches, so a child starts on the model its parent is
     // on. What tools there are does not depend on the model, so the schemas hold.
     let build = |model: &Arc<dyn Model>| {
+        if let Some(factory) = &registry_factory {
+            return factory(&prompt, model);
+        }
         let mut registry = Registry::for_prompt(&prompt);
         if let Some(delegation) = delegation.clone()
             && prompt.identity.allows_tool(tools::agent::NAME)

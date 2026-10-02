@@ -244,6 +244,14 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// No tools or MCP connections. Hosts add only the tools they want to expose.
+    pub fn empty() -> Self {
+        Self {
+            tools: Vec::new(),
+            native: None,
+        }
+    }
+
     /// Every built-in tool, plus `skill` when there are skills to load.
     pub fn new(skills: Vec<crate::skills::Skill>) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = vec![
@@ -340,8 +348,7 @@ impl Registry {
         self
     }
 
-    /// Any tool, for a test that needs one the session never offers.
-    #[cfg(test)]
+    /// Append a host tool. Names must be unique within the registry.
     pub fn with_tool(mut self, tool: Box<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
