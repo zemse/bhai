@@ -5,7 +5,9 @@
 and logs its pid to stderr, the way `npx` leaves the real server; `fake_mcp.py http` serves the same tools over streamable
 HTTP on a free port, printed as JSON on stdout, and redirects a POST to any other path there;
 `fake_mcp.py paged` lists one tool per page; `fake_mcp.py endless` always has a next page;
-`fake_mcp.py drift` lists the same tools with echo's description changed.
+`fake_mcp.py drift` lists the same tools with echo's description changed; `fake_mcp.py oauth`
+is the http server behind OAuth, its own authorization server, whose first token is about to
+lapse and whose MCP endpoint takes only the one a refresh gives.
 """
 
 import json
@@ -98,21 +100,86 @@ def serve_http():
         def log_message(self, *args):
             pass
 
+        def base(self):
+            return "http://127.0.0.1:%d" % self.server.server_port
+
+        def reply(self, status, value, headers=()):
+            body = json.dumps(value).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            for name, header in headers:
+                self.send_header(name, header)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
-            self.send_error(405)
+            from urllib.parse import parse_qs, urlencode, urlsplit
+
+            path = urlsplit(self.path)
+            if MODE != "oauth":
+                self.send_error(405)
+            elif path.path.startswith("/.well-known/oauth-protected-resource"):
+                base = self.base()
+                self.reply(200, {"resource": base + "/mcp", "authorization_servers": [base]})
+            elif path.path.startswith("/.well-known/oauth-authorization-server"):
+                base = self.base()
+                self.reply(200, {
+                    "issuer": base,
+                    "authorization_endpoint": base + "/authorize",
+                    "token_endpoint": base + "/token",
+                    "registration_endpoint": base + "/register",
+                    "response_types_supported": ["code"],
+                    "code_challenge_methods_supported": ["S256"],
+                })
+            elif path.path == "/authorize":
+                query = {k: v[0] for k, v in parse_qs(path.query).items()}
+                back = urlencode({"code": "c0de", "state": query["state"]})
+                self.send_response(302)
+                self.send_header("Location", query["redirect_uri"] + "?" + back)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self.send_error(404)
+
+        def token(self):
+            from urllib.parse import parse_qs
+
+            length = int(self.headers.get("Content-Length", 0))
+            form = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode()).items()}
+            grant = (form.get("grant_type"), form.get("code") or form.get("refresh_token"))
+            if grant == ("authorization_code", "c0de"):
+                token = {"access_token": "stale", "expires_in": 5, "refresh_token": "r1"}
+            elif grant == ("refresh_token", "r1"):
+                token = {"access_token": "fresh", "expires_in": 3600, "refresh_token": "r2"}
+            else:
+                self.reply(400, {"error": "invalid_grant"})
+                return
+            self.reply(200, dict(token, token_type="Bearer"))
 
         def do_DELETE(self):
             self.send_response(200)
             self.end_headers()
 
         def do_POST(self):
+            if MODE == "oauth" and self.path == "/register":
+                self.reply(201, {"client_id": "fake-client", "redirect_uris": []})
+                return
+            if MODE == "oauth" and self.path == "/token":
+                self.token()
+                return
             if self.path != "/mcp":
                 self.send_response(308)
                 self.send_header("Location", "/mcp")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            if self.headers.get("Authorization") != "Bearer " + TOKEN:
+            if MODE == "oauth" and self.headers.get("Authorization") != "Bearer fresh":
+                metadata = self.base() + "/.well-known/oauth-protected-resource"
+                challenge = 'Bearer resource_metadata="%s"' % metadata
+                self.reply(401, {"error": "unauthorized"}, [("WWW-Authenticate", challenge)])
+                return
+            if MODE != "oauth" and self.headers.get("Authorization") != "Bearer " + TOKEN:
                 self.send_error(401)
                 return
             length = int(self.headers.get("Content-Length", 0))
@@ -143,7 +210,7 @@ def main():
     mode = MODE
     if mode == "exit":
         sys.exit(1)
-    if mode == "http":
+    if mode in ("http", "oauth"):
         serve_http()
     else:
         serve_stdio(mode)

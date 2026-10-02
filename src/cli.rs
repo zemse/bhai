@@ -91,15 +91,19 @@ pub async fn entry() -> Result<()> {
     }
 
     // `bhai mcp approve <name>` records a `.mcp.json` server as it is defined now, which
-    // is how a server that changed since its approval is accepted again.
+    // is how a server that changed since its approval is accepted again. `bhai mcp login
+    // <name>` signs in to a hosted server over OAuth, and `logout` forgets the login.
     if args.first().is_some_and(|a| a == "mcp") {
-        let name = match (args.get(1).map(String::as_str), args.get(2)) {
-            (Some("approve"), Some(name)) => name,
-            _ => bail!("usage: bhai mcp approve <server>"),
+        let (verb, name) = match (args.get(1).map(String::as_str), args.get(2)) {
+            (Some(verb @ ("approve" | "login" | "logout")), Some(name)) => (verb, name),
+            _ => bail!("usage: bhai mcp approve|login|logout <server>"),
         };
         let cwd = std::env::current_dir()?;
         let roots = instructions::Roots::from_env(cwd);
         let config = Config::load(roots.home.as_deref(), &roots.cwd)?;
+        if verb != "approve" {
+            return mcp_login(&roots, &config, verb == "login", name).await;
+        }
         let server = mcp::servers::approve(&roots, &config.mcp_servers, name)?;
         let what = match &server.url {
             Some(url) => url.clone(),
@@ -157,7 +161,7 @@ pub async fn entry() -> Result<()> {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [usage] [sessions [prune [n]]] [mcp approve <server>] [--probe [prompt]] [--cache-check [minutes]] [--judge-eval [file]] [--as <identity>] [--resume [id] | --pick] [--workflow <name> [input] [--workflow-yes]] [exec <prompt|-> [--json]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
+                "bhai: {e:#}\nusage: bhai [identities] [usage] [sessions [prune [n]]] [mcp approve|login|logout <server>] [--probe [prompt]] [--cache-check [minutes]] [--judge-eval [file]] [--as <identity>] [--resume [id] | --pick] [--workflow <name> [input] [--workflow-yes]] [exec <prompt|-> [--json]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
             );
             std::process::exit(2);
         }
@@ -589,6 +593,39 @@ fn edit_draft(
     drop(held);
     reader.paused.store(false, Ordering::SeqCst);
     edited
+}
+
+/// `bhai mcp login <name>`, or `logout` when `login` is false.
+async fn mcp_login(
+    roots: &instructions::Roots,
+    config: &Config,
+    login: bool,
+    name: &str,
+) -> Result<()> {
+    let server = mcp::servers::load(roots, &config.mcp_servers)
+        .into_iter()
+        .find(|s| s.name == name)
+        .with_context(|| format!("no MCP server `{name}` is configured"))?;
+    let Some(url) = &server.url else {
+        bail!("`{name}` is a stdio server; only an HTTP server signs in");
+    };
+    let store = server
+        .credentials
+        .context("no home directory to keep the login in")?;
+    if !login {
+        match mcp::oauth::logout(&store, url)? {
+            true => println!("logged out of {name}"),
+            false => println!("{name} had no login"),
+        }
+        return Ok(());
+    }
+    mcp::oauth::login(&store, url, |page| {
+        println!("sign in to {name} in the browser; if it does not open, go to\n{page}");
+        mcp::oauth::open_browser(page);
+    })
+    .await?;
+    println!("logged in to {name}; a running bhai picks it up with `/mcp reload {name}`");
+    Ok(())
 }
 
 /// Stop the MCP servers, if any were started.

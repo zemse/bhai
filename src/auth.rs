@@ -186,7 +186,7 @@ fn refusal_code(body: &str) -> Option<String> {
 /// Write through a neighbouring temp file and rename, so a concurrent reader sees either
 /// the old credentials or the new ones and never half of a file. The temp file is created
 /// 0600 and synced before the rename, so the rename never exposes a world-readable file.
-fn write_atomically(path: &Path, contents: &str) -> Result<()> {
+pub fn write_atomically(path: &Path, contents: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("auth");
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));

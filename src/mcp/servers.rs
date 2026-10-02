@@ -52,6 +52,8 @@ pub struct Server {
     pub tool_timeout: Option<Duration>,
     /// Where its tool catalog is pinned, for an approved `.mcp.json` server.
     pub pin: Option<Pin>,
+    /// The store an HTTP server's OAuth login is kept in.
+    pub credentials: Option<PathBuf>,
 }
 
 /// A server's entry in the catalog store.
@@ -183,6 +185,7 @@ pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
                 startup_timeout: server.startup_timeout_sec.and_then(seconds),
                 tool_timeout: server.tool_timeout_sec.and_then(seconds),
                 pin: None,
+                credentials: None,
             },
         );
     }
@@ -190,6 +193,10 @@ pub fn load(roots: &Roots, bhai: &BTreeMap<String, McpServer>) -> Vec<Server> {
         if server.skip.is_none() {
             server.skip = super::browser::refused(server, roots.home.as_deref());
         }
+        server.credentials = roots
+            .home
+            .as_ref()
+            .map(|home| home.join(super::oauth::STORE));
     }
     found
 }
@@ -410,6 +417,7 @@ fn server(name: &str, entry: &Value, source: &str) -> Server {
             .and_then(Value::as_f64)
             .and_then(seconds),
         pin: None,
+        credentials: None,
     }
 }
 

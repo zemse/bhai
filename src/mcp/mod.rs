@@ -32,6 +32,7 @@ use crate::instructions::Roots;
 use crate::tools::Image;
 
 mod browser;
+pub mod oauth;
 pub mod servers;
 
 use servers::Server;
@@ -815,15 +816,31 @@ pub fn fake_server(name: &str, mode: &str) -> Option<Server> {
         startup_timeout: None,
         tool_timeout: None,
         pin: None,
+        credentials: None,
     })
 }
 
 /// `fake_mcp.py http` on a free port, with the token it wants in a header.
 #[cfg(test)]
 pub fn fake_http_server(name: &str) -> Option<(Server, std::process::Child)> {
+    let (server, child) = fake_web_server(name, "http")?;
+    let headers = std::collections::BTreeMap::from([(
+        "Authorization".to_string(),
+        "Bearer s3cret".to_string(),
+    )]);
+    let server = Server {
+        headers: crate::config::Headers(headers),
+        ..server
+    };
+    Some((server, child))
+}
+
+/// `fake_mcp.py <mode>` serving over HTTP on a free port.
+#[cfg(test)]
+fn fake_web_server(name: &str, mode: &str) -> Option<(Server, std::process::Child)> {
     use std::io::BufRead as _;
 
-    let stdio = fake_server(name, "http")?;
+    let stdio = fake_server(name, mode)?;
     let mut child = std::process::Command::new(&stdio.command)
         .args(&stdio.args)
         .stdout(Stdio::piped())
@@ -837,13 +854,8 @@ pub fn fake_http_server(name: &str) -> Option<(Server, std::process::Child)> {
     let port = serde_json::from_str::<Value>(&line).expect("port line")["port"]
         .as_u64()
         .expect("port number");
-    let headers = std::collections::BTreeMap::from([(
-        "Authorization".to_string(),
-        "Bearer s3cret".to_string(),
-    )]);
     let server = Server {
         url: Some(format!("http://127.0.0.1:{port}/mcp")),
-        headers: crate::config::Headers(headers),
         ..stdio
     };
     Some((server, child))
@@ -1179,7 +1191,8 @@ async fn stdio(server: &Server, log_dir: &Path) -> Result<(Service, Option<Group
     Ok((service, group))
 }
 
-/// A streamable HTTP server. Header values are never named in an error: they carry tokens.
+/// A streamable HTTP server, with its OAuth login when one is kept. Header values are never
+/// named in an error: they carry tokens.
 async fn http(server: &Server, url: &str) -> Result<Service> {
     let mut headers = HashMap::new();
     for (name, value) in &server.headers.0 {
@@ -1190,8 +1203,23 @@ async fn http(server: &Server, url: &str) -> Result<Service> {
         headers.insert(name, value);
     }
     let config = StreamableHttpClientTransportConfig::with_uri(url).custom_headers(headers);
-    let transport = StreamableHttpClientTransport::with_client(http_client()?, config);
-    ().serve(transport).await.context("initialize failed")
+    let client = http_client()?;
+    let login = match &server.credentials {
+        Some(store) => oauth::authorized(store, url, client.clone()).await?,
+        None => None,
+    };
+    let served = match login {
+        Some(login) => ().serve(StreamableHttpClientTransport::with_client(login, config)).await,
+        None => ().serve(StreamableHttpClientTransport::with_client(client, config)).await,
+    };
+    match served {
+        Ok(service) => Ok(service),
+        Err(e) if oauth::needs_login(&e) => anyhow::bail!(
+            "needs an OAuth login; `bhai mcp login {}` signs in",
+            server.name
+        ),
+        Err(e) => Err(e).context("initialize failed"),
+    }
 }
 
 /// Redirects an HTTP server may send before the request fails.
@@ -1476,6 +1504,7 @@ mod tests {
             startup_timeout: None,
             tool_timeout: None,
             pin: None,
+            credentials: None,
         };
         let Err(why) = http(&server, &url).await else {
             panic!("a cross-origin redirect was followed");
@@ -1813,6 +1842,73 @@ mod tests {
             panic!("{:?}", hub.servers[1]);
         };
         assert!(!why.contains("nope"), "{why}");
+        hub.shutdown().await;
+        child.kill().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_oauth_server_signs_in_once_and_refreshes_its_token() {
+        let Some((server, mut child)) = fake_web_server("hosted", "oauth") else {
+            return;
+        };
+        let dir = temp_dir();
+        let store = dir.join("mcp-credentials.json");
+        let server = Server {
+            credentials: Some(store.clone()),
+            ..server
+        };
+        let url = server.url.clone().unwrap();
+        let identity = Identity::default();
+        let connect = || {
+            Hub::connect(
+                vec![server.clone()],
+                &identity,
+                &dir,
+                Duration::from_secs(10),
+            )
+        };
+
+        let hub = connect().await;
+        assert_eq!(
+            hub.servers[0].state,
+            State::Failed("needs an OAuth login; `bhai mcp login hosted` signs in".to_string())
+        );
+        hub.shutdown().await;
+
+        // The test is the browser: it follows the sign-in page's redirect back to bhai.
+        let (page_tx, page_rx) = tokio::sync::oneshot::channel::<String>();
+        let browser = tokio::spawn(async move {
+            let page = page_rx.await.unwrap();
+            reqwest::get(page).await.unwrap().text().await.unwrap()
+        });
+        oauth::login(&store, &url, |page| page_tx.send(page.to_string()).unwrap())
+            .await
+            .unwrap();
+        assert!(browser.await.unwrap().contains("Signed in"));
+        let kept = std::fs::read_to_string(&store).unwrap();
+        assert!(
+            kept.contains("\"stale\"") && kept.contains("fake-client"),
+            "{kept}"
+        );
+
+        // The token from the sign-in is about to lapse, and the server takes only the one
+        // a refresh gives, so connecting at all means it refreshed; the store keeps that one.
+        let hub = connect().await;
+        assert_eq!(hub.servers[0].state, State::Connected, "{:?}", hub.servers);
+        let args = serde_json::json!({"message": "hi"});
+        let (out, ok, _) = hub.call("mcp__hosted__echo", args).await;
+        assert_eq!((out.as_str(), ok), ("echo: hi", true));
+        let kept = std::fs::read_to_string(&store).unwrap();
+        assert!(
+            kept.contains("\"fresh\"") && kept.contains("\"r2\""),
+            "{kept}"
+        );
+        hub.shutdown().await;
+
+        assert!(oauth::logout(&store, &url).unwrap());
+        let hub = connect().await;
+        assert!(matches!(&hub.servers[0].state, State::Failed(why) if why.contains("login")));
         hub.shutdown().await;
         child.kill().unwrap();
         let _ = std::fs::remove_dir_all(dir);

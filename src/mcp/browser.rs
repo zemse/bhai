@@ -175,6 +175,7 @@ mod tests {
             startup_timeout: None,
             tool_timeout: None,
             pin: None,
+            credentials: None,
         }
     }
 

@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- `bhai mcp login <server>` signs in to a hosted MCP server over OAuth and keeps the login at 0600 by server url, so Notion, Linear and other servers that need OAuth start with a token that refreshes before it lapses; `bhai mcp logout <server>` forgets it.
 - A `/btw` or a summarising compaction answered at a tier other than priority now turns `/fast` off and says so, the same way a turn's reply does.
 - `cargo bench` runs Criterion benches for a cold and a tail redraw of a 2800-entry transcript, wrapping a 1 MiB line, and `profile::build` over 10k history items. It fails when a median goes past its ceiling in `benches/ceilings/ceilings.toml`.
 - The built-in status bar reads `gpt-6-astra high (272k context) | bhai:main | ctx:6% | 5h:17% resets@03:10 | 7d:84% resets@Sat 05:30`: segments split by ` | `, the directory before the branch, and each window's reset as a local time (a weekday past a day off). Windows are named and ordered by their length, not by which slot the server sent them in, so a plan whose only window is the week (Pro Lite sends it as primary) shows `5h:none | 7d:…`; `$limits` uses the same format and `$limit_5h`/`$limit_week` follow the length too. A weekly window is `7d`, not `wk`, in `/usage` as well.
