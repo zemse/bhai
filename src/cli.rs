@@ -444,6 +444,8 @@ allow it.",
         }
         return Ok(());
     }
+    // Only a run that stays up has a list to show it in.
+    session.watch_background(crate::background::sources(hub.clone()));
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         session.entries().restore(&history);

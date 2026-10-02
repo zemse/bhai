@@ -557,6 +557,7 @@ pub struct Proxy {
     /// Where secrets are read from in bhai's environment, removed from the child's.
     sources: Vec<String>,
     describe: String,
+    started: std::time::Instant,
 }
 
 static PROXY: OnceLock<Proxy> = OnceLock::new();
@@ -605,6 +606,7 @@ async fn spawn(settings: &Settings, upstream: reqwest::Client) -> Result<Proxy> 
             })
             .collect(),
         describe: describe(&settings.allow, &secrets),
+        started: std::time::Instant::now(),
     };
     let state = Arc::new(State {
         rules,
@@ -730,6 +732,10 @@ impl Proxy {
 
     pub fn describe(&self) -> &str {
         &self.describe
+    }
+
+    pub fn started(&self) -> std::time::Instant {
+        self.started
     }
 }
 

@@ -16,6 +16,8 @@ mod app;
 mod askpass;
 #[path = "../../src/auth.rs"]
 mod auth;
+#[path = "../../src/background.rs"]
+mod background;
 #[path = "../../src/branch.rs"]
 mod branch;
 #[path = "../../src/cache.rs"]

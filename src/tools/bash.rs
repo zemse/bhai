@@ -39,6 +39,9 @@ const DRAIN: Duration = Duration::from_millis(100);
 /// Bytes kept from each end of each stream. Two streams at twice this is what
 /// `format_output` may pass on, which is [`super::MAX_OUTPUT`].
 const KEEP: usize = super::MAX_OUTPUT / 4;
+/// Bytes of a session's latest output kept for the background list, apart from what a
+/// poll takes.
+const RECENT: usize = 4096;
 /// How each result starts, which is how [`outcome`] reads it back.
 const EXIT: &str = "exit code: ";
 const KILLED: &str = "killed by signal";
@@ -467,6 +470,11 @@ struct Shared {
     pending: Vec<u8>,
     /// Streams not yet at end of file.
     open: usize,
+    /// The last [`RECENT`] bytes of both streams as they arrived; reading them takes
+    /// nothing from the next poll.
+    recent: std::collections::VecDeque<u8>,
+    /// Bytes have fallen off the front of `recent`.
+    recent_cut: bool,
 }
 
 /// A running command and the tasks reading its output. Reading goes on between calls,
@@ -483,6 +491,7 @@ struct Proc {
     readers: Vec<tokio::task::JoinHandle<()>>,
     status: Option<ExitStatus>,
     drained_by: Option<tokio::time::Instant>,
+    started: Instant,
     /// Held while the command lives: its sudo can ask only while it is registered.
     _asking: Option<crate::askpass::Call>,
 }
@@ -579,6 +588,8 @@ impl Proc {
             stderr: Kept::new(tty),
             pending: Vec::new(),
             open: pipes.len(),
+            recent: std::collections::VecDeque::new(),
+            recent_cut: false,
         }));
         let closed = Arc::new(Notify::new());
         let readers = pipes
@@ -595,6 +606,7 @@ impl Proc {
             readers,
             status: None,
             drained_by: None,
+            started: Instant::now(),
             _asking: asking,
         })
     }
@@ -685,6 +697,12 @@ fn read_into(
                 false => shared.stdout.push(&buf[..n]),
             }
             queue(&mut shared.pending, &buf[..n]);
+            shared.recent.extend(&buf[..n]);
+            if shared.recent.len() > RECENT {
+                let over = shared.recent.len() - RECENT;
+                shared.recent.drain(..over);
+                shared.recent_cut = true;
+            }
         }
     })
 }
@@ -803,6 +821,9 @@ struct Session {
     line: String,
     group: Option<u32>,
     used: Instant,
+    started: Instant,
+    /// The proc's output, read here without waiting on a poll that holds the proc.
+    shared: Arc<Mutex<Shared>>,
     proc: Arc<tokio::sync::Mutex<Proc>>,
 }
 
@@ -846,6 +867,8 @@ fn keep(command: &str, proc: Proc) -> u32 {
             line: String::new(),
             group: proc.group,
             used: Instant::now(),
+            started: proc.started,
+            shared: Arc::clone(&proc.shared),
             proc: Arc::new(tokio::sync::Mutex::new(proc)),
         },
     );
@@ -856,6 +879,82 @@ fn keep(command: &str, proc: Proc) -> u32 {
 /// such session.
 pub(crate) fn session(id: u32) -> Option<(String, bool)> {
     sessions().live.get(&id).map(|s| (s.command.clone(), s.tty))
+}
+
+/// A session as the background list shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Running {
+    pub id: u32,
+    pub command: String,
+    pub tty: bool,
+    /// Its process group, which is its leader's pid.
+    pub group: Option<u32>,
+    pub age: Duration,
+    /// The command has exited and its result waits for the next poll.
+    pub exited: bool,
+    /// The last of what it printed, known secrets blanked.
+    pub tail: String,
+}
+
+/// Every session kept running, oldest first. Nothing is taken from what the next
+/// `write_stdin` reads.
+pub fn kept() -> Vec<Running> {
+    sessions()
+        .live
+        .iter()
+        .map(|(&id, session)| Running {
+            id,
+            command: session.command.clone(),
+            tty: session.tty,
+            group: session.group,
+            age: session.started.elapsed(),
+            exited: exited(&session.proc),
+            tail: recent(
+                &session.shared.lock().unwrap_or_else(|e| e.into_inner()),
+                session.tty,
+            ),
+        })
+        .collect()
+}
+
+/// Whether the command has exited. A proc a poll holds is still being waited on, so it
+/// counts as running until that poll says otherwise.
+fn exited(proc: &tokio::sync::Mutex<Proc>) -> bool {
+    let Ok(mut proc) = proc.try_lock() else {
+        return false;
+    };
+    if proc.status.is_none()
+        && let Ok(Some(status)) = proc.child.try_wait()
+    {
+        // Reaped here, so the next poll must not wait on it again, nor kill a group
+        // whose id may be reused.
+        proc.status = Some(status);
+        proc.drained_by = Some(tokio::time::Instant::now() + DRAIN);
+    }
+    proc.status.is_some()
+}
+
+/// The text of `shared.recent`, decoded as a poll would and with known secrets blanked,
+/// a value cut at the front included.
+fn recent(shared: &Shared, tty: bool) -> String {
+    let (front, back) = shared.recent.as_slices();
+    let mut bytes = [front, back].concat();
+    if shared.recent_cut {
+        let start = bytes
+            .iter()
+            .position(|&b| b & 0xc0 != 0x80)
+            .unwrap_or(bytes.len());
+        bytes.drain(..start);
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let text = match tty {
+        true => plain(&text),
+        false => text.into_owned(),
+    };
+    match shared.recent_cut {
+        true => crate::redact::apply_around_gap("", &text).1,
+        false => crate::redact::apply(&text).into_owned(),
+    }
 }
 
 /// What a shell has been given and not yet run once `chars` follow `line`: a ctrl-c drops
@@ -1459,6 +1558,61 @@ mod tests {
         assert_eq!(outcome(&out), Some(Outcome::Failed(4)));
         assert_eq!(session(id), None);
         assert!(check_input(id, "").is_err());
+    }
+
+    /// The background list reads a session's output without taking it from the poll.
+    #[tokio::test]
+    async fn the_kept_list_shows_a_tail_and_leaves_the_output_to_the_poll() {
+        crate::redact::register("bash-kept-secret-55e1");
+        let command = "printf 'a bash-kept-secret-55e1\\n'; sleep 30";
+        let out = start(command, None, YIELD_MIN, false, quiet()).await;
+        let id = session_id(&out);
+        let row = kept().into_iter().find(|r| r.id == id).unwrap();
+        assert_eq!(
+            (row.command.as_str(), row.tty, row.exited),
+            (command, false, false)
+        );
+        assert!(row.group.is_some());
+        assert_eq!(row.tail, "a [REDACTED]\n");
+        assert_eq!(
+            kept().into_iter().find(|r| r.id == id).unwrap().tail,
+            row.tail
+        );
+        let out = write(id, "\u{3}", Duration::from_secs(5), quiet()).await;
+        assert!(kept().iter().all(|r| r.id != id));
+        // The poll still reads what was printed since the start yielded.
+        assert!(!matches!(outcome(&out), Some(Outcome::Running(_))), "{out}");
+    }
+
+    #[tokio::test]
+    async fn an_exited_session_shows_as_exited_until_its_poll_reads_it() {
+        let out = start("sleep 0.5; echo done", None, YIELD_MIN, false, quiet()).await;
+        let id = session_id(&out);
+        let begun = Instant::now();
+        while !kept().iter().any(|r| r.id == id && r.exited) {
+            assert!(begun.elapsed() < Duration::from_secs(5), "never exited");
+            tokio::time::sleep(TICK).await;
+        }
+        let out = write(id, "", Duration::from_secs(5), quiet()).await;
+        assert!(out.starts_with("exit code: 0\ndone\n"), "{out}");
+        assert_eq!(session(id), None);
+    }
+
+    #[test]
+    fn a_cut_tail_starts_on_a_whole_character_and_blanks_a_cut_secret() {
+        crate::redact::register("bash-tail-secret-0b7d");
+        let mut shared = Shared {
+            stdout: Kept::default(),
+            stderr: Kept::default(),
+            pending: Vec::new(),
+            open: 0,
+            recent: "é-tail-secret-0b7d ok".bytes().skip(1).collect(),
+            recent_cut: true,
+        };
+        assert_eq!(recent(&shared, false), "[REDACTED] ok");
+        shared.recent_cut = false;
+        shared.recent = "\u{1b}[1mbold\u{1b}[0m\r\n".bytes().collect();
+        assert_eq!(recent(&shared, true), "bold\n");
     }
 
     #[tokio::test]

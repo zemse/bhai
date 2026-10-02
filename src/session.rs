@@ -150,6 +150,9 @@ pub enum Event {
         missed: bool,
         queued: bool,
     },
+    /// What runs in the background changed; this many things run now, and
+    /// [`Session::background`] lists them.
+    Background(usize),
     /// A local notice, such as where `/context` wrote its export.
     Info(String),
     /// The model call failed and is sent again; what it streamed is dropped from the
@@ -244,6 +247,8 @@ fn idle_secs<S: serde::Serializer>(last: &Instant, s: S) -> Result<S::Ok, S::Err
 struct Pane {
     row: ChildRow,
     entries: Arc<Mutex<Entries>>,
+    /// When the pane opened; a continued child keeps it.
+    started: Instant,
 }
 
 /// One child agent as `/export-debug` writes it: its row and everything its pane showed.
@@ -542,6 +547,9 @@ pub struct Session {
     judge: Option<Arc<Judge>>,
     /// The project's schedules, once [`Session::run_schedules`] fires them into this one.
     schedules: std::sync::OnceLock<Arc<crate::schedules::Schedules>>,
+    /// Where [`Session::background`] reads what else runs, once
+    /// [`Session::watch_background`] is given them.
+    sources: std::sync::OnceLock<Vec<Box<dyn crate::background::Source>>>,
 }
 
 impl Session {
@@ -573,6 +581,7 @@ impl Session {
             policy,
             judge,
             schedules: std::sync::OnceLock::new(),
+            sources: std::sync::OnceLock::new(),
         })
     }
 
@@ -702,6 +711,49 @@ impl Session {
     /// The schedules this session fires, once they run.
     pub fn schedules(&self) -> Option<Arc<crate::schedules::Schedules>> {
         self.schedules.get().cloned()
+    }
+
+    /// Read what runs in the background from `sources` as well as this session's running
+    /// children and schedules, and publish [`Event::Background`] whenever that changes.
+    /// The watcher holds the session weakly, so it ends with it.
+    pub fn watch_background(
+        self: &Arc<Self>,
+        sources: Vec<Box<dyn crate::background::Source>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let _ = self.sources.set(sources);
+        let session = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut tick = tokio::time::interval(crate::background::POLL);
+            loop {
+                tick.tick().await;
+                let Some(session) = session.upgrade() else {
+                    return;
+                };
+                let now = session.background();
+                if crate::background::changed(&seen, &now) {
+                    session.publish(Event::Background(now.len()));
+                    seen = now;
+                }
+            }
+        })
+    }
+
+    /// Everything running that the user did not start by typing, known secrets blanked.
+    pub fn background(&self) -> Vec<crate::background::Row> {
+        let mut rows: Vec<_> = self
+            .panes()
+            .iter()
+            .filter(|pane| pane.row.state == ChildState::Running)
+            .map(|pane| crate::background::child(&pane.row, pane.started))
+            .collect();
+        if let Some(schedules) = self.schedules.get() {
+            rows.extend(crate::background::schedules(schedules));
+        }
+        for source in self.sources.get().into_iter().flatten() {
+            rows.extend(source.rows());
+        }
+        crate::background::snapshot(rows)
     }
 
     /// The tokens a call on the compacted copy would read, while there is one.
@@ -1467,6 +1519,7 @@ impl Session {
                         last: Instant::now(),
                     },
                     entries,
+                    started: Instant::now(),
                 });
             }
             Event::ChildEnded { id, ok } => {
@@ -1713,6 +1766,62 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Entry::Failed(text) if text.contains("panic")));
         assert!(said, "{:?}", session.entries().list);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_background_count_is_published_when_what_runs_changes() {
+        use crate::background::{Kind, tests::Fake, tests::row};
+        let (session, _rx) = session();
+        let mut events = session.subscribe();
+        let fake = Fake::default();
+        let rows = Arc::clone(&fake.0);
+        rows.lock().unwrap().push(row(Kind::Mcp, "fs", "connected"));
+        let watching = session.watch_background(vec![Box::new(fake)]);
+        // Half a poll out of step with the watcher, so each step spans one of its looks.
+        tokio::time::sleep(crate::background::POLL / 2).await;
+        assert_eq!(events.try_recv(), Ok(Event::Background(1)));
+        let step = || tokio::time::sleep(crate::background::POLL);
+
+        session.on_agent(AgentEvent::ChildStarted {
+            id: "c1".to_string(),
+            identity: "general".to_string(),
+            description: "read the tests".to_string(),
+            task: "go".to_string(),
+        });
+        while events.try_recv().is_ok() {}
+        step().await;
+        assert_eq!(events.try_recv(), Ok(Event::Background(2)));
+        let listed = session.background();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| (r.kind, r.id.as_str()))
+                .collect::<Vec<_>>(),
+            [(Kind::Child, "c1"), (Kind::Mcp, "fs")]
+        );
+        assert_eq!(listed[0].label, "read the tests");
+
+        // Output alone is no change; a state is.
+        rows.lock().unwrap()[0].detail = "more".to_string();
+        step().await;
+        assert!(events.try_recv().is_err());
+        rows.lock().unwrap()[0].state = "failed".to_string();
+        step().await;
+        assert_eq!(events.try_recv(), Ok(Event::Background(2)));
+
+        session.on_agent(AgentEvent::ChildEnded {
+            id: "c1".to_string(),
+            ok: true,
+        });
+        rows.lock().unwrap().clear();
+        while events.try_recv().is_ok() {}
+        step().await;
+        assert_eq!(events.try_recv(), Ok(Event::Background(0)));
+        assert!(session.background().is_empty());
+
+        drop(session);
+        step().await;
+        assert!(watching.is_finished());
     }
 
     #[test]

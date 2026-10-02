@@ -780,6 +780,27 @@ then run it with `mcp_call` using the exact `mcp__server__tool` name.\n"
         out
     }
 
+    /// The servers connected now: launched or reloaded ones, then any a child started.
+    pub fn running(&self) -> Vec<Status> {
+        let mut running: Vec<Status> = self
+            .live()
+            .into_iter()
+            .filter(|s| s.state == State::Connected)
+            .collect();
+        if let Ok(late) = self.shared.late.try_lock() {
+            running.extend(
+                late.iter()
+                    .map(|(status, _)| status)
+                    .filter(|s| {
+                        s.state == State::Connected && !running.iter().any(|r| r.name == s.name)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+        }
+        running
+    }
+
     /// Startup lines for servers that failed.
     pub fn notices(&self) -> Vec<String> {
         self.servers

@@ -126,18 +126,33 @@ fn candidates(home: Option<&Path>, path: Option<&std::ffi::OsStr>) -> Vec<PathBu
     out
 }
 
-/// Every running browser's process group, by its profile, so a signal or panic that ends
-/// bhai can end them too: the group is their own, so nothing else would.
-static BROWSERS: Mutex<BTreeMap<PathBuf, u32>> = Mutex::new(BTreeMap::new());
+/// A browser a render has running.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Running {
+    /// Its process group, which is its leader's pid.
+    pub group: u32,
+    pub started: Instant,
+    /// The page it was started to render.
+    pub url: String,
+}
 
-fn browsers() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, u32>> {
+/// Every running browser, by its profile, so a signal or panic that ends bhai can end
+/// them too: the group is their own, so nothing else would.
+static BROWSERS: Mutex<BTreeMap<PathBuf, Running>> = Mutex::new(BTreeMap::new());
+
+fn browsers() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Running>> {
     BROWSERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The browsers renders have running now.
+pub fn running() -> Vec<Running> {
+    browsers().values().cloned().collect()
 }
 
 /// Kill every browser a render started and delete its profile.
 pub fn kill_all() {
-    for (profile, group) in std::mem::take(&mut *browsers()) {
-        super::bash::kill_group(Some(group));
+    for (profile, running) in std::mem::take(&mut *browsers()) {
+        super::bash::kill_group(Some(running.group));
         let _ = std::fs::remove_dir_all(profile);
     }
 }
@@ -151,7 +166,7 @@ struct Browser {
 }
 
 impl Browser {
-    async fn launch(exe: &Path) -> Result<(Browser, String), String> {
+    async fn launch(exe: &Path, url: &Url) -> Result<(Browser, String), String> {
         let profile = std::env::temp_dir().join(format!("bhai-chrome-{}", uuid::Uuid::new_v4()));
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -177,7 +192,12 @@ impl Browser {
         };
         let group = child.id();
         if let Some(group) = group {
-            browsers().insert(profile.clone(), group);
+            let running = Running {
+                group,
+                started: Instant::now(),
+                url: url.to_string(),
+            };
+            browsers().insert(profile.clone(), running);
         }
         let mut browser = Browser {
             child,
@@ -272,7 +292,7 @@ pub(crate) async fn render(
     screenshot: bool,
     refusal: fn(IpAddr) -> Option<&'static str>,
 ) -> Result<Rendered, String> {
-    let (browser, endpoint) = Browser::launch(exe).await?;
+    let (browser, endpoint) = Browser::launch(exe, url).await?;
     let out = async {
         let port_path = endpoint.trim_start_matches("ws://127.0.0.1:");
         let port = port_path

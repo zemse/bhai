@@ -38,6 +38,7 @@ pub mod agent;
 mod app;
 mod askpass;
 mod auth;
+pub mod background;
 mod branch;
 pub mod cache;
 mod childenv;
