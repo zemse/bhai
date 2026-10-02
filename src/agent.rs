@@ -1781,13 +1781,7 @@ async fn turn(
                 Delta::Truncated => AgentEvent::Info(
                     "cut off at the model's output limit; the answer is what it had".to_string(),
                 ),
-                // The client has already turned fast off; this tells the session so.
-                Delta::Downgraded(tier) => {
-                    let _ = tx.send(AgentEvent::Info(format!(
-                        "fast: the backend answered at the `{tier}` tier, not priority, so fast is off; /fast on asks again."
-                    )));
-                    AgentEvent::Fast(false)
-                }
+                Delta::Downgraded(tier) => return downgraded(&tier, tx),
                 Delta::Retrying {
                     attempt,
                     of,
@@ -2337,6 +2331,7 @@ impl Compaction<'_> {
             Delta::RateLimits(limits) => {
                 let _ = tx.send(AgentEvent::RateLimits(limits));
             }
+            Delta::Downgraded(tier) => downgraded(&tier, tx),
             _ => {}
         };
         self.model
@@ -2392,6 +2387,15 @@ impl Compaction<'_> {
     }
 }
 
+/// The client has already turned fast off, and only on the call that did; this tells the
+/// session so. Every call that can carry the tier reports it, not only the turn's.
+fn downgraded(tier: &str, tx: &mpsc::UnboundedSender<AgentEvent>) {
+    let _ = tx.send(AgentEvent::Info(format!(
+        "fast: the backend answered at the `{tier}` tier, not priority, so fast is off; /fast on asks again."
+    )));
+    let _ = tx.send(AgentEvent::Fast(false));
+}
+
 /// What `/btw` adds after the history: the question, framed so the model answers from
 /// what it already has rather than going off to work.
 fn btw_request(question: &str) -> Value {
@@ -2428,6 +2432,7 @@ async fn btw(
         Delta::RateLimits(limits) => {
             let _ = tx.send(AgentEvent::RateLimits(limits));
         }
+        Delta::Downgraded(tier) => downgraded(&tier, tx),
         _ => {}
     };
     let _ = tx.send(AgentEvent::Sending(prompt_tokens(

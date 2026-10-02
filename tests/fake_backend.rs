@@ -567,6 +567,65 @@ async fn a_reply_at_the_default_tier_turns_fast_off() {
     );
 }
 
+/// The service_tier each request asked for, in order.
+fn tiers(fake: &Fake) -> Vec<Value> {
+    fake.responses()
+        .iter()
+        .map(|seen| seen.body["service_tier"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_btw_answered_at_the_default_tier_turns_fast_off() {
+    let fake = Arc::new(Fake::default());
+    fake.replies
+        .lock()
+        .unwrap()
+        .extend([says_at("because", "default"), says("next")]);
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    bhai.post("/fast", json!({ "on": true })).await;
+    assert_eq!(events.until("fast").await["data"], true);
+    bhai.post("/prompt", json!({ "text": "/btw why?" })).await;
+    assert_eq!(events.until("fast").await["data"], false);
+    events.until("turn_end").await;
+    assert_eq!(bhai.state().await["fast"], false);
+    bhai.post("/prompt", json!({ "text": "go on" })).await;
+    events.until("turn_end").await;
+
+    assert_eq!(tiers(&fake), [json!("priority"), Value::Null]);
+}
+
+#[tokio::test]
+async fn a_summary_answered_at_the_default_tier_turns_fast_off() {
+    let fake = Arc::new(Fake::default());
+    fake.replies.lock().unwrap().extend([
+        says("one"),
+        fails("context_length_exceeded"),
+        says_at("the summary", "default"),
+        says("two"),
+    ]);
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    bhai.post("/fast", json!({ "on": true })).await;
+    assert_eq!(events.until("fast").await["data"], true);
+    bhai.post("/prompt", json!({ "text": "first" })).await;
+    events.until("turn_end").await;
+    bhai.post("/prompt", json!({ "text": "second" })).await;
+    assert_eq!(events.until("fast").await["data"], false);
+    events.until("turn_end").await;
+    assert!(events.kinds().contains(&"compacted"), "{:#?}", events.got);
+    assert_eq!(bhai.state().await["fast"], false);
+
+    let priority = json!("priority");
+    assert_eq!(
+        tiers(&fake),
+        [priority.clone(), priority.clone(), priority, Value::Null]
+    );
+}
+
 #[tokio::test]
 async fn startup_timing_names_each_stage_in_order_before_the_server_line() {
     let fake = Arc::new(Fake::default());
