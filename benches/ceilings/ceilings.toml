@@ -1,0 +1,7 @@
+# The most each bench's median may take, in microseconds. Each sits about three times
+# over its median on an M-series laptop, so noise and a slower machine pass and a
+# regression of that size does not.
+"render/transcript_cold_120x40" = 300_000
+"render/transcript_tail_120x40" = 2_500
+"wrap/line_1mib" = 15_000
+"profile/build_10k" = 360_000
