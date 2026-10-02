@@ -4,8 +4,8 @@
 use crate::{
     agent, app, askpass, cache, childenv, client, config, egress, external, identity, input,
     instructions, judge, limits, mcp, memory, models, notify, permissions, profile, sandbox,
-    search, server, session, sessions, skills, startup, statusline, syntax, title, tokens, tools,
-    trace, ui, workflow, worktrees,
+    schedules, search, server, session, sessions, skills, startup, statusline, syntax, title,
+    tokens, tools, trace, ui, workflow, worktrees,
 };
 
 use std::path::PathBuf;
@@ -438,6 +438,7 @@ allow it.",
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         session.entries().restore(&history);
+        session.run_schedules(schedules::Schedules::new(&cwd));
         for notice in &notices {
             eprintln!("bhai: {notice}");
         }
@@ -1676,6 +1677,10 @@ async fn run(
             .list
             .extend(notices.into_iter().map(app::Entry::Info));
     }
+    // After the transcript is restored, so a missed schedule's turn follows it.
+    session.run_schedules(schedules::Schedules::new(
+        &std::env::current_dir().unwrap_or_default(),
+    ));
     if let Some(listener) = listener {
         let addr = listener.local_addr()?;
         let token = server::mint();

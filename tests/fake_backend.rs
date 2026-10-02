@@ -374,6 +374,17 @@ impl Bhai {
         env: &[(&str, &str)],
         config: Option<&str>,
     ) -> Bhai {
+        Self::start_prepared(backend, flags, env, config, |_| {}).await
+    }
+
+    /// As `start_in`, with `prepare` given the project before bhai starts in it.
+    async fn start_prepared(
+        backend: &str,
+        flags: &[&str],
+        env: &[(&str, &str)],
+        config: Option<&str>,
+        prepare: impl FnOnce(&std::path::Path),
+    ) -> Bhai {
         let dir = std::env::temp_dir().join(format!("bhai-fake-{}", uuid::Uuid::new_v4()));
         let (home, codex) = logged_in(&dir);
         if let Some(config) = config {
@@ -383,6 +394,7 @@ impl Bhai {
         }
         let project = dir.join("project");
         std::fs::create_dir_all(&project).unwrap();
+        prepare(&project);
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_bhai"))
             .args(["--serve", "0", "--headless"])
@@ -1632,4 +1644,73 @@ async fn a_tool_call_inside_a_turn_sends_only_its_output_on_the_socket() {
     assert_eq!(input.len(), 1, "{next}");
     assert_eq!(input[0]["type"], "function_call_output");
     assert_eq!(input[0]["call_id"], "call_1");
+}
+
+#[tokio::test]
+async fn a_schedule_missed_while_bhai_was_down_fires_at_startup_framed_as_late() {
+    let fake = Arc::new(Fake::default());
+    fake.replies.lock().unwrap().push_back(says("checked"));
+    let row = |id: &str, spec: &str, text: &str, recurs: bool| {
+        let mut row = json!({
+            "id": id,
+            "spec": spec,
+            "text": text,
+            "origin": "user",
+            "created": "2026-01-01T09:00:00Z",
+            "next": "2026-01-01T10:00:00Z",
+        });
+        if recurs {
+            row["expires"] = json!("2100-01-01T00:00:00Z");
+        }
+        row
+    };
+    let rows = json!([
+        row("late01", "in 1h", "check the deploy", false),
+        row("poll01", "every 1d", "poll the queue", true),
+    ]);
+    let bhai = Bhai::start_prepared(&serve_fake(fake.clone()).await, &[], &[], None, |project| {
+        std::fs::create_dir_all(project.join(".bhai")).unwrap();
+        std::fs::write(project.join(".bhai/schedules.json"), rows.to_string()).unwrap();
+    })
+    .await;
+    let mut events = bhai.events().await;
+
+    let user = events.until("user").await;
+    let shown = user["data"].as_str().unwrap();
+    assert!(shown.starts_with("(missed `in 1h`, due "), "{shown}");
+    assert!(shown.ends_with(") check the deploy"), "{shown}");
+    events.until("turn_end").await;
+    let notes: Vec<&Value> = events.got.iter().filter(|e| e["type"] == "info").collect();
+    assert!(
+        notes.iter().any(|n| {
+            let text = n["data"].as_str().unwrap_or_default();
+            text.contains("poll01") && text.contains("it fires next at")
+        }),
+        "{notes:?}"
+    );
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 1, "{sent:#?}");
+    let body = &sent[0].body;
+    assert!(
+        mentions(body, "[scheduled: the user set this at "),
+        "{body}"
+    );
+    assert!(mentions(body, "so it runs late"), "{body}");
+    assert!(mentions(body, "check the deploy"), "{body}");
+    assert!(!mentions(body, "poll the queue"), "{body}");
+
+    // The one-shot row is gone and the recurring one waits for its next slot.
+    let path = bhai.project().join(".bhai/schedules.json");
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let saved = saved.as_array().unwrap();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(saved[0]["id"], "poll01");
+    assert_ne!(saved[0]["next"], "2026-01-01T10:00:00Z");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 }

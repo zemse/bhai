@@ -95,6 +95,10 @@ mod prompt;
 mod redact;
 #[path = "../../src/sandbox.rs"]
 mod sandbox;
+#[path = "../../src/schedule.rs"]
+mod schedule;
+#[path = "../../src/schedules.rs"]
+mod schedules;
 #[path = "../../src/search.rs"]
 mod search;
 #[path = "../../src/server.rs"]

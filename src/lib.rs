@@ -82,6 +82,7 @@ mod redact;
 mod runtime;
 mod sandbox;
 pub mod schedule;
+pub mod schedules;
 mod search;
 pub mod server;
 pub mod session;

@@ -78,7 +78,7 @@ impl Place {
         crate::sessions::private_dir(&self.bhai).map_err(|e| e.to_string())?;
         let file = crate::sessions::private_append(&self.bhai.join(LOCK))
             .map_err(|e| format!("could not open the worktree lock: {e}"))?;
-        Lock::take(file)
+        Lock::take(file, "the worktree registry")
     }
 
     /// The registry's rows as written, each checked by [`Place::checked`] before use: a
@@ -904,18 +904,18 @@ fn alive(pid: u32) -> bool {
 }
 
 /// An exclusive `flock` on the lock file, let go when the file closes.
-struct Lock(#[allow(dead_code)] std::fs::File);
+pub(crate) struct Lock(#[allow(dead_code)] std::fs::File);
 
 impl Lock {
     #[allow(unsafe_code)]
-    fn take(file: std::fs::File) -> Result<Self, String> {
+    pub(crate) fn take(file: std::fs::File, what: &str) -> Result<Self, String> {
         use std::os::fd::AsRawFd as _;
         // SAFETY: the descriptor is the open file's, held for the call.
         let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0;
         match taken {
             true => Ok(Self(file)),
             false => Err(format!(
-                "could not lock the worktree registry: {}",
+                "could not lock {what}: {}",
                 std::io::Error::last_os_error()
             )),
         }

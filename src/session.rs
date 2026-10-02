@@ -530,6 +530,8 @@ pub struct Session {
     policy: Arc<Policy>,
     /// The auto-approval judge, when one runs; it owns its own usage and budget.
     judge: Option<Arc<Judge>>,
+    /// The project's schedules, once [`Session::run_schedules`] fires them into this one.
+    schedules: std::sync::OnceLock<Arc<crate::schedules::Schedules>>,
 }
 
 impl Session {
@@ -560,6 +562,7 @@ impl Session {
             cancel,
             policy,
             judge,
+            schedules: std::sync::OnceLock::new(),
         })
     }
 
@@ -672,6 +675,23 @@ impl Session {
         inner.start();
         self.publish(Event::User(prompt.shown));
         Ok(())
+    }
+
+    /// Fire `schedules` into this session as each falls due, catching up first on what
+    /// was missed while no bhai ran. The runner holds the session weakly, so it ends
+    /// with it.
+    pub fn run_schedules(
+        self: &Arc<Self>,
+        schedules: crate::schedules::Schedules,
+    ) -> tokio::task::JoinHandle<()> {
+        let schedules = Arc::new(schedules);
+        let _ = self.schedules.set(Arc::clone(&schedules));
+        tokio::spawn(crate::schedules::run(Arc::downgrade(self), schedules))
+    }
+
+    /// The schedules this session fires, once they run.
+    pub fn schedules(&self) -> Option<Arc<crate::schedules::Schedules>> {
+        self.schedules.get().cloned()
     }
 
     /// The tokens a call on the compacted copy would read, while there is one.
