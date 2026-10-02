@@ -1682,12 +1682,24 @@ fn input_row(row: Row, selection: Option<&Range<usize>>) -> Line<'static> {
     ])
 }
 
+/// What a remember choice says once its key has been pressed.
+fn confirm_hint(armed: bool) -> Span<'static> {
+    match armed {
+        true => Span::styled("  again to save", Style::new().fg(Color::Yellow).bold()),
+        false => Span::raw(""),
+    }
+}
+
 /// The approval prompt. Each `[k]` choice is recorded in `app.buttons` so a click on
 /// it acts exactly as pressing `k`.
 fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(pending) = &app.pending else {
         return;
     };
+    if app.approval_shown.is_none_or(|(id, _)| id != pending.id) {
+        app.approval_shown = Some((pending.id, None));
+        app.armed = None;
+    }
     let scroll = app.approval_scroll;
     let title = if pending.tool == "bash" {
         " run this command? ".to_string()
@@ -1711,6 +1723,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
         options.push(Line::from(vec![
             key("[a]", Color::Cyan),
             Span::raw(format!(" always allow this exact {what}: {rule}")),
+            confirm_hint(app.armed == Some('a')),
         ]));
     }
     if let Some(rule) = &pending.offers.prefix {
@@ -1723,6 +1736,7 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
         options.push(Line::from(vec![
             key("[p]", Color::Cyan),
             Span::raw(format!(" {what}: {rule}")),
+            confirm_hint(app.armed == Some('p')),
         ]));
     }
 
@@ -1905,7 +1919,7 @@ mod tests {
         KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use ratatui::style::Modifier;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn usage(input: u64, cached: u64, output: u64, reasoning: u64) -> Usage {
         Usage {
@@ -2666,6 +2680,105 @@ mod tests {
         }
     }
 
+    /// Draw `app` and age the approval in it past the settle window, as one the user
+    /// has had time to read.
+    fn settle(app: &mut App) {
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        age(app);
+    }
+
+    /// Put the approval last drawn on screen, long enough ago to have been read.
+    fn age(app: &mut App) {
+        app.drawn();
+        if let Some((_, Some(at))) = &mut app.approval_shown {
+            *at -= Duration::from_secs(1);
+        }
+    }
+
+    #[test]
+    fn a_key_typed_as_the_approval_appears_does_not_allow_it() {
+        let y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let mut app = App::detached();
+        let shown = approval(Some("ls"));
+        app.on_event(Event::Approval {
+            id: shown.id,
+            tool: shown.tool,
+            command: shown.command,
+            preview: shown.preview,
+            offers: shown.offers,
+        });
+        app.on_key(y);
+        assert!(
+            app.pending.is_some(),
+            "y before the box is drawn is dropped"
+        );
+
+        // The window opens when the frame reaches the screen, not when it is built.
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.on_key(y);
+        assert!(
+            app.pending.is_some(),
+            "y before the frame is flushed is dropped"
+        );
+        app.drawn();
+        app.on_key(y);
+        assert!(
+            app.pending.is_some(),
+            "y inside the settle window is dropped"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.pending.is_none(), "rejecting never waits");
+
+        app.pending = Some(approval(None));
+        settle(&mut app);
+        app.on_key(y);
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn a_remember_key_needs_a_second_press() {
+        let mut app = App::detached();
+        app.pending = Some(approval(Some("ls")));
+        settle(&mut app);
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.on_key(a);
+        assert!(app.pending.is_some());
+        assert_eq!(app.armed, Some('a'));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("again to save"), "{shown}");
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.armed, None, "another key disarms");
+        app.on_key(a);
+        app.on_key(a);
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn a_new_approval_settles_again_and_drops_an_armed_key() {
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let mut app = App::detached();
+        app.pending = Some(approval(Some("ls")));
+        settle(&mut app);
+        app.on_key(a);
+        assert_eq!(app.armed, Some('a'));
+        // Answered elsewhere, and the next call takes its place under the same keys.
+        app.pending = Some(Approval {
+            id: 8,
+            ..approval(Some("ls"))
+        });
+        app.on_key(a);
+        assert!(app.pending.is_some(), "the new box has not been drawn");
+        settle(&mut app);
+        assert_eq!(app.armed, None);
+        app.on_key(a);
+        assert!(app.pending.is_some(), "a still needs its second press");
+    }
+
     #[test]
     fn clicking_an_approval_choice_answers_it() {
         let mut app = App::detached();
@@ -2721,6 +2834,7 @@ mod tests {
         app.pending = Some(long);
         let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        age(&mut app);
         let shown = screen(&terminal);
         assert!(shown.contains("lines hidden"));
         assert!(!shown.contains("line40"));
@@ -3109,6 +3223,7 @@ mod tests {
         app.pending = Some(edit.clone());
         let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        age(&mut app);
         let text = screen(&terminal);
         assert!(text.contains("edit /f.rs (1 lines -> 1 lines)"), "{text}");
         assert!(text.contains("-old"), "{text}");

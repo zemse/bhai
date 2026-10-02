@@ -1679,6 +1679,7 @@ async fn run(
         }
         if dirty {
             terminal.draw(|frame| ui::render(frame, &mut app))?;
+            app.drawn();
         }
         let Some(event) = rx_event.recv().await else {
             break;

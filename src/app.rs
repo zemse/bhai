@@ -31,7 +31,7 @@ use crate::models::{Choice, Picker};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
 use crate::search::{Kind, Pick, Search};
-use crate::session::{Approval, ChildRow, Event, Prompt, Session, SubmitError};
+use crate::session::{APPROVAL_SETTLE, Approval, ChildRow, Event, Prompt, Session, SubmitError};
 use crate::skills::Skill;
 use crate::speed::Speed;
 use crate::statusline;
@@ -252,6 +252,11 @@ pub struct App {
     pub approval_seen: bool,
     /// Lines of the command the box shows at once, for paging.
     pub approval_page: usize,
+    /// The approval last drawn, and when that frame reached the screen (`None` until it
+    /// has), so a key typed before or as it appears is not taken for the answer.
+    pub approval_shown: Option<(u64, Option<Instant>)>,
+    /// The remember key pressed once, which a second press confirms.
+    pub armed: Option<char>,
     /// The trust question, until it is answered.
     pub trust_gate: Option<TrustGate>,
     /// sudo asking for a password, the front one on screen.
@@ -381,6 +386,8 @@ impl App {
             approval_scroll: 0,
             approval_seen: false,
             approval_page: 1,
+            approval_shown: None,
+            armed: None,
             trust_gate: None,
             passwords: VecDeque::new(),
             typed: Secret::new(),
@@ -472,25 +479,7 @@ impl App {
 
         // An approval is modal: nothing else happens until it is answered.
         if self.pending.is_some() {
-            let page = self.approval_page.max(1);
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => self.scroll_approval(-1),
-                KeyCode::Down | KeyCode::Char('j') => self.scroll_approval(1),
-                KeyCode::PageUp => self.scroll_approval(-(page as isize)),
-                KeyCode::PageDown => self.scroll_approval(page as isize),
-                KeyCode::Home => self.approval_scroll = 0,
-                KeyCode::End => self.approval_scroll = usize::MAX,
-                // Approving what has not been read is how a hidden tail gets through.
-                KeyCode::Char('y' | 'a' | 'p') if !self.approval_seen => {}
-                KeyCode::Char('y') => self.answer(Answer::Accept(None)),
-                KeyCode::Char('a') => self.answer(Answer::Accept(Some(Remember::Exact))),
-                KeyCode::Char('p') => self.answer(Answer::Accept(Some(Remember::Prefix))),
-                KeyCode::Char('r') | KeyCode::Char('n') | KeyCode::Esc => {
-                    self.answer(Answer::Reject)
-                }
-                KeyCode::Char('c') if ctrl => self.interrupt(),
-                _ => {}
-            }
+            self.approval_key(key.code, ctrl, false);
             return;
         }
 
@@ -892,7 +881,7 @@ impl App {
         let at = Position::new(x, y);
         let button = self.buttons.iter().find(|(area, _)| area.contains(at));
         if let Some(&(_, code)) = button.filter(|_| self.pending.is_some()) {
-            self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+            self.approval_key(code, false, true);
             return true;
         }
         if self.scrollbar.is_some_and(|bar| bar.contains(at)) {
@@ -1490,6 +1479,13 @@ impl App {
         self.effort = state.effort;
         self.fast = state.fast;
         self.identity = state.identity;
+    }
+
+    /// The frame just drawn is on screen, so an approval in it starts settling now.
+    pub fn drawn(&mut self) {
+        if let Some((_, at @ None)) = &mut self.approval_shown {
+            *at = Some(Instant::now());
+        }
     }
 
     /// Move on what moves by itself; returns whether any of it shows, so an idle session
@@ -2425,6 +2421,53 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             // `Event::Mode` follows and sets the mode; this only says what happened.
             Ok(text) => self.note(Entry::Info(text)),
             Err(e) => self.note(Entry::Error(format!("{e:#}"))),
+        }
+    }
+
+    /// Keys while an approval is up. The answers that allow something wait until the
+    /// command's end has been on screen and `APPROVAL_SETTLE` has passed since the box
+    /// reached the screen, so a steer being typed does not approve; `a` and `p` save a
+    /// permanent rule, so a typed one asks for a second press. A click is already
+    /// deliberate and skips the wait and the second press.
+    fn approval_key(&mut self, code: KeyCode, ctrl: bool, clicked: bool) {
+        let page = self.approval_page.max(1);
+        let allows = matches!(code, KeyCode::Char('y' | 'a' | 'p')) && !ctrl;
+        let settled = match (&self.pending, self.approval_shown) {
+            (Some(p), Some((id, Some(at)))) => p.id == id && at.elapsed() >= APPROVAL_SETTLE,
+            _ => false,
+        };
+        // Approving what has not been read is how a hidden tail gets through.
+        if allows && (!self.approval_seen || !(clicked || settled)) {
+            return;
+        }
+        let armed = self.armed.take();
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_approval(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_approval(1),
+            KeyCode::PageUp => self.scroll_approval(-(page as isize)),
+            KeyCode::PageDown => self.scroll_approval(page as isize),
+            KeyCode::Home => self.approval_scroll = 0,
+            KeyCode::End => self.approval_scroll = usize::MAX,
+            KeyCode::Char('y') if !ctrl => self.answer(Answer::Accept(None)),
+            KeyCode::Char(c @ ('a' | 'p')) if !ctrl => {
+                let remember = if c == 'a' {
+                    Remember::Exact
+                } else {
+                    Remember::Prefix
+                };
+                if clicked || armed == Some(c) {
+                    self.answer(Answer::Accept(Some(remember)));
+                } else if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.offers.get(remember).is_some())
+                {
+                    self.armed = Some(c);
+                }
+            }
+            KeyCode::Char('r' | 'n') | KeyCode::Esc => self.answer(Answer::Reject),
+            KeyCode::Char('c') if ctrl => self.interrupt(),
+            _ => {}
         }
     }
 
@@ -3513,6 +3556,25 @@ mod tests {
         assert_eq!(app.model, "m");
         // Token counts are summed from the stream, so a resync must not add them again.
         assert_eq!((app.tokens_in, app.tokens_out), (0, 0));
+    }
+
+    #[test]
+    fn an_approval_read_back_on_resync_still_ignores_an_immediate_y() {
+        let mut app = App::detached();
+        let (reply, mut answered) = tokio::sync::oneshot::channel();
+        app.session().on_agent(crate::agent::AgentEvent::Approval {
+            tool: "bash".to_string(),
+            command: "ls".to_string(),
+            preview: None,
+            offers: crate::permissions::Offers::default(),
+            reply,
+        });
+        app.resync();
+        assert!(app.pending.is_some());
+        app.approval_seen = true;
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.pending.is_some());
+        assert!(answered.try_recv().is_err());
     }
 
     fn transcript(lines: &[&str]) -> App {

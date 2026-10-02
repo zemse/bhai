@@ -390,7 +390,9 @@ struct Approve {
 }
 
 /// The body is optional: `{"id"?, "remember"?: "exact" | "prefix"}`. With an `id`, an
-/// approval other than that one is left unanswered and the request is a 409.
+/// approval other than that one is left unanswered and the request is a 409. Without
+/// one it is also a 409 while the approval is new, since it may have been meant for the
+/// one before.
 async fn approve(State(session): State<Arc<Session>>, body: Bytes) -> Response {
     let approve: Approve = match parse_body(&body) {
         Ok(approve) => approve,
@@ -407,6 +409,13 @@ async fn approve(State(session): State<Arc<Session>>, body: Bytes) -> Response {
     {
         let message = format!("this approval offers no {} rule", remember.as_str());
         return error(StatusCode::BAD_REQUEST, &message);
+    }
+    if approve.id.is_none() && session.settling() {
+        let message = format!(
+            "approval {} just appeared; send its id to answer it now",
+            pending.id
+        );
+        return error(StatusCode::CONFLICT, &message);
     }
     answer(&session, Answer::Accept(approve.remember), Some(pending.id))
 }
@@ -701,6 +710,11 @@ mod tests {
     const TOKEN: &str = "test-token";
 
     async fn start() -> (String, oneshot::Receiver<Answer>) {
+        let (base, rx_decision, _) = start_session().await;
+        (base, rx_decision)
+    }
+
+    async fn start_session() -> (String, oneshot::Receiver<Answer>, Arc<Session>) {
         let (tx_user, mut rx_user) = mpsc::channel::<crate::agent::UserInput>(1);
         let (tx_control, mut rx_control) = mpsc::channel::<Control>(1);
         let (tx_agent, rx_agent) = mpsc::unbounded_channel();
@@ -766,8 +780,8 @@ mod tests {
         });
         let listener = bind(0).await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(serve(listener, session, TOKEN.to_string()));
-        (base, rx_decision)
+        tokio::spawn(serve(listener, Arc::clone(&session), TOKEN.to_string()));
+        (base, rx_decision, session)
     }
 
     async fn get_json(http: &reqwest::Client, url: String) -> Value {
@@ -809,7 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn drives_a_turn_over_http() {
-        let (base, rx_decision) = start().await;
+        let (base, rx_decision, session) = start_session().await;
         let http = reqwest::Client::new();
 
         let state = get_json(&http, format!("{base}/state")).await;
@@ -886,6 +900,28 @@ mod tests {
                 StatusCode::BAD_REQUEST
             );
         }
+        // While the approval is new, an answer that does not name it is refused.
+        session.just_shown();
+        let bodyless = http
+            .post(format!("{base}/approve"))
+            .header(TOKEN_HEADER, TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bodyless.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            post(
+                &http,
+                format!("{base}/approve"),
+                json!({"remember": "exact"})
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            get_json(&http, format!("{base}/state")).await["pending"]["id"],
+            1
+        );
         assert_eq!(
             post(
                 &http,

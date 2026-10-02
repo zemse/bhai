@@ -458,6 +458,10 @@ fn fast_notice(on: bool, was: Option<Option<RateLimits>>, now: Option<RateLimits
     }
 }
 
+/// How long an approval on screen ignores an answer that allows it without naming it:
+/// one typed or sent as it appeared was meant for something else.
+pub const APPROVAL_SETTLE: Duration = Duration::from_millis(300);
+
 #[derive(Default)]
 struct Inner {
     working: bool,
@@ -489,6 +493,8 @@ struct Inner {
     /// Calls waiting on the user, oldest first. Parallel workflow steps each park one,
     /// so there can be several; only the front is on screen.
     pending: VecDeque<(Approval, oneshot::Sender<Answer>)>,
+    /// When the front of `pending` was published.
+    shown: Option<Instant>,
 }
 
 impl Inner {
@@ -775,6 +781,19 @@ impl Session {
         self.publish(Event::User(prompt.shown));
     }
 
+    /// Whether the approval on screen appeared less than `APPROVAL_SETTLE` ago.
+    pub fn settling(&self) -> bool {
+        let inner = self.lock();
+        !inner.pending.is_empty() && inner.shown.is_some_and(|at| at.elapsed() < APPROVAL_SETTLE)
+    }
+
+    /// Restart the settle window of the approval on screen, as though it had just come
+    /// up, so a test does not race the clock.
+    #[cfg(test)]
+    pub fn just_shown(&self) {
+        self.lock().shown = Some(Instant::now());
+    }
+
     /// Answer the approval on screen, only if it is `id` when one is given, and only
     /// with a rule it offered. Returns the id answered, or `None` if there was nothing
     /// (or something else) to answer.
@@ -796,6 +815,7 @@ impl Session {
             remember: answer.remember(),
         });
         // Whatever was parked behind it takes its place on screen.
+        inner.shown = Some(Instant::now());
         if let Some((next, _)) = inner.pending.front() {
             self.publish(Event::Approval {
                 id: next.id,
@@ -1160,6 +1180,7 @@ impl Session {
                 if inner.pending.len() > 1 {
                     return;
                 }
+                inner.shown = Some(Instant::now());
                 Event::Approval {
                     id,
                     tool,
@@ -2375,6 +2396,22 @@ mod tests {
         assert_eq!(session.answer(Answer::Reject, Some(2)), Some(2));
         assert_eq!(second.try_recv(), Ok(Answer::Reject));
         assert!(session.state().pending.is_none());
+    }
+
+    #[test]
+    fn a_new_approval_settles_before_a_blind_answer() {
+        let (session, _rx) = session();
+        assert!(!session.settling());
+        let _first = approval(&session);
+        let _second = approval(&session);
+        assert!(session.settling());
+        session.lock().shown = Some(Instant::now() - APPROVAL_SETTLE);
+        assert!(!session.settling());
+        // The one parked behind comes up as new.
+        assert_eq!(session.answer(Answer::Reject, Some(1)), Some(1));
+        assert!(session.settling());
+        assert_eq!(session.answer(Answer::Reject, Some(2)), Some(2));
+        assert!(!session.settling());
     }
 
     #[test]
