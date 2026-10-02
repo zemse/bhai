@@ -3009,8 +3009,12 @@ async fn execute(
 
     let audit = |outcome, by, reason: &str| policy.audit(name, &summary, outcome, by, reason);
 
+    // In a worktree the rules decide the same call in the checkout, which is what they are
+    // written against.
+    let checked = registry.checked(name, &args);
+
     // The policy answers first; only `Ask` reaches the prompt.
-    match policy.check(name, &args, tool.needs_approval()) {
+    match policy.check(name, &checked, tool.needs_approval()) {
         Decision::Allow(reason) => {
             // A tool that needs no approval is allowed before any rule is consulted, so
             // there is no reason to carry; the log says which it was rather than nothing.
@@ -3048,7 +3052,7 @@ not retry it. Try a different approach, or ask the user."
         Decision::Ask => {
             let (target, detail) = judge::target(name, &args, &summary);
             // Deciding takes a few seconds, so the UI says what it is waiting on.
-            let asking = judge.is_some() && policy.judgeable(name, &args).is_ok();
+            let asking = judge.is_some() && policy.judgeable(name, &checked).is_ok();
             if asking {
                 let _ = tx.send(AgentEvent::Judging(Some(summary.clone())));
             }
@@ -3056,7 +3060,7 @@ not retry it. Try a different approach, or ask the user."
             // Deciding takes seconds and a verdict is worth nothing on a turn that is
             // over, so the wait for one ends with the interrupt rather than after it.
             let verdict = client::unless_cancelled(
-                judged(judge, policy, name, &args, &target, &detail),
+                judged(judge, policy, name, &checked, &args, &target, &detail),
                 cancel,
             )
             .await;
@@ -3139,7 +3143,7 @@ as-is. Try a different approach, or ask the user."
                             each.join(" and ")
                         ))
                     };
-                    let offer = match policy.offers(name, &args).prefix {
+                    let offer = match policy.offers(name, &checked).prefix {
                         Some(rule) => format!(
                             " To permit this and calls like it, the user can run `/allow {rule}`."
                         ),
@@ -3153,7 +3157,7 @@ as-is. Try a different approach, or ask the user."
                     );
                 }
                 Err(_) => {
-                    let offers = policy.offers(name, &args);
+                    let offers = policy.offers(name, &checked);
                     let preview = tool.preview(&args);
                     if let Some(result) = ask(name, &summary, preview, &offers, policy, tx).await {
                         audit("blocked", "you", "");
@@ -3220,13 +3224,14 @@ async fn judged(
     judge: Option<&Judge>,
     policy: &Policy,
     name: &str,
+    checked: &Value,
     args: &Value,
     target: &str,
     detail: &str,
 ) -> Result<Verdict, Undecided> {
     let judge = judge.ok_or(Undecided::Off)?;
     policy
-        .judgeable(name, args)
+        .judgeable(name, checked)
         .map_err(Undecided::Unjudgeable)?;
     judge
         .decide_writing(name, target, detail, &policy.written(name, args))
@@ -5873,6 +5878,107 @@ mod tests {
         }
         // The write ran, so the log is not claiming something that did not happen.
         assert!(repo.join("notes.txt").exists());
+    }
+
+    /// A child in a worktree answers to the rules as the same call in the checkout, so a
+    /// rule anchored at the project holds for the worktree's copy of the same file too.
+    #[tokio::test]
+    async fn a_worktree_child_answers_to_the_rules_of_the_checkout() {
+        use crate::permissions::{Rule, Rules};
+
+        let dir = tools::temp_dir();
+        let repo = dir.join("repo");
+        let workdir = repo.join(".bhai/worktrees/s-c1");
+        for root in [&repo, &workdir] {
+            std::fs::create_dir_all(root.join("secrets")).unwrap();
+            std::fs::create_dir_all(root.join("config")).unwrap();
+            std::fs::write(root.join("secrets/key"), "hunter2").unwrap();
+            std::fs::write(root.join("config/prod.yml"), "prod").unwrap();
+        }
+        std::fs::write(workdir.join("notes.txt"), "from the worktree").unwrap();
+        let rules = Rules {
+            deny: vec![Rule::parse("Read(/secrets/**)").unwrap()],
+            ask: vec![Rule::parse("Read(/config/**)").unwrap()],
+            ..Rules::default()
+        };
+        let policy = Policy::new(Mode::Bypass, rules, None, repo.clone());
+        let registry = Registry::new(Vec::new()).with_workdir(crate::worktrees::Rooted {
+            project: repo.clone(),
+            workdir: workdir.clone(),
+        });
+        // Nothing answers, so a call put to the user is refused as the session ending.
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let cancel = Arc::new(Cancel::default());
+        let run = |call: Value| {
+            let (registry, policy, tx, cancel) = (&registry, &policy, &tx, cancel.flag());
+            async move {
+                execute(
+                    registry,
+                    policy,
+                    None,
+                    &call,
+                    None,
+                    tx,
+                    &cancel,
+                    &mut Vec::new(),
+                )
+                .await
+            }
+        };
+        let read = |path: String| fake::call("read", json!({ "path": path }));
+
+        for path in [
+            repo.join("secrets/key").display().to_string(),
+            "secrets/key".to_string(),
+            workdir.join("secrets/key").display().to_string(),
+            workdir.join("src/../secrets/key").display().to_string(),
+        ] {
+            let (output, ok) = run(read(path.clone())).await;
+            assert!(!ok, "{path}: {output}");
+            assert!(
+                output.contains("deny rule Read(/secrets/**)"),
+                "{path}: {output}"
+            );
+        }
+        for path in [
+            repo.join("config/prod.yml").display().to_string(),
+            workdir.join("config/prod.yml").display().to_string(),
+        ] {
+            let (output, ok) = run(read(path.clone())).await;
+            assert!(!ok, "{path}: {output}");
+            assert_eq!(
+                output, "Not executed: the session is shutting down.",
+                "{path}"
+            );
+        }
+
+        // What no rule names still runs, in the worktree.
+        let (output, ok) = run(read("notes.txt".to_string())).await;
+        assert!(ok, "{output}");
+        assert!(output.contains("from the worktree"), "{output}");
+
+        // An allow rule for the project's files lets the worktree's copies through.
+        let rules = Rules {
+            allow: vec![Rule::parse("Edit(src/**)").unwrap().by_user()],
+            ..Rules::default()
+        };
+        let policy = Policy::new(Mode::Ask, rules, None, repo.clone());
+        let (output, ok) = execute(
+            &registry,
+            &policy,
+            None,
+            &fake::call("write", json!({ "path": "src/new.rs", "content": "x" })),
+            None,
+            &tx,
+            &cancel.flag(),
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(ok, "{output}");
+        assert!(workdir.join("src/new.rs").is_file());
+        assert!(!repo.join("src/new.rs").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// An interrupt while the judge is deciding still stops the call: a verdict that

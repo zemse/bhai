@@ -486,7 +486,24 @@ pub struct Rooted {
 }
 
 impl Rooted {
-    pub fn args(&self, tool: &str, mut args: Value) -> Value {
+    pub fn args(&self, tool: &str, args: Value) -> Value {
+        let start = self.workdir.display().to_string();
+        Self::moved(tool, args, &start, |p| self.path(p))
+    }
+
+    /// Rooted `args` as the same call in the checkout, for the permission rules: they
+    /// resolve against the project, so a worktree path would pass every rule anchored there.
+    pub fn checked(&self, tool: &str, args: &Value) -> Value {
+        let start = self.project.display().to_string();
+        Self::moved(tool, args.clone(), &start, |p| self.back(p))
+    }
+
+    fn moved(
+        tool: &str,
+        mut args: Value,
+        start: &str,
+        path: impl Fn(&str) -> Option<String>,
+    ) -> Value {
         use crate::tools::{bash, edit, patch, read, view_image, write};
         let Some(object) = args.as_object_mut() else {
             return args;
@@ -498,25 +515,22 @@ impl Rooted {
                     .and_then(Value::as_str)
                     .filter(|d| !d.is_empty());
                 let dir = match given {
-                    Some(dir) => self.path(dir),
-                    None => Some(self.workdir.display().to_string()),
+                    Some(dir) => path(dir),
+                    None => Some(start.to_string()),
                 };
                 if let Some(dir) = dir {
                     object.insert("workdir".to_string(), Value::String(dir));
                 }
             }
             read::NAME | write::NAME | edit::NAME | view_image::NAME => {
-                let moved = object
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .and_then(|p| self.path(p));
-                if let Some(path) = moved {
-                    object.insert("path".to_string(), Value::String(path));
+                let moved = object.get("path").and_then(Value::as_str).and_then(&path);
+                if let Some(moved) = moved {
+                    object.insert("path".to_string(), Value::String(moved));
                 }
             }
             patch::NAME => {
                 if let Some(input) = object.get("input").and_then(Value::as_str) {
-                    let input = self.patch(input);
+                    let input = Self::patch(input, &path);
                     object.insert("input".to_string(), Value::String(input));
                 }
             }
@@ -545,7 +559,29 @@ impl Rooted {
         Some(moved.display().to_string())
     }
 
-    fn patch(&self, input: &str) -> String {
+    /// `path` under the worktree as the same place in the checkout, or `None` when it is
+    /// not under the worktree. A relative one is taken against the worktree, where it runs.
+    fn back(&self, path: &str) -> Option<String> {
+        // Lexically, as the rules read paths: `..` out of the worktree leaves it.
+        let mut given = PathBuf::new();
+        for part in self.workdir.join(path).components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    given.pop();
+                }
+                std::path::Component::CurDir => {}
+                part => given.push(part),
+            }
+        }
+        let rest = given.strip_prefix(&self.workdir).ok()?;
+        let back = match rest.as_os_str().is_empty() {
+            true => self.project.clone(),
+            false => self.project.join(rest),
+        };
+        Some(back.display().to_string())
+    }
+
+    fn patch(input: &str, path: impl Fn(&str) -> Option<String>) -> String {
         const HEADERS: [&str; 4] = [
             "*** Add File: ",
             "*** Delete File: ",
@@ -555,8 +591,8 @@ impl Rooted {
         let mut out: Vec<String> = Vec::new();
         for line in input.split('\n') {
             let moved = HEADERS.iter().find_map(|header| {
-                let path = line.strip_prefix(header)?;
-                Some(format!("{header}{}", self.path(path.trim_end())?))
+                let given = line.strip_prefix(header)?;
+                Some(format!("{header}{}", path(given.trim_end())?))
             });
             out.push(moved.unwrap_or_else(|| line.to_string()));
         }
@@ -989,6 +1025,47 @@ mod tests {
         assert_eq!(
             args("web_search", serde_json::json!({"query": "/p/a"})),
             serde_json::json!({"query": "/p/a"})
+        );
+    }
+
+    #[test]
+    fn the_rules_see_a_call_as_it_would_be_in_the_checkout() {
+        let rooted = Rooted {
+            project: PathBuf::from("/p"),
+            workdir: PathBuf::from("/p/.bhai/worktrees/s-c1"),
+        };
+        let checked = |tool: &str, args: Value| rooted.checked(tool, &rooted.args(tool, args));
+        assert_eq!(
+            checked("bash", serde_json::json!({"command": "ls"})),
+            serde_json::json!({"command": "ls", "workdir": "/p"})
+        );
+        for (given, seen) in [
+            ("/p/secrets/key", "/p/secrets/key"),
+            ("secrets/key", "/p/secrets/key"),
+            ("/p/.bhai/worktrees/s-c1/secrets/key", "/p/secrets/key"),
+            (
+                "/p/.bhai/worktrees/s-c1/src/../secrets/key",
+                "/p/secrets/key",
+            ),
+            ("/p/.bhai/worktrees/s-c1", "/p"),
+            // Out of the worktree, a path is what it is.
+            (
+                "/p/.bhai/worktrees/s-c1/../s-c2/a",
+                "/p/.bhai/worktrees/s-c1/../s-c2/a",
+            ),
+            ("/p/.bhai/MEMORY.md", "/p/.bhai/MEMORY.md"),
+            ("/etc/hosts", "/etc/hosts"),
+        ] {
+            assert_eq!(
+                checked("edit", serde_json::json!({"path": given}))["path"],
+                seen,
+                "{given}"
+            );
+        }
+        let patch = "*** Begin Patch\n*** Update File: /p/.bhai/worktrees/s-c1/a.rs\n*** Move to: b.rs\n@@\n-x\n+y\n*** End Patch";
+        assert_eq!(
+            checked("apply_patch", serde_json::json!({"input": patch}))["input"],
+            "*** Begin Patch\n*** Update File: /p/a.rs\n*** Move to: /p/b.rs\n@@\n-x\n+y\n*** End Patch"
         );
     }
 }

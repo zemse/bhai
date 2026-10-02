@@ -396,7 +396,7 @@ impl Registry {
         registry
     }
 
-    /// Move every call into a child's worktree before it is decided and run.
+    /// Move every call into a child's worktree before it is run.
     pub fn with_workdir(mut self, rooted: crate::worktrees::Rooted) -> Self {
         self.rooted = Some(rooted);
         self
@@ -407,6 +407,15 @@ impl Registry {
         match &self.rooted {
             Some(rooted) => rooted.args(name, args),
             None => args,
+        }
+    }
+
+    /// Rooted `args` as the permission rules must see them: as the same call in the
+    /// checkout when there is a worktree.
+    pub fn checked(&self, name: &str, args: &Value) -> Value {
+        match &self.rooted {
+            Some(rooted) => rooted.checked(name, args),
+            None => args.clone(),
         }
     }
 
