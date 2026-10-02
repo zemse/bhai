@@ -49,6 +49,8 @@ mod commands;
 pub mod compact;
 pub mod config;
 mod debug;
+#[cfg(feature = "dictation")]
+mod dictation;
 mod diff;
 mod egress;
 pub mod entries;

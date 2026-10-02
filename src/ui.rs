@@ -1604,6 +1604,25 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::new().fg(Color::Cyan),
         ));
     }
+    #[cfg(feature = "dictation")]
+    if let Some(dictation) = &app.dictation {
+        use crate::dictation::Status;
+        match dictation.status() {
+            Status::Idle => {}
+            Status::Recording => {
+                block = block.title(Line::styled(
+                    " ● recording · ctrl+space stops · esc drops ",
+                    Style::new().fg(Color::Red),
+                ))
+            }
+            Status::Transcribing => {
+                block = block.title(Line::styled(
+                    " transcribing ",
+                    Style::new().fg(Color::DarkGray),
+                ))
+            }
+        }
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

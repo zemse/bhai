@@ -699,6 +699,8 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
     childenv::set_pass(&config.pass_env);
+    #[cfg(feature = "dictation")]
+    crate::dictation::set(config.dictation.clone());
     // With no network there is nothing for the allowlist to let through.
     let proxy = match &config.egress {
         Some(settings) if config.sandbox.network => Some(egress::start(settings).await?.port()),

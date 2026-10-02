@@ -47,6 +47,10 @@ unicode-width = "0.2.2"
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v4"] }
 
+[features]
+# ctrl+space dictation through local recorder and whisper commands, set in `[dictation]`.
+dictation = []
+
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 # Paused time, for the timers that fire after the cache would have lapsed.

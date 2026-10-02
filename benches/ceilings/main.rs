@@ -34,6 +34,9 @@ mod compact;
 mod config;
 #[path = "../../src/debug.rs"]
 mod debug;
+#[cfg(feature = "dictation")]
+#[path = "../../src/dictation.rs"]
+mod dictation;
 #[path = "../../src/diff.rs"]
 mod diff;
 #[path = "../../src/egress.rs"]

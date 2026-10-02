@@ -326,6 +326,9 @@ pub struct App {
     /// `ctrl+g` asked for the draft in the user's editor; the loop that owns the
     /// terminal opens it.
     pub editing: bool,
+    /// ctrl+space dictation, when `[dictation]` is in the global config.
+    #[cfg(feature = "dictation")]
+    pub dictation: Option<crate::dictation::Dictation>,
     session: Arc<Session>,
 }
 
@@ -419,6 +422,8 @@ impl App {
             esc_armed: None,
             cleared: None,
             editing: false,
+            #[cfg(feature = "dictation")]
+            dictation: crate::dictation::configured(),
             session,
         }
     }
@@ -609,6 +614,13 @@ impl App {
                     self.entries()
                         .push(Entry::Error("that subagent has finished".to_string()));
                 }
+            }
+            // Terminals send ctrl+space as NUL, which reads as ctrl+space or ctrl+@.
+            #[cfg(feature = "dictation")]
+            KeyCode::Char(' ' | '@') if ctrl => self.dictate(),
+            #[cfg(feature = "dictation")]
+            KeyCode::Esc if self.dictation.as_mut().is_some_and(|d| d.cancel()) => {
+                self.note(Entry::Info("dictation dropped".to_string()));
             }
             KeyCode::Esc if self.inside.is_some() => self.leave_child(),
             KeyCode::Esc if self.busy() => self.confirm_interrupt(),
@@ -1243,6 +1255,39 @@ impl App {
         }
     }
 
+    /// ctrl+space: start recording, or stop and transcribe into the prompt.
+    #[cfg(feature = "dictation")]
+    fn dictate(&mut self) {
+        let Some(dictation) = &mut self.dictation else {
+            return self.note(Entry::Info(
+                "dictation is off: add a [dictation] table to ~/.config/bhai/config.toml"
+                    .to_string(),
+            ));
+        };
+        if let Err(e) = dictation.toggle() {
+            self.note(Entry::Error(format!("dictation: {e}")));
+        }
+    }
+
+    /// The transcript, at the cursor, once the transcriber has one.
+    #[cfg(feature = "dictation")]
+    fn heard(&mut self) -> bool {
+        let Some(heard) = self.dictation.as_mut().and_then(|d| d.poll()) else {
+            return false;
+        };
+        match heard {
+            Ok(text) => {
+                // Spoken words run on from typed ones with a space between.
+                let gap = self.input.before().ends_with(|c: char| !c.is_whitespace());
+                self.input
+                    .insert(&format!("{}{text}", if gap { " " } else { "" }));
+                self.refresh_menu();
+            }
+            Err(e) => self.note(Entry::Error(format!("dictation: {e}"))),
+        }
+        true
+    }
+
     /// What the user's editor left of the draft, or why it left nothing.
     pub fn edited(&mut self, result: anyhow::Result<String>) {
         match result {
@@ -1456,6 +1501,10 @@ impl App {
         // The backends answer on a task of their own; this is where the picker hears.
         if let Some(picker) = &mut self.picker {
             changed |= picker.poll();
+        }
+        #[cfg(feature = "dictation")]
+        {
+            changed |= self.heard();
         }
         let designed = self
             .designing
@@ -3815,6 +3864,45 @@ mod tests {
         assert_eq!(app.input.value(), "earlier");
         down(&mut app);
         assert_eq!(app.input.value(), "one\ntwo", "the draft comes back");
+    }
+
+    #[cfg(feature = "dictation")]
+    #[test]
+    fn ctrl_space_dictates_into_the_prompt_at_the_cursor() {
+        use crate::dictation::{Dictation, Settings, Status};
+        let sh = |script: &str| {
+            ["sh", "-c", script, "sh", "{wav}"]
+                .map(String::from)
+                .to_vec()
+        };
+        let ctrl_space = || key(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        let mut app = App::detached();
+        app.on_key(ctrl_space());
+        let said = |app: &App| app.entries().list.last().map(|e| format!("{e:?}"));
+        assert!(said(&app).unwrap().contains("dictation is off"));
+
+        app.dictation = Some(Dictation::new(Settings {
+            record: sh("head -c 100 /dev/zero > \"$1\"; exec sleep 30"),
+            transcribe: sh("echo ' and the parser'"),
+            model: None,
+        }));
+        app.input.set("fix the lexer".to_string());
+        app.on_key(ctrl_space());
+        let status = |app: &App| app.dictation.as_ref().unwrap().status();
+        assert_eq!(status(&app), Status::Recording);
+        // esc drops it, and the next ctrl+space starts afresh.
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(status(&app), Status::Idle);
+        app.on_key(ctrl_space());
+        app.dictation.as_ref().unwrap().wait_for_audio(100);
+        app.on_key(ctrl_space());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while status(&app) != Status::Idle {
+            assert!(Instant::now() < deadline, "no transcript");
+            std::thread::sleep(Duration::from_millis(10));
+            app.tick();
+        }
+        assert_eq!(app.input.value(), "fix the lexer and the parser");
     }
 
     #[test]
