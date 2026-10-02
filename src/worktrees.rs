@@ -81,19 +81,22 @@ impl Place {
         Lock::take(file)
     }
 
-    fn load(&self) -> Result<Vec<Entry>, String> {
+    /// The registry's rows as written, each checked by [`Place::checked`] before use: a
+    /// clone can commit `.bhai`, so nothing in it is taken on trust.
+    fn load(&self) -> Result<Vec<Value>, String> {
+        let unparsed =
+            |e: serde_json::Error| format!("{} does not parse: {e}", self.registry().display());
         match std::fs::read_to_string(self.registry()) {
             Ok(text) if text.trim().is_empty() => Ok(Vec::new()),
-            Ok(text) => serde_json::from_str(&text)
-                .map_err(|e| format!("{} does not parse: {e}", self.registry().display())),
+            Ok(text) => serde_json::from_str(&text).map_err(unparsed),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(format!("could not read {}: {e}", self.registry().display())),
         }
     }
 
     /// Written aside and renamed over, so a crash mid-write leaves the old list whole.
-    fn save(&self, entries: &[Entry]) -> Result<(), String> {
-        let text = serde_json::to_string_pretty(entries).map_err(|e| e.to_string())?;
+    fn save(&self, rows: &[Value]) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(rows).map_err(|e| e.to_string())?;
         let aside = self
             .bhai
             .join(format!(".{REGISTRY}.{}.tmp", std::process::id()));
@@ -102,20 +105,126 @@ impl Place {
             .map_err(|e| format!("could not write {}: {e}", self.registry().display()))
     }
 
+    /// The rows that are entries bhai could have written.
+    #[cfg(test)]
+    fn entries(&self) -> Result<Vec<Entry>, String> {
+        Ok(self
+            .load()?
+            .iter()
+            .filter_map(|row| self.checked(row).ok())
+            .collect())
+    }
+
+    /// `row` as an entry, or why it is not one bhai could have written. Every field that
+    /// reaches git or a child is held to the shape `create` gives it.
+    fn checked(&self, row: &Value) -> Result<Entry, String> {
+        let entry: Entry = serde_json::from_value(row.clone()).map_err(|e| e.to_string())?;
+        let dir = self.bhai.join(DIR);
+        let name = entry
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| entry.path == dir.join(name))
+            .filter(|name| {
+                !name.starts_with(['.', '-'])
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            });
+        if name.is_none() {
+            return Err(format!(
+                "its path {:?} is not one under {}",
+                entry.path,
+                dir.display()
+            ));
+        }
+        // Lexically under it is not enough: a symlink there could lead anywhere.
+        for at in [&dir, &entry.path] {
+            if std::fs::symlink_metadata(at).is_ok() && at.canonicalize().ok().as_ref() != Some(at)
+            {
+                return Err(format!("{} leads out of {}", at.display(), dir.display()));
+            }
+        }
+        let inside = entry.workdir.strip_prefix(&entry.path).is_ok_and(|rest| {
+            rest.components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        });
+        if !inside {
+            return Err(format!(
+                "its workdir {:?} is not in its worktree",
+                entry.workdir
+            ));
+        }
+        if !branch_name(&entry.branch)
+            || git(
+                &self.project,
+                &["check-ref-format", &format!("refs/heads/{}", entry.branch)],
+            )
+            .is_err()
+        {
+            return Err(format!(
+                "its branch {:?} is not one bhai names",
+                entry.branch
+            ));
+        }
+        let hex = entry
+            .base
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+        if !(hex && matches!(entry.base.len(), 40 | 64)) {
+            return Err(format!("its base {:?} is not a full object id", entry.base));
+        }
+        if entry.pid == 0 {
+            return Err("its pid is 0".to_string());
+        }
+        for (field, text) in [("session", &entry.session), ("child", &entry.child)] {
+            if text.is_empty() || text.chars().any(char::is_control) {
+                return Err(format!("its {field} {text:?} is not one bhai names"));
+            }
+        }
+        Ok(entry)
+    }
+
+    /// What `git worktree list` says of each worktree: its path and the branch checked
+    /// out there, `None` when it is detached.
+    fn listing(&self) -> Result<Vec<(PathBuf, Option<String>)>, String> {
+        let out = git(&self.project, &["worktree", "list", "--porcelain", "-z"])?;
+        let mut listed: Vec<(PathBuf, Option<String>)> = Vec::new();
+        for field in out.split('\0') {
+            if let Some(path) = field.strip_prefix("worktree ") {
+                listed.push((PathBuf::from(path), None));
+            } else if let Some(branch) = field.strip_prefix("branch ")
+                && let Some(last) = listed.last_mut()
+            {
+                last.1 = Some(branch.to_string());
+            }
+        }
+        Ok(listed)
+    }
+
     /// A worktree for child `child` of `session`: the one it was kept in when it is
     /// continued, or a new one on a new branch from `HEAD`.
     pub fn lease(&self, session: &str, child: &str) -> Result<Lease, String> {
         {
             let _lock = self.lock()?;
-            let mut entries = self.load()?;
-            if let Some(entry) = entries
-                .iter_mut()
-                .find(|e| e.session == session && e.child == child && e.kept && e.path.is_dir())
-            {
-                (entry.kept, entry.pid) = (false, std::process::id());
-                let entry = entry.clone();
-                self.save(&entries)?;
-                return Ok(Lease::new(self.clone(), entry));
+            let mut rows = self.load()?;
+            let listing = self.listing().unwrap_or_default();
+            for row in &mut rows {
+                let Ok(mut entry) = self.checked(row) else {
+                    continue;
+                };
+                let ours = ours(&listing, &entry);
+                if entry.session == session
+                    && entry.child == child
+                    && entry.kept
+                    && ours
+                    && entry.path.is_dir()
+                {
+                    (entry.kept, entry.pid) = (false, std::process::id());
+                    *row = serde_json::to_value(&entry).map_err(|e| e.to_string())?;
+                    self.save(&rows)?;
+                    return Ok(Lease::new(self.clone(), entry));
+                }
             }
         }
         self.create(session, child)
@@ -154,22 +263,34 @@ impl Place {
         if !ignore.exists() {
             let _ = std::fs::write(&ignore, "*\n");
         }
+        let row = serde_json::to_value(&entry).map_err(|e| e.to_string())?;
+        // Held to what a sweep would hold it to, so it is never written to be skipped.
+        self.checked(&row)
+            .map_err(|e| format!("could not add a worktree: {e}"))?;
         {
             let _lock = self.lock()?;
-            let mut entries = self.load()?;
-            entries.push(entry.clone());
-            self.save(&entries)?;
+            let mut rows = self.load()?;
+            rows.push(row.clone());
+            self.save(&rows)?;
         }
         let path = entry.path.to_string_lossy();
         let added = git(
             &self.project,
-            &["worktree", "add", "-b", &entry.branch, &path, &entry.base],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &entry.branch,
+                "--end-of-options",
+                &path,
+                &entry.base,
+            ],
         );
         if let Err(e) = added {
             let _lock = self.lock()?;
-            let mut entries = self.load()?;
-            entries.retain(|e| e.path != entry.path);
-            self.save(&entries)?;
+            let mut rows = self.load()?;
+            rows.retain(|r| *r != row);
+            self.save(&rows)?;
             return Err(format!("could not add a worktree: {e}"));
         }
         Ok(entry)
@@ -180,50 +301,79 @@ impl Place {
         let Ok(_lock) = self.lock() else {
             return Outcome::Kept("the registry could not be locked".to_string());
         };
-        let mut entries = match self.load() {
-            Ok(entries) => entries,
+        let mut rows = match self.load() {
+            Ok(rows) => rows,
             Err(e) => return Outcome::Kept(e),
         };
-        let Some(at) = entries.iter().position(|e| e.path == path) else {
+        let at = rows
+            .iter()
+            .position(|row| row.get("path").and_then(Value::as_str) == path.to_str());
+        let Some(at) = at else {
             return Outcome::Gone;
         };
-        let outcome = self.settle(&entries[at]);
+        let entry = match self.checked(&rows[at]) {
+            Ok(entry) => entry,
+            Err(e) => return Outcome::Kept(format!("its registry entry was changed: {e}")),
+        };
+        let listing = match self.listing() {
+            Ok(listing) => listing,
+            Err(e) => return Outcome::Kept(format!("git could not list its worktrees: {e}")),
+        };
+        let outcome = self.settle(&entry, &listing);
         match outcome {
             Outcome::Removed => {
-                entries.remove(at);
+                rows.remove(at);
             }
-            _ => entries[at].kept = true,
+            _ => rows[at]["kept"] = Value::Bool(true),
         }
-        let _ = self.save(&entries);
+        let _ = self.save(&rows);
         outcome
     }
 
-    /// Settle every entry `pick` chooses, in one hold of the lock.
-    fn sweep(&self, pick: impl Fn(&Entry) -> bool) -> Result<Vec<(Entry, Outcome)>, String> {
+    /// Settle every entry `pick` chooses, in one hold of the lock. A row that is not an
+    /// entry bhai could have written is left as it is and said.
+    fn sweep(&self, pick: impl Fn(&Entry) -> bool) -> Result<Swept, String> {
         let _lock = self.lock()?;
-        let entries = self.load()?;
+        let rows = self.load()?;
+        // Taken once, before any prune, so a worktree pruned for one entry still shows
+        // whose it was for the next.
+        let listing = self.listing()?;
         let mut left = Vec::new();
-        let mut settled = Vec::new();
-        for mut entry in entries {
+        let mut swept = Swept::default();
+        for (at, row) in rows.into_iter().enumerate() {
+            let mut entry = match self.checked(&row) {
+                Ok(entry) => entry,
+                Err(why) => {
+                    swept.skipped.push(skipped(at, &why));
+                    left.push(row);
+                    continue;
+                }
+            };
             if !pick(&entry) {
-                left.push(entry);
+                left.push(row);
                 continue;
             }
-            let outcome = self.settle(&entry);
+            let outcome = self.settle(&entry, &listing);
             if outcome != Outcome::Removed {
                 entry.kept = true;
-                left.push(entry.clone());
+                left.push(serde_json::to_value(&entry).map_err(|e| e.to_string())?);
             }
-            settled.push((entry, outcome));
+            swept.settled.push((entry, outcome));
         }
         self.save(&left)?;
-        Ok(settled)
+        Ok(swept)
     }
 
     /// Remove `entry`'s worktree and branch if nothing would be lost, without touching
-    /// the registry. Any doubt keeps it.
-    fn settle(&self, entry: &Entry) -> Outcome {
+    /// the registry. Any doubt keeps it, and neither is touched unless `listing` has
+    /// that branch checked out at that path.
+    fn settle(&self, entry: &Entry, listing: &[(PathBuf, Option<String>)]) -> Outcome {
+        let listed = listing.iter().find(|(path, _)| *path == entry.path);
+        let ours = ours(listing, entry);
         let exists = entry.path.is_dir();
+        if exists && listed.is_none() {
+            return Outcome::Kept("git does not list it as a worktree".to_string());
+        }
         let ahead = match self.ahead(entry, exists) {
             Ok(ahead) => ahead,
             Err(e) => return Outcome::Kept(format!("its commits could not be read: {e}")),
@@ -231,13 +381,23 @@ impl Place {
         if !exists {
             // Deleted by hand: git still lists it until it is pruned.
             let _ = git(&self.project, &["worktree", "prune"]);
+            let branch = self.branch_exists(entry);
             if ahead > 0 {
                 return Outcome::Kept(format!(
                     "its directory is gone, but the branch has {}",
                     count(ahead, "commit")
                 ));
             }
-            let _ = self.drop_branch(entry);
+            if branch && !ours {
+                return Outcome::Kept(format!(
+                    "its directory is gone and git did not have branch {} checked out there, so \
+the branch is left as it is",
+                    entry.branch
+                ));
+            }
+            if branch {
+                let _ = self.drop_branch(entry);
+            }
             return Outcome::Removed;
         }
         let changes = match git(&entry.path, &["status", "--porcelain"]) {
@@ -254,26 +414,42 @@ impl Place {
             }
             return Outcome::Kept(why.join(" and "));
         }
+        if !ours {
+            return Outcome::Kept(format!("it is not on branch {}", entry.branch));
+        }
         let path = entry.path.to_string_lossy();
-        if let Err(e) = git(&self.project, &["worktree", "remove", &path]) {
+        let removed = git(
+            &self.project,
+            &["worktree", "remove", "--end-of-options", &path],
+        );
+        if let Err(e) = removed {
             return Outcome::Kept(format!("git worktree remove failed: {e}"));
         }
         let _ = self.drop_branch(entry);
         Outcome::Removed
     }
 
+    fn branch_exists(&self, entry: &Entry) -> bool {
+        let branch = format!("refs/heads/{}", entry.branch);
+        git(
+            &self.project,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &branch,
+            ],
+        )
+        .is_ok()
+    }
+
     /// Commits on the branch, or at the worktree's `HEAD` should the child have moved
     /// it, that neither the base nor the checkout's `HEAD` has.
     fn ahead(&self, entry: &Entry, exists: bool) -> Result<usize, String> {
         let mut tips = Vec::new();
-        let branch = format!("refs/heads/{}", entry.branch);
-        if git(
-            &self.project,
-            &["rev-parse", "--verify", "--quiet", &branch],
-        )
-        .is_ok()
-        {
-            tips.push(branch);
+        if self.branch_exists(entry) {
+            tips.push(format!("refs/heads/{}", entry.branch));
         }
         if exists && let Ok(head) = git(&entry.path, &["rev-parse", "--verify", "HEAD"]) {
             tips.push(head);
@@ -282,9 +458,9 @@ impl Place {
             return Ok(0);
         }
         let head = git(&self.project, &["rev-parse", "--verify", "HEAD"])?;
-        let mut args = vec!["rev-list", "--count"];
-        args.extend(tips.iter().map(String::as_str));
-        args.extend(["--not", &entry.base, &head]);
+        let not = [format!("^{}", entry.base), format!("^{head}")];
+        let mut args = vec!["rev-list", "--count", "--end-of-options"];
+        args.extend(tips.iter().chain(&not).map(String::as_str));
         git(&self.project, &args)?
             .parse()
             .map_err(|e| format!("{e}"))
@@ -292,7 +468,10 @@ impl Place {
 
     /// Only called once `ahead` is 0, so every commit on it is reachable elsewhere.
     fn drop_branch(&self, entry: &Entry) -> Result<String, String> {
-        git(&self.project, &["branch", "-D", &entry.branch])
+        git(
+            &self.project,
+            &["branch", "-D", "--end-of-options", &entry.branch],
+        )
     }
 
     /// At startup: settle what sessions that have ended left behind, then prune what
@@ -305,16 +484,17 @@ impl Place {
         let own = std::process::id();
         // This process has only just started, so an entry under its pid is a dead
         // process's that had the same one.
-        let settled = match self.sweep(|e| e.pid == own || !alive(e.pid)) {
-            Ok(settled) => settled,
+        let swept = match self.sweep(|e| e.pid == own || !alive(e.pid)) {
+            Ok(swept) => swept,
             Err(e) => return vec![format!("worktrees: {e}")],
         };
         let _ = git(&self.project, &["worktree", "prune"]);
-        let removed = settled
+        let removed = swept
+            .settled
             .iter()
             .filter(|(_, o)| *o == Outcome::Removed)
             .count();
-        let kept = settled.len() - removed;
+        let kept = swept.settled.len() - removed;
         let mut lines = Vec::new();
         if removed > 0 {
             lines.push(format!(
@@ -328,6 +508,12 @@ impl Place {
                 count(kept, "worktree")
             ));
         }
+        lines.extend(
+            swept
+                .skipped
+                .iter()
+                .map(|line| format!("worktrees: {line}")),
+        );
         lines
     }
 
@@ -339,7 +525,8 @@ impl Place {
         }
         let own = std::process::id();
         match self.sweep(|e| e.pid == own) {
-            Ok(settled) => settled
+            Ok(swept) => swept
+                .settled
                 .iter()
                 .filter_map(|(entry, outcome)| match outcome {
                     Outcome::Kept(why) => Some(kept(entry, why)),
@@ -352,15 +539,22 @@ impl Place {
 
     /// `/worktrees`: every worktree the registry lists, and how it stands.
     pub fn list(&self) -> String {
-        let entries = match self.load() {
-            Ok(entries) => entries,
+        let rows = match self.load() {
+            Ok(rows) => rows,
             Err(e) => return format!("worktrees: {e}"),
         };
-        if entries.is_empty() {
+        if rows.is_empty() {
             return "no worktrees: a child gets one when the `agent` call asks for it".to_string();
         }
-        let mut out = vec![format!("{}:", count(entries.len(), "worktree"))];
-        for entry in &entries {
+        let mut out = vec![format!("{}:", count(rows.len(), "worktree"))];
+        for (at, row) in rows.iter().enumerate() {
+            let entry = match self.checked(row) {
+                Ok(entry) => entry,
+                Err(why) => {
+                    out.push(format!("  {}", skipped(at, &why)));
+                    continue;
+                }
+            };
             let state = match (entry.kept, alive(entry.pid)) {
                 (false, true) => "its child is running",
                 (true, _) => "kept",
@@ -380,21 +574,64 @@ impl Place {
     /// `/worktrees clean`: remove every one no child is working in that has nothing to
     /// lose.
     pub fn clean(&self) -> String {
-        let settled = match self.sweep(|e| e.kept || !alive(e.pid)) {
-            Ok(settled) => settled,
+        let swept = match self.sweep(|e| e.kept || !alive(e.pid)) {
+            Ok(swept) => swept,
             Err(e) => return format!("worktrees: {e}"),
         };
-        let removed = settled
+        let removed = swept
+            .settled
             .iter()
             .filter(|(_, o)| *o == Outcome::Removed)
             .count();
         let mut out = vec![format!("removed {}", count(removed, "worktree"))];
-        out.extend(settled.iter().filter_map(|(entry, outcome)| match outcome {
-            Outcome::Kept(why) => Some(kept(entry, why)),
-            _ => None,
-        }));
+        out.extend(
+            swept
+                .settled
+                .iter()
+                .filter_map(|(entry, outcome)| match outcome {
+                    Outcome::Kept(why) => Some(kept(entry, why)),
+                    _ => None,
+                }),
+        );
+        out.extend(swept.skipped);
         out.join("\n")
     }
+}
+
+/// What a sweep did: the entries it settled, and a line for each row it left alone.
+#[derive(Default)]
+struct Swept {
+    settled: Vec<(Entry, Outcome)>,
+    skipped: Vec<String>,
+}
+
+/// The line for row `at` of the registry, left alone for `why`.
+fn skipped(at: usize, why: &str) -> String {
+    format!("entry {} of .bhai/{REGISTRY} was left alone: {why}", at + 1)
+}
+
+/// Whether git has `entry`'s branch checked out at its path.
+fn ours(listing: &[(PathBuf, Option<String>)], entry: &Entry) -> bool {
+    let branch = format!("refs/heads/{}", entry.branch);
+    listing
+        .iter()
+        .any(|(path, on)| *path == entry.path && on.as_deref() == Some(branch.as_str()))
+}
+
+/// A branch of the shape `create` names: `bhai/` and a name of plain characters, which
+/// no git command can take for an option or a revision expression.
+fn branch_name(branch: &str) -> bool {
+    let Some(name) = branch.strip_prefix("bhai/") else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.starts_with(['.', '-'])
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !name.ends_with(".lock")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// The session's place, until [`settle`] has settled it.
@@ -739,7 +976,7 @@ mod tests {
         let lease = place.lease("session-1", "a1b2c3").unwrap();
         let entry = lease.entry().clone();
         // Listed before its child has done anything, and private.
-        let listed = place.load().unwrap();
+        let listed = place.entries().unwrap();
         assert_eq!(listed, vec![entry.clone()]);
         #[cfg(unix)]
         {
@@ -764,7 +1001,7 @@ mod tests {
         assert!(!entry.path.exists());
         assert!(!branches(&dir).contains("bhai/"));
         assert_eq!(worktrees(&dir), 1);
-        assert!(place.load().unwrap().is_empty());
+        assert!(place.entries().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -789,7 +1026,7 @@ mod tests {
             "{line}"
         );
         assert!(line.contains(&entry.path.display().to_string()), "{line}");
-        let listed = place.load().unwrap();
+        let listed = place.entries().unwrap();
         assert!(listed[0].kept, "{listed:?}");
 
         // `/worktrees clean` leaves it while it still has changes.
@@ -826,16 +1063,16 @@ mod tests {
             std::fs::write(lease.entry().path.join("b.txt"), "b\n").unwrap();
             // Dropped without `finish`, as an aborted task drops it.
         }
-        let listed = place.load().unwrap();
+        let listed = place.entries().unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].kept);
         let again = place.lease("s", "c1").unwrap();
         assert_eq!(again.entry().path, listed[0].path);
         assert!(again.entry().path.join("b.txt").is_file());
-        assert!(!place.load().unwrap()[0].kept, "in use again");
+        assert!(!place.entries().unwrap()[0].kept, "in use again");
         std::fs::remove_file(again.entry().path.join("b.txt")).unwrap();
         drop(again);
-        assert!(place.load().unwrap().is_empty());
+        assert!(place.entries().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -864,15 +1101,15 @@ mod tests {
         std::fs::write(theirs.entry().path.join("t.txt"), "t\n").unwrap();
         let (mine_path, theirs_entry) = (mine.entry().path.clone(), theirs.entry().clone());
         // The process that owns `t` is another, still running: this test's parent.
-        let mut entries = place.load().unwrap();
-        entries[1].pid = std::os::unix::process::parent_id();
-        place.save(&entries).unwrap();
+        let mut rows = place.load().unwrap();
+        rows[1]["pid"] = std::os::unix::process::parent_id().into();
+        place.save(&rows).unwrap();
         std::mem::forget((mine, theirs));
 
         assert!(place.quit().is_empty());
         assert!(!mine_path.exists());
         assert!(theirs_entry.path.is_dir());
-        let left = place.load().unwrap();
+        let left = place.entries().unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].session, "t");
         assert!(!left[0].kept, "its child is still running in that process");
@@ -911,7 +1148,7 @@ mod tests {
             .unwrap();
         assert!(!status.success());
         let place = Place::new(&dir);
-        let entries = place.load().unwrap();
+        let entries = place.entries().unwrap();
         assert_eq!(entries.len(), 3, "{entries:?}");
         assert!(entries.iter().all(|e| !e.kept && !alive(e.pid)));
         let (clean_entry, dirty_entry, gone_entry) =
@@ -935,7 +1172,7 @@ mod tests {
         assert!(!branches.contains(&clean_entry.branch), "{branches}");
         assert!(!branches.contains(&gone_entry.branch), "{branches}");
         assert!(branches.contains(&dirty_entry.branch), "{branches}");
-        let left = place.load().unwrap();
+        let left = place.entries().unwrap();
         assert_eq!(left.len(), 1);
         assert!(left[0].kept);
         let listed = place.list();
@@ -995,7 +1232,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let place = Place::new(&dir);
-        let entries = place.load().unwrap();
+        let entries = place.entries().unwrap();
         assert_eq!(entries.len(), 2, "{entries:?}");
         #[allow(unsafe_code)]
         // SAFETY: only sends a signal, to the child started above.
@@ -1011,7 +1248,7 @@ mod tests {
             kept: true,
             ..entries[1].clone()
         };
-        assert_eq!(place.load().unwrap(), vec![kept_entry]);
+        assert_eq!(place.entries().unwrap(), vec![kept_entry]);
         assert!(entries[1].path.join("a.txt").is_file());
         let stderr = String::from_utf8_lossy(&out.stderr);
         let line = format!("bhai: {}", kept(&entries[1], "1 uncommitted change"));
@@ -1033,7 +1270,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            place.load().unwrap().is_empty(),
+            place.entries().unwrap().is_empty(),
             "the entry it wrote first is gone"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1054,7 +1291,7 @@ mod tests {
         run(&dir, &["branch", "bhai/s-c2"]);
         let err = place.lease("s", "c2").err().unwrap();
         assert!(err.starts_with("could not add a worktree"), "{err}");
-        assert_eq!(place.load().unwrap(), vec![entry.clone()]);
+        assert_eq!(place.entries().unwrap(), vec![entry.clone()]);
         assert!(entry.workdir.join("s.txt").is_file());
         assert_eq!(lease.finish(), Outcome::Removed);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1157,5 +1394,138 @@ mod tests {
             checked("apply_patch", serde_json::json!({"input": patch}))["input"],
             "*** Begin Patch\n*** Update File: /p/a.rs\n*** Move to: /p/b.rs\n@@\n-x\n+y\n*** End Patch"
         );
+    }
+
+    /// The registry sits in the project, which a clone can commit: every field of a row
+    /// that is not one bhai could have written is kept from git, and a row that is, but
+    /// names a branch and worktree git does not have together, touches neither.
+    #[test]
+    fn a_hostile_registry_reaches_no_git_command() {
+        let dir = repo();
+        let place = Place::new(&dir);
+        let base = run(&dir, &["rev-parse", "HEAD"]);
+        let outside = crate::tools::temp_dir().canonicalize().unwrap();
+        let victim = outside.join("victim");
+        std::fs::write(&victim, "keep\n").unwrap();
+        let output = format!("--output={}", victim.display());
+        let worktrees_dir = place.bhai.join(DIR);
+        std::fs::create_dir_all(&worktrees_dir).unwrap();
+        // The user's own branches and worktrees, all merged and clean.
+        run(&dir, &["branch", "feature"]);
+        run(&dir, &["branch", "bhai/mine"]);
+        let foreign = outside.join("foreign");
+        let foreign_arg = foreign.display().to_string();
+        run(&dir, &["worktree", "add", "-q", &foreign_arg, "feature"]);
+        let user = worktrees_dir.join("user");
+        let user_arg = user.display().to_string();
+        run(
+            &dir,
+            &["worktree", "add", "-q", "-b", "bhai/user", &user_arg],
+        );
+        std::os::unix::fs::symlink(&foreign, worktrees_dir.join("link")).unwrap();
+
+        let row = |path: &Path, branch: &str, base: &str| {
+            serde_json::json!({
+                "path": path, "workdir": path, "branch": branch, "base": base,
+                "session": "old", "child": "c0", "pid": 999_999_999u32, "kept": true,
+            })
+        };
+        let ghost = worktrees_dir.join("ghost");
+        let with = |mut row: Value, field: &str, value: Value| {
+            row[field] = value;
+            row
+        };
+        let valid = row(&ghost, "bhai/ghost", &base);
+        let up = ghost.join("..").display().to_string();
+        let hostile: Vec<(Value, &str)> = vec![
+            (row(&ghost, "bhai/ghost", &output), "its base"),
+            (row(&ghost, "bhai/ghost", "HEAD"), "its base"),
+            (row(&ghost, "bhai/ghost", &base[..12]), "its base"),
+            (row(&ghost, &output, &base), "its branch"),
+            (row(&ghost, "feature", &base), "its branch"),
+            (row(&ghost, "bhai/../feature", &base), "its branch"),
+            (row(&ghost, "bhai/x@{-1}", &base), "its branch"),
+            (row(&dir, "bhai/ghost", &base), "its path"),
+            (row(&foreign, "bhai/ghost", &base), "its path"),
+            (
+                row(&worktrees_dir.join("../.."), "bhai/ghost", &base),
+                "its path",
+            ),
+            (row(Path::new(&output), "bhai/ghost", &base), "its path"),
+            (
+                row(&worktrees_dir.join("-x"), "bhai/ghost", &base),
+                "its path",
+            ),
+            (
+                row(&worktrees_dir.join("link"), "bhai/ghost", &base),
+                "leads out",
+            ),
+            (with(valid.clone(), "workdir", "/etc".into()), "its workdir"),
+            (with(valid.clone(), "workdir", up.into()), "its workdir"),
+            (with(valid.clone(), "pid", "1".into()), "u32"),
+            (with(valid.clone(), "pid", (-1).into()), "u32"),
+            (with(valid.clone(), "pid", 0.into()), "its pid is 0"),
+            (with(valid, "child", "c\u{1b}[2J".into()), "its child"),
+            ("--output".into(), "invalid type"),
+        ];
+        // Well formed, but git does not have that branch checked out there.
+        let mut rows: Vec<Value> = hostile.iter().map(|(row, _)| row.clone()).collect();
+        rows.push(row(&user, "bhai/mine", &base));
+        rows.push(row(&ghost, "bhai/mine", &base));
+        place.save(&rows).unwrap();
+
+        let snapshot = |dir: &Path| {
+            (
+                branches(dir),
+                run(dir, &["worktree", "list", "--porcelain"]),
+                std::fs::read_to_string(&victim).unwrap(),
+            )
+        };
+        let before = snapshot(&dir);
+        let lines = place.startup();
+        let cleaned = place.clean();
+        let listed = place.list();
+        // A continued child is not handed a hostile row's workdir.
+        let lease = place.lease("old", "c0").unwrap();
+        assert_eq!(lease.entry().path, worktrees_dir.join("old-c0"));
+        assert_eq!(lease.finish(), Outcome::Removed);
+        assert_eq!(snapshot(&dir), before);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        assert!(foreign.join("a.txt").is_file() && user.join("a.txt").is_file());
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .chain(std::fs::read_dir(&outside).unwrap())
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('-'))
+            .collect();
+        assert!(strays.is_empty(), "{strays:?}");
+
+        for (at, (_, why)) in hostile.iter().enumerate() {
+            let line = lines
+                .iter()
+                .find(|line| line.starts_with(&format!("worktrees: entry {} of", at + 1)))
+                .unwrap_or_else(|| panic!("entry {}: {lines:?}", at + 1));
+            assert!(line.contains(why), "{line}");
+            assert!(!line.contains('\u{1b}'), "{line}");
+            let line = &line["worktrees: ".len()..];
+            assert!(cleaned.contains(line), "{cleaned}");
+            assert!(listed.contains(line), "{listed}");
+        }
+        let kept = "2 worktrees of ended sessions kept with changes: /worktrees lists them";
+        assert!(lines.contains(&kept.to_string()), "{lines:?}");
+        assert!(
+            cleaned.contains("it is not on branch bhai/mine"),
+            "{cleaned}"
+        );
+        assert!(
+            cleaned.contains("so the branch is left as it is"),
+            "{cleaned}"
+        );
+        // Nor is any row dropped: they are the user's to look at.
+        let left = place.load().unwrap();
+        assert_eq!(left.len(), rows.len());
+        assert_eq!(left[..hostile.len()], rows[..hostile.len()]);
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

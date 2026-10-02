@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- A child that asks for `worktree: true` runs in its own git worktree under .bhai/worktrees on a bhai/<session>-<child> branch. The worktree is recorded in .bhai/worktrees.json before it exists and is settled however the child or session ends (done, error, interrupt, quit, signal, or the next startup after a crash): a clean one is removed with its branch, and one with changes is kept and named with how to merge it. A registry row reaches git only if bhai could have written it and git has that branch checked out at that path; any other row is left alone and reported.
 - A web link in the transcript underlines in every row it wraps over while the pointer is on it, with its target in the status line, and a click that is not a drag or a double click opens it in the default browser; a file: link or any other scheme is never opened.
 - `--profile` also writes each turn, model call, tool call and subagent as a span to `.bhai/debug/trace.jsonl`, with its parent, root and duration. No span carries a prompt, arguments or output. A build with the `otel` feature also exports the spans over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 - An image on its way to the model, from a tool or pasted into the prompt, is decoded under a 128 MiB cap, scaled to fit 2048 px and 2048x768 pixels with a line saying so, and cached by content hash so a repeat keeps the prefix. One the backend refuses is swapped for a placeholder line in the history and the call goes again.
