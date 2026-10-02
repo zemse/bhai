@@ -132,7 +132,9 @@ impl Tool for Fetch {
 /// The host a `fetch` call names, lowercase, as `Fetch(domain:...)` rules match it.
 pub fn host(args: &Value) -> Option<String> {
     let (_, url) = request(args).ok()?;
-    url.host_str().map(str::to_ascii_lowercase)
+    let host = url.host_str()?.to_ascii_lowercase();
+    // `evil.com.` is `evil.com` to DNS, so a rule naming one must stop the other.
+    Some(host.strip_suffix('.').map(str::to_string).unwrap_or(host))
 }
 
 /// The method and the URL, checked to be http(s) with a host.
@@ -867,6 +869,10 @@ mod tests {
         assert_eq!(
             host(&json!({"url": "https://Docs.Example.com/x"})).as_deref(),
             Some("docs.example.com")
+        );
+        assert_eq!(
+            host(&json!({"url": "https://Evil.com./x"})).as_deref(),
+            Some("evil.com")
         );
     }
 

@@ -69,10 +69,10 @@ impl Rule {
                 Pattern::Path(content.to_string())
             }
             Some(content) if tool == "fetch" => match content.strip_prefix("domain:") {
-                Some(host) if !host.trim().is_empty() => {
-                    Pattern::Domain(host.trim().to_ascii_lowercase())
-                }
-                _ => return Err(bad("expected `domain:<host>`")),
+                Some(host) => Pattern::Domain(
+                    domain(host.trim()).ok_or_else(|| bad("expected `domain:<host>`"))?,
+                ),
+                None => return Err(bad("expected `domain:<host>`")),
             },
             Some(_) => return Err(bad("this tool takes no pattern")),
         };
@@ -234,6 +234,21 @@ impl Rule {
             _ => false,
         }
     }
+}
+
+/// A `Fetch` rule's host as `fetch::host` gives a URL's: punycode, lowercase, no trailing
+/// dot, so `bücher.de` matches `xn--bcher-kva.de`. A leading `*.` is kept.
+fn domain(host: &str) -> Option<String> {
+    let (wild, name) = match host.strip_prefix("*.") {
+        Some(name) => ("*.", name),
+        None => ("", host),
+    };
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.is_empty() {
+        return None;
+    }
+    let name = url::Host::parse(name).ok()?.to_string();
+    Some(format!("{wild}{name}"))
 }
 
 /// A plain tool name, or an MCP name like `mcp__chrome-devtools__*` whose only `*` ends it.
@@ -635,7 +650,19 @@ mod tests {
                 .unwrap()
                 .matches_domain("docs.rs")
         );
-        for bad in ["Fetch(docs.rs)", "Fetch(domain:)", "Fetch(url:https://x)"] {
+        let idn = Rule::parse("Fetch(domain:Bücher.de.)").unwrap();
+        assert!(idn.matches_domain("xn--bcher-kva.de"));
+        let idn_under = Rule::parse("Fetch(domain:*.bücher.de)").unwrap();
+        assert!(idn_under.matches_domain("a.xn--bcher-kva.de"));
+        for bad in [
+            "Fetch(docs.rs)",
+            "Fetch(domain:)",
+            "Fetch(domain:.)",
+            "Fetch(domain:*.)",
+            "Fetch(domain:docs.rs/x)",
+            "Fetch(domain:docs.rs:443)",
+            "Fetch(url:https://x)",
+        ] {
             assert!(Rule::parse(bad).is_err(), "{bad}");
         }
     }

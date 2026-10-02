@@ -271,6 +271,7 @@ dependencies = [
  "toml",
  "tui-input",
  "unicode-width",
+ "url",
  "uuid",
 ]
 

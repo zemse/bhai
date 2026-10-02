@@ -1966,6 +1966,33 @@ mod tests {
     }
 
     #[test]
+    fn a_fetch_deny_rule_covers_the_trailing_dot_and_unicode_spellings() {
+        let call = |url: &str| json!({ "url": url });
+        let bypass = policy(
+            Mode::Bypass,
+            &[],
+            &[
+                "Fetch(domain:evil.com)",
+                "Fetch(domain:*.evil.com)",
+                "Fetch(domain:bücher.de)",
+            ],
+            &[],
+        );
+        for (url, rule) in [
+            ("https://evil.com./x", "Fetch(domain:evil.com)"),
+            ("https://a.evil.com./", "Fetch(domain:*.evil.com)"),
+            ("https://bücher.de/", "Fetch(domain:bücher.de)"),
+            ("https://xn--bcher-kva.de./", "Fetch(domain:bücher.de)"),
+        ] {
+            assert_eq!(
+                bypass.check("fetch", &call(url), true),
+                Decision::Deny(format!("deny rule {rule}")),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
     fn a_fetch_is_decided_by_its_domain_and_a_private_one_never_judged() {
         let call = |url: &str| json!({ "url": url });
         let docs = call("https://Docs.rs/serde");
