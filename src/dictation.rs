@@ -5,7 +5,7 @@
 //! `whisper-cli`, so speech never leaves the machine and nothing is downloaded.
 
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -49,20 +49,52 @@ pub fn configured() -> Option<Dictation> {
     SETTINGS.get().cloned().map(Dictation::new)
 }
 
-/// Every recorder not yet reaped, by process group, with its WAV and log: the group is
-/// its own, so a signal that kills bhai never reaches it.
-static RECORDERS: Mutex<BTreeMap<u32, (PathBuf, PathBuf)>> = Mutex::new(BTreeMap::new());
+/// In a recording's directory, which only the user can enter.
+const WAV: &str = "speech.wav";
+const LOG: &str = "recorder.log";
 
-fn recorders() -> std::sync::MutexGuard<'static, BTreeMap<u32, (PathBuf, PathBuf)>> {
-    RECORDERS.lock().unwrap_or_else(|e| e.into_inner())
+/// Every recording's directory until it is deleted, with the process group working on it
+/// (the recorder, then the transcriber) while one runs unreaped. The group is its own, so
+/// a signal that kills bhai never reaches it.
+static RECORDINGS: Mutex<BTreeMap<PathBuf, Option<u32>>> = Mutex::new(BTreeMap::new());
+
+fn recordings() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, Option<u32>>> {
+    RECORDINGS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Kill every recorder and delete what it caught, when bhai dies of a signal or a panic.
+/// Kill whatever works on every recording and delete it, when bhai dies of a signal or a
+/// panic.
 pub fn kill_all() {
-    for (group, (wav, log)) in std::mem::take(&mut *recorders()) {
+    for (dir, group) in std::mem::take(&mut *recordings()) {
+        if let Some(group) = group {
+            interrupt(group, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Kill whatever works on `dir` and delete it.
+fn discard(dir: &Path) {
+    if let Some(Some(group)) = recordings().remove(dir) {
         interrupt(group, libc::SIGKILL);
-        let _ = std::fs::remove_file(wav);
-        let _ = std::fs::remove_file(log);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Delete `dir` once nothing works on it.
+fn release(dir: &Path) {
+    recordings().remove(dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Name the group now working on `dir`; false when it was discarded meanwhile.
+fn claim(dir: &Path, group: Option<u32>) -> bool {
+    match recordings().get_mut(dir) {
+        Some(slot) => {
+            *slot = group;
+            true
+        }
+        None => false,
     }
 }
 
@@ -71,12 +103,8 @@ type Heard = Arc<Mutex<Option<Result<String, String>>>>;
 
 enum State {
     Idle,
-    Recording {
-        child: Child,
-        wav: PathBuf,
-        log: PathBuf,
-    },
-    Transcribing(Heard),
+    Recording { child: Child, dir: PathBuf },
+    Transcribing { heard: Heard, dir: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +131,7 @@ impl Dictation {
         match self.state {
             State::Idle => Status::Idle,
             State::Recording { .. } => Status::Recording,
-            State::Transcribing(_) => Status::Transcribing,
+            State::Transcribing { .. } => Status::Transcribing,
         }
     }
 
@@ -116,30 +144,50 @@ impl Dictation {
                 self.stop(true);
                 Ok(())
             }
-            State::Transcribing(_) => Ok(()),
+            State::Transcribing { .. } => Ok(()),
         }
     }
 
     fn start(&mut self) -> Result<(), String> {
-        let base = std::env::temp_dir().join(format!("bhai-dictation-{}", uuid::Uuid::new_v4()));
-        let wav = base.with_extension("wav");
-        let log = base.with_extension("log");
+        let dir = std::env::temp_dir().join(format!("bhai-dictation-{}", uuid::Uuid::new_v4()));
+        let wav = dir.join(WAV);
         let model = self.settings.model.as_deref();
         // The transcriber's placeholders are checked now, not after the user has spoken.
         fill(&self.settings.transcribe, &wav, model)?;
         let argv = fill(&self.settings.record, &wav, model)?;
-        let stderr = File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
-        let child = command(&argv)
-            .stdout(Stdio::null())
-            .stderr(stderr)
-            .process_group(0)
-            .spawn()
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&log);
-                format!("could not start {}: {e}", argv[0])
-            })?;
-        recorders().insert(child.id(), (wav.clone(), log.clone()));
-        self.state = State::Recording { child, wav, log };
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        recordings().insert(dir.clone(), None);
+        let spawned = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(dir.join(LOG))
+            .map_err(|e| format!("{}: {e}", dir.join(LOG).display()))
+            .and_then(|stderr| {
+                command(&argv)
+                    .stdout(Stdio::null())
+                    .stderr(stderr)
+                    .process_group(0)
+                    .spawn()
+                    .map_err(|e| format!("could not start {}: {e}", argv[0]))
+            });
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                release(&dir);
+                return Err(e);
+            }
+        };
+        if !claim(&dir, Some(child.id())) {
+            // A signal took the directory while the recorder started.
+            interrupt(child.id(), libc::SIGKILL);
+            let _ = child.wait();
+            return Err("dictation was stopped".to_string());
+        }
+        self.state = State::Recording { child, dir };
         Ok(())
     }
 
@@ -149,11 +197,7 @@ impl Dictation {
         if !matches!(self.state, State::Recording { .. }) {
             return;
         }
-        let State::Recording {
-            mut child,
-            wav,
-            log,
-        } = std::mem::replace(&mut self.state, State::Idle)
+        let State::Recording { mut child, dir } = std::mem::replace(&mut self.state, State::Idle)
         else {
             unreachable!()
         };
@@ -165,18 +209,18 @@ impl Dictation {
         }
         if !keep {
             let _ = child.wait();
-            recorders().remove(&child.id());
-            let _ = std::fs::remove_file(&wav);
-            let _ = std::fs::remove_file(&log);
+            release(&dir);
             return;
         }
         let heard: Heard = Arc::default();
-        self.state = State::Transcribing(Arc::clone(&heard));
+        self.state = State::Transcribing {
+            heard: Arc::clone(&heard),
+            dir: dir.clone(),
+        };
         let settings = self.settings.clone();
         std::thread::spawn(move || {
-            let result = finish(child, running, &wav, &log, &settings);
-            let _ = std::fs::remove_file(&wav);
-            let _ = std::fs::remove_file(&log);
+            let result = finish(child, running, &dir, &settings);
+            release(&dir);
             *heard.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         });
     }
@@ -199,7 +243,7 @@ impl Dictation {
                 }
                 None
             }
-            State::Transcribing(heard) => {
+            State::Transcribing { heard, .. } => {
                 let done = heard.lock().unwrap_or_else(|e| e.into_inner()).take();
                 if done.is_some() {
                     self.state = State::Idle;
@@ -212,8 +256,14 @@ impl Dictation {
 }
 
 impl Drop for Dictation {
+    /// The transcriber's thread would outlive a quitting bhai no more than it does, so the
+    /// transcriber is killed and the recording deleted here.
     fn drop(&mut self) {
-        self.stop(false);
+        match &self.state {
+            State::Recording { .. } => self.stop(false),
+            State::Transcribing { dir, .. } => discard(dir),
+            State::Idle => {}
+        }
     }
 }
 
@@ -221,29 +271,44 @@ impl Drop for Dictation {
 fn finish(
     mut child: Child,
     stopped: bool,
-    wav: &Path,
-    log: &Path,
+    dir: &Path,
     settings: &Settings,
 ) -> Result<String, String> {
+    let (wav, log) = (dir.join(WAV), dir.join(LOG));
     let status = child.wait();
     // Reaped, the group's id may be reused, so it is no longer killed.
-    recorders().remove(&child.id());
+    let kept = claim(dir, None);
     let status = status.map_err(|e| e.to_string())?;
+    if !kept {
+        return Err("dictation was stopped".to_string());
+    }
     // A recorder that was stopped may well report the signal; one that quit by itself
     // with a failure has its reason in the log.
     if !stopped && !status.success() {
-        let said = std::fs::read_to_string(log).unwrap_or_default();
+        let said = std::fs::read_to_string(&log).unwrap_or_default();
         return Err(last_line(&said).unwrap_or(&status.to_string()).to_string());
     }
     // A WAV header alone is 44 bytes.
-    if std::fs::metadata(wav).map_or(0, |m| m.len()) <= 44 {
+    if std::fs::metadata(&wav).map_or(0, |m| m.len()) <= 44 {
         return Err("the recorder wrote no audio".to_string());
     }
-    let argv = fill(&settings.transcribe, wav, settings.model.as_deref())?;
-    let out = command(&argv)
+    let argv = fill(&settings.transcribe, &wav, settings.model.as_deref())?;
+    let transcriber = command(&argv)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
         .map_err(|e| format!("could not start {}: {e}", argv[0]))?;
+    if !claim(dir, Some(transcriber.id())) {
+        interrupt(transcriber.id(), libc::SIGKILL);
+    }
+    let out = transcriber.wait_with_output();
+    let kept = claim(dir, None);
+    let out = out.map_err(|e| e.to_string())?;
+    if !kept {
+        return Err("dictation was stopped".to_string());
+    }
     if !out.status.success() {
         let said = String::from_utf8_lossy(&out.stderr);
         return Err(last_line(&said)
@@ -313,9 +378,10 @@ fn last_line(text: &str) -> Option<&str> {
 impl Dictation {
     /// Block until the recorder has written `bytes`, and return where.
     pub fn wait_for_audio(&self, bytes: u64) -> PathBuf {
-        let State::Recording { wav, .. } = &self.state else {
+        let State::Recording { dir, .. } = &self.state else {
             panic!("not recording");
         };
+        let wav = &dir.join(WAV);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::fs::metadata(wav).map_or(0, |m| m.len()) < bytes {
             assert!(
@@ -339,7 +405,8 @@ impl Dictation {
 #[allow(unsafe_code)]
 fn interrupt(pid: u32, signal: libc::c_int) {
     if let Ok(pid) = i32::try_from(pid) {
-        // SAFETY: `killpg` only sends a signal; the group is the recorder's own.
+        // SAFETY: `killpg` only sends a signal; the group is the recorder's or the
+        // transcriber's own.
         unsafe {
             libc::killpg(pid, signal);
         }
@@ -393,8 +460,79 @@ mod tests {
             Ok("fix the lexer using tiny.bin")
         );
         assert_eq!(dictation.status(), Status::Idle);
-        assert!(!wav.exists());
-        assert!(!wav.with_extension("log").exists());
+        assert!(!wav.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn only_the_user_can_read_a_recording() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut dictation = Dictation::new(Settings {
+            record: sh(RECORD),
+            transcribe: sh("true"),
+            model: None,
+        });
+        dictation.toggle().unwrap();
+        let wav = dictation.wait_for_audio(100);
+        let dir = wav.parent().unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(dir), 0o700);
+        assert_eq!(mode(&dir.join(LOG)), 0o600);
+        assert!(dictation.cancel());
+        assert!(!dir.exists());
+    }
+
+    /// A transcriber that says its process group in the recording's directory, then
+    /// takes its time.
+    const SLOW: &str = "echo $$ > \"$(dirname \"$1\")/started\"; exec sleep 30";
+
+    /// Block until `SLOW` has started for the recording at `wav`, and return its group.
+    fn transcriber(wav: &Path) -> i32 {
+        let started = wav.parent().unwrap().join("started");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let said = std::fs::read_to_string(&started).unwrap_or_default();
+            if let Ok(group) = said.trim().parse() {
+                return group;
+            }
+            assert!(Instant::now() < deadline, "no transcriber");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn alive(group: i32) -> bool {
+        #[allow(unsafe_code)]
+        // SAFETY: signal 0 only asks whether the group exists.
+        let sent = unsafe { libc::killpg(group, 0) };
+        sent == 0
+    }
+
+    /// Wait out a killed group's reaping, which whoever holds it does in a moment.
+    fn gone(group: i32) -> bool {
+        let killed = Instant::now();
+        while alive(group) && killed.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        !alive(group)
+    }
+
+    #[test]
+    fn quitting_while_transcribing_kills_the_transcriber_and_deletes_the_recording() {
+        let mut dictation = Dictation::new(Settings {
+            record: sh(RECORD),
+            transcribe: sh(SLOW),
+            model: None,
+        });
+        dictation.toggle().unwrap();
+        let wav = dictation.wait_for_audio(100);
+        dictation.toggle().unwrap();
+        let group = transcriber(&wav);
+        assert!(wav.exists());
+        drop(dictation);
+        assert!(
+            !wav.parent().unwrap().exists(),
+            "the recording outlived bhai"
+        );
+        assert!(gone(group), "transcriber {group} outlived bhai");
     }
 
     #[test]
@@ -451,7 +589,7 @@ mod tests {
         assert!(dictation.cancel());
         assert_eq!(dictation.status(), Status::Idle);
         assert_eq!(dictation.poll(), None);
-        assert!(!wav.exists());
+        assert!(!wav.parent().unwrap().exists());
     }
 
     #[test]
@@ -470,8 +608,10 @@ mod tests {
     }
 
     /// Set in the copy of the test binary that `a_signal_ends_the_recorder_with_bhai`
-    /// starts, to the file it writes its recorder's process group to.
+    /// starts, to the file it writes the process group working on its recording to.
     const SIGNALLED: &str = "BHAI_TEST_DICTATION_SIGNALLED";
+    /// Set alongside it when the signal is to come while transcribing.
+    const TRANSCRIBING: &str = "BHAI_TEST_DICTATION_TRANSCRIBING";
 
     /// The test runs itself again as the process to signal, since the signal kills it.
     #[test]
@@ -482,19 +622,34 @@ mod tests {
                 crate::tools::bash::kill_all_on_signal().unwrap();
                 let mut dictation = Dictation::new(Settings {
                     record: sh("head -c 100 /dev/zero > \"$1\"; exec sleep 600"),
-                    transcribe: sh("true"),
+                    transcribe: sh(SLOW),
                     model: None,
                 });
                 dictation.toggle().unwrap();
                 let wav = dictation.wait_for_audio(100);
-                let said = format!("{} {}", dictation.recorder(), wav.display());
-                std::fs::write(&file, said).unwrap();
+                let group = match std::env::var_os(TRANSCRIBING) {
+                    Some(_) => {
+                        dictation.toggle().unwrap();
+                        transcriber(&wav)
+                    }
+                    None => i32::try_from(dictation.recorder()).unwrap(),
+                };
+                std::fs::write(&file, format!("{group} {}", wav.display())).unwrap();
                 tokio::time::sleep(Duration::from_secs(60)).await;
             });
             return;
         }
+        signalled(false);
+        signalled(true);
+    }
+
+    fn signalled(transcribing: bool) {
         let file = std::env::temp_dir().join(format!("bhai-signal-{}", uuid::Uuid::new_v4()));
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        if transcribing {
+            command.env(TRANSCRIBING, "1");
+        }
+        let mut child = command
             .args(["a_signal_ends_the_recorder_with_bhai", "--nocapture"])
             .env(SIGNALLED, &file)
             .stdout(Stdio::null())
@@ -512,13 +667,7 @@ mod tests {
             assert!(begun.elapsed() < Duration::from_secs(20), "no recorder");
             std::thread::sleep(Duration::from_millis(50));
         };
-        let alive = || {
-            #[allow(unsafe_code)]
-            // SAFETY: signal 0 only asks whether the group exists.
-            let sent = unsafe { libc::killpg(group, 0) };
-            sent == 0
-        };
-        assert!(alive());
+        assert!(alive(group));
         assert!(wav.exists());
         let pid = i32::try_from(child.id()).unwrap();
         #[allow(unsafe_code)]
@@ -528,14 +677,15 @@ mod tests {
         }
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGHUP));
-        // The killed group is reaped by whatever inherits it, which takes a moment.
-        let killed = Instant::now();
-        while alive() && killed.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
         let _ = std::fs::remove_file(&file);
-        assert!(!alive(), "recorder {group} outlived bhai");
-        assert!(!wav.exists(), "the recording outlived bhai");
+        assert!(
+            gone(group),
+            "{group} outlived bhai, transcribing: {transcribing}"
+        );
+        assert!(
+            !wav.parent().unwrap().exists(),
+            "the recording outlived bhai"
+        );
     }
 
     #[test]

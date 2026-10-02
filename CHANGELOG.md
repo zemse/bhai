@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- Dictation records each take into its own private directory (0o700, log 0o600), and quitting or a hangup, interrupt, terminate or panic while whisper transcribes kills the transcriber's process group and deletes the recording.
 - A `Fetch(domain:*)` rule (or an imported `WebFetch(domain:*)`) now covers every fetch. Any other `*` in a domain rule is now refused, where before it was accepted and matched no host.
 - The egress proxy checks a request's path the way the upstream URL parses it, and refuses one whose raw path parses to a different path (a `\` or a dot segment), so a path-scoped rule can no longer be stepped out of.
 - tools::ssrf resolves a URL's host itself and refuses it when any address is loopback, private, link-local (the cloud metadata address included), CGNAT, unspecified, multicast or reserved, including IPv4 inside IPv6. It connects to the address it checked and rechecks every redirect hop, up to 5. This is the guard the fetch tools (N7-01, N7-02) go through.
