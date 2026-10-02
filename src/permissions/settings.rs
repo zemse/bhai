@@ -332,6 +332,14 @@ mod tests {
     }
 
     #[test]
+    fn a_webfetch_rule_for_every_domain_covers_every_fetch() {
+        let rule = claude_rule("WebFetch(domain:*)").unwrap().unwrap();
+        assert!(rule.is_any() && rule.applies_to("fetch"));
+        assert!(rule.matches_domain("example.com"));
+        assert!(claude_rule("WebFetch(domain:*.*)").unwrap().is_err());
+    }
+
+    #[test]
     fn a_home_working_directory_reads_the_global_file_once() {
         let dir = temp_dir();
         write(

@@ -69,6 +69,7 @@ impl Rule {
                 Pattern::Path(content.to_string())
             }
             Some(content) if tool == "fetch" => match content.strip_prefix("domain:") {
+                Some(host) if host.trim() == "*" => Pattern::Any,
                 Some(host) => Pattern::Domain(
                     domain(host.trim()).ok_or_else(|| bad("expected `domain:<host>`"))?,
                 ),
@@ -237,14 +238,15 @@ impl Rule {
 }
 
 /// A `Fetch` rule's host as `fetch::host` gives a URL's: punycode, lowercase, no trailing
-/// dot, so `bücher.de` matches `xn--bcher-kva.de`. A leading `*.` is kept.
+/// dot, so `bücher.de` matches `xn--bcher-kva.de`. A leading `*.` is kept; any other `*`
+/// is refused, since `Host::parse` accepts it and the rule would then match no host.
 fn domain(host: &str) -> Option<String> {
     let (wild, name) = match host.strip_prefix("*.") {
         Some(name) => ("*.", name),
         None => ("", host),
     };
     let name = name.strip_suffix('.').unwrap_or(name);
-    if name.is_empty() {
+    if name.is_empty() || name.contains('*') {
         return None;
     }
     let name = url::Host::parse(name).ok()?.to_string();
@@ -654,7 +656,17 @@ mod tests {
         assert!(idn.matches_domain("xn--bcher-kva.de"));
         let idn_under = Rule::parse("Fetch(domain:*.bücher.de)").unwrap();
         assert!(idn_under.matches_domain("a.xn--bcher-kva.de"));
+        for every in ["Fetch(domain:*)", "Fetch(domain: * )"] {
+            let rule = Rule::parse(every).unwrap();
+            assert!(rule.is_any(), "{every}");
+            assert!(rule.matches_domain("example.com"));
+            assert!(rule.matches_domain("127.0.0.1"));
+        }
         for bad in [
+            "Fetch(domain:*.*)",
+            "Fetch(domain:*.*.com)",
+            "Fetch(domain:a*.com)",
+            "Fetch(domain:**)",
             "Fetch(docs.rs)",
             "Fetch(domain:)",
             "Fetch(domain:.)",
