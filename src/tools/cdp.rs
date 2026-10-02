@@ -54,7 +54,9 @@ pub(crate) fn command(id: u64, session: Option<&str>, method: &str, params: Valu
 
 /// A frame from the browser, or `None` when it is neither an answer nor an event.
 pub(crate) fn parse(text: &str) -> Option<Incoming> {
-    let frame: Value = serde_json::from_str(text).ok()?;
+    let frame: Value = serde_json::from_str(text)
+        .or_else(|_| serde_json::from_str(&without_lone_surrogates(text)))
+        .ok()?;
     let session = frame
         .get("sessionId")
         .and_then(Value::as_str)
@@ -75,6 +77,40 @@ pub(crate) fn parse(text: &str) -> Option<Incoming> {
         params: frame.get("params").cloned().unwrap_or_else(|| json!({})),
         session,
     }))
+}
+
+/// `text` with each `\uXXXX` escape of an unpaired surrogate made `�`. Chrome sends a
+/// page's lone surrogate that way, and serde_json refuses the whole frame over it.
+fn without_lone_surrogates(text: &str) -> String {
+    fn unit(rest: &str) -> Option<u16> {
+        let hex = rest.strip_prefix("\\u")?.get(..4)?;
+        u16::from_str_radix(hex, 16).ok()
+    }
+    let high = |u: u16| (0xD800..0xDC00).contains(&u);
+    let low = |u: u16| (0xDC00..0xE000).contains(&u);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        match unit(rest) {
+            Some(u) if high(u) && unit(&rest[6..]).is_some_and(low) => {
+                out.push_str(&rest[..12]);
+                rest = &rest[12..];
+            }
+            Some(u) if high(u) || low(u) => {
+                out.push_str("\\ufffd");
+                rest = &rest[6..];
+            }
+            _ => {
+                let len = rest[1..].chars().next().map_or(1, |c| 1 + c.len_utf8());
+                out.push_str(&rest[..len]);
+                rest = &rest[len..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 impl Cdp {
@@ -213,6 +249,27 @@ mod tests {
         assert_eq!(parse(r#"{"neither":true}"#), None);
     }
 
+    #[test]
+    fn a_lone_surrogate_from_the_page_does_not_lose_the_answer() {
+        let text = |frame: &str| match parse(frame) {
+            Some(Incoming::Reply { id: 9, result }) => {
+                result.unwrap()["v"].as_str().unwrap().to_string()
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(text(r#"{"id":9,"result":{"v":"x\ud800y"}}"#), "x\u{fffd}y");
+        assert_eq!(text(r#"{"id":9,"result":{"v":"x\uDC00"}}"#), "x\u{fffd}");
+        assert_eq!(
+            text(r#"{"id":9,"result":{"v":"\ud800\ud800"}}"#),
+            "\u{fffd}\u{fffd}"
+        );
+        assert_eq!(text(r#"{"id":9,"result":{"v":"😀\ud800"}}"#), "😀\u{fffd}");
+        assert_eq!(
+            text(r#"{"id":9,"result":{"v":"\\ud800 \"q\" é\ud800"}}"#),
+            "\\ud800 \"q\" é\u{fffd}"
+        );
+    }
+
     /// A browser end that answers each command with what `answer` makes of it, `None`
     /// meaning no answer, and sends `events` first.
     async fn fake(
@@ -234,6 +291,12 @@ mod tests {
                 let command: Value = serde_json::from_str(text.as_str()).unwrap();
                 if command["method"] == "Test.close" {
                     break;
+                }
+                // As Chrome escapes a page's lone surrogate, which no `Value` can hold.
+                if command["method"] == "Test.surrogate" {
+                    let frame = format!(r#"{{"id":{},"result":{{"v":"x\ud800"}}}}"#, command["id"]);
+                    ws.send(Message::Text(frame.into())).await.unwrap();
+                    continue;
                 }
                 match answer(&command) {
                     Some(reply) => held.push(reply),
@@ -278,6 +341,18 @@ mod tests {
         let event = events.recv().await.unwrap();
         assert_eq!(event.method, "Target.targetCreated");
         assert_eq!(event.params, json!({"id": 1}));
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_a_lone_surrogate_reaches_its_caller() {
+        let (cdp, _events) = fake(Vec::new(), |_| None).await;
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cdp.call(None, "Test.surrogate", json!({})),
+        )
+        .await
+        .expect("the answer was dropped");
+        assert_eq!(answer.unwrap(), json!({"v": "x\u{fffd}"}));
     }
 
     #[tokio::test]

@@ -418,11 +418,13 @@ pub(crate) async fn load(
     })
 }
 
-/// The page's title, URL and visible text, the text cut in the page.
+/// The page's title, URL and visible text, the text cut in the page. A lone surrogate,
+/// which the cut can make of an emoji, is replaced so the reply is valid JSON.
 fn extract() -> String {
     format!(
-        "({{title: document.title, url: location.href, text: (document.body || \
-document.documentElement || {{innerText: ''}}).innerText.slice(0, {MAX_TEXT})}})"
+        "((w) => ({{title: w(document.title), url: location.href, text: w((document.body || \
+document.documentElement || {{innerText: ''}}).innerText.slice(0, {MAX_TEXT}))}}))\
+((s) => String(s).replace(/[\\uD800-\\uDBFF](?![\\uDC00-\\uDFFF])|(?<![\\uD800-\\uDBFF])[\\uDC00-\\uDFFF]/g, '\\uFFFD'))"
     )
 }
 
