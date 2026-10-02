@@ -1667,6 +1667,18 @@ impl App {
             self.usage();
             return;
         }
+        if let Some(rest) = message.strip_prefix("/worktrees")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            let place = crate::worktrees::Place::new(&std::env::current_dir().unwrap_or_default());
+            self.note(match rest.trim() {
+                "" => Entry::Info(place.list()),
+                "clean" => Entry::Info(place.clean()),
+                other => Entry::Error(format!("/worktrees [clean]: no `{other}`")),
+            });
+            return;
+        }
         if message == "/copy" {
             self.follow = true;
             self.copy();
@@ -3104,6 +3116,24 @@ mod tests {
         app.input.set("/allow not a rule".to_string());
         app.submit();
         assert!(last(&mut app).contains("expected a tool name"));
+    }
+
+    /// Only the listing: `clean` would act on the checkout the tests run in.
+    #[test]
+    fn worktrees_lists_and_refuses_what_it_does_not_take() {
+        let (mut app, _user, _control) = connected();
+        app.input.set("/worktrees".to_string());
+        app.submit();
+        match app.entries().list.last() {
+            Some(Entry::Info(text)) => assert!(text.contains("worktree"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        app.input.set("/worktrees prune".to_string());
+        app.submit();
+        match app.entries().list.last() {
+            Some(Entry::Error(text)) => assert_eq!(text, "/worktrees [clean]: no `prune`"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]

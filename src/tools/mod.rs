@@ -250,6 +250,8 @@ pub struct Registry {
     tools: Vec<Box<dyn Tool>>,
     /// The hub calls to functions `tool_search` loaded are resolved against.
     native: Option<Arc<crate::mcp::Hub>>,
+    /// A child's worktree, which its calls are moved into.
+    rooted: Option<crate::worktrees::Rooted>,
 }
 
 impl Registry {
@@ -258,6 +260,7 @@ impl Registry {
         Self {
             tools: Vec::new(),
             native: None,
+            rooted: None,
         }
     }
 
@@ -279,6 +282,7 @@ impl Registry {
         Self {
             tools,
             native: None,
+            rooted: None,
         }
     }
 
@@ -390,6 +394,20 @@ impl Registry {
             .tools
             .retain(|t| prompt.identity.allows_tool(t.name()));
         registry
+    }
+
+    /// Move every call into a child's worktree before it is decided and run.
+    pub fn with_workdir(mut self, rooted: crate::worktrees::Rooted) -> Self {
+        self.rooted = Some(rooted);
+        self
+    }
+
+    /// `args` for a call to `name`, moved into the worktree when there is one.
+    pub fn rooted(&self, name: &str, args: Value) -> Value {
+        match &self.rooted {
+            Some(rooted) => rooted.args(name, args),
+            None => args,
+        }
     }
 
     /// Tool names in registration order.

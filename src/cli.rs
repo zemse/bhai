@@ -5,7 +5,7 @@ use crate::{
     agent, app, askpass, cache, childenv, client, config, egress, external, identity, input,
     instructions, judge, limits, mcp, memory, models, notify, permissions, profile, sandbox,
     search, server, session, sessions, skills, startup, statusline, syntax, title, tokens, tools,
-    trace, ui, workflow,
+    trace, ui, workflow, worktrees,
 };
 
 use std::path::PathBuf;
@@ -307,6 +307,9 @@ pub async fn entry() -> Result<()> {
     };
     let mut notices = prompt.notices();
     notices.extend(warnings);
+    // Before this session has started a child, so what is swept is the ended sessions'.
+    let worktrees = worktrees::Place::new(&cwd);
+    notices.extend(worktrees.startup());
     if let Some(Err(e)) = statusline.as_deref().map(statusline::Template::parse) {
         notices.push(format!(
             "statusline in the global config does not parse, so the built-in bar is shown: {e}"
@@ -415,6 +418,7 @@ allow it.",
             Err(e) => Err(e),
         };
         shutdown(hub).await;
+        settle_worktrees(&worktrees);
         return result;
     }
     // `exec` is one prompt, run to the end of its turn with the events on stdout.
@@ -424,6 +428,7 @@ allow it.",
         }
         let result = headless_exec(&session, prompt, args.json).await;
         shutdown(hub).await;
+        settle_worktrees(&worktrees);
         if !result? {
             std::process::exit(1);
         }
@@ -443,6 +448,7 @@ allow it.",
         );
         let result = server::serve(listener, session, token).await;
         shutdown(hub).await;
+        settle_worktrees(&worktrees);
         return result;
     }
 
@@ -516,7 +522,16 @@ allow it.",
     if let Some(hint) = sessions::exit_hint(&dir, &session_id) {
         eprint!("{hint}");
     }
+    settle_worktrees(&worktrees);
     result
+}
+
+/// As the session quits: settle every worktree its children made, and say which were kept
+/// and how to take their work.
+fn settle_worktrees(place: &worktrees::Place) {
+    for line in place.quit() {
+        eprintln!("bhai: {line}");
+    }
 }
 
 /// Turn mouse capture on or off while running, for `/mouse`; returns the state it left.
@@ -1414,6 +1429,7 @@ async fn cache_check(setup: Setup, wait: Option<Duration>) -> Result<bool> {
             judge: None,
             results: mpsc::unbounded_channel().0,
             slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
+            session: client.session_id().to_string(),
         });
         registry = registry.with_models(tools::models::Models {
             current: Arc::new(client.clone()),

@@ -16,6 +16,7 @@ use crate::agent::{
 use crate::identity::{self, Identity};
 use crate::judge::Judge;
 use crate::permissions::Policy;
+use crate::worktrees;
 
 pub const NAME: &str = "agent";
 pub const CLOSE: &str = "close_agent";
@@ -62,6 +63,8 @@ pub struct Agent {
     pub slots: Arc<Semaphore>,
     /// This session's transcript directory.
     pub transcripts: PathBuf,
+    /// This session's id, which its children's worktrees are registered under.
+    pub session: String,
 }
 
 impl Tool for Agent {
@@ -106,6 +109,14 @@ impl Tool for Agent {
                         "type": "string",
                         "description": "The complete task for the child."
                     },
+                    "worktree": {
+                        "type": "boolean",
+                        "description": "Run the child in a git worktree of its own, on a new \
+        branch from HEAD, so it can edit while other children edit too. Its report says whether \
+        the worktree had changes and how to merge them. Use it for a child that edits files \
+        alongside others; one that only reads does not need it. A continued child keeps the \
+        worktree it had."
+                    },
                     "continue": {
                         "type": "string",
                         "description": "The id of a child that has finished, to carry on from \
@@ -138,14 +149,17 @@ impl Tool for Agent {
                 Ok(parsed) => parsed,
                 Err(e) => return (e, false),
             };
-            let (id, identity, history) = match continued(args) {
+            let asked = args.get("worktree").and_then(Value::as_bool) == Some(true);
+            let (id, identity, history, isolate) = match continued(args) {
                 Some(id) => match self.reopen(id) {
-                    Ok((identity, history)) => (id.to_string(), identity, history),
+                    Ok((identity, history, had)) => {
+                        (id.to_string(), identity, history, asked || had)
+                    }
                     Err(e) => return (e, false),
                 },
                 None => {
                     let id = uuid::Uuid::new_v4().simple().to_string()[..6].to_string();
-                    (id, identity, Vec::new())
+                    (id, identity, Vec::new(), asked)
                 }
             };
             // Before the spawn, not after: a typo otherwise costs a child that runs far
@@ -153,13 +167,29 @@ impl Tool for Agent {
             if let Some(e) = self.unserved(&identity).await {
                 return (e, false);
             }
+            let lease = match isolate {
+                true => match self.lease(&id).await {
+                    Ok(lease) => Some(lease),
+                    Err(e) => return (format!("child {id} was not started: {e}."), false),
+                },
+                false => None,
+            };
+            let place = lease.as_ref().map(|lease| {
+                let entry = lease.entry();
+                format!(
+                    " in worktree {} on branch {}",
+                    entry.workdir.display(),
+                    entry.branch
+                )
+            });
             let waiting = MAX_RUNNING.saturating_sub(self.slots.available_permits());
             let again = match history.is_empty() {
                 true => "",
                 false => " again, from where it left off",
             };
-            self.spawn(&id, &identity, description, task, history);
+            self.spawn(&id, &identity, description, task, history, lease);
             let name = &identity.name;
+            let place = place.unwrap_or_default();
             let queued = match waiting >= MAX_RUNNING {
                 true => format!(
                     ", behind the {MAX_RUNNING} already running: it starts when one of them ends"
@@ -168,7 +198,7 @@ impl Tool for Agent {
             };
             (
                 format!(
-                    "child {id} ({name}) started{again}{queued}. Its report will reach you as a \
+                    "child {id} ({name}) started{place}{again}{queued}. Its report will reach you as a \
 message when it finishes; nothing else is needed to collect it."
                 ),
                 true,
@@ -244,14 +274,19 @@ impl Agent {
         description: &str,
         task: &str,
         history: Vec<Value>,
+        lease: Option<worktrees::Lease>,
     ) {
-        let (id, description, task) = (id.to_string(), description.to_string(), task.to_string());
+        let (id, description) = (id.to_string(), description.to_string());
+        let task = match &lease {
+            Some(lease) => format!("{}\n\n{task}", lease.note()),
+            None => task.to_string(),
+        };
         let identity = identity.clone();
         let transcript = self.transcripts.join(format!("child-{id}.jsonl"));
         let model = self.model.child(&identity);
         // What `continue` runs it as. Without it the child still runs, it just cannot be
         // continued, so a failed write is reported rather than refused.
-        if let Err(e) = self.remember(&id, &identity, model.name()) {
+        if let Err(e) = self.remember(&id, &identity, model.name(), lease.is_some()) {
             let _ = self.tx.send(AgentEvent::Error(format!(
                 "{}{e:#}",
                 agent::TRANSCRIPT_ERROR
@@ -272,23 +307,27 @@ impl Agent {
         let span = crate::trace::child(&id, &identity.name);
         let run = async move {
             // Past `MAX_RUNNING` the child waits here rather than the parent waiting
-            // for the call, so the model is never blocked on a slot.
+            // for the call, so the model is never blocked on a slot. The lease is held
+            // by this task, so however it ends the worktree is settled.
             let Ok(_slot) = slots.acquire().await else {
                 return;
             };
             // Interrupted while it waited for a slot. It never ran, so there is no
             // transcript to report; say so rather than leaving the parent to wonder.
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut text = format!(
+                    "child {id} ({}) was stopped before it started.",
+                    identity.name
+                );
+                text.push_str(&settle(lease).await);
                 let _ = results.send(ChildResult {
                     identity: identity.name.clone(),
                     description,
-                    text: format!(
-                        "child {id} ({}) was stopped before it started.",
-                        identity.name
-                    ),
+                    text,
                 });
                 return;
             }
+            let workdir = lease.as_ref().map(worktrees::Lease::rooted);
             let (_mailbox, steer) = agent::Mailbox::open(&mailboxes, &id);
             let finished = agent::run_child(Child {
                 id: &id,
@@ -305,10 +344,11 @@ impl Agent {
                 judge,
                 contract: None,
                 history,
+                workdir,
             })
             .await;
             let name = &identity.name;
-            let text = match finished.result {
+            let mut text = match finished.result {
                 Ok(text) => format!(
                     "child {id} ({name}) finished in {} steps{}, {}/{} tokens\n{}",
                     finished.steps,
@@ -330,6 +370,7 @@ impl Agent {
                     truncate(&sanitize(&format!("{e:#}")))
                 ),
             };
+            text.push_str(&settle(lease).await);
             let _ = results.send(ChildResult {
                 identity: identity.name.clone(),
                 description,
@@ -346,18 +387,26 @@ impl Agent {
 
     /// The model is the one it ran on rather than the identity's: its encrypted reasoning
     /// replays only to that one, whatever the session has switched to since.
-    fn remember(&self, id: &str, identity: &Identity, model: &str) -> std::io::Result<()> {
+    fn remember(
+        &self,
+        id: &str,
+        identity: &Identity,
+        model: &str,
+        worktree: bool,
+    ) -> std::io::Result<()> {
         crate::sessions::private_dir(&self.transcripts)?;
         let meta = json!({
             "identity": identity.name,
             "model": model,
             "effort": identity.effort,
+            "worktree": worktree,
         });
         crate::sessions::private_write(&self.meta(id), &meta.to_string())
     }
 
-    /// The identity and history of finished child `id`, for `continue`.
-    fn reopen(&self, id: &str) -> Result<(Identity, Vec<Value>), String> {
+    /// The identity and history of finished child `id`, for `continue`, and whether it
+    /// ran in a worktree.
+    fn reopen(&self, id: &str) -> Result<(Identity, Vec<Value>, bool), String> {
         let gone = || {
             format!(
                 "no finished child {id} to continue: give the id an `agent` call of this \
@@ -388,7 +437,21 @@ session returned."
         if history.is_empty() {
             return Err(gone());
         }
-        Ok((identity, history))
+        let worktree = meta.get("worktree").and_then(Value::as_bool) == Some(true);
+        Ok((identity, history, worktree))
+    }
+
+    /// A worktree for child `id`: the one it was kept in, or a new one. Git runs off the
+    /// runtime's threads.
+    async fn lease(&self, id: &str) -> Result<worktrees::Lease, String> {
+        let project = match self.delegation.cache_root.parent() {
+            Some(project) if !project.as_os_str().is_empty() => project.to_path_buf(),
+            _ => return Err("this session has no project to make a worktree in".to_string()),
+        };
+        let (session, id) = (self.session.clone(), id.to_string());
+        tokio::task::spawn_blocking(move || worktrees::Place::new(&project).lease(&session, &id))
+            .await
+            .map_err(|e| e.to_string())?
     }
 
     /// What is wrong with the model the child would run on, if anything. `None` when it
@@ -459,6 +522,21 @@ identity and model it had, since its history belongs to them."
         }
         Ok((identity, description, prompt))
     }
+}
+
+/// Settle a child's worktree, off the runtime's threads, and say what became of it as a
+/// line of its report.
+async fn settle(lease: Option<worktrees::Lease>) -> String {
+    let Some(lease) = lease else {
+        return String::new();
+    };
+    let entry = lease.entry().clone();
+    let outcome = tokio::task::spawn_blocking(move || lease.finish())
+        .await
+        .unwrap_or_else(|e| worktrees::Outcome::Kept(e.to_string()));
+    worktrees::report(&entry, &outcome)
+        .map(|line| format!("\n{line}"))
+        .unwrap_or_default()
 }
 
 /// The child a call continues, if it names one.
@@ -559,6 +637,7 @@ mod tests {
             results: tx_results,
             slots: Arc::new(Semaphore::new(MAX_RUNNING)),
             transcripts: super::super::temp_dir(),
+            session: "session-1".to_string(),
         };
         Harness {
             agent,
@@ -1007,6 +1086,169 @@ mod tests {
         );
         assert!(harness.results.try_recv().is_err(), "nothing was started");
         harness.cleanup();
+    }
+
+    /// A repository with one commit, for a child that asks for a worktree.
+    fn repo() -> PathBuf {
+        let dir = super::super::temp_dir().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "first",
+        ]);
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_child_in_a_worktree_edits_there_and_is_continued_there() {
+        use crate::permissions::{Mode, Rules};
+
+        let dir = repo();
+        let original = dir.join("a.txt").display().to_string();
+        let fake = Fake::new(vec![
+            vec![call("write", json!({"path": original, "content": "two\n"}))],
+            vec![say("changed it")],
+            vec![say("still there")],
+        ]);
+        let mut harness = tool(&fake, false);
+        harness.agent.delegation.cache_root = dir.join(".bhai");
+        harness.agent.policy = Arc::new(Policy::new(
+            Mode::Bypass,
+            Rules::default(),
+            None,
+            dir.clone(),
+        ));
+        let args = json!({"description": "edit", "prompt": "change a.txt", "worktree": true});
+        let (started, ok) = harness.agent.execute(&args).await;
+        assert!(ok, "{started}");
+        let workdir = dir.join(".bhai/worktrees");
+        assert!(
+            started.contains(&format!(" started in worktree {}/", workdir.display())),
+            "{started}"
+        );
+        let report = harness.results.recv().await.expect("a report").text;
+        assert!(report.contains("finished in 2 steps"), "{report}");
+        assert!(
+            report.contains("was kept: 1 uncommitted change."),
+            "{report}"
+        );
+        // The user's checkout is untouched; the write landed in the worktree.
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        let registry = std::fs::read_to_string(dir.join(".bhai/worktrees.json")).unwrap();
+        let entries: Vec<worktrees::Entry> = serde_json::from_str(&registry).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].kept);
+        let path = entries[0].path.clone();
+        assert_eq!(
+            std::fs::read_to_string(path.join("a.txt")).unwrap(),
+            "two\n"
+        );
+        assert!(report.contains(&format!("`git merge {}`", entries[0].branch)));
+        // The child was told where it works, ahead of its task.
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let input = bodies[0].1["input"].to_string();
+        assert!(
+            input.contains("You work in a git worktree of your own"),
+            "{input}"
+        );
+
+        // Continued, it is back in the worktree it left, which it did not need to ask for.
+        let id = report["child ".len()..]
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_string();
+        let again = json!({"description": "look", "prompt": "check", "continue": id});
+        let (started, ok) = harness.agent.execute(&again).await;
+        assert!(ok, "{started}");
+        assert!(
+            started.contains(&format!("in worktree {}", path.display())),
+            "{started}"
+        );
+        let report = harness.results.recv().await.expect("a report").text;
+        assert!(
+            report.contains("was kept: 1 uncommitted change."),
+            "{report}"
+        );
+        harness.cleanup();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_child_leaves_no_clean_worktree_behind() {
+        let dir = repo();
+        let fake = Fake::new(Vec::new()).with_children(vec![fake::step(fake::HANG)]);
+        let mut harness = tool(&fake, false);
+        harness.agent.delegation.cache_root = dir.join(".bhai");
+        let args = json!({"description": "wait", "prompt": "p", "worktree": true});
+        let (started, ok) = harness.agent.execute(&args).await;
+        assert!(ok, "{started}");
+        let slots = Arc::clone(&harness.agent.slots);
+        for _ in 0..1000 {
+            if slots.available_permits() < MAX_RUNNING {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        harness.agent.cancel.stop();
+        let report = harness.results.recv().await.expect("a report").text;
+        assert!(report.contains("interrupted by the user"), "{report}");
+        assert!(
+            report.contains(
+                "\nIts worktree had no changes and was removed with branch bhai/session1-"
+            ),
+            "{report}"
+        );
+        assert!(
+            !dir.join(".bhai/worktrees")
+                .read_dir()
+                .unwrap()
+                .any(|e| { e.unwrap().file_name() != ".gitignore" })
+        );
+        harness.cleanup();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_worktree_outside_a_repository_is_refused_before_the_child_starts() {
+        let mut harness = tool(&Fake::default(), false);
+        let args = json!({"description": "edit", "prompt": "p", "worktree": true});
+        let (out, ok) = harness.agent.execute(&args).await;
+        assert!(!ok);
+        assert!(out.ends_with("no project to make a worktree in."), "{out}");
+        let dir = super::super::temp_dir();
+        harness.agent.delegation.cache_root = dir.join(".bhai");
+        let (out, ok) = harness.agent.execute(&args).await;
+        assert!(!ok);
+        assert!(
+            out.contains("was not started: a worktree needs a git repository with a commit"),
+            "{out}"
+        );
+        assert!(harness.results.try_recv().is_err(), "nothing was started");
+        harness.cleanup();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

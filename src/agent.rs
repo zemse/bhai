@@ -794,6 +794,7 @@ pub(crate) async fn run_configured(
                 judge: judge.clone(),
                 results: tx_results.clone(),
                 slots: Arc::clone(&slots),
+                session: session_id.clone(),
             });
             registry = registry.with_models(tools::models::Models {
                 current: Arc::clone(model),
@@ -2637,6 +2638,8 @@ pub struct Child<'a> {
     /// What an earlier run of this child left in its history, which `task` follows;
     /// empty for a fresh child.
     pub history: Vec<Value>,
+    /// The worktree its calls are moved into, when it runs in one.
+    pub workdir: Option<crate::worktrees::Rooted>,
 }
 
 /// How a child agent ended.
@@ -2657,6 +2660,9 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     let identity = child.prompt.identity.name.clone();
     let accepted: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
     let mut registry = Registry::for_prompt(&child.prompt);
+    if let Some(rooted) = child.workdir.clone() {
+        registry = registry.with_workdir(rooted);
+    }
     if let Some(contract) = &child.contract {
         registry = registry.with_submit(tools::submit::Submit {
             contract: Arc::clone(contract),
@@ -2994,6 +3000,7 @@ async fn execute(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let (args, summary) = match tools::parse_arguments(arguments)
+        .map(|args| registry.rooted(name, args))
         .and_then(|args| tool.describe(&args).map(|summary| (args, summary)))
     {
         Ok(parsed) => parsed,
@@ -4523,6 +4530,7 @@ mod tests {
                     judge: None,
                     contract: Some(contract),
                     history: Vec::new(),
+                    workdir: None,
                 })
                 .await
                 .result
@@ -4563,6 +4571,7 @@ mod tests {
             judge: None,
             contract: None,
             history: Vec::new(),
+            workdir: None,
         })
         .await;
 
@@ -4597,6 +4606,7 @@ mod tests {
             judge: None,
             contract: None,
             history: Vec::new(),
+            workdir: None,
         })
         .await;
 
@@ -4643,6 +4653,7 @@ mod tests {
             judge: None,
             contract: None,
             history: Vec::new(),
+            workdir: None,
         })
         .await;
 
@@ -4682,6 +4693,7 @@ mod tests {
             judge: None,
             contract: None,
             history: Vec::new(),
+            workdir: None,
         })
         .await;
 
@@ -4754,6 +4766,7 @@ mod tests {
             judge: Some(parent.child("c1", "note what the parser does")),
             contract: None,
             history: Vec::new(),
+            workdir: None,
         })
         .await;
 

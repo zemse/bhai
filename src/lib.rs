@@ -97,6 +97,7 @@ mod trace;
 mod ui;
 mod websocket;
 pub mod workflow;
+pub mod worktrees;
 mod wrap;
 
 pub use agent::{AgentEvent, Cancel, Control, Model, UserInput};

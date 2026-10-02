@@ -1322,6 +1322,7 @@ async fn step(
         judge: run.judge.map(|judge| judge.child(&id, prompt)),
         contract: step.contract.clone(),
         history: Vec::new(),
+        workdir: None,
     })
     .instrument(crate::trace::child(&id, &identity.name))
     .await;

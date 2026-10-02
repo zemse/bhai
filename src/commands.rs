@@ -115,6 +115,11 @@ pub const COMMANDS: &[Command] = &[
         args: " [clear]",
         help: "prompts waiting behind the turn",
     },
+    Command {
+        name: "worktrees",
+        args: " [clean]",
+        help: "the children's git worktrees, clean removes the unchanged ones",
+    },
     // No args hint, though it takes `<name> [effort]`: the picker is the usual way in,
     // and a hint would make enter fill the prompt rather than open it.
     Command {

@@ -127,6 +127,8 @@ mod ui;
 mod websocket;
 #[path = "../../src/workflow.rs"]
 mod workflow;
+#[path = "../../src/worktrees.rs"]
+mod worktrees;
 #[path = "../../src/wrap.rs"]
 mod wrap;
 

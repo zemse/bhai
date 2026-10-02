@@ -5,3 +5,6 @@
 /.bhai/sessions/
 /bhai-debug-*.md
 /evals/results/
+/.bhai/worktrees/
+/.bhai/worktrees.json
+/.bhai/worktrees.lock
