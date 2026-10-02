@@ -991,6 +991,7 @@ pub fn kill_all_on_signal() -> io::Result<()> {
         tokio::spawn(async move {
             if stream.recv().await.is_some() {
                 kill_all();
+                super::browser::kill_all();
                 #[cfg(feature = "dictation")]
                 crate::dictation::kill_all();
                 crate::worktrees::settle();

@@ -10,6 +10,8 @@ use serde_json::Value;
 
 pub mod agent;
 pub mod bash;
+pub mod browser;
+mod cdp;
 pub mod edit;
 pub mod fetch;
 pub mod goal;

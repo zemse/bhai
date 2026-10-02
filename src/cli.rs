@@ -481,6 +481,7 @@ allow it.",
     std::panic::set_hook(Box::new(move |info| {
         // The sessions are in a static, so no unwinding or drop would end them.
         tools::bash::kill_all_panicking();
+        tools::browser::kill_all();
         #[cfg(feature = "dictation")]
         crate::dictation::kill_all();
         modes.release();
@@ -647,9 +648,11 @@ async fn mcp_login(
     Ok(())
 }
 
-/// Stop the MCP servers, if any were started, and the shell sessions.
+/// Stop the MCP servers, if any were started, the shell sessions and any browser a fetch
+/// is rendering in.
 async fn shutdown(hub: Option<Arc<mcp::Hub>>) {
     tools::bash::kill_all();
+    tools::browser::kill_all();
     if let Some(hub) = hub {
         hub.shutdown().await;
     }

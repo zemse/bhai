@@ -78,7 +78,7 @@ pub async fn check(url: &Url) -> Result<SocketAddr, String> {
     check_with(url, refusal).await
 }
 
-async fn check_with(
+pub(super) async fn check_with(
     url: &Url,
     refusal: fn(IpAddr) -> Option<&'static str>,
 ) -> Result<SocketAddr, String> {

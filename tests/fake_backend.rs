@@ -310,6 +310,11 @@ fn writes(call_id: &str, path: &str, content: &str) -> String {
 
 /// The model asking to fetch `url`.
 fn fetches(call_id: &str, url: &str) -> String {
+    fetches_with(call_id, json!({ "url": url }))
+}
+
+/// The model calling `fetch` with `args`.
+fn fetches_with(call_id: &str, args: Value) -> String {
     sse(&[
         json!({
             "type": "response.output_item.done",
@@ -317,7 +322,7 @@ fn fetches(call_id: &str, url: &str) -> String {
                 "type": "function_call",
                 "name": "fetch",
                 "call_id": call_id,
-                "arguments": json!({ "url": url }).to_string()
+                "arguments": args.to_string()
             }
         }),
         completed(),
@@ -961,6 +966,39 @@ async fn a_fetch_asks_by_domain_and_the_guard_refuses_a_loopback_address() {
     // Refused before any connection is made.
     assert!(
         text.starts_with("refused:") && text.contains("loopback"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_rendered_fetch_with_no_browser_says_so_and_starts_nothing() {
+    let fake = Arc::new(Fake::default());
+    let backend = serve_fake(fake.clone()).await;
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        let args = json!({ "url": format!("{backend}/page"), "render": "always" });
+        replies.push_back(fetches_with("call_r", args));
+        replies.push_back(says("no browser"));
+    }
+    let bhai = Bhai::start_with(&backend, &[("BHAI_CHROME", "/nonexistent/chrome")]).await;
+    let mut events = bhai.events().await;
+
+    bhai.post("/prompt", json!({ "text": "render it" })).await;
+    let approval = events.until("approval").await;
+    assert_eq!(approval["data"]["tool"], "fetch", "{approval}");
+    let (status, answer) = bhai
+        .post("/approve", json!({ "id": approval["data"]["id"] }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    events.until("turn_end").await;
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    let outputs = items(&sent[1].body, "function_call_output");
+    let output = outputs.iter().find(|o| o["call_id"] == "call_r").unwrap();
+    let text = output["output"].as_str().unwrap();
+    assert_eq!(
+        text, "BHAI_CHROME names /nonexistent/chrome, which is not a file",
         "{text}"
     );
 }
