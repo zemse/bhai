@@ -2427,8 +2427,9 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     /// Keys while an approval is up. The answers that allow something wait until the
     /// command's end has been on screen and `APPROVAL_SETTLE` has passed since the box
     /// reached the screen, so a steer being typed does not approve; `a` and `p` save a
-    /// permanent rule, so a typed one asks for a second press. A click is already
-    /// deliberate and skips the wait and the second press.
+    /// permanent rule, so a typed one asks for a second press. A click skips the second
+    /// press but not the wait: the second click of a double click lands on the next
+    /// approval when one comes up in the same place.
     fn approval_key(&mut self, code: KeyCode, ctrl: bool, clicked: bool) {
         let page = self.approval_page.max(1);
         let allows = matches!(code, KeyCode::Char('y' | 'a' | 'p')) && !ctrl;
@@ -2437,7 +2438,7 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             _ => false,
         };
         // Approving what has not been read is how a hidden tail gets through.
-        if allows && (!self.approval_seen || !(clicked || settled)) {
+        if allows && (!self.approval_seen || !settled) {
             return;
         }
         let armed = self.armed.take();

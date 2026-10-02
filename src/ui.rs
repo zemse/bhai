@@ -2780,6 +2780,46 @@ mod tests {
     }
 
     #[test]
+    fn a_double_click_does_not_answer_the_approval_that_comes_up_under_it() {
+        let mut app = App::detached();
+        app.pending = Some(approval(Some("ls")));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        age(&mut app);
+        let &(always, _) = app
+            .buttons
+            .iter()
+            .find(|(_, k)| *k == KeyCode::Char('a'))
+            .unwrap();
+        app.on_mouse(down(always.x + 1, always.y));
+        assert!(app.pending.is_none());
+
+        // A parallel step's approval was parked behind, and comes up in the same place.
+        let next = approval(Some("ls"));
+        app.on_event(Event::Approval {
+            id: 9,
+            tool: next.tool,
+            command: next.command,
+            preview: next.preview,
+            offers: next.offers,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.drawn();
+        assert!(app.buttons.iter().any(|&(area, k)| {
+            k == KeyCode::Char('a')
+                && area.contains(ratatui::layout::Position::new(always.x + 1, always.y))
+        }));
+        app.on_mouse(down(always.x + 1, always.y));
+        assert!(
+            app.pending.is_some(),
+            "the second click of the double click"
+        );
+        age(&mut app);
+        app.on_mouse(down(always.x + 1, always.y));
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
     fn clicking_an_approval_choice_answers_it() {
         let mut app = App::detached();
         app.pending = Some(approval(None));
@@ -2801,11 +2841,18 @@ mod tests {
         assert!(app.buttons.iter().all(|(_, k)| *k != KeyCode::Char('a')));
         assert!(!app.on_mouse(down(yes.right() + 1, yes.y)));
         assert!(app.pending.is_some());
+        app.on_mouse(down(yes.x + 1, yes.y));
+        assert!(
+            app.pending.is_some(),
+            "a click waits out the settle window too"
+        );
+        age(&mut app);
         assert!(app.on_mouse(down(yes.x + 1, yes.y)));
         assert!(app.pending.is_none());
 
         app.pending = Some(approval(Some("ls")));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        age(&mut app);
         let &(always, _) = app
             .buttons
             .iter()
