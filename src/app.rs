@@ -214,6 +214,13 @@ pub struct App {
     pub copies: Vec<(usize, Range<usize>, String)>,
     /// The transcript's text area, filled in by the renderer.
     pub transcript_area: Option<Rect>,
+    /// The links the last frame drew over the transcript, filled in by the renderer.
+    pub links: Vec<crate::links::Shown>,
+    /// The pointer and the scroll it was last seen at: a scroll since moves the text
+    /// out from under it, so the link it was on is no longer hovered.
+    pointer: Option<(Position, usize)>,
+    /// What a click on a link opens it with; tests swap it so no browser starts.
+    opener: fn(&str) -> std::io::Result<()>,
     /// The selected span of the transcript, drawn reversed and copied by `ctrl+y`.
     pub selection: Option<Selection>,
     /// The wrapped cell a transcript drag anchors at.
@@ -369,6 +376,9 @@ impl App {
             sources: Vec::new(),
             copies: Vec::new(),
             transcript_area: None,
+            links: Vec::new(),
+            pointer: None,
+            opener: crate::links::launch,
             selection: None,
             anchor: None,
             press: None,
@@ -851,7 +861,9 @@ impl App {
             MouseEventKind::ScrollDown => self.wheel(WHEEL_LINES as isize),
             MouseEventKind::Moved => {
                 self.mouse_row = Some(mouse.row);
-                return self.rehover();
+                let before = self.hovered_index();
+                self.pointer = Some((Position::new(mouse.column, mouse.row), self.scroll));
+                return self.rehover() | (self.hovered_index() != before);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_row = Some(mouse.row);
@@ -877,7 +889,9 @@ impl App {
                     return self.copy_selection(at) | self.rehover();
                 }
                 return clicked
-                    && (self.click_copy(mouse.column, mouse.row) || self.click_entry(mouse.row));
+                    && (self.click_link(mouse.column, mouse.row)
+                        || self.click_copy(mouse.column, mouse.row)
+                        || self.click_entry(mouse.row));
             }
             _ => return false,
         }
@@ -934,6 +948,38 @@ impl App {
         };
         if count > 1 {
             self.press = None;
+        }
+        true
+    }
+
+    /// The web link under the pointer, unless the transcript has scrolled since it moved.
+    fn hovered_index(&self) -> Option<usize> {
+        let (at, _) = self.pointer.filter(|(_, scroll)| *scroll == self.scroll)?;
+        self.links
+            .iter()
+            .position(|link| link.contains(at) && crate::links::openable(&link.target))
+    }
+
+    pub fn hovered_link(&self) -> Option<&crate::links::Shown> {
+        self.hovered_index().map(|index| &self.links[index])
+    }
+
+    /// The release of a click on a web link, with nothing selected: it opens in the
+    /// browser. Returns whether it was one.
+    fn click_link(&mut self, x: u16, y: u16) -> bool {
+        if self.selection.is_some() {
+            return false;
+        }
+        let at = Position::new(x, y);
+        let Some(link) = self
+            .links
+            .iter()
+            .find(|link| link.contains(at) && crate::links::openable(&link.target))
+        else {
+            return false;
+        };
+        if let Err(err) = crate::links::open(&link.target, self.opener) {
+            self.note(Entry::Error(err));
         }
         true
     }
@@ -3689,6 +3735,96 @@ mod tests {
         app.max_scroll = lines - height as usize;
         app.follow = false;
         app
+    }
+
+    thread_local! {
+        static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record(url: &str) -> std::io::Result<()> {
+        OPENED.with(|opened| opened.borrow_mut().push(url.to_string()));
+        Ok(())
+    }
+
+    fn opened() -> Vec<String> {
+        OPENED.with(|opened| std::mem::take(&mut *opened.borrow_mut()))
+    }
+
+    /// A link wrapped from the end of row 1 to the start of row 2, and a file link on
+    /// row 3, as the renderer would leave them.
+    fn linked() -> App {
+        let mut app = scrolled(20, 4);
+        app.opener = record;
+        app.links = vec![
+            crate::links::Shown {
+                target: "https://example.com".to_string(),
+                spans: vec![(1, 30..40), (2, 0..8)],
+            },
+            crate::links::Shown {
+                target: "file:///etc/hosts".to_string(),
+                spans: vec![(3, 0..10)],
+            },
+        ];
+        app
+    }
+
+    #[test]
+    fn the_pointer_on_any_row_of_a_link_hovers_all_of_it() {
+        let mut app = linked();
+        assert!(app.on_mouse(at(MouseEventKind::Moved, 3, 2)));
+        assert_eq!(
+            app.hovered_link().map(|link| link.target.as_str()),
+            Some("https://example.com")
+        );
+        // Along the same link is no change; off it clears the hover.
+        app.on_mouse(at(MouseEventKind::Moved, 35, 1));
+        assert!(app.hovered_link().is_some());
+        app.on_mouse(at(MouseEventKind::Moved, 20, 1));
+        assert!(app.hovered_link().is_none());
+        // A file link never hovers, as a click would not open it.
+        app.on_mouse(at(MouseEventKind::Moved, 2, 3));
+        assert!(app.hovered_link().is_none());
+    }
+
+    #[test]
+    fn a_scroll_takes_the_hover_off() {
+        let mut app = linked();
+        app.on_mouse(at(MouseEventKind::Moved, 3, 2));
+        app.on_mouse(at(MouseEventKind::ScrollDown, 3, 2));
+        assert!(app.hovered_link().is_none());
+        // The next move hovers whatever the scroll brought under it.
+        app.on_mouse(at(MouseEventKind::Moved, 3, 2));
+        assert!(app.hovered_link().is_some());
+    }
+
+    #[test]
+    fn a_click_on_a_link_opens_it_and_a_drag_over_it_selects() {
+        let mut app = linked();
+        opened();
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 4, 2));
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 4, 2));
+        assert_eq!(opened(), ["https://example.com"]);
+        assert!(app.pinned.is_empty(), "the click went to the link alone");
+
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 32, 1));
+        app.on_mouse(at(MouseEventKind::Drag(MouseButton::Left), 2, 2));
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 2, 2));
+        assert!(opened().is_empty());
+        assert!(app.selection.is_some());
+
+        // A press that leaves a selection behind, a double click, opens nothing.
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 5, 2));
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 5, 2));
+        opened();
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 5, 2));
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 5, 2));
+        assert!(app.selection.is_some());
+        assert!(opened().is_empty());
+
+        // A file link is no web link, so the click is an ordinary one.
+        app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 2, 3));
+        app.on_mouse(at(MouseEventKind::Up(MouseButton::Left), 2, 3));
+        assert!(opened().is_empty());
     }
 
     #[test]

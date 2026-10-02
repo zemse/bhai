@@ -3,7 +3,7 @@
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use std::collections::HashMap;
@@ -65,9 +65,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_links(frame, app);
 }
 
-/// The URLs and file paths in the transcript rows in view, as OSC 8 links.
-fn render_links(frame: &mut Frame, app: &App) {
+/// The URLs and file paths in the transcript rows in view, as OSC 8 links, kept for
+/// the mouse, and the web link under the pointer underlined in every row it covers.
+fn render_links(frame: &mut Frame, app: &mut App) {
     let Some(area) = app.transcript_area else {
+        app.links.clear();
         return;
     };
     let view = app.scroll..(app.scroll + area.height as usize).min(app.lines.len());
@@ -78,7 +80,7 @@ fn render_links(frame: &mut Frame, app: &App) {
         home: home.as_deref(),
         files: !crate::clipboard::over_ssh(|name| std::env::var_os(name)),
     };
-    crate::links::stamp(
+    app.links = crate::links::stamp(
         frame.buffer_mut(),
         area,
         view,
@@ -87,6 +89,16 @@ fn render_links(frame: &mut Frame, app: &App) {
         &app.margins,
         &places,
     );
+    if let Some(link) = app.hovered_link() {
+        let buf = frame.buffer_mut();
+        for (y, xs) in &link.spans {
+            for x in xs.clone() {
+                if let Some(cell) = buf.cell_mut((x, *y)) {
+                    cell.modifier.insert(Modifier::UNDERLINED);
+                }
+            }
+        }
+    }
 }
 
 /// What a drag's copy leaves behind, beside where the drag ended so the eye is already
@@ -445,6 +457,12 @@ const ALWAYS: u8 = 0;
 /// left of the rate-limit windows. It sits under the prompt so the transcript has the
 /// whole screen above it to scroll through.
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+    // Where a click would go, in place of the bar while the pointer is on a link.
+    if let Some(link) = app.hovered_link() {
+        let line = Span::styled(format!(" ↗ {}", link.target), Style::new().fg(Color::Cyan));
+        frame.render_widget(Paragraph::new(Line::from(line)), area);
+        return;
+    }
     // The user's own template, when they wrote one, clipped at the edge like any row.
     if let Some(template) = &app.statusline {
         let spans = template.render(&crate::statusline::values(app), area.width as usize);
@@ -4270,6 +4288,50 @@ mod tests {
             })
             .collect();
         assert_eq!(linked, "https://example.com/d");
+    }
+
+    #[test]
+    fn hovering_a_wrapped_link_underlines_every_row_of_it_and_names_it_below() {
+        let mut app = App::detached();
+        let url = "https://example.com/a/very/long/path/to/wrap";
+        app.entries().push(Entry::Assistant(format!("see {url}")));
+        let mut terminal = Terminal::new(TestBackend::new(30, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.links.len(), 1);
+        let spans = app.links[0].spans.clone();
+        assert!(spans.len() > 1, "{spans:?}");
+        let underlined = |terminal: &Terminal<TestBackend>| {
+            spans.iter().all(|(y, xs)| {
+                xs.clone().all(|x| {
+                    terminal.backend().buffer()[(x, *y)]
+                        .modifier
+                        .contains(Modifier::UNDERLINED)
+                })
+            })
+        };
+        assert!(!underlined(&terminal));
+
+        let (y, xs) = spans.last().unwrap();
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: xs.start,
+            row: *y,
+            modifiers: KeyModifiers::NONE,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(underlined(&terminal));
+        let shown = screen(&terminal);
+        assert!(shown.contains("↗ https://example.com/"), "{shown}");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!underlined(&terminal));
+        assert!(!screen(&terminal).contains('↗'));
     }
 
     #[test]

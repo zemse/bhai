@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- A web link in the transcript underlines in every row it wraps over while the pointer is on it, with its target in the status line, and a click that is not a drag or a double click opens it in the default browser; a file: link or any other scheme is never opened.
 - `--profile` also writes each turn, model call, tool call and subagent as a span to `.bhai/debug/trace.jsonl`, with its parent, root and duration. No span carries a prompt, arguments or output. A build with the `otel` feature also exports the spans over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 - An image on its way to the model, from a tool or pasted into the prompt, is decoded under a 128 MiB cap, scaled to fit 2048 px and 2048x768 pixels with a line saying so, and cached by content hash so a repeat keeps the prefix. One the backend refuses is swapped for a placeholder line in the history and the call goes again.
 - `websocket = true` in the global config sends a conversation's Codex calls over the Responses WebSocket, one socket per conversation. A call that extends the last one sends only its new items under `previous_response_id`, a new socket or a lost response replays the history whole, and a refused upgrade puts the session on HTTPS.

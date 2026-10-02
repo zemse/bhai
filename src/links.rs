@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use ratatui::buffer::{Buffer, CellDiffOption};
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use crate::wrap::Join;
 
@@ -20,6 +20,62 @@ const MAX_WORD: usize = 4096;
 pub struct Link {
     pub chars: Range<usize>,
     pub target: String,
+}
+
+/// A link as the frame drew it: its target and, row by row, the screen columns it
+/// covers. A link wrapped over rows has a span on each.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Shown {
+    pub target: String,
+    pub spans: Vec<(u16, Range<u16>)>,
+}
+
+impl Shown {
+    pub fn contains(&self, at: Position) -> bool {
+        self.spans
+            .iter()
+            .any(|(y, xs)| *y == at.y && xs.contains(&at.x))
+    }
+}
+
+/// Whether a click may open `target`: only a web page, so text in the transcript can
+/// never have a click run a `file:` URL or another scheme's handler.
+pub fn openable(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && !target.chars().any(char::is_control)
+}
+
+/// Open `target` with `launch`, refusing anything [`openable`] does not pass.
+pub fn open(target: &str, launch: fn(&str) -> std::io::Result<()>) -> Result<(), String> {
+    if !openable(target) {
+        return Err(format!(
+            "not opening {target}: only http and https links open"
+        ));
+    }
+    launch(target).map_err(|err| format!("opening {target}: {err}"))
+}
+
+/// The default browser on `url`: `open` on macOS, `xdg-open` elsewhere, with the URL as
+/// an argument and no shell. Nothing waits for it but a thread that reaps it.
+pub fn launch(url: &str) -> std::io::Result<()> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let mut command = std::process::Command::new(program);
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Its own group, so a ctrl+c meant for bhai does not reach it.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 /// Where to look for the files a path names.
@@ -181,6 +237,7 @@ fn wrapped(id: &str, target: &str, symbol: &str) -> String {
 /// Turn the links in the transcript rows `view` into OSC 8 links in `buf`, where `area`
 /// shows them from its top row. A word split over rows is one link, and a cell whose
 /// symbol is not the char the row has there, an overlay drawn over it, is left alone.
+/// Returns each link with the cells it took.
 pub fn stamp(
     buf: &mut Buffer,
     area: Rect,
@@ -189,7 +246,8 @@ pub fn stamp(
     joins: &[Join],
     margins: &[usize],
     places: &Places,
-) {
+) -> Vec<Shown> {
+    let mut shown = Vec::new();
     let split = |line: usize| joins.get(line) == Some(&Join::Split);
     // Rows past these on either side of the view can only hold part of a word too long
     // to be a link.
@@ -223,6 +281,7 @@ pub fn stamp(
         }
         for link in find(&text, places) {
             let id = format!("bhai-{line}-{}", link.chars.start);
+            let mut spans: Vec<(u16, Range<u16>)> = Vec::new();
             for &(row, column, c) in &cells[link.chars] {
                 if !view.contains(&row) || column >= area.width {
                     continue;
@@ -246,10 +305,23 @@ pub fn stamp(
                     .set_diff_option(CellDiffOption::ForcedWidth(
                         NonZeroU16::new(width as u16).expect("at least one"),
                     ));
+                let x = area.x + column;
+                let cells = x..x.saturating_add(width as u16);
+                match spans.last_mut() {
+                    Some((at, xs)) if *at == y && xs.end == x => xs.end = cells.end,
+                    _ => spans.push((y, cells)),
+                }
+            }
+            if !spans.is_empty() {
+                shown.push(Shown {
+                    target: link.target,
+                    spans,
+                });
             }
         }
         line = end;
     }
+    shown
 }
 
 #[cfg(test)]
@@ -362,7 +434,18 @@ mod tests {
         }
         // An overlay over the last cell of the link.
         buf[(5, 1)].set_symbol("#");
-        stamp(&mut buf, area, 0..2, &lines, &joins, &margins, &none());
+        let shown = stamp(&mut buf, area, 0..2, &lines, &joins, &margins, &none());
+        // One link, a span on each row, broken where the overlay sits.
+        assert_eq!(
+            shown,
+            [Shown {
+                target: "https://example.com".to_string(),
+                spans: vec![(0, 8..19), (1, 2..5), (1, 6..10)],
+            }]
+        );
+        assert!(shown[0].contains(Position::new(3, 1)));
+        assert!(!shown[0].contains(Position::new(5, 1)));
+        assert!(!shown[0].contains(Position::new(7, 0)));
         let open = "\x1b]8;id=bhai-0-6;https://example.com\x1b\\";
         assert_eq!(buf[(8, 0)].symbol(), format!("{open}h\x1b]8;;\x1b\\"));
         assert_eq!(buf[(4, 1)].symbol(), format!("{open}l\x1b]8;;\x1b\\"));
@@ -382,6 +465,26 @@ mod tests {
             &none(),
         );
         assert_eq!(buf[(2, 0)].symbol(), format!("{open}m\x1b]8;;\x1b\\"));
+    }
+
+    fn launched(_: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_web_link_opens() {
+        assert!(open("https://example.com/a", launched).is_ok());
+        assert!(open("HTTP://example.com", launched).is_ok());
+        for target in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "x-man-page://ls",
+            "https://a.io/\u{7}",
+        ] {
+            assert!(open(target, launched).is_err(), "{target}");
+        }
+        let failed = open("https://a.io", |_| Err(std::io::Error::other("no browser")));
+        assert_eq!(failed, Err("opening https://a.io: no browser".to_string()));
     }
 
     #[test]
