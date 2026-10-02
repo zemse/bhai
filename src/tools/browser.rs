@@ -307,6 +307,21 @@ struct Watch {
     refusals: usize,
 }
 
+impl Watch {
+    fn new() -> Self {
+        Watch {
+            loaded: false,
+            open: 0,
+            changed: Instant::now(),
+            requests: 0,
+            bytes: 0,
+            document: None,
+            refused: Vec::new(),
+            refusals: 0,
+        }
+    }
+}
+
 /// Load `url` in a new page of the browser on `cdp` and read it.
 pub(crate) async fn load(
     cdp: &Arc<Cdp>,
@@ -333,16 +348,7 @@ pub(crate) async fn load(
         )
         .await?;
     let session = string(&attached, "sessionId")?;
-    let watch = Arc::new(Mutex::new(Watch {
-        loaded: false,
-        open: 0,
-        changed: Instant::now(),
-        requests: 0,
-        bytes: 0,
-        document: None,
-        refused: Vec::new(),
-        refusals: 0,
-    }));
+    let watch = Arc::new(Mutex::new(Watch::new()));
     let intercepting = tokio::spawn(intercept(
         Arc::clone(cdp),
         events,
@@ -534,7 +540,7 @@ async fn answer(
     };
     let answer = match over {
         Some(why) => Answer::Refuse(why),
-        None => make(request, refusal).await,
+        None => make(request, refusal, &watch).await,
     };
     let document = params["resourceType"] == "Document" && params["frameId"] == frame.as_str();
     let (method, reply) = match answer {
@@ -545,7 +551,6 @@ async fn answer(
             body,
         } => {
             let mut w = lock(&watch);
-            w.bytes += body.len();
             if document {
                 w.document = Some((status, url.clone()));
             }
@@ -603,7 +608,13 @@ const DROPPED_RESPONSE: [&str; 4] = [
 ];
 
 /// Make the request Chrome paused, through the guard and without following a redirect.
-async fn make(request: &Value, refusal: fn(IpAddr) -> Option<&'static str>) -> Answer {
+/// Each chunk read is counted into `watch` as it arrives, so requests in flight together
+/// share the page's byte cap.
+async fn make(
+    request: &Value,
+    refusal: fn(IpAddr) -> Option<&'static str>,
+    watch: &Mutex<Watch>,
+) -> Answer {
     let Some(Ok(url)) = request["url"].as_str().map(Url::parse) else {
         return Answer::Refuse(format!(
             "a request to an unreadable URL: {}",
@@ -667,7 +678,19 @@ async fn make(request: &Value, refusal: fn(IpAddr) -> Option<&'static str>) -> A
                     MAX_RESPONSE >> 20
                 ));
             }
-            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(Some(chunk)) => {
+                {
+                    let mut w = lock(watch);
+                    if w.bytes + chunk.len() > MAX_BYTES {
+                        return Answer::Refuse(format!(
+                            "{url}: the page passed {} MiB",
+                            MAX_BYTES >> 20
+                        ));
+                    }
+                    w.bytes += chunk.len();
+                }
+                body.extend_from_slice(&chunk);
+            }
             Ok(None) => break,
             Err(e) => return Answer::Refuse(format!("{url}: reading the body: {e}")),
         }
@@ -723,7 +746,8 @@ mod tests {
             .route(
                 "/hop",
                 get(|| async { axum::response::Redirect::temporary("/app") }),
-            );
+            )
+            .route("/mib", get(|| async { vec![b'x'; 1 << 20] }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
@@ -733,8 +757,9 @@ mod tests {
     #[tokio::test]
     async fn a_paused_request_is_made_through_the_guard_one_hop_at_a_time() {
         let base = site().await;
+        let watch = Mutex::new(Watch::new());
         let request = |url: &str| json!({"url": url, "method": "GET", "headers": {"Accept-Encoding": "gzip", "X-Kept": "1"}});
-        match make(&request(&format!("{base}/app")), but_local).await {
+        match make(&request(&format!("{base}/app")), but_local, &watch).await {
             Answer::Fulfil {
                 status,
                 headers,
@@ -751,7 +776,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        match make(&request(&format!("{base}/hop")), but_local).await {
+        match make(&request(&format!("{base}/hop")), but_local, &watch).await {
             Answer::Fulfil {
                 status, headers, ..
             } => {
@@ -765,17 +790,17 @@ mod tests {
             "http://169.254.169.254/latest/".to_string(),
             "http://[::1]/".to_string(),
         ] {
-            match make(&request(&url), ssrf::refusal).await {
+            match make(&request(&url), ssrf::refusal, &watch).await {
                 Answer::Refuse(why) => assert!(why.starts_with("refused:"), "{why}"),
                 other => panic!("{url}: {other:?}"),
             }
         }
         assert_eq!(
-            make(&request("data:text/plain,hi"), ssrf::refusal).await,
+            make(&request("data:text/plain,hi"), ssrf::refusal, &watch).await,
             Answer::Continue
         );
         assert!(matches!(
-            make(&request("file:///etc/passwd"), ssrf::refusal).await,
+            make(&request("file:///etc/passwd"), ssrf::refusal, &watch).await,
             Answer::Refuse(_)
         ));
     }
@@ -955,6 +980,36 @@ mod tests {
             .unwrap();
         assert_eq!(page.status, None);
         assert!(page.refused[0].contains("private"), "{:?}", page.refused);
+    }
+
+    #[tokio::test]
+    async fn requests_in_flight_together_share_the_page_byte_cap() {
+        let base = site().await;
+        let sent = Sent::default();
+        let count = (MAX_BYTES >> 20) + 10;
+        let (cdp, events) =
+            fake_browser(vec![format!("{base}/mib"); count], Arc::clone(&sent)).await;
+        let url = Url::parse(&format!("{base}/mib")).unwrap();
+        let page = load(&cdp, events, &url, false, but_local).await.unwrap();
+
+        let sent = sent.lock().unwrap();
+        let fulfilled: usize = sent
+            .iter()
+            .filter(|(m, _, _)| m == "Fetch.fulfillRequest")
+            .map(|(_, p, _)| {
+                crate::clipboard::unbase64(p["body"].as_str().unwrap())
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert!(fulfilled <= MAX_BYTES, "{fulfilled} bytes handed on");
+        assert!(fulfilled > 0);
+        assert!(
+            page.refusals >= count - (MAX_BYTES >> 20),
+            "{}",
+            page.refusals
+        );
+        assert!(page.refused[0].contains("MiB"), "{:?}", page.refused);
     }
 
     /// Needs a Chrome or Chromium on the machine: `cargo test -- --ignored real_chrome`.
