@@ -62,6 +62,7 @@ pub async fn entry() -> Result<()> {
     if args.first().is_some_and(|a| a == askpass::FLAG) {
         std::process::exit(askpass::helper(&args[1..]));
     }
+    tools::bash::kill_all_on_signal()?;
     if args.first().is_some_and(|a| a == "identities") {
         return identities();
     }

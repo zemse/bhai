@@ -951,6 +951,36 @@ pub fn kill_all() {
     }
 }
 
+/// Make a hangup, an interrupt or a terminate end every session before bhai dies of it,
+/// as it still does: the sessions' process groups would outlive it, holding their ports.
+pub fn kill_all_on_signal() -> io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    for kind in [
+        SignalKind::hangup(),
+        SignalKind::interrupt(),
+        SignalKind::terminate(),
+    ] {
+        let mut stream = signal(kind)?;
+        tokio::spawn(async move {
+            if stream.recv().await.is_some() {
+                kill_all();
+                die_of(kind.as_raw_value());
+            }
+        });
+    }
+    Ok(())
+}
+
+/// End this process with `signal`, as if no handler had caught it.
+#[allow(unsafe_code)]
+fn die_of(signal: libc::c_int) {
+    // SAFETY: restoring the default action and raising a signal touch no memory.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
 /// What the command printed: stdout, then stderr.
 fn body(stdout: &Kept, stderr: &Kept) -> String {
     let mut body = stdout.text();
@@ -1439,6 +1469,98 @@ mod tests {
         );
         write(id, "\u{4}", Duration::from_secs(5), quiet()).await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Set in the copy of the test binary that `a_signal_ends_the_sessions_with_bhai`
+    /// starts, to the file it writes its session's process group to.
+    const SIGNALLED: &str = "BHAI_TEST_SIGNALLED";
+
+    /// The test runs itself again as the process to signal, since the signal kills it.
+    #[test]
+    fn a_signal_ends_the_sessions_with_bhai() {
+        if let Some(file) = std::env::var_os(SIGNALLED) {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                kill_all_on_signal().unwrap();
+                let out = start("sleep 600", None, YIELD_MIN, false, quiet()).await;
+                let group = sessions().live[&session_id(&out)].group.unwrap();
+                std::fs::write(&file, group.to_string()).unwrap();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+            return;
+        }
+        let file = std::env::temp_dir().join(format!("bhai-signal-{}", uuid::Uuid::new_v4()));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["a_signal_ends_the_sessions_with_bhai", "--nocapture"])
+            .env(SIGNALLED, &file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let begun = Instant::now();
+        let group = loop {
+            if let Some(group) = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|g| g.parse::<i32>().ok())
+            {
+                break group;
+            }
+            assert!(begun.elapsed() < Duration::from_secs(20), "no session");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let alive = || {
+            #[allow(unsafe_code)]
+            // SAFETY: signal 0 only asks whether the group exists.
+            let sent = unsafe { libc::killpg(group, 0) };
+            sent == 0
+        };
+        assert!(alive());
+        let pid = i32::try_from(child.id()).unwrap();
+        #[allow(unsafe_code)]
+        // SAFETY: only sends a signal, to the child started above.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        // The killed group is reaped by whatever inherits it, which takes a moment.
+        let killed = Instant::now();
+        while alive() && killed.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&file);
+        assert!(!alive(), "session {group} outlived bhai");
+    }
+
+    /// What the judge rules on, and caches its verdict under, is the line that runs, not
+    /// the last piece of it.
+    #[tokio::test]
+    async fn a_line_typed_in_pieces_reaches_the_judge_whole() {
+        use crate::tools::Tool;
+        let shell = "bash --norc --noprofile";
+        let out = start(shell, None, Duration::from_millis(300), true, quiet()).await;
+        let id = session_id(&out);
+        let typed = |chars: &str| json!({ "session_id": id, "chars": chars });
+        let stdin = crate::tools::stdin::WriteStdin;
+        let first = stdin.describe(&typed("echo one | ca")).unwrap();
+        assert_eq!(
+            first,
+            format!("type \"echo one | ca\" into session {id}: {shell}")
+        );
+        write(id, "echo one | ca", Duration::from_millis(250), quiet()).await;
+        let args = typed("t\n");
+        let summary = stdin.describe(&args).unwrap();
+        let (target, _) = crate::judge::target(crate::tools::stdin::NAME, &args, &summary);
+        assert!(target.contains("\"echo one | cat\\n\""), "{target}");
+        // A bare enter after one line is not the same call as after another.
+        write(id, "t\n", Duration::from_millis(250), quiet()).await;
+        assert_eq!(
+            stdin.describe(&typed("\n")).unwrap(),
+            format!("type \"\\n\" into session {id}: {shell}")
+        );
+        write(id, "ls", Duration::from_millis(250), quiet()).await;
+        assert!(stdin.describe(&typed("\n")).unwrap().contains("\"ls\\n\""));
+        write(id, "\u{3}exit\n", Duration::from_secs(5), quiet()).await;
     }
 
     #[tokio::test]

@@ -71,9 +71,17 @@ impl Tool for WriteStdin {
     fn describe(&self, args: &Value) -> Result<String, String> {
         let (id, chars, _) = parse(args)?;
         let (command, _) = bash::check_input(id, chars)?;
-        Ok(match chars.is_empty() {
-            true => format!("poll session {id}: {command}"),
-            false => format!("type {chars:?} into session {id}: {command}"),
+        // A shell runs the line earlier writes left unfinished along with `chars`, so the
+        // summary, which is what the user, the judge and its cache see, names it whole.
+        let entered = bash::input_line(id, chars)
+            .map(|(_, line)| line)
+            .filter(|line| line.len() > chars.len());
+        Ok(match (chars.is_empty(), entered) {
+            (true, _) => format!("poll session {id}: {command}"),
+            (false, None) => format!("type {chars:?} into session {id}: {command}"),
+            (false, Some(line)) => {
+                format!("type {chars:?} into session {id}, entering {line:?}: {command}")
+            }
         })
     }
 
