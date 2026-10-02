@@ -169,8 +169,9 @@ fn tool_schema() -> Value {
     with session ID N` and holds the output so far, and `write_stdin` polls it for more or, \
     for a `tty` session, types into it. Use that for dev servers, watchers, long builds and \
     REPLs. A job sent to the background with `&` must redirect its output to a file, since \
-    it inherits this command's own.{}{}",
+    it inherits this command's own.{}{}{}",
         crate::sandbox::active().map_or("", Sandbox::describe),
+        crate::egress::active().map_or("", crate::egress::Proxy::describe),
         match crate::askpass::active() {
             true =>
                 " For root, use `sudo -A`: it asks the user for their password, which you never see.",
@@ -533,6 +534,9 @@ impl Proc {
         };
         crate::childenv::scrub(bash);
         crate::childenv::non_interactive(bash);
+        if let Some(proxy) = crate::egress::active() {
+            proxy.apply(bash);
+        }
         if let Some(call) = &asking {
             call.env(bash);
         }
@@ -1246,6 +1250,22 @@ mod tests {
         };
         assert!(!out.contains("connected"), "{out}");
         assert!(!out.starts_with("exit code: 0"), "{out}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_sandbox_through_a_proxy_connects_to_its_port_alone() {
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = |listener: &std::net::TcpListener| listener.local_addr().unwrap().port();
+        let command = |port: u16| format!("exec 3<>/dev/tcp/127.0.0.1/{port} && echo connected");
+        let sandbox = Sandbox::with(vec!["/dev".into()], true).through(Some(port(&proxy)));
+        let Some(out) = sandboxed(&command(port(&proxy)), &sandbox).await else {
+            return;
+        };
+        assert!(out.contains("connected"), "{out}");
+        let out = sandboxed(&command(port(&other)), &sandbox).await.unwrap();
+        assert!(!out.contains("connected"), "{out}");
     }
 
     #[tokio::test]

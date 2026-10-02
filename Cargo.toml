@@ -17,21 +17,28 @@ include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 axum = "0.8.9"
+base64 = "0.22.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 futures-util = "0.3.33"
+http-body-util = "0.1.4"
+hyper = { version = "1.11.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 libc = "0.2.189"
 merman-ascii = "0.7.0"
 merman-core = "0.7.0"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = "0.30.2"
+rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls", "http2"] }
 rmcp = { version = "2.2.0", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 tiktoken-rs = "0.12"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "io-util", "net", "signal"] }
+tokio-rustls = { version = "0.26.4", default-features = false }
 toml = "1.1.6"
 tui-input = "0.15.3"
 unicode-width = "0.2.2"

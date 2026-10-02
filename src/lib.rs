@@ -50,6 +50,7 @@ pub mod compact;
 pub mod config;
 mod debug;
 mod diff;
+mod egress;
 pub mod entries;
 mod environment;
 mod external;

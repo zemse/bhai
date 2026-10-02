@@ -2,9 +2,10 @@
 //! Inference runs through the Codex CLI's ChatGPT-subscription credentials.
 
 use crate::{
-    agent, app, askpass, cache, childenv, client, config, external, identity, input, instructions,
-    judge, limits, mcp, memory, models, notify, permissions, profile, sandbox, search, server,
-    session, sessions, skills, startup, statusline, syntax, title, tokens, tools, ui, workflow,
+    agent, app, askpass, cache, childenv, client, config, egress, external, identity, input,
+    instructions, judge, limits, mcp, memory, models, notify, permissions, profile, sandbox,
+    search, server, session, sessions, skills, startup, statusline, syntax, title, tokens, tools,
+    ui, workflow,
 };
 
 use std::path::PathBuf;
@@ -698,7 +699,12 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let roots = instructions::Roots::from_env(cwd);
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
     childenv::set_pass(&config.pass_env);
-    sandbox::set(&config.sandbox, &roots.cwd, roots.home.as_deref());
+    // With no network there is nothing for the allowlist to let through.
+    let proxy = match &config.egress {
+        Some(settings) if config.sandbox.network => Some(egress::start(settings).await?.port()),
+        _ => None,
+    };
+    sandbox::set(&config.sandbox, &roots.cwd, roots.home.as_deref(), proxy);
     // Named once for the process: code already on screen is not repainted.
     if let Some(theme) = &config.code_theme {
         syntax::set_theme(theme);

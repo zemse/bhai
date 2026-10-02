@@ -36,6 +36,8 @@ mod config;
 mod debug;
 #[path = "../../src/diff.rs"]
 mod diff;
+#[path = "../../src/egress.rs"]
+mod egress;
 #[path = "../../src/entries.rs"]
 mod entries;
 #[path = "../../src/environment.rs"]

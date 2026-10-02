@@ -6,6 +6,9 @@
 //! On macOS the profile only denies; everything else is allowed, so a command can still
 //! ask a running service (over a unix socket or Mach) to write for it. On Linux the
 //! network rule covers TCP only, so UDP, DNS included, still goes out.
+//!
+//! With the egress proxy running (see `egress`), IP traffic may go to its port alone, on
+//! Linux to that port at any address.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -68,9 +71,10 @@ const CACHE_VARS: [&str; 5] = [
 static SANDBOX: OnceLock<Sandbox> = OnceLock::new();
 
 /// Named once for the process, like `pass_env`: every bash call after this is sandboxed.
-pub fn set(settings: &Settings, root: &Path, home: Option<&Path>) {
-    if settings.active() {
-        let _ = SANDBOX.set(Sandbox::new(settings, root, home));
+/// A `proxy` port turns it on, since nothing else holds a command to the proxy.
+pub fn set(settings: &Settings, root: &Path, home: Option<&Path>, proxy: Option<u16>) {
+    if settings.active() || proxy.is_some() {
+        let _ = SANDBOX.set(Sandbox::new(settings, root, home).through(proxy));
     }
 }
 
@@ -83,6 +87,8 @@ pub struct Sandbox {
     /// Resolved through symlinks, since both kernels check the real path.
     writable: Vec<PathBuf>,
     network: bool,
+    /// The egress proxy's loopback port, the one place IP traffic may go.
+    proxy: Option<u16>,
 }
 
 /// A command ready for `-lc` and its script, and what has to live until it is spawned.
@@ -130,12 +136,22 @@ impl Sandbox {
                 writable.push(dir);
             }
         }
-        Self { writable, network }
+        Self {
+            writable,
+            network,
+            proxy: None,
+        }
+    }
+
+    pub(crate) fn through(mut self, proxy: Option<u16>) -> Self {
+        self.proxy = proxy;
+        self
     }
 
     /// What the model is told, so a refused write reads as the sandbox and not a fault.
     pub fn describe(&self) -> &'static str {
-        match self.network {
+        // The proxy says what it lets through.
+        match self.network || self.proxy.is_some() {
             true => {
                 " Commands run in a sandbox: writes outside the working directory, the temp \
     dirs and the toolchain caches fail with \"Operation not permitted\"."
@@ -170,9 +186,17 @@ impl Sandbox {
         let mut profile = format!(
             "(version 1)\n(allow default)\n(deny file-write* (require-not (require-any{roots})))\n"
         );
+        if !self.network || self.proxy.is_some() {
+            profile.push_str("(deny network-outbound (remote ip))\n");
+        }
+        // A later rule wins over an earlier one it overlaps.
+        if let Some(port) = self.proxy {
+            profile.push_str(&format!(
+                "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+            ));
+        }
         if !self.network {
-            profile
-                .push_str("(deny network-outbound (remote ip))\n(deny network-bind (local ip))\n");
+            profile.push_str("(deny network-bind (local ip))\n");
         }
         profile
     }
@@ -181,7 +205,7 @@ impl Sandbox {
     #[allow(unsafe_code)]
     pub fn bash(&self) -> io::Result<Shell> {
         use std::os::fd::AsRawFd;
-        let ruleset = landlock::ruleset(&self.writable, self.network)?;
+        let ruleset = landlock::ruleset(&self.writable, self.network, self.proxy)?;
         let fd = ruleset.as_raw_fd();
         let mut command = Command::new("bash");
         // SAFETY: the closure makes two syscalls and allocates nothing, so it is safe
@@ -224,6 +248,7 @@ mod landlock {
 
     const CREATE_RULESET_VERSION: u32 = 1;
     const RULE_PATH_BENEATH: u32 = 1;
+    const RULE_NET_PORT: u32 = 2;
 
     const WRITE_FILE: u64 = 1 << 1;
     const REMOVE_DIR: u64 = 1 << 4;
@@ -268,9 +293,16 @@ mod landlock {
         parent_fd: i32,
     }
 
-    /// A ruleset that allows writes under `writable` alone, and with `network` false no
-    /// TCP bind or connect. Built in the parent, where allocating is fine.
-    pub fn ruleset(writable: &[PathBuf], network: bool) -> io::Result<OwnedFd> {
+    #[repr(C)]
+    struct NetPortAttr {
+        allowed_access: u64,
+        port: u64,
+    }
+
+    /// A ruleset that allows writes under `writable` alone, with `network` false no TCP
+    /// bind, and with `network` false or a `proxy` port no TCP connect but to that port.
+    /// Built in the parent, where allocating is fine.
+    pub fn ruleset(writable: &[PathBuf], network: bool, proxy: Option<u16>) -> io::Result<OwnedFd> {
         // SAFETY: a version query reads no memory.
         let abi = unsafe {
             libc::syscall(
@@ -290,6 +322,11 @@ mod landlock {
                 "`network = false` needs Landlock ABI 4 (Linux 6.7); this kernel has an older one",
             ));
         }
+        if proxy.is_some() && abi < 4 {
+            return Err(io::Error::other(
+                "`[egress]` needs Landlock ABI 4 (Linux 6.7); this kernel has an older one",
+            ));
+        }
         let mut access = WRITES;
         if abi >= 2 {
             access |= REFER;
@@ -299,7 +336,11 @@ mod landlock {
         }
         let attr = RulesetAttr {
             handled_access_fs: access,
-            handled_access_net: if network { 0 } else { BIND_TCP | CONNECT_TCP },
+            handled_access_net: match (network, proxy) {
+                (false, _) => BIND_TCP | CONNECT_TCP,
+                (true, Some(_)) => CONNECT_TCP,
+                (true, None) => 0,
+            },
         };
         // SAFETY: `attr` is a live struct of the size passed.
         let fd = unsafe {
@@ -334,6 +375,25 @@ mod landlock {
                     ruleset.as_raw_fd(),
                     RULE_PATH_BENEATH,
                     &rule as *const PathBeneathAttr,
+                    0u32,
+                )
+            };
+            if added < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if let Some(port) = proxy {
+            let rule = NetPortAttr {
+                allowed_access: CONNECT_TCP,
+                port: u64::from(port),
+            };
+            // SAFETY: `rule` is live for the call.
+            let added = unsafe {
+                libc::syscall(
+                    libc::SYS_landlock_add_rule,
+                    ruleset.as_raw_fd(),
+                    RULE_NET_PORT,
+                    &rule as *const NetPortAttr,
                     0u32,
                 )
             };

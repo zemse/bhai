@@ -11,6 +11,8 @@
 //! So is `[bash] pass_env`, the credential-looking variables children may still inherit,
 //! and `[bash] writable`; a project file may turn `[bash] sandbox` on and `network` off,
 //! never the reverse. `[bash] sudo` likewise: a project file may turn it off, never on.
+//! `[egress]`, the allowlist and secrets of the proxy bash goes out through, is the
+//! global file's alone.
 //! `web_search` is off unless the global file turns it on, since each search sends the
 //! last two user messages and some of the answers between them to the ChatGPT backend's
 //! undocumented search endpoint; a project file may turn it off. `image_gen` likewise,
@@ -76,6 +78,8 @@ pub struct Config {
     pub sandbox: crate::sandbox::Settings,
     /// `[bash] sudo`: `sudo -A` asks for the password in the terminal.
     pub sudo: bool,
+    /// `[egress]`: the proxy bash goes out through, or `None` for none.
+    pub egress: Option<crate::egress::Settings>,
 }
 
 impl Default for Config {
@@ -105,6 +109,7 @@ impl Default for Config {
             pass_env: Vec::new(),
             sandbox: crate::sandbox::Settings::default(),
             sudo: false,
+            egress: None,
         }
     }
 }
@@ -194,6 +199,7 @@ struct Layer {
     statusline: Option<String>,
     #[serde(default)]
     bash: BashLayer,
+    egress: Option<crate::egress::Settings>,
     #[serde(default)]
     permissions: RulesLayer,
 }
@@ -375,6 +381,10 @@ impl Config {
             self.sandbox
                 .writable
                 .extend(layer.bash.writable.iter().cloned());
+            // Where commands may send data, and which secrets ride along, likewise.
+            if layer.egress.is_some() {
+                self.egress = layer.egress.clone();
+            }
         }
         // A project file may turn the sandbox on and the network off, never the reverse.
         if let Some(on) = layer.bash.sandbox
@@ -715,6 +725,33 @@ mod tests {
 
         write(&cwd.join(".bhai/config.toml"), "[bash]\nsudo = false\n");
         assert!(!Config::load(Some(&home), &cwd).unwrap().sudo);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn egress_is_the_global_files_alone() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[egress]\nallow = [\"https://evil.example\"]\n",
+        );
+        assert_eq!(Config::load(Some(&home), &cwd).unwrap().egress, None);
+
+        write(
+            &global_path(&home),
+            "[egress]\nallow = [\"GET https://api.github.com/repos\"]\n\
+             [egress.secrets.GITHUB_TOKEN]\norigin = \"https://api.github.com\"\n\
+             command = [\"secrets\", \"get\", \"GITHUB_TOKEN\"]\n",
+        );
+        let egress = Config::load(Some(&home), &cwd).unwrap().egress.unwrap();
+        assert_eq!(egress.allow, ["GET https://api.github.com/repos"]);
+        let secret = &egress.secrets["GITHUB_TOKEN"];
+        assert_eq!(secret.origin, "https://api.github.com");
+        assert_eq!(secret.command.as_deref().unwrap()[0], "secrets");
+
+        write(&global_path(&home), "[egress]\nallowed = []\n");
+        assert!(Config::load(Some(&home), &cwd).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
