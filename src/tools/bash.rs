@@ -990,6 +990,8 @@ pub fn kill_all_on_signal() -> io::Result<()> {
         tokio::spawn(async move {
             if stream.recv().await.is_some() {
                 kill_all();
+                #[cfg(feature = "dictation")]
+                crate::dictation::kill_all();
                 die_of(kind.as_raw_value());
             }
         });

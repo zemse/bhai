@@ -3896,6 +3896,9 @@ mod tests {
         app.on_key(ctrl_space());
         app.dictation.as_ref().unwrap().wait_for_audio(100);
         app.on_key(ctrl_space());
+        // esc while transcribing, as to interrupt a turn, leaves the transcript coming.
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(status(&app), Status::Transcribing);
         let deadline = Instant::now() + Duration::from_secs(10);
         while status(&app) != Status::Idle {
             assert!(Instant::now() < deadline, "no transcript");

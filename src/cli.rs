@@ -469,6 +469,8 @@ allow it.",
     std::panic::set_hook(Box::new(move |info| {
         // The sessions are in a static, so no unwinding or drop would end them.
         tools::bash::kill_all_panicking();
+        #[cfg(feature = "dictation")]
+        crate::dictation::kill_all();
         modes.release();
         title::pop();
         hook(info);
