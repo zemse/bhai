@@ -18,6 +18,8 @@ mod askpass;
 mod auth;
 #[path = "../../src/background.rs"]
 mod background;
+#[path = "../../src/bgview.rs"]
+mod bgview;
 #[path = "../../src/branch.rs"]
 mod branch;
 #[path = "../../src/cache.rs"]

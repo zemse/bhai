@@ -15,6 +15,7 @@ use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::askpass::{self, Secret};
+use crate::bgview::{Act, BgView};
 use crate::branch::Branch;
 use crate::client::Usage;
 use crate::clipboard;
@@ -313,6 +314,12 @@ pub struct App {
     pub inside: Option<Inside>,
     /// Each subagent row's area and id, filled in by the renderer so a click opens it.
     pub child_rows: Vec<(Rect, String)>,
+    /// How many things run in the background, from [`Event::Background`].
+    pub background: usize,
+    /// The status bar's `bg` chip, filled in by the renderer while it is drawn.
+    pub chip: Option<Rect>,
+    /// The background list, shown over the transcript while open.
+    pub bg: Option<BgView>,
     /// The `/model` picker, shown instead of the prompt while open.
     pub picker: Option<Picker>,
     /// The `ctrl+r` search over the prompt history, shown instead of the prompt while open.
@@ -429,6 +436,9 @@ impl App {
             diff: None,
             inside: None,
             child_rows: Vec::new(),
+            background: 0,
+            chip: None,
+            bg: None,
             picker: None,
             search: None,
             ollama_url: crate::ollama::DEFAULT_URL.to_string(),
@@ -492,6 +502,17 @@ impl App {
         if self.pending.is_some() {
             self.approval_key(key.code, ctrl, false);
             return;
+        }
+
+        // The background list takes the keys while open; ctrl+s shuts it as it opened it.
+        if let Some(bg) = &mut self.bg
+            && !(ctrl && key.code == KeyCode::Char('c'))
+        {
+            let act = match key.code {
+                KeyCode::Char('s') if ctrl => Act::Close,
+                code => bg.on_key(code),
+            };
+            return self.bg_act(act);
         }
 
         if let Some(diff) = &mut self.diff
@@ -633,6 +654,7 @@ impl App {
             KeyCode::Esc if self.busy() => self.confirm_interrupt(),
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
+            KeyCode::Char('s') if ctrl => self.toggle_bg(),
             KeyCode::Char('l') if ctrl => self.toggle_folds(),
             KeyCode::Char('y') if ctrl => self.copy(),
             KeyCode::Char('v') if ctrl => self.paste(),
@@ -852,6 +874,22 @@ impl App {
 
     /// Returns whether the screen needs a redraw.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let at = Position::new(mouse.column, mouse.row);
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) && self.pending.is_none() {
+            if self.chip.is_some_and(|chip| chip.contains(at)) {
+                self.toggle_bg();
+                return true;
+            }
+            if let Some(bg) = self
+                .bg
+                .as_mut()
+                .filter(|bg| bg.area.is_some_and(|area| area.contains(at)))
+            {
+                let act = bg.click(mouse.column, mouse.row);
+                self.bg_act(act);
+                return true;
+            }
+        }
         // With an approval up, clicks still reach its buttons.
         if let Some(diff) = self.diff.as_mut().filter(|_| self.pending.is_none()) {
             return diff_mouse(diff, mouse);
@@ -861,9 +899,9 @@ impl App {
             MouseEventKind::ScrollDown => self.wheel(WHEEL_LINES as isize),
             MouseEventKind::Moved => {
                 self.mouse_row = Some(mouse.row);
-                let before = self.hovered_index();
+                let before = (self.hovered_index(), self.on_chip());
                 self.pointer = Some((Position::new(mouse.column, mouse.row), self.scroll));
-                return self.rehover() | (self.hovered_index() != before);
+                return self.rehover() | ((self.hovered_index(), self.on_chip()) != before);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_row = Some(mouse.row);
@@ -962,6 +1000,72 @@ impl App {
 
     pub fn hovered_link(&self) -> Option<&crate::links::Shown> {
         self.hovered_index().map(|index| &self.links[index])
+    }
+
+    /// Whether the pointer was last seen in `area`, however the transcript has scrolled.
+    pub fn pointing_at(&self, area: Rect) -> bool {
+        self.pointer.is_some_and(|(at, _)| area.contains(at))
+    }
+
+    fn on_chip(&self) -> bool {
+        self.chip.is_some_and(|chip| self.pointing_at(chip))
+    }
+
+    /// Open the background list on what runs now, or shut it.
+    fn toggle_bg(&mut self) {
+        self.bg = match self.bg.take() {
+            Some(_) => None,
+            None => {
+                self.diff = None;
+                let rows = self.session.background();
+                self.background = rows.len();
+                Some(BgView::new(rows))
+            }
+        };
+    }
+
+    /// Read what runs into the open background list.
+    fn refresh_bg(&mut self) {
+        if let Some(bg) = &mut self.bg {
+            let rows = self.session.background();
+            self.background = rows.len();
+            bg.refresh(rows);
+        }
+    }
+
+    /// Do what a key or click on the background list asked.
+    fn bg_act(&mut self, act: Act) {
+        match act {
+            Act::None => {}
+            Act::Close => self.bg = None,
+            Act::Child(id) => {
+                self.bg = None;
+                if self.inside.as_ref().is_none_or(|open| open.id != id) {
+                    self.open_child(&id);
+                }
+            }
+            Act::Kill(id) => {
+                let said = match crate::tools::bash::stop(id) {
+                    true => Entry::Info(format!("stopped bash session {id}")),
+                    false => Entry::Error(format!("bash session {id} has already ended")),
+                };
+                self.note(said);
+                self.refresh_bg();
+            }
+            Act::Cancel(id) => {
+                let said = self.with_schedules(|schedules| {
+                    schedules.cancel(&id).map(|row| {
+                        let now = schedules.now();
+                        format!("cancelled {}", crate::schedules::describe(&row, now))
+                    })
+                });
+                self.note(match said {
+                    Ok(said) => Entry::Info(said),
+                    Err(e) => Entry::Error(e),
+                });
+                self.refresh_bg();
+            }
+        }
     }
 
     /// The release of a click on a web link, with nothing selected: it opens in the
@@ -1514,6 +1618,10 @@ impl App {
                 self.working = false;
                 self.judging = None;
             }
+            Event::Background(count) => {
+                self.background = count;
+                self.refresh_bg();
+            }
             _ => {}
         }
     }
@@ -1535,6 +1643,7 @@ impl App {
         self.effort = state.effort;
         self.fast = state.fast;
         self.identity = state.identity;
+        self.background = self.session.background().len();
     }
 
     /// The frame just drawn is on screen, so an approval in it starts settling now.
@@ -1562,6 +1671,8 @@ impl App {
             .map_or(0, |d| d.as_secs());
         if second != self.second {
             self.second = second;
+            // The open list's output tails and ages move on with the clock.
+            self.refresh_bg();
             changed = true;
         }
         // A selection drag still held past the edge of the transcript, which the

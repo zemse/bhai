@@ -322,7 +322,17 @@ fn draw(frame: &mut Frame, app: &mut App) {
         }
         return;
     }
-    render_transcript(frame, transcript_area, app);
+    match &mut app.bg {
+        // The background list covers the transcript, so nothing of it is there to click.
+        Some(bg) => {
+            bg.render(frame, transcript_area);
+            app.rows.clear();
+            app.lines.clear();
+            app.transcript_area = None;
+            app.scrollbar = None;
+        }
+        None => render_transcript(frame, transcript_area, app),
+    }
     render_plan(frame, plan_area, plan.as_ref());
     render_children(frame, children_area, app, &children);
     render_queued(frame, queued_area, app);
@@ -456,7 +466,9 @@ const ALWAYS: u8 = 0;
 /// The bottom bar: where the session is running, how full its context is, and what is
 /// left of the rate-limit windows. It sits under the prompt so the transcript has the
 /// whole screen above it to scroll through.
-fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
+    let area = render_chip(frame, area, app);
+    let app: &App = app;
     // Where a click would go, in place of the bar while the pointer is on a link.
     if let Some(link) = app.hovered_link() {
         let line = Span::styled(format!(" ↗ {}", link.target), Style::new().fg(Color::Cyan));
@@ -619,6 +631,29 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// `bg 3` at the right end of the bar while anything runs in the background, kept in
+/// `app.chip` so a click on it opens the list. Returns what is left of the bar.
+fn render_chip(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
+    if app.background == 0 {
+        app.chip = None;
+        return area;
+    }
+    let text = format!(" bg {} ", app.background);
+    let width = (text.chars().count() as u16).min(area.width);
+    let [rest, chip] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).areas(area);
+    app.chip = Some(chip);
+    // Lit as a link is while the pointer is on it, and while the list is open.
+    let style = match app.pointing_at(chip) || app.bg.is_some() {
+        true => Style::new()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::UNDERLINED),
+        false => Style::new(),
+    };
+    frame.render_widget(Paragraph::new(Span::styled(text, style)), chip);
+    rest
+}
+
 /// The spinner row above the prompt, drawn only while a turn is actually running.
 fn render_working(frame: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 {
@@ -731,7 +766,7 @@ fn headroom(used_percent: f64) -> Style {
 
 /// `text` cut to `max` characters, with an ellipsis when it had more. Callers work out
 /// their room by subtraction, so `max` can reach zero on a narrow terminal.
-fn clip(text: &str, max: usize) -> String {
+pub(crate) fn clip(text: &str, max: usize) -> String {
     let flat = text.replace('\n', " ");
     match flat.chars().count() > max {
         true => flat.chars().take(max.saturating_sub(1)).collect::<String>() + "…",
@@ -4400,5 +4435,301 @@ mod tests {
         );
         assert!(shown.contains("[sudo] password for u: ********"), "{shown}");
         assert!(!shown.contains("s3cret"), "{shown}");
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn moved(column: u16, row: u16) -> MouseEvent {
+        left(MouseEventKind::Moved, column, row)
+    }
+
+    #[test]
+    fn the_bg_chip_shows_while_something_runs_and_lights_under_the_pointer() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!status(&terminal).contains("bg "), "{}", status(&terminal));
+        assert!(app.chip.is_none());
+
+        app.on_event(Event::Background(3));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            status(&terminal).ends_with(" bg 3"),
+            "{}",
+            status(&terminal)
+        );
+        let chip = app.chip.unwrap();
+        assert_eq!((chip.right(), chip.y), (80, 9));
+        let cell = status_cell(&terminal, "bg 3");
+        assert!(!cell.modifier.contains(Modifier::UNDERLINED));
+
+        assert!(
+            app.on_mouse(moved(chip.x + 1, chip.y)),
+            "onto the chip redraws"
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let cell = status_cell(&terminal, "bg 3");
+        assert_eq!(cell.fg, Color::Cyan);
+        assert!(cell.modifier.contains(Modifier::UNDERLINED));
+        assert!(
+            !app.on_mouse(moved(chip.x + 2, chip.y)),
+            "along it is no change"
+        );
+        assert!(app.on_mouse(moved(2, 2)), "off it redraws");
+
+        app.on_event(Event::Background(0));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!status(&terminal).contains("bg "), "{}", status(&terminal));
+        assert!(app.chip.is_none());
+    }
+
+    /// An app whose background is a bash session, a child, a schedule and a server.
+    fn with_background() -> App {
+        use crate::background::{Kind, tests::Fake, tests::row};
+        let app = App::detached();
+        let now = std::time::SystemTime::now();
+        let ago = |secs| Some(now - Duration::from_secs(secs));
+        let mut bash = row(Kind::Bash, "900001", "running");
+        bash.label = "npm run dev".to_string();
+        bash.started = ago(125);
+        bash.pid = Some(4242);
+        bash.detail = "ready on http://localhost:5173\nGET / 200\n".to_string();
+        let mut schedule = row(Kind::Schedule, "s9", "scheduled");
+        schedule.label = "check CI".to_string();
+        schedule.started = ago(600);
+        schedule.detail = "s9 `in 20m` next 17:30".to_string();
+        let mut mcp = row(Kind::Mcp, "fs", "connected");
+        mcp.label = "fs".to_string();
+        mcp.detail = "project, 4 tools".to_string();
+        let fake = Fake::default();
+        fake.0.lock().unwrap().extend([bash, schedule, mcp]);
+        app.session().watch_background(vec![Box::new(fake)]);
+        app.session().publish(Event::ChildStarted {
+            id: "c1".to_string(),
+            identity: "worker".to_string(),
+            description: "read the tests".to_string(),
+            task: "go".to_string(),
+        });
+        app
+    }
+
+    /// The rows the overlay drew, which is the transcript's area.
+    fn overlay(terminal: &Terminal<TestBackend>, app: &App) -> Vec<String> {
+        let area = app.bg.as_ref().and_then(|bg| bg.area).unwrap();
+        screen(terminal)
+            .lines()
+            .skip(area.y as usize)
+            .take(area.height as usize)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The screen row the list drew row `index` on.
+    fn list_row(app: &App, index: usize) -> u16 {
+        app.bg.as_ref().unwrap().area.unwrap().y + 1 + index as u16
+    }
+
+    /// The list, opened with a click on the chip.
+    fn open_list(app: &mut App, terminal: &mut Terminal<TestBackend>) {
+        app.on_event(Event::Background(4));
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let chip = app.chip.unwrap();
+        assert!(click(app, chip.x + 1, chip.y));
+        terminal.draw(|frame| render(frame, app)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_background_list_at_80_columns() {
+        let mut app = with_background();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        open_list(&mut app, &mut terminal);
+        let shown = overlay(&terminal, &app);
+        assert_eq!(
+            shown[..6],
+            [
+                "┌ background (4) ──────────────────────────────────────────────────────────────┐",
+                "│ bash     npm run dev                                           2m  running   │",
+                "│ child    read the tests                                        0s  running   │",
+                "│ schedule check CI                                             10m  scheduled │",
+                "│ mcp      fs                                                     -  connected │",
+                "│                                                                              │",
+            ],
+            "{}",
+            shown.join("\n")
+        );
+        assert!(
+            shown
+                .last()
+                .unwrap()
+                .ends_with("↑↓ select · enter open · esc close ┘"),
+            "{}",
+            shown.join("\n")
+        );
+
+        // A click on the bash row inspects it.
+        let y = list_row(&app, 0);
+        assert!(click(&mut app, 4, y));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = overlay(&terminal, &app);
+        assert_eq!(
+            shown[..9],
+            [
+                "┌ bash 900001 ─────────────────────────────────────────────────────────────────┐",
+                "│ ‹ back                                                              [x kill] │",
+                "│ command  npm run dev                                                         │",
+                "│ pid      4242                                                                │",
+                "│ age      2m                                                                  │",
+                "│ state    running                                                             │",
+                "│ output                                                                       │",
+                "│  ready on http://localhost:5173                                              │",
+                "│  GET / 200                                                                   │",
+            ],
+            "{}",
+            shown.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_background_list_at_40_columns() {
+        let mut app = with_background();
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        open_list(&mut app, &mut terminal);
+        let shown = overlay(&terminal, &app);
+        assert_eq!(
+            shown[..5],
+            [
+                "┌ background (4) ──────────────────────┐",
+                "│ bash     npm run dev   2m  running   │",
+                "│ child    read the t…   0s  running   │",
+                "│ schedule check CI     10m  scheduled │",
+                "│ mcp      fs             -  connected │",
+            ],
+            "{}",
+            shown.join("\n")
+        );
+        assert!(
+            status(&terminal).ends_with(" bg 4"),
+            "{}",
+            status(&terminal)
+        );
+
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = overlay(&terminal, &app);
+        assert_eq!(
+            shown[..6],
+            [
+                "┌ schedule s9 ─────────────────────────┐",
+                "│ ‹ back                    [x cancel] │",
+                "│ prompt   check CI                    │",
+                "│ age      10m                         │",
+                "│ state    scheduled                   │",
+                "│ when     s9 `in 20m` next 17:30      │",
+            ],
+            "{}",
+            shown.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kill_takes_a_second_click_and_a_stray_click_disarms_it() {
+        let mut app = with_background();
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        open_list(&mut app, &mut terminal);
+        let y = list_row(&app, 0);
+        assert!(click(&mut app, 4, y));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        let (x, y) = shown
+            .lines()
+            .enumerate()
+            .find_map(|(y, row)| {
+                row.find("[x kill]")
+                    .map(|at| (row[..at].chars().count() as u16, y as u16))
+            })
+            .unwrap();
+        assert!(click(&mut app, x + 1, y));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("[x again to kill]"));
+        // A click anywhere else in the inspector puts it back as it was.
+        assert!(click(&mut app, 4, y + 3));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("[x kill]"));
+        let ended = |app: &App| {
+            app.session().entries().list.iter().any(|entry| {
+                matches!(entry, Entry::Error(text) if text == "bash session 900001 has already ended")
+            })
+        };
+        assert!(click(&mut app, x + 1, y));
+        assert!(!ended(&app));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        // The second click lands on the button as the armed frame drew it.
+        let x = screen(&terminal)
+            .lines()
+            .nth(y as usize)
+            .and_then(|row| row.find("[x again").map(|at| row[..at].chars().count()))
+            .unwrap() as u16;
+        assert!(click(&mut app, x + 1, y));
+        assert!(ended(&app), "{:?}", app.session().entries().list);
+
+        // The way back, and esc out of the list.
+        assert!(click(&mut app, 3, y));
+        assert!(app.bg.as_ref().unwrap().open.is_none());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.bg.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_child_row_opens_its_pane_and_ctrl_s_toggles_the_list() {
+        let mut app = with_background();
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.bg.is_some());
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.bg.is_none());
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let y = list_row(&app, 1);
+        assert!(click(&mut app, 4, y));
+        assert!(app.bg.is_none());
+        assert_eq!(app.inside.as_ref().map(|i| i.id.as_str()), Some("c1"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_schedule_from_the_list_removes_it() {
+        let mut app = App::detached();
+        let dir = crate::tools::temp_dir();
+        app.session()
+            .run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+        let store = app.session().schedules().unwrap();
+        let row = store.remind("in 20m check CI").unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.background, 1);
+        assert!(screen(&terminal).contains("schedule check CI"));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('x'));
+        assert_eq!(store.list().unwrap().0.len(), 1, "one x only arms it");
+        key(&mut app, KeyCode::Char('x'));
+        assert!(store.list().unwrap().0.is_empty());
+        let bg = app.bg.as_ref().unwrap();
+        assert!(bg.open.is_none() && bg.rows.is_empty());
+        assert_eq!(app.background, 0);
+        let said = format!("cancelled {}", row.id);
+        assert!(
+            app.session()
+                .entries()
+                .list
+                .iter()
+                .any(|entry| matches!(entry, Entry::Info(text) if text.starts_with(&said))),
+            "{:?}",
+            app.session().entries().list
+        );
     }
 }

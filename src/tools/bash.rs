@@ -1056,6 +1056,41 @@ pub(crate) async fn write(id: u32, chars: &str, wait: Duration, live: Live<'_>) 
     }
 }
 
+/// How long a session the user stops has after its ctrl-c before its group is killed.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// Stop session `id` for the user: a ctrl-c, then its process group killed if it is still
+/// running [`STOP_GRACE`] later. It leaves the table at once, so a poll after it finds no
+/// session. False when there is no such session.
+pub fn stop(id: u32) -> bool {
+    let Some(session) = sessions().live.remove(&id) else {
+        return false;
+    };
+    tokio::spawn(async move {
+        // A poll holding the proc has it until its own wait ends.
+        let mut proc = session.proc.lock().await;
+        if proc.status.is_some() {
+            return;
+        }
+        // On a terminal, ctrl-c goes to whatever job has the foreground.
+        let typed = match proc.input.as_mut() {
+            Some(input) => match input.write_all(b"\x03").await {
+                Ok(()) => input.flush().await.is_ok(),
+                Err(_) => false,
+            },
+            None => false,
+        };
+        if !typed {
+            signal_group(proc.group, libc::SIGINT);
+        }
+        if let Ok(Ok(status)) = tokio::time::timeout(STOP_GRACE, proc.child.wait()).await {
+            proc.status = Some(status);
+        }
+        // Dropped with no status, the proc kills its group.
+    });
+    true
+}
+
 /// Kill every session, when bhai exits: a session's process group is its own, so
 /// nothing else would end a dev server left running.
 pub fn kill_all() {
@@ -1624,6 +1659,50 @@ mod tests {
         let out = write(id, "", Duration::from_secs(5), quiet()).await;
         assert!(out.starts_with("exit code: 0\ndone\n"), "{out}");
         assert_eq!(session(id), None);
+    }
+
+    /// Whether nothing of group `group` is left running.
+    #[allow(unsafe_code)]
+    fn ended(group: u32) -> bool {
+        // SAFETY: signal 0 only checks that the group exists.
+        zombie(group) || unsafe { libc::killpg(group as i32, 0) } != 0
+    }
+
+    async fn stopped_within(group: u32, limit: Duration) {
+        let begun = Instant::now();
+        while !ended(group) {
+            assert!(begun.elapsed() < limit, "the group outlived {limit:?}");
+            tokio::time::sleep(TICK).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_session_takes_its_ctrl_c_and_leaves_the_table() {
+        let command = "trap 'exit 3' INT; while :; do sleep 0.1; done";
+        let out = start(command, None, YIELD_MIN, false, quiet()).await;
+        let id = session_id(&out);
+        let group = kept().into_iter().find(|r| r.id == id).unwrap().group;
+        assert!(stop(id));
+        assert_eq!(session(id), None);
+        assert!(!stop(id), "a second stop finds nothing");
+        // Well inside the grace, so it was the ctrl-c that ended it.
+        stopped_within(group.unwrap(), STOP_GRACE / 2).await;
+        assert!(
+            write(id, "", TICK, quiet())
+                .await
+                .starts_with("no running session")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_session_that_ignores_ctrl_c_is_killed_after_the_grace() {
+        let out = start("trap '' INT; sleep 30", None, YIELD_MIN, false, quiet()).await;
+        let id = session_id(&out);
+        let group = kept().into_iter().find(|r| r.id == id).unwrap().group;
+        let begun = Instant::now();
+        assert!(stop(id));
+        stopped_within(group.unwrap(), STOP_GRACE * 3).await;
+        assert!(begun.elapsed() >= STOP_GRACE, "{:?}", begun.elapsed());
     }
 
     #[test]
