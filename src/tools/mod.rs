@@ -11,6 +11,7 @@ use serde_json::Value;
 pub mod agent;
 pub mod bash;
 pub mod edit;
+pub mod fetch;
 pub mod goal;
 pub mod history;
 pub mod image_gen;
@@ -29,7 +30,7 @@ pub mod web;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 11] = [
+pub const NAMES: [&str; 12] = [
     bash::NAME,
     read::NAME,
     write::NAME,
@@ -41,6 +42,7 @@ pub const NAMES: [&str; 11] = [
     history::READ,
     memory::NAME,
     web::NAME,
+    fetch::NAME,
 ];
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
@@ -265,6 +267,7 @@ impl Registry {
             Box::new(patch::ApplyPatch),
             Box::new(view_image::ViewImage),
             Box::new(stdin::WriteStdin),
+            Box::new(fetch::Fetch::default()),
         ];
         if !skills.is_empty() {
             tools.push(Box::new(skill::Skill { skills }));
@@ -566,7 +569,8 @@ mod tests {
                 "edit",
                 "apply_patch",
                 "view_image",
-                "write_stdin"
+                "write_stdin",
+                "fetch"
             ]
         );
     }
@@ -580,8 +584,8 @@ mod tests {
             source: "~/.claude/skills".to_string(),
         };
         let registry = Registry::new(vec![skill]);
-        assert_eq!(registry.schemas().len(), 8);
-        for name in ["bash", "write", "edit", "apply_patch"] {
+        assert_eq!(registry.schemas().len(), 9);
+        for name in ["bash", "write", "edit", "apply_patch", "fetch"] {
             assert!(registry.get(name).unwrap().needs_approval(), "{name}");
         }
         assert!(!registry.get("read").unwrap().needs_approval());

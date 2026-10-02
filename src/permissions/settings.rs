@@ -169,6 +169,7 @@ fn claude_rule(text: &str) -> Option<Result<Rule, String>> {
     match lower.as_str() {
         "bash" | "read" | "edit" | "write" => Some(Rule::parse(text)),
         "multiedit" => Some(Rule::parse(&text.trim().replacen(name, "Edit", 1))),
+        "webfetch" => Some(Rule::parse(&text.trim().replacen(name, "Fetch", 1))),
         _ if lower.starts_with("mcp__") => Some(Rule::parse(text)),
         _ => None,
     }
@@ -298,15 +299,16 @@ mod tests {
             texts(&rules.allow),
             [
                 "Bash(git log:*)",
+                "Fetch(domain:x.com)",
                 "mcp__github__get",
                 "Edit(src/**)",
                 "Read"
             ]
         );
         let users: Vec<bool> = rules.allow.iter().map(|r| r.user).collect();
-        assert_eq!(users, [true, true, true, false]);
+        assert_eq!(users, [true, true, true, true, false]);
         let repo: Vec<bool> = rules.allow.iter().map(|r| r.repo).collect();
-        assert_eq!(repo, [false, false, false, true]);
+        assert_eq!(repo, [false, false, false, false, true]);
         // `Bash(npm run test?)` is a shape `Rule::parse` refuses. A deny rule is kept as
         // the text it names rather than dropped, so it still stops what it was written for.
         assert_eq!(

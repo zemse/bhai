@@ -203,6 +203,10 @@ pub fn parse(text: &str, path: &Path, source: &str) -> Option<Identity> {
 /// The bhai tool a bhai or Claude Code tool name refers to, like `Read` or `Bash(git:*)`.
 fn tool_name(name: &str) -> Option<String> {
     let name = name.split('(').next().unwrap_or(name).trim().to_lowercase();
+    let name = match name.as_str() {
+        "webfetch" => tools::fetch::NAME.to_string(),
+        _ => name,
+    };
     let known = tools::NAMES.contains(&name.as_str())
         || [MCP, tools::mcp::SEARCH, tools::mcp::CALL].contains(&name.as_str());
     known.then_some(name)
@@ -437,9 +441,12 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         assert!(bhai.allows_tool("apply_patch"), "it follows `edit`");
 
         let claude = identity(
-            "---\nname: reviewer\ndescription: Reviews code\ntools: Read, Grep, Bash(git:*), Glob\n---\nReview.\n",
+            "---\nname: reviewer\ndescription: Reviews code\ntools: Read, Grep, Bash(git:*), Glob, WebFetch\n---\nReview.\n",
         );
-        assert_eq!(claude.tools, Some(vec!["read".into(), "bash".into()]));
+        assert_eq!(
+            claude.tools,
+            Some(vec!["read".into(), "bash".into(), "fetch".into()])
+        );
         assert!(claude.skills.is_empty() && claude.mcp.is_empty());
         assert!(claude.allows_skill("anything"));
         assert_eq!(claude.instructions, None);

@@ -32,6 +32,8 @@ enum Pattern {
     /// Words joined by spaces, where each `*` matches any text.
     Glob(String),
     Path(String),
+    /// A `fetch` host, lowercase: exact, or with a leading `*.` any host under it.
+    Domain(String),
     /// The text of a bash pattern nothing here can parse, matched anywhere in the command.
     /// Only ever a deny or an ask rule: over-matching there asks too often, which is the
     /// safe side, while over-matching an allow rule approves what the user did not.
@@ -66,6 +68,12 @@ impl Rule {
             Some(content) if matches!(tool.as_str(), "read" | "edit" | "write") => {
                 Pattern::Path(content.to_string())
             }
+            Some(content) if tool == "fetch" => match content.strip_prefix("domain:") {
+                Some(host) if !host.trim().is_empty() => {
+                    Pattern::Domain(host.trim().to_ascii_lowercase())
+                }
+                _ => return Err(bad("expected `domain:<host>`")),
+            },
             Some(_) => return Err(bad("this tool takes no pattern")),
         };
         Ok(Self {
@@ -183,7 +191,7 @@ impl Rule {
                         .strip_suffix(" *")
                         .is_some_and(|bare| wildcard(bare, &text, false))
             }
-            Pattern::Path(_) | Pattern::Raw(_) => false,
+            Pattern::Path(_) | Pattern::Domain(_) | Pattern::Raw(_) => false,
         }
     }
 
@@ -206,7 +214,24 @@ impl Rule {
                 let path = fold_all(components(path));
                 glob(&pattern, &path)
             }
-            Pattern::Command { .. } | Pattern::Glob(_) | Pattern::Raw(_) => false,
+            Pattern::Command { .. } | Pattern::Glob(_) | Pattern::Domain(_) | Pattern::Raw(_) => {
+                false
+            }
+        }
+    }
+
+    /// `host` must be lowercase. `*.example.com` covers the hosts under it, not
+    /// `example.com` itself.
+    pub fn matches_domain(&self, host: &str) -> bool {
+        match &self.pattern {
+            Pattern::Any => true,
+            Pattern::Domain(want) => match want.strip_prefix("*.") {
+                Some(parent) => host
+                    .strip_suffix(parent)
+                    .is_some_and(|sub| sub.len() > 1 && sub.ends_with('.')),
+                None => host == want,
+            },
+            _ => false,
         }
     }
 }
@@ -590,6 +615,29 @@ mod tests {
 
     fn words(s: &str) -> Vec<String> {
         s.split(' ').map(str::to_string).collect()
+    }
+
+    #[test]
+    fn fetch_rules_match_by_domain() {
+        let exact = Rule::parse("Fetch(domain:Docs.rs)").unwrap();
+        assert!(exact.applies_to("fetch"));
+        assert!(exact.matches_domain("docs.rs"));
+        assert!(!exact.matches_domain("x.docs.rs"));
+        assert!(!exact.matches_domain("docs.rs.evil.com"));
+        let under = Rule::parse("Fetch(domain:*.example.com)").unwrap();
+        assert!(under.matches_domain("a.example.com"));
+        assert!(under.matches_domain("a.b.example.com"));
+        assert!(!under.matches_domain("example.com"));
+        assert!(!under.matches_domain("badexample.com"));
+        assert!(Rule::parse("Fetch").unwrap().matches_domain("any.where"));
+        assert!(
+            !Rule::parse("Read(docs.rs)")
+                .unwrap()
+                .matches_domain("docs.rs")
+        );
+        for bad in ["Fetch(docs.rs)", "Fetch(domain:)", "Fetch(url:https://x)"] {
+            assert!(Rule::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

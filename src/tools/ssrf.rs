@@ -109,7 +109,7 @@ async fn check_with(
 
 /// The address a URL host names directly; the url crate has already normalised forms
 /// like `2130706433` and `0x7f.1`, and keeps an IPv6 host in brackets.
-fn literal(host: &str) -> Option<IpAddr> {
+pub fn literal(host: &str) -> Option<IpAddr> {
     host.trim_start_matches('[')
         .trim_end_matches(']')
         .parse()
@@ -136,7 +136,7 @@ pub async fn send(method: Method, url: Url, timeout: Duration) -> Result<Respons
     send_with(method, url, timeout, refusal).await
 }
 
-async fn send_with(
+pub(super) async fn send_with(
     method: Method,
     mut url: Url,
     timeout: Duration,

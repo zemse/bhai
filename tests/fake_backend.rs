@@ -224,6 +224,22 @@ fn writes(call_id: &str, path: &str, content: &str) -> String {
     ])
 }
 
+/// The model asking to fetch `url`.
+fn fetches(call_id: &str, url: &str) -> String {
+    sse(&[
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "fetch",
+                "call_id": call_id,
+                "arguments": json!({ "url": url }).to_string()
+            }
+        }),
+        completed(),
+    ])
+}
+
 /// A `home` and a `codex` home under `dir`, the latter holding a login the fake accepts.
 fn logged_in(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let (home, codex) = (dir.join("home"), dir.join("codex"));
@@ -744,6 +760,40 @@ async fn a_tool_call_waits_for_approve_runs_and_its_output_goes_back() {
     assert!(
         outputs.iter().any(|o| o["call_id"] == "call_1"),
         "{outputs:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_fetch_asks_by_domain_and_the_guard_refuses_a_loopback_address() {
+    let fake = Arc::new(Fake::default());
+    let backend = serve_fake(fake.clone()).await;
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(fetches("call_f", &format!("{backend}/page")));
+        replies.push_back(says("could not"));
+    }
+    let bhai = Bhai::start(&backend).await;
+    let mut events = bhai.events().await;
+
+    bhai.post("/prompt", json!({ "text": "fetch it" })).await;
+    let approval = events.until("approval").await;
+    assert_eq!(approval["data"]["tool"], "fetch", "{approval}");
+    let (status, answer) = bhai
+        .post("/approve", json!({ "id": approval["data"]["id"] }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    events.until("turn_end").await;
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    assert!(tool_names(&sent[0].body).contains(&"fetch"));
+    let outputs = items(&sent[1].body, "function_call_output");
+    let output = outputs.iter().find(|o| o["call_id"] == "call_f").unwrap();
+    let text = output["output"].as_str().unwrap();
+    // Refused before any connection is made.
+    assert!(
+        text.starts_with("refused:") && text.contains("loopback"),
+        "{text}"
     );
 }
 

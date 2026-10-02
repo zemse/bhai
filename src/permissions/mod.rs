@@ -16,7 +16,7 @@ pub mod rules;
 pub mod settings;
 pub mod trust;
 
-use crate::tools::{image_gen, patch, view_image};
+use crate::tools::{fetch, image_gen, patch, ssrf, view_image};
 use rules::Base;
 pub use rules::Rule;
 pub use trust::Trust;
@@ -441,6 +441,10 @@ impl Policy {
                 ),
                 None => (None, None),
             },
+            (fetch::NAME, _, _) => match fetch::host(args) {
+                Some(host) => (Rule::parse(&format!("Fetch(domain:{host})")).ok(), None),
+                None => (None, None),
+            },
             _ => (None, None),
         };
         let works = |rule: Option<Rule>| {
@@ -730,8 +734,33 @@ impl Checker<'_> {
             },
             patch::NAME => self.check_patch(args, needs_approval),
             crate::tools::stdin::NAME => self.check_typing(tool, &Typing::of(args)),
+            fetch::NAME => match fetch::host(args) {
+                Some(host) => self.check_fetch(&host, needs_approval),
+                None => Decision::Ask,
+            },
             _ => self.check_other(tool, needs_approval),
         }
+    }
+
+    /// `Fetch` rules decide a fetch by the host it names; the redirects it follows are
+    /// the guard's to check, not the rules'.
+    fn check_fetch(&self, host: &str, needs_approval: bool) -> Decision {
+        let find = |rules: &[Rule]| {
+            rules
+                .iter()
+                .find(|r| r.applies_to(fetch::NAME) && r.matches_domain(host))
+                .cloned()
+        };
+        if let Some(rule) = find(&self.rules.deny) {
+            return denied(&rule);
+        }
+        if find(&self.rules.ask).is_some() {
+            return Decision::Ask;
+        }
+        if !needs_approval {
+            return Decision::Allow(String::new());
+        }
+        self.fallback(find(&self.allow()).map(|r| rule_reason(&r)))
     }
 
     /// Each file a patch touches is decided as a `write` to it, so `Edit` and `Write`
@@ -1065,6 +1094,27 @@ impl Checker<'_> {
                 })
             }
             crate::tools::stdin::NAME => self.judgeable_typing(tool, &Typing::of(args)),
+            // The guard refuses a private address when the fetch runs; one written into
+            // the URL is kept from the judge too, so it is never what the judge approved.
+            fetch::NAME => {
+                let host =
+                    fetch::host(args).ok_or_else(|| Reserved::Protected("no URL".to_string()))?;
+                let inside = host == "localhost"
+                    || host.ends_with(".localhost")
+                    || ssrf::literal(&host).is_some_and(|ip| ssrf::refusal(ip).is_some());
+                if inside {
+                    return Err(Reserved::Protected(host));
+                }
+                match self
+                    .rules
+                    .ask
+                    .iter()
+                    .find(|r| r.applies_to(fetch::NAME) && r.matches_domain(&host))
+                {
+                    Some(rule) => Err(Reserved::Asked(rule.text.clone())),
+                    None => Ok(()),
+                }
+            }
             // An MCP server the user has not approved is never connected, so an
             // `mcp_call` that gets this far names one they did approve.
             _ => match self.rules.ask.iter().find(|r| r.applies_to(tool)) {
@@ -1913,6 +1963,63 @@ mod tests {
             None,
             "one file's rule does not let the other through"
         );
+    }
+
+    #[test]
+    fn a_fetch_is_decided_by_its_domain_and_a_private_one_never_judged() {
+        let call = |url: &str| json!({ "url": url });
+        let docs = call("https://Docs.rs/serde");
+        let auto = policy(
+            Mode::Auto,
+            &["Fetch(domain:docs.rs)"],
+            &["Fetch(domain:*.evil.com)"],
+            &["Fetch(domain:ask.me)"],
+        );
+        assert_eq!(
+            auto.check("fetch", &docs, true),
+            allowed("rule Fetch(domain:docs.rs)")
+        );
+        assert_eq!(
+            auto.check("fetch", &call("http://a.evil.com/"), true),
+            Decision::Deny("deny rule Fetch(domain:*.evil.com)".to_string())
+        );
+        assert_eq!(
+            auto.check("fetch", &call("https://ask.me/"), true),
+            Decision::Ask
+        );
+        assert_eq!(
+            auto.check("fetch", &call("https://other.org/"), true),
+            Decision::Ask
+        );
+        let ask = policy(Mode::Ask, &[], &[], &[]);
+        assert_eq!(ask.check("fetch", &docs, true), Decision::Ask);
+        assert_eq!(
+            ask.offers("fetch", &docs).exact.as_deref(),
+            Some("Fetch(domain:docs.rs)")
+        );
+
+        assert_eq!(auto.judgeable("fetch", &call("https://other.org/")), Ok(()));
+        assert_eq!(
+            auto.judgeable("fetch", &call("https://ask.me/x")),
+            Err(Reserved::Asked("Fetch(domain:ask.me)".to_string()))
+        );
+        for url in [
+            "http://127.0.0.1:8080/",
+            "http://localhost/",
+            "http://api.localhost/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.1.2.3/",
+            "http://[::1]/",
+            "http://0x7f.1/",
+        ] {
+            assert!(
+                matches!(
+                    auto.judgeable("fetch", &call(url)),
+                    Err(Reserved::Protected(_))
+                ),
+                "{url}"
+            );
+        }
     }
 
     #[test]
