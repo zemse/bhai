@@ -21,6 +21,7 @@ pub mod patch;
 pub mod plan;
 pub mod read;
 pub mod skill;
+pub mod ssrf;
 pub mod stdin;
 pub mod submit;
 pub mod view_image;

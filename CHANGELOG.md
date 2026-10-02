@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-02
 
+- tools::ssrf resolves a URL's host itself and refuses it when any address is loopback, private, link-local (the cloud metadata address included), CGNAT, unspecified, multicast or reserved, including IPv4 inside IPv6. It connects to the address it checked and rechecks every redirect hop, up to 5. This is the guard the fetch tools (N7-01, N7-02) go through.
 - bash yields a command still running after yield_time_ms (10 s by default) as a session instead of killing it at 120 s; write_stdin polls it or, with tty: true, types into it. Typed text answers to the Bash rules as the whole commands it joins into, and only the user can approve a line left inside a quote, a continuation or a heredoc. A hangup, interrupt, terminate or panic kills every bash session before bhai exits.
 - `reasoning_context = "all_turns"` and `verbosity = "low"|"medium"|"high"` in the global config add `reasoning.context` and `text.verbosity` to every Codex request, including /btw and summary calls. Unset (the default), neither is sent, so the request body and its cached prefix stay as they were. A project file cannot set them, and a bad verbosity value fails config load.
 - `bhai mcp login <server>` signs in to a hosted MCP server over OAuth and keeps the login at 0600 by server url, so Notion, Linear and other servers that need OAuth start with a token that refreshes before it lapses; `bhai mcp logout <server>` forgets it.
