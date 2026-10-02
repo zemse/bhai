@@ -1083,10 +1083,16 @@ pub fn stop(id: u32) -> bool {
         if !typed {
             signal_group(proc.group, libc::SIGINT);
         }
-        if let Ok(Ok(status)) = tokio::time::timeout(STOP_GRACE, proc.child.wait()).await {
+        let deadline = Instant::now() + STOP_GRACE;
+        while Instant::now() < deadline && !proc.child.id().is_none_or(zombie) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // A non-interactive shell starts its `&` jobs ignoring SIGINT, so they outlive a
+        // leader the ctrl-c ended. Unreaped, the leader keeps the group id from reuse.
+        kill_group(proc.group);
+        if let Ok(status) = proc.child.wait().await {
             proc.status = Some(status);
         }
-        // Dropped with no status, the proc kills its group.
     });
     true
 }
@@ -1703,6 +1709,42 @@ mod tests {
         assert!(stop(id));
         stopped_within(group.unwrap(), STOP_GRACE * 3).await;
         assert!(begun.elapsed() >= STOP_GRACE, "{:?}", begun.elapsed());
+    }
+
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    async fn a_stopped_session_kills_the_jobs_its_ctrl_c_left_running() {
+        let out = start(
+            "sleep 301 & echo $!; sleep 100",
+            None,
+            YIELD_MIN,
+            false,
+            quiet(),
+        )
+        .await;
+        let id = session_id(&out);
+        let begun = Instant::now();
+        let job: i32 = loop {
+            let tail = kept().into_iter().find(|r| r.id == id).unwrap().tail;
+            if let Ok(pid) = tail.trim().parse() {
+                break pid;
+            }
+            assert!(
+                begun.elapsed() < Duration::from_secs(5),
+                "no pid in {tail:?}"
+            );
+            tokio::time::sleep(TICK).await;
+        };
+        assert!(stop(id));
+        let begun = Instant::now();
+        // SAFETY: signal 0 only checks that the process exists.
+        while unsafe { libc::kill(job, 0) } == 0 {
+            assert!(
+                begun.elapsed() < STOP_GRACE * 3,
+                "the `&` job outlived the stop"
+            );
+            tokio::time::sleep(TICK).await;
+        }
     }
 
     #[test]
