@@ -98,6 +98,8 @@ pub enum AgentEvent {
     /// The model runs at this effort again, after the backend refused an update to
     /// another one.
     Effort(String),
+    /// Whether later calls ask for the priority tier, as `/fast` left it.
+    Fast(bool),
     /// Token counts for the model call that just finished.
     Usage(Usage),
     /// Token counts for a model call a child agent just finished.
@@ -236,6 +238,9 @@ pub enum Control {
         effort: String,
         window: Option<u64>,
     },
+    /// Ask for the priority tier from the next call on, or stop, for `/fast`. Taken
+    /// mid-turn too, since it changes what a call costs, not what it says.
+    Fast(bool),
 }
 
 /// A model backend. `Client` is the real one; tests drive the loop with a fake.
@@ -256,6 +261,12 @@ pub trait Model: Send + Sync {
     /// The same backend on another model, for `/model`; `None` when it cannot switch.
     fn switch(&self, _model: &str, _effort: &str) -> Option<Arc<dyn Model>> {
         None
+    }
+
+    /// Ask for the priority tier from the next call on, or stop; returns whether it is
+    /// now asked for. A backend with no tiers stays off.
+    fn set_fast(&self, _on: bool) -> bool {
+        false
     }
 
     /// The model's name, which picks its tokenizer.
@@ -327,6 +338,10 @@ impl Model for Client {
 
     fn switch(&self, model: &str, effort: &str) -> Option<Arc<dyn Model>> {
         Some(Arc::new(Client::switch(self, model, effort)))
+    }
+
+    fn set_fast(&self, on: bool) -> bool {
+        Client::set_fast(self, on)
     }
 
     fn name(&self) -> &str {
@@ -890,6 +905,10 @@ pub(crate) async fn run_configured(
                         let _ = reply.send(report(&history, &calls, tokenizer));
                         continue;
                     }
+                    Control::Fast(on) => {
+                        set_fast(model.as_ref(), on, &tx);
+                        continue;
+                    }
                     // Nothing is summarised: the conversation is over, so the history
                     // goes, and the session file records that it did so a resume agrees.
                     Control::Clear => {
@@ -1262,6 +1281,7 @@ pub(crate) async fn run_configured(
                         Control::Context(reply) => {
                             let _ = reply.send(report(&before, &calls_before, tokenizer));
                         }
+                        Control::Fast(on) => set_fast(model.as_ref(), on, &tx),
                         // Never while a tool call may be pending: once the turn is over.
                         Control::Compact(prompt) => {
                             compact_next = true;
@@ -1566,6 +1586,19 @@ fn drop_fork(fork: &mut Option<Fork>, tx: &mpsc::UnboundedSender<AgentEvent>) {
     if fork.take().is_some() {
         let _ = tx.send(AgentEvent::Fork(None));
     }
+}
+
+/// `/fast`: the tier `model` now asks for, said either way so the session never shows a
+/// tier the backend is not being asked for.
+fn set_fast(model: &dyn Model, on: bool, tx: &mpsc::UnboundedSender<AgentEvent>) {
+    let fast = model.set_fast(on);
+    if on && !fast {
+        let _ = tx.send(AgentEvent::Error(format!(
+            "{} has no priority tier; /fast is for the Codex backend",
+            model.name()
+        )));
+    }
+    let _ = tx.send(AgentEvent::Fast(fast));
 }
 
 /// Tokens a call on `items` reads before it can answer: the instructions, the tool
@@ -2641,7 +2674,9 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::Cleared
                 | AgentEvent::Fork(_)
                 // A child's effort is its own request's, never an update.
-                | AgentEvent::Effort(_) => continue,
+                | AgentEvent::Effort(_)
+                // The tier is the session's switch, which a child only follows.
+                | AgentEvent::Fast(_) => continue,
                 // An approval is modal, so it is answered where every other one is,
                 // with the tag saying which child is asking.
                 AgentEvent::Approval {
@@ -7380,6 +7415,28 @@ mod tests {
             "{sent:?}"
         );
         assert_eq!(texts(sent, "user"), ["first", "second", "third"]);
+    }
+
+    #[tokio::test]
+    async fn fast_on_a_backend_with_no_tier_is_refused_and_stays_off() {
+        let (_fake, _tx_user, tx_control, mut rx, _cancel) = gpt6(Vec::new());
+        tx_control.send(Control::Fast(true)).await.unwrap();
+        let mut said = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+        {
+            let done = matches!(event, AgentEvent::Fast(_));
+            if done || matches!(event, AgentEvent::Error(_)) {
+                said.push(event);
+            }
+            if done {
+                break;
+            }
+        }
+        assert!(
+            matches!(&said[..], [AgentEvent::Error(e), AgentEvent::Fast(false)] if e.contains("no priority tier")),
+            "{said:?}"
+        );
     }
 
     fn effort(effort: &str) -> Control {

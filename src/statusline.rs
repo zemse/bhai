@@ -21,6 +21,7 @@ use crate::tools::BoxFuture;
 pub const VARIABLES: &[(&str, &str)] = &[
     ("model", "the model the session talks to"),
     ("effort", "its reasoning effort; empty on Ollama"),
+    ("fast", "`fast` while /fast has calls on the priority tier"),
     ("provider", "`codex` or `ollama`"),
     ("identity", "the identity the session runs as"),
     ("mode", "the permission mode: ask, auto or bypass"),
@@ -414,6 +415,13 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
         Value::plain(match provider {
             Provider::Codex => app.effort.as_str(),
             Provider::Ollama => "",
+        }),
+    );
+    set(
+        "fast",
+        Value::plain(match provider == Provider::Codex && app.fast {
+            true => "fast",
+            false => "",
         }),
     );
     set(

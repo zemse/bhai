@@ -266,6 +266,8 @@ pub struct App {
     second: u64,
     pub model: String,
     pub effort: String,
+    /// Calls ask for the priority tier, for `/fast`.
+    pub fast: bool,
     pub identity: String,
     pub mode: Mode,
     pub tokens_in: u64,
@@ -384,6 +386,7 @@ impl App {
             second: 0,
             model: session.state().model,
             effort: session.state().effort,
+            fast: session.state().fast,
             identity: session.state().identity,
             mode: session.state().mode,
             tokens_in: 0,
@@ -1388,6 +1391,7 @@ impl App {
                 self.model = model;
                 self.effort = effort;
             }
+            Event::Fast(on) => self.fast = on,
             // A child's report opened a turn nobody typed. Deliberately not `follow`:
             // a landing report must not yank a scrolled-up reader to the bottom.
             Event::Resumed(_) => self.working = true,
@@ -1415,6 +1419,7 @@ impl App {
         self.mode = state.mode;
         self.model = state.model;
         self.effort = state.effort;
+        self.fast = state.fast;
         self.identity = state.identity;
     }
 
@@ -1647,6 +1652,13 @@ impl App {
             self.effort_command(rest.trim());
             return;
         }
+        if let Some(rest) = message.strip_prefix("/fast")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            self.fast_command(rest.trim());
+            return;
+        }
         if let Some(rest) = message.strip_prefix("/model-default")
             && (rest.is_empty() || rest.starts_with(' '))
         {
@@ -1854,6 +1866,23 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             return;
         }
         self.switch_model(self.model.clone(), rest.to_string(), None);
+    }
+
+    /// `/fast [on|off]`: the priority tier for this session's calls; on its own it flips.
+    /// The session's notice says what it costs, so nothing is noted here on success.
+    fn fast_command(&mut self, rest: &str) {
+        let on = match rest {
+            "" => !self.fast,
+            "on" => true,
+            "off" => false,
+            _ => {
+                self.note(Entry::Error("usage: /fast [on|off]".to_string()));
+                return;
+            }
+        };
+        if let Err(e) = self.session.set_fast(on) {
+            self.note(Entry::Error(e.to_string()));
+        }
     }
 
     /// `/model-default`: the picker again, but what it picks is saved for new sessions

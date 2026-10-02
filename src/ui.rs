@@ -459,7 +459,13 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             match crate::client::Provider::of(&app.model) {
                 crate::client::Provider::Codex => {
-                    format!(" {} {} ({} context)", app.model, app.effort, size(window))
+                    let fast = if app.fast { " fast" } else { "" };
+                    format!(
+                        " {} {}{fast} ({} context)",
+                        app.model,
+                        app.effort,
+                        size(window)
+                    )
                 }
                 crate::client::Provider::Ollama => {
                     format!(" {} ({} context)", app.model, size(window))

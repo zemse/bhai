@@ -127,6 +127,11 @@ pub const COMMANDS: &[Command] = &[
         args: " <level>",
         help: "the reasoning effort, keeping the model",
     },
+    Command {
+        name: "fast",
+        args: " [on|off]",
+        help: "the priority tier, which spends the plan faster",
+    },
     // No args hint, for the same reason as `/model`.
     Command {
         name: "model-default",

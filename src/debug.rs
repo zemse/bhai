@@ -371,6 +371,7 @@ mod tests {
             state: State {
                 model: "gpt-5.5".to_string(),
                 effort: "medium".to_string(),
+                fast: false,
                 identity: "general".to_string(),
                 mode: Mode::Auto,
                 working: false,

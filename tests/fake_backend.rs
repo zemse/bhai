@@ -474,6 +474,47 @@ async fn a_prompt_reaches_the_backend_and_its_answer_reaches_events() {
 }
 
 #[tokio::test]
+async fn fast_asks_for_the_priority_tier_only_while_it_is_on() {
+    let fake = Arc::new(Fake::default());
+    for text in ["one", "two", "three"] {
+        fake.replies.lock().unwrap().push_back(says(text));
+    }
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+
+    bhai.post("/prompt", json!({ "text": "first" })).await;
+    events.until("turn_end").await;
+
+    let (status, answer) = bhai.post("/fast", json!({ "on": true })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(events.until("fast").await["data"], true);
+    assert_eq!(bhai.state().await["fast"], true);
+    bhai.post("/prompt", json!({ "text": "second" })).await;
+    events.until("turn_end").await;
+
+    bhai.post("/fast", json!({ "on": false })).await;
+    assert_eq!(events.until("fast").await["data"], false);
+    bhai.post("/prompt", json!({ "text": "third" })).await;
+    events.until("turn_end").await;
+
+    let tiers: Vec<Value> = fake
+        .responses()
+        .iter()
+        .map(|seen| seen.body["service_tier"].clone())
+        .collect();
+    assert_eq!(tiers, [Value::Null, json!("priority"), Value::Null]);
+    let notices: Vec<&str> = events
+        .got
+        .iter()
+        .filter(|e| e["type"] == "info")
+        .filter_map(|e| e["data"].as_str())
+        .filter(|text| text.starts_with("fast:"))
+        .collect();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert!(notices[0].contains("priority tier"), "{}", notices[0]);
+}
+
+#[tokio::test]
 async fn startup_timing_names_each_stage_in_order_before_the_server_line() {
     let fake = Arc::new(Fake::default());
     let backend = serve_fake(fake).await;

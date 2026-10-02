@@ -56,6 +56,7 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/goal", post(goal))
         .route("/mode", post(mode))
         .route("/model", post(model))
+        .route("/fast", post(fast))
         .route("/context", get(context))
         .route("/permissions", get(permissions))
         .route("/allow", post(allow))
@@ -132,6 +133,11 @@ struct ModeBody {
 struct ModelBody {
     model: Option<String>,
     effort: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FastBody {
+    on: bool,
 }
 
 #[derive(Deserialize)]
@@ -472,6 +478,14 @@ async fn model(State(session): State<Arc<Session>>, Json(body): Json<ModelBody>)
     let (model, effort) = (body.model.unwrap_or(model), body.effort.unwrap_or(effort));
     match session.set_model(model.clone(), effort.clone(), None) {
         Ok(()) => Json(json!({ "ok": true, "model": model, "effort": effort })).into_response(),
+        Err(e) => error(StatusCode::CONFLICT, &e.to_string()),
+    }
+}
+
+/// `/fast on|off`. The agent may refuse it, so `Event::Fast` says what is in force.
+async fn fast(State(session): State<Arc<Session>>, Json(body): Json<FastBody>) -> Response {
+    match session.set_fast(body.on) {
+        Ok(()) => ok(),
         Err(e) => error(StatusCode::CONFLICT, &e.to_string()),
     }
 }

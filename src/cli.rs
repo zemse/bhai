@@ -1245,6 +1245,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             }
             AgentEvent::Fork(None) => {}
             AgentEvent::Effort(effort) => println!("[info] effort {effort}"),
+            AgentEvent::Fast(on) => println!("[info] fast {}", if on { "on" } else { "off" }),
             AgentEvent::Usage(u) => println!(
                 "\n[usage] input={} cached={} output={} reasoning={}",
                 u.input, u.cached, u.output, u.reasoning

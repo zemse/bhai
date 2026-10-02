@@ -173,6 +173,29 @@ impl RateLimits {
             .then_some(self)
     }
 
+    /// What moved from `before` to `self`: `5h 17% to 24%` for each window both report,
+    /// then `credits 8312 to 8290` where both know the balance. A window that reset in
+    /// between reads as going down.
+    pub fn moved_since(&self, before: &Self) -> Vec<String> {
+        let mut moved: Vec<String> = self
+            .windows()
+            .filter_map(|now| {
+                let then = before.windows().find(|w| w.label() == now.label())?;
+                Some(format!(
+                    "{} {:.0}% to {:.0}%",
+                    now.label(),
+                    then.used_percent,
+                    now.used_percent
+                ))
+            })
+            .collect();
+        let balance = |l: &Self| l.credits.filter(|c| !c.unlimited)?.remaining;
+        if let (Some(then), Some(now)) = (balance(before), balance(self)) {
+            moved.push(format!("credits {then:.0} to {now:.0}"));
+        }
+        moved
+    }
+
     /// The windows present, in order.
     pub fn windows(&self) -> impl Iterator<Item = Window> {
         [self.primary, self.secondary].into_iter().flatten()
@@ -790,6 +813,42 @@ mod tests {
 
         let plus = json!({ "credits": { "has_credits": false, "balance": "0" } });
         assert_eq!(report(&plus, now), "credits: none");
+    }
+
+    #[test]
+    fn moved_since_pairs_windows_by_length_and_reads_the_balance() {
+        let window = |used: f64, minutes: u64| Window {
+            used_percent: used,
+            window_minutes: Some(minutes),
+            resets_at: None,
+        };
+        let credits = |left: f64| Credits {
+            remaining: Some(left),
+            ..Credits::default()
+        };
+        let before = RateLimits {
+            primary: Some(window(17.0, 300)),
+            secondary: None,
+            credits: Some(credits(8312.0)),
+        };
+        let after = RateLimits {
+            primary: Some(window(24.4, 300)),
+            secondary: Some(window(85.0, 10_080)),
+            credits: Some(credits(8290.2)),
+        };
+        assert_eq!(
+            after.moved_since(&before),
+            ["5h 17% to 24%", "credits 8312 to 8290"]
+        );
+        let unlimited = RateLimits {
+            credits: Some(Credits {
+                unlimited: true,
+                ..Credits::default()
+            }),
+            ..before
+        };
+        assert_eq!(after.moved_since(&unlimited), ["5h 17% to 24%"]);
+        assert!(RateLimits::default().moved_since(&before).is_empty());
     }
 
     #[test]

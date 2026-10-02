@@ -66,6 +66,8 @@ const USAGE_WAIT: Duration = Duration::from_secs(2);
 /// The backend's routing token: sent back, it brings a call to the backend that answered
 /// the turn's first call, where that call's prefix is cached.
 const TURN_STATE: &str = "x-codex-turn-state";
+/// The `service_tier` `/fast` asks for, as openai/codex's fast mode sends it.
+pub const FAST_TIER: &str = "priority";
 
 /// The `reasoning.effort` values the Responses API takes. The models catalog also lists
 /// `ultra` for some models, which the API refuses.
@@ -348,6 +350,9 @@ pub struct Client {
     header_log: Option<PathBuf>,
     /// The turn's first [`TURN_STATE`]; shared by clones, fresh for each child.
     turn_state: Arc<Mutex<Option<String>>>,
+    /// `/fast`: conversation calls ask for [`FAST_TIER`]. Shared by clones and children,
+    /// so a switch reaches the calls left in a running turn.
+    fast: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -374,6 +379,7 @@ impl Client {
             window: None,
             header_log: None,
             turn_state: Arc::default(),
+            fast: Arc::default(),
         })
     }
 
@@ -450,6 +456,19 @@ impl Client {
             .with_overrides(Some(model.to_string()), Some(effort.to_string()));
         switched.reset_cache(reason);
         switched
+    }
+
+    /// Send later calls at [`FAST_TIER`], or at the plan's default tier; returns whether
+    /// fast is now on. Only the Codex backend has tiers, so on Ollama it stays off.
+    pub fn set_fast(&self, on: bool) -> bool {
+        let on = on && self.provider() == Provider::Codex;
+        self.fast.store(on, Ordering::Relaxed);
+        on
+    }
+
+    /// Whether conversation calls ask for [`FAST_TIER`].
+    pub fn fast(&self) -> bool {
+        self.fast.load(Ordering::Relaxed)
     }
 
     /// Where this client's Ollama server is, for asking it what it has pulled.
@@ -696,13 +715,16 @@ impl Client {
     /// The request body for one call, in whichever shape this client's backend reads.
     fn body(&self, instructions: &str, tools: &[Value], input: &[Value]) -> Value {
         match self.provider() {
-            Provider::Codex => request_body(
-                &self.model,
-                &self.effort,
-                &self.cache_key,
-                instructions,
-                tools,
-                input,
+            Provider::Codex => with_tier(
+                request_body(
+                    &self.model,
+                    &self.effort,
+                    &self.cache_key,
+                    instructions,
+                    tools,
+                    input,
+                ),
+                self.fast(),
             ),
             Provider::Ollama => ollama::request_body(
                 &self.model,
@@ -1072,6 +1094,15 @@ pub fn request_body(
         "include": ["reasoning.encrypted_content"],
         "prompt_cache_key": cache_key,
     })
+}
+
+/// `body` asking for [`FAST_TIER`] when `fast`. Off, the field is left out rather than
+/// sent as `default`, so the request is what it was before `/fast` existed.
+pub fn with_tier(mut body: Value, fast: bool) -> Value {
+    if fast {
+        body["service_tier"] = json!(FAST_TIER);
+    }
+    body
 }
 
 /// Whether `item` is a message the model wrote in the `commentary` phase.
@@ -1573,5 +1604,43 @@ mod tests {
         }}});
         let usage = Usage::from_completed(&event).unwrap();
         assert_eq!((usage.cached, usage.cache_write), (200, 800));
+    }
+
+    #[test]
+    fn fast_asks_for_the_priority_tier_and_off_sends_no_tier() {
+        let client = Client::new(&Choice::default())
+            .unwrap()
+            .with_overrides(Some("gpt-5.5".to_string()), Some("medium".to_string()));
+        assert!(!client.fast());
+        assert!(client.body("i", &[], &[]).get("service_tier").is_none());
+
+        assert!(client.set_fast(true));
+        assert_eq!(client.body("i", &[], &[])["service_tier"], FAST_TIER);
+        // A switch and a child are the same session, so they follow the one switch.
+        let switched = client.switch("gpt-5.4", "high");
+        let child = client.for_child(&crate::identity::Identity::default());
+        assert_eq!(switched.body("i", &[], &[])["service_tier"], FAST_TIER);
+        assert_eq!(child.body("i", &[], &[])["service_tier"], FAST_TIER);
+
+        assert!(!client.set_fast(false));
+        assert!(child.body("i", &[], &[]).get("service_tier").is_none());
+    }
+
+    #[test]
+    fn ollama_has_no_fast_tier() {
+        let client = Client::new(&Choice::default())
+            .unwrap()
+            .with_overrides(Some("ollama:gemma4:e2b".to_string()), None);
+        assert!(!client.set_fast(true));
+        assert!(!client.fast());
+        assert!(client.body("i", &[], &[]).get("service_tier").is_none());
+    }
+
+    #[test]
+    fn a_tier_change_is_no_break_to_the_guard() {
+        let body = request_body("m", "e", "k", "i", &[], &[]);
+        let mut guard = CacheGuard::new("c", None, true);
+        guard.check(&body).unwrap();
+        assert_eq!(guard.check(&with_tier(body, true)).unwrap(), None);
     }
 }

@@ -175,6 +175,8 @@ pub enum Event {
         model: String,
         effort: String,
     },
+    /// `/fast` left calls asking for the priority tier, or not.
+    Fast(bool),
     Error(String),
     /// The turn failed rather than answering. The history still stands, so `retry` can
     /// run the same turn again without the user retyping anything.
@@ -261,6 +263,8 @@ pub struct State {
     pub model: String,
     /// The reasoning effort the model runs at.
     pub effort: String,
+    /// Whether calls ask for the priority tier, for `/fast`.
+    pub fast: bool,
     pub identity: String,
     pub mode: Mode,
     pub working: bool,
@@ -409,6 +413,51 @@ impl fmt::Display for SubmitError {
     }
 }
 
+/// What `/fast` says: turned on, what it costs and where the plan stands; turned off, how
+/// far the plan moved while it was on. The backend does not say what a priority call
+/// cost, so that movement is the only measure, and it counts every call in the time.
+fn fast_notice(on: bool, was: Option<Option<RateLimits>>, now: Option<RateLimits>) -> String {
+    match (on, was) {
+        (true, Some(_)) => "fast: already on.".to_string(),
+        (true, None) => {
+            let standing: Vec<String> = now
+                .iter()
+                .flat_map(|l| {
+                    l.windows()
+                        .map(|w| format!("{}:{:.0}%", w.label(), w.used_percent))
+                        .chain(
+                            l.credits
+                                .filter(|c| !c.unlimited)
+                                .map(|c| format!("credits:{}", c.amount())),
+                        )
+                })
+                .collect();
+            let measure = match standing.is_empty() {
+                true => "The plan's usage is not known yet, so /fast off cannot say what it spent."
+                    .to_string(),
+                false => format!(
+                    "The plan stands at {}; /fast off says how far that moved.",
+                    standing.join(" ")
+                ),
+            };
+            format!(
+                "fast: on. Calls ask for the priority tier, which spends the plan's usage faster than the standard one; a plan that does not take it fails the next call, and /fast off goes back. {measure}"
+            )
+        }
+        (false, None) => "fast: off.".to_string(),
+        (false, Some(before)) => {
+            let moved = before
+                .zip(now)
+                .map(|(before, now)| now.moved_since(&before))
+                .unwrap_or_default();
+            match moved.is_empty() {
+                true => "fast: off. The plan's usage was not reported both when it went on and since, so what it spent is unknown.".to_string(),
+                false => format!("fast: off. While it was on: {}.", moved.join(", ")),
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     working: bool,
@@ -429,6 +478,9 @@ struct Inner {
     verb: Option<(&'static str, &'static str)>,
     last_cache_break: Option<CacheBreak>,
     rate_limits: Option<RateLimits>,
+    /// `/fast` is on, and the headroom when it went on, which turning it off measures
+    /// what it spent against.
+    fast: Option<Option<RateLimits>>,
     /// The tokens a call on the compacted copy would read, while there is one.
     fork: Option<u64>,
     goal: Option<crate::goal::Goal>,
@@ -550,6 +602,7 @@ impl Session {
         State {
             model,
             effort,
+            fast: inner.fast.is_some(),
             identity: self.identity.clone(),
             mode: self.policy.mode(),
             working: inner.working,
@@ -811,6 +864,14 @@ impl Session {
         *self.model.lock().unwrap_or_else(|e| e.into_inner()) = (model.clone(), effort.clone());
         self.publish(Event::Model { model, effort });
         Ok(())
+    }
+
+    /// Ask for the priority tier from the next call on, or stop, for `/fast`. Taken
+    /// while a turn runs too. `Event::Fast` says what the backend is now asked for.
+    pub fn set_fast(&self, on: bool) -> Result<(), SubmitError> {
+        self.tx_control
+            .try_send(Control::Fast(on))
+            .map_err(|_| SubmitError::Closed)
     }
 
     /// Tokens the next message would re-read uncached, once the last call is older than
@@ -1229,6 +1290,16 @@ impl Session {
                     model: current.0.clone(),
                     effort,
                 }
+            }
+            AgentEvent::Fast(on) => {
+                let was = inner.fast.take();
+                let notice = fast_notice(on, was, inner.rate_limits);
+                inner.fast = match on {
+                    true => Some(was.unwrap_or(inner.rate_limits)),
+                    false => None,
+                };
+                self.publish(Event::Info(notice));
+                Event::Fast(on)
             }
             AgentEvent::Error(s) => Event::Error(s),
             AgentEvent::TurnFailed(s) => Event::TurnFailed(s),
@@ -2571,6 +2642,59 @@ mod tests {
             events.try_recv(),
             Ok(Event::Model { effort, .. }) if effort == "medium"
         ));
+    }
+
+    #[test]
+    fn fast_says_what_the_plan_spent_while_it_was_on() {
+        let (session, mut control) = on("gpt-5.5");
+        session.set_fast(true).unwrap();
+        assert!(matches!(control.try_recv(), Ok(Control::Fast(true))));
+        // Nothing changes until the agent says what the backend is now asked for.
+        assert!(!session.state().fast);
+
+        let limits = |used: f64, left: f64| RateLimits {
+            primary: Some(crate::limits::Window {
+                used_percent: used,
+                window_minutes: Some(300),
+                resets_at: None,
+            }),
+            secondary: None,
+            credits: Some(crate::limits::Credits {
+                remaining: Some(left),
+                ..Default::default()
+            }),
+        };
+        session.on_agent(AgentEvent::RateLimits(limits(17.0, 500.0)));
+        let mut events = session.subscribe();
+        session.on_agent(AgentEvent::Fast(true));
+        assert!(session.state().fast);
+        let Ok(Event::Info(notice)) = events.try_recv() else {
+            panic!("no notice");
+        };
+        assert!(notice.starts_with("fast: on."), "{notice}");
+        assert!(notice.contains("5h:17% credits:500"), "{notice}");
+        assert_eq!(events.try_recv(), Ok(Event::Fast(true)));
+
+        session.on_agent(AgentEvent::RateLimits(limits(23.0, 480.0)));
+        let mut events = session.subscribe();
+        session.on_agent(AgentEvent::Fast(false));
+        assert!(!session.state().fast);
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Info(
+                "fast: off. While it was on: 5h 17% to 23%, credits 500 to 480.".to_string()
+            ))
+        );
+        assert_eq!(events.try_recv(), Ok(Event::Fast(false)));
+    }
+
+    #[test]
+    fn fast_with_no_usage_known_says_its_cost_is_unknown() {
+        let on_notice = fast_notice(true, None, None);
+        assert!(on_notice.contains("not known yet"), "{on_notice}");
+        assert!(fast_notice(false, Some(None), None).contains("unknown"));
+        assert_eq!(fast_notice(false, None, None), "fast: off.");
+        assert_eq!(fast_notice(true, Some(None), None), "fast: already on.");
     }
 
     #[test]
