@@ -11,8 +11,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use chrono::{
-    DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone,
-    Timelike,
+    DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset,
+    TimeZone, Timelike,
 };
 use serde::{Deserialize, Serialize};
 
@@ -230,13 +230,23 @@ fn resolve<Tz: TimeZone>(tz: &Tz, local: NaiveDateTime) -> Option<DateTime<Tz>> 
     let mut local = local;
     // No zone has a gap longer than a day.
     for _ in 0..=24 * 60 {
-        match tz.from_local_datetime(&local) {
-            LocalResult::Single(t) => return Some(t),
-            LocalResult::Ambiguous(first, _) => return Some(first),
-            LocalResult::None => {
-                local = local.with_second(0)?.with_nanosecond(0)? + Duration::minutes(1)
-            }
+        let (a, b) = match tz.from_local_datetime(&local) {
+            LocalResult::Single(t) => (Some(t), None),
+            LocalResult::Ambiguous(a, b) => (Some(a), Some(b)),
+            LocalResult::None => (None, None),
+        };
+        // chrono 0.4's `Local` hands a repeated time back later first, and reads the
+        // minute a change ends on in both offsets (02:00 as -04:00 too when clocks fall
+        // back), so only an instant the zone itself puts at that offset counts.
+        let first = [a, b]
+            .into_iter()
+            .flatten()
+            .filter(|t| t.offset().fix() == tz.offset_from_utc_datetime(&t.naive_utc()).fix())
+            .min();
+        if first.is_some() {
+            return first;
         }
+        local = local.with_second(0)?.with_nanosecond(0)? + Duration::minutes(1);
     }
     None
 }
@@ -400,7 +410,7 @@ fn field(text: &str, what: &str, min: u32, max: u32, names: &[&str]) -> Result<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{FixedOffset, Offset, Utc};
+    use chrono::{FixedOffset, Utc};
 
     /// US Eastern for 2026 alone: clocks go 02:00 to 03:00 on March 8 and 02:00 back to
     /// 01:00 on November 1, so DST edges are testable without the machine's zone.
@@ -474,6 +484,45 @@ mod tests {
         }
     }
 
+    /// Eastern read the way chrono 0.4's `Local` reads it: a repeated time's two
+    /// instants come back later first, and the minute each change ends on is read in
+    /// the old offset as well.
+    #[derive(Debug, Clone, Copy)]
+    struct EasternLikeLocal;
+
+    impl TimeZone for EasternLikeLocal {
+        type Offset = EasternOffset;
+
+        fn from_offset(_: &EasternOffset) -> Self {
+            EasternLikeLocal
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> LocalResult<EasternOffset> {
+            Eastern.offset_from_local_date(local)
+        }
+
+        fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<EasternOffset> {
+            if *local == utc(2026, 3, 8, 2, 0) {
+                return LocalResult::Single(offset(EST));
+            }
+            if *local == utc(2026, 11, 1, 2, 0) {
+                return LocalResult::Ambiguous(offset(EST), offset(EDT));
+            }
+            match Eastern.offset_from_local_datetime(local) {
+                LocalResult::Ambiguous(earlier, later) => LocalResult::Ambiguous(later, earlier),
+                other => other,
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> EasternOffset {
+            Eastern.offset_from_utc_date(utc)
+        }
+
+        fn offset_from_utc_datetime(&self, at: &NaiveDateTime) -> EasternOffset {
+            Eastern.offset_from_utc_datetime(at)
+        }
+    }
+
     /// A local time in Eastern that is not ambiguous or skipped.
     fn et(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Eastern> {
         Eastern
@@ -482,22 +531,16 @@ mod tests {
             .unwrap()
     }
 
-    /// An instant given in UTC, shown in Eastern.
-    fn at_utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Eastern> {
-        Utc.from_utc_datetime(&utc(y, mo, d, h, mi))
-            .with_timezone(&Eastern)
-    }
-
     fn spec(text: &str) -> Spec {
         text.parse().unwrap()
     }
 
-    fn next(text: &str, after: DateTime<Eastern>) -> Option<DateTime<Eastern>> {
+    fn next<Tz: TimeZone>(text: &str, after: DateTime<Tz>) -> Option<DateTime<Tz>> {
         spec(text).next_after(&after)
     }
 
     /// The first `n` fires of a recurring spec after `after`.
-    fn fires(text: &str, after: DateTime<Eastern>, n: usize) -> Vec<DateTime<Eastern>> {
+    fn fires<Tz: TimeZone>(text: &str, after: DateTime<Tz>, n: usize) -> Vec<DateTime<Tz>> {
         let spec = spec(text);
         std::iter::successors(spec.next_after(&after), |t| spec.next_after(t))
             .take(n)
@@ -739,60 +782,79 @@ mod tests {
 
     #[test]
     fn a_skipped_local_time_fires_at_the_next_valid_minute() {
-        let before = et(2026, 3, 7, 12, 0);
+        skipped_local_time_fires_at_the_next_valid_minute_in(Eastern);
+        skipped_local_time_fires_at_the_next_valid_minute_in(EasternLikeLocal);
+    }
+
+    fn skipped_local_time_fires_at_the_next_valid_minute_in<Tz: TimeZone>(tz: Tz) {
+        let local = |d, h, mi| tz.from_local_datetime(&utc(2026, 3, d, h, mi)).unwrap();
+        let at_utc = |d, h, mi| {
+            Utc.from_utc_datetime(&utc(2026, 3, d, h, mi))
+                .with_timezone(&tz)
+        };
+        let before = local(7, 12, 0);
         // 02:30 does not exist on March 8; 03:00 EDT is the next minute that does.
-        assert_eq!(next("at 02:30", before), Some(at_utc(2026, 3, 8, 7, 0)));
-        assert_eq!(
-            next("at 2026-03-08 02:30", before),
-            Some(at_utc(2026, 3, 8, 7, 0))
-        );
+        assert_eq!(next("at 02:30", before.clone()), Some(at_utc(8, 7, 0)));
+        assert_eq!(next("at 02:00", before.clone()), Some(at_utc(8, 7, 0)));
+        assert_eq!(next("at 2026-03-08 02:30", before), Some(at_utc(8, 7, 0)));
         // Every skipped slot collapses into that one fire, then the schedule resumes.
         assert_eq!(
-            fires("cron */20 2,3 * * *", et(2026, 3, 8, 1, 50), 4),
+            fires("cron */20 2,3 * * *", local(8, 1, 50), 4),
             [
-                at_utc(2026, 3, 8, 7, 0),
-                at_utc(2026, 3, 8, 7, 20),
-                at_utc(2026, 3, 8, 7, 40),
-                at_utc(2026, 3, 9, 6, 0),
+                at_utc(8, 7, 0),
+                at_utc(8, 7, 20),
+                at_utc(8, 7, 40),
+                at_utc(9, 6, 0),
             ]
         );
-        assert_eq!(et(2026, 3, 8, 3, 0), at_utc(2026, 3, 8, 7, 0));
+        assert_eq!(local(8, 3, 0), at_utc(8, 7, 0));
     }
 
     #[test]
     fn a_repeated_local_time_fires_once() {
-        let before = et(2026, 10, 31, 12, 0);
+        repeated_local_time_fires_once_in(Eastern);
+        repeated_local_time_fires_once_in(EasternLikeLocal);
+    }
+
+    fn repeated_local_time_fires_once_in<Tz: TimeZone>(tz: Tz) {
+        let local = |mo, d, h, mi| tz.from_local_datetime(&utc(2026, mo, d, h, mi)).unwrap();
+        let at_utc = |d, h, mi| {
+            Utc.from_utc_datetime(&utc(2026, 11, d, h, mi))
+                .with_timezone(&tz)
+        };
+        let before = local(10, 31, 12, 0);
         // 01:30 happens at 05:30 UTC (EDT) and again at 06:30 UTC (EST): only the first.
-        assert_eq!(next("at 01:30", before), Some(at_utc(2026, 11, 1, 5, 30)));
+        assert_eq!(next("at 01:30", before.clone()), Some(at_utc(1, 5, 30)));
+        // 02:00 happens once, at 07:00 UTC.
+        assert_eq!(next("at 02:00", before.clone()), Some(at_utc(1, 7, 0)));
+        assert_eq!(next("at 2026-11-01 01:30", before), Some(at_utc(1, 5, 30)));
+        // Asked from the first pass, the next minute is a minute away, not an hour.
+        assert_eq!(next("at 01:30", at_utc(1, 5, 10)), Some(at_utc(1, 5, 30)));
         assert_eq!(
-            next("at 2026-11-01 01:30", before),
-            Some(at_utc(2026, 11, 1, 5, 30))
+            next("cron * * * * *", at_utc(1, 5, 10)),
+            Some(at_utc(1, 5, 11))
         );
         assert_eq!(
-            fires("cron 0,30 1,2 * * *", et(2026, 11, 1, 0, 45), 5),
+            fires("cron 0,30 1,2 * * *", local(11, 1, 0, 45), 5),
             [
-                at_utc(2026, 11, 1, 5, 0),
-                at_utc(2026, 11, 1, 5, 30),
-                at_utc(2026, 11, 1, 7, 0),
-                at_utc(2026, 11, 1, 7, 30),
-                at_utc(2026, 11, 2, 6, 0),
+                at_utc(1, 5, 0),
+                at_utc(1, 5, 30),
+                at_utc(1, 7, 0),
+                at_utc(1, 7, 30),
+                at_utc(2, 6, 0),
             ]
         );
         // Asked from inside the second pass, a slot from the first is not fired again.
-        let second_pass = at_utc(2026, 11, 1, 6, 10);
+        let second_pass = at_utc(1, 6, 10);
         assert_eq!(
-            next("cron 15 1 * * *", second_pass),
-            Some(et(2026, 11, 2, 1, 15))
+            next("cron 15 1 * * *", second_pass.clone()),
+            Some(local(11, 2, 1, 15))
         );
-        assert_eq!(next("at 01:15", second_pass), Some(et(2026, 11, 2, 1, 15)));
+        assert_eq!(next("at 01:15", second_pass), Some(local(11, 2, 1, 15)));
         // An elapsed interval walks through both passes.
         assert_eq!(
-            fires("every 30m", at_utc(2026, 11, 1, 5, 0), 3),
-            [
-                at_utc(2026, 11, 1, 5, 30),
-                at_utc(2026, 11, 1, 6, 0),
-                at_utc(2026, 11, 1, 6, 30)
-            ]
+            fires("every 30m", at_utc(1, 5, 0), 3),
+            [at_utc(1, 5, 30), at_utc(1, 6, 0), at_utc(1, 6, 30)]
         );
     }
 }

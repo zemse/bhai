@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-03
+
+- A repeated local time (the hour clocks fall back through) now fires on its first pass under the machine's real time zone too. Before, chrono's Local made it fire on the second pass, and a per-minute cron went silent for that hour.
+
 ## 2026-10-02
 
 - A page whose title or text holds a lone UTF-16 surrogate now renders instead of hanging until the 45 s timeout. The surrogate is replaced with U+FFFD in the page, and the DevTools reader repairs one in any reply rather than dropping it.
