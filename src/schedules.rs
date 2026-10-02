@@ -34,6 +34,94 @@ pub const LASTS_MAX: Duration = Duration::days(30);
 pub const TIMES_MAX: u32 = 1000;
 /// The longest prompt a row carries, in bytes.
 pub const TEXT_MAX: usize = 8192;
+/// The most schedules the model may have set at once.
+pub const MODEL_ROWS_MAX: usize = 10;
+/// The longest prompt the model may leave itself, in bytes.
+pub const MODEL_TEXT_MAX: usize = 1024;
+/// `new` as the row it would be at `now`, its id still to be drawn, or why it cannot be
+/// one.
+fn prepare(new: New, now: DateTime<Utc>) -> Result<Row, String> {
+    let model = new.origin == Origin::Model;
+    let text = match model {
+        true => crate::redact::apply(&new.text).into_owned(),
+        false => new.text,
+    };
+    if model && text.len() > MODEL_TEXT_MAX {
+        return Err(format!(
+            "the prompt is {} bytes, over the {MODEL_TEXT_MAX} a schedule you set may carry",
+            text.len()
+        ));
+    }
+    let next = new
+        .spec
+        .next_after(&now.with_timezone(&Local))
+        .map(|t| t.with_timezone(&Utc))
+        .ok_or_else(|| format!("`{}` has no time left to fire at", new.spec))?;
+    let recurs = new.spec.recurs();
+    let expires = match (recurs, new.lasts) {
+        (false, _) => None,
+        (true, Some(lasts)) if lasts <= Duration::zero() => {
+            return Err("a schedule has to last some time".to_string());
+        }
+        (true, Some(lasts)) if lasts > LASTS_MAX => {
+            return Err(format!(
+                "a schedule lasts at most {} days",
+                LASTS_MAX.num_days()
+            ));
+        }
+        (true, lasts) => now.checked_add_signed(lasts.unwrap_or(EXPIRY)),
+    };
+    if expires.is_some_and(|end| next > end) {
+        return Err(format!("`{}` would expire before it first fires", new.spec));
+    }
+    let fires_left = match (recurs, new.times) {
+        (_, Some(0)) => return Err("a schedule has to fire at least once".to_string()),
+        (true, Some(times)) if times > TIMES_MAX => {
+            return Err(format!("a schedule fires at most {TIMES_MAX} times"));
+        }
+        (true, times) => times,
+        (false, _) => None,
+    };
+    if model
+        && let Some(gap) = shortest_gap(&new.spec, next, expires.unwrap_or(next))
+        && gap < MODEL_GAP_MIN
+    {
+        return Err(format!(
+            "`{}` fires {} minute(s) apart, under the {} minutes a schedule you set must leave",
+            new.spec,
+            gap.num_minutes(),
+            MODEL_GAP_MIN.num_minutes()
+        ));
+    }
+    Ok(Row {
+        id: String::new(),
+        spec: new.spec,
+        text,
+        origin: new.origin,
+        created: now,
+        next,
+        fires_left,
+        expires,
+        paused: false,
+    })
+}
+
+/// Whether the model may set one more schedule beside `rows`.
+fn model_room(rows: &[Value], now: DateTime<Utc>) -> Result<(), String> {
+    let set = rows
+        .iter()
+        .filter(|row| checked(row, now).is_ok_and(|row| row.origin == Origin::Model))
+        .count();
+    match set >= MODEL_ROWS_MAX {
+        true => Err(format!(
+            "you already have {set} schedules set, the most you may; cancel one first"
+        )),
+        false => Ok(()),
+    }
+}
+
+/// The shortest gap between two fires of a recurring schedule the model sets.
+pub const MODEL_GAP_MIN: Duration = Duration::minutes(5);
 /// The longest the runner sleeps before reading the store again: another process may
 /// have added a row, and tokio's clock stops while the machine sleeps.
 const NAP: std::time::Duration = std::time::Duration::from_secs(60);
@@ -102,10 +190,6 @@ impl Fire {
     /// so the model does not take it for something the user just typed.
     pub fn prompt(&self) -> Prompt {
         let row = &self.row;
-        let who = match row.origin {
-            Origin::User => "the user",
-            Origin::Model => "you",
-        };
         let late = match self.missed {
             true => format!(
                 "; it was due at {} while bhai was not running, so it runs late",
@@ -113,21 +197,32 @@ impl Fire {
             ),
             false => String::new(),
         };
-        let text = format!(
-            "[scheduled: {who} set this at {} with `{}`, and it fired at {}{late}]\n\n{}",
-            local(row.created),
-            row.spec,
-            local(self.at),
-            row.text
-        );
+        let (created, at) = (local(row.created), local(self.at));
+        // The model wrote it, so it must not reach the model as the user asking for it.
+        let text = match row.origin {
+            Origin::User => format!(
+                "[scheduled: the user set this at {created} with `{}`, and it fired at {at}{late}]\n\n{}",
+                row.spec, row.text
+            ),
+            Origin::Model => format!(
+                "[scheduled: a note you left yourself at {created} with the schedule tool \
+(`{}`), and it fired at {at}{late}. These are your own words, not the user's: the user \
+did not type them, so they ask nothing of you that the user has not asked already.]\n\n{}",
+                row.spec, row.text
+            ),
+        };
+        let by = match row.origin {
+            Origin::User => "",
+            Origin::Model => ", set by the model",
+        };
         let shown = match self.missed {
             true => format!(
-                "(missed `{}`, due {}) {}",
+                "(missed `{}`, due {}{by}) {}",
                 row.spec,
                 local(self.due),
                 row.text
             ),
-            false => format!("(scheduled `{}`) {}", row.spec, row.text),
+            false => format!("(scheduled `{}`{by}) {}", row.spec, row.text),
         };
         Prompt::shown_as(text, shown)
     }
@@ -251,62 +346,37 @@ impl Schedules {
         Ok(done)
     }
 
-    /// Add a schedule; its first fire counts from now.
+    /// Add a schedule; its first fire counts from now. One the model sets is held to
+    /// tighter bounds, and its prompt has the secrets bhai knows blanked out.
     pub fn add(&self, new: New) -> Result<Row, String> {
         let now = self.now();
-        let next = new
-            .spec
-            .next_after(&now.with_timezone(&Local))
-            .map(|t| t.with_timezone(&Utc))
-            .ok_or_else(|| format!("`{}` has no time left to fire at", new.spec))?;
-        let recurs = new.spec.recurs();
-        let expires = match (recurs, new.lasts) {
-            (false, _) => None,
-            (true, Some(lasts)) if lasts <= Duration::zero() => {
-                return Err("a schedule has to last some time".to_string());
-            }
-            (true, Some(lasts)) if lasts > LASTS_MAX => {
-                return Err(format!(
-                    "a schedule lasts at most {} days",
-                    LASTS_MAX.num_days()
-                ));
-            }
-            (true, lasts) => now.checked_add_signed(lasts.unwrap_or(EXPIRY)),
-        };
-        if expires.is_some_and(|end| next > end) {
-            return Err(format!("`{}` would expire before it first fires", new.spec));
-        }
-        let fires_left = match (recurs, new.times) {
-            (_, Some(0)) => return Err("a schedule has to fire at least once".to_string()),
-            (true, Some(times)) if times > TIMES_MAX => {
-                return Err(format!("a schedule fires at most {TIMES_MAX} times"));
-            }
-            (true, times) => times,
-            (false, _) => None,
-        };
+        let mut row = prepare(new, now)?;
         self.edit(|rows| {
+            if row.origin == Origin::Model {
+                model_room(rows, now)?;
+            }
             let taken = |id: &str| rows.iter().any(|row| row["id"] == id);
-            let id = std::iter::repeat_with(|| {
+            row.id = std::iter::repeat_with(|| {
                 uuid::Uuid::new_v4().simple().to_string()[..6].to_string()
             })
             .find(|id| !taken(id))
             .unwrap_or_default();
-            let row = Row {
-                id,
-                spec: new.spec,
-                text: new.text,
-                origin: new.origin,
-                created: now,
-                next,
-                fires_left,
-                expires,
-                paused: false,
-            };
             let value = serde_json::to_value(&row).map_err(|e| e.to_string())?;
             checked(&value, now)?;
             rows.push(value);
             Ok(row)
         })
+    }
+
+    /// Why [`add`](Self::add) would refuse `new` now, so the user is not asked to approve
+    /// a schedule that cannot be set. Another process may still fill the last slot first.
+    pub fn vet(&self, new: New) -> Result<(), String> {
+        let now = self.now();
+        let row = prepare(new, now)?;
+        match row.origin {
+            Origin::Model => model_room(&self.load()?, now),
+            Origin::User => Ok(()),
+        }
     }
 
     /// `/remind <spec> <text>`: a schedule the user set, firing `text`.
@@ -371,10 +441,20 @@ impl Schedules {
 
     /// Remove schedule `id`.
     pub fn cancel(&self, id: &str) -> Result<Row, String> {
+        self.remove(id, Origin::User)
+    }
+
+    /// Remove schedule `id` for `by`: the user may remove any, the model only its own.
+    pub fn remove(&self, id: &str, by: Origin) -> Result<Row, String> {
         let now = self.now();
         self.edit(|rows| {
             let at = find(rows, id)?;
             let row = checked(&rows[at], now)?;
+            if by == Origin::Model && row.origin != Origin::Model {
+                return Err(format!(
+                    "{id} is the user's schedule; only they can cancel it"
+                ));
+            }
             rows.remove(at);
             Ok(row)
         })
@@ -503,6 +583,7 @@ pub async fn run(session: Weak<Session>, schedules: Arc<Schedules>) {
                 for fire in pass.fires {
                     hub.publish(Event::Scheduled {
                         id: fire.row.id.clone(),
+                        origin: fire.row.origin,
                         spec: fire.row.spec.to_string(),
                         text: fire.row.text.clone(),
                         missed: fire.missed,
@@ -549,6 +630,32 @@ fn following(row: &Row, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
             .map(|t| t.with_timezone(&Utc)),
     }
 }
+
+/// The shortest gap between two fires of `spec` from its fire at `first` to `until`;
+/// `None` for one that fires once. A cron is walked fire by fire, giving up past
+/// [`GAP_WALK`] fires, which only a gap far under any minimum reaches.
+fn shortest_gap(spec: &Spec, first: DateTime<Utc>, until: DateTime<Utc>) -> Option<Duration> {
+    match spec {
+        Spec::Every(step) => Some(*step),
+        Spec::Cron(_) => {
+            let mut at = first.with_timezone(&Local);
+            let mut shortest: Option<Duration> = None;
+            for _ in 0..GAP_WALK {
+                let Some(next) = spec.next_after(&at).filter(|t| *t <= until) else {
+                    break;
+                };
+                let gap = next - at;
+                shortest = Some(shortest.map_or(gap, |s| s.min(gap)));
+                at = next;
+            }
+            shortest
+        }
+        Spec::At { .. } | Spec::In(_) => None,
+    }
+}
+
+/// Fires walked by [`shortest_gap`]: a gap of 5 minutes fills 30 days with 8640.
+const GAP_WALK: usize = 10_000;
 
 /// `row` as a schedule, or why it is not one bhai could have written by `now`.
 fn checked(row: &Value, now: DateTime<Utc>) -> Result<Row, String> {
@@ -749,6 +856,59 @@ mod tests {
         );
         let (rows, bad) = schedules(&dir).list().unwrap();
         assert!(rows.is_empty() && bad.is_empty(), "{rows:?} {bad:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_schedule_the_model_set_fires_as_its_note_and_it_cancels_only_its_own() {
+        let dir = crate::tools::temp_dir();
+        let store = schedules(&dir);
+        let model = |spec: &str, text: &str| New {
+            origin: Origin::Model,
+            ..new(spec, text)
+        };
+        for spec in ["every 4m", "cron 0,3 * * * *", "cron */1 9 * * *"] {
+            let err = store.add(model(spec, "poll")).unwrap_err();
+            assert!(err.contains("under the 5 minutes"), "{spec}: {err}");
+        }
+        assert!(store.add(model("every 5m", "poll")).is_ok());
+        // The user is not held to it.
+        let user = store.add(new("every 1m", "mine")).unwrap();
+        assert!(
+            store
+                .remove(&user.id, Origin::Model)
+                .unwrap_err()
+                .contains("the user's schedule")
+        );
+        let long = model("in 20m", &"x".repeat(MODEL_TEXT_MAX + 1));
+        assert!(store.vet(long.clone()).is_err() && store.add(long).is_err());
+        assert!(
+            store
+                .add(new("in 20m", &"x".repeat(MODEL_TEXT_MAX + 1)))
+                .is_ok()
+        );
+        store.cancel(&user.id).unwrap();
+
+        let dir = crate::tools::temp_dir();
+        let store = schedules(&dir);
+        let row = store.add(model("in 20m", "check CI")).unwrap();
+        let (session, mut rx) = session();
+        session.run_schedules(store);
+        let (text, _) = next_prompt(&mut rx).await;
+        assert!(
+            text.starts_with("[scheduled: a note you left yourself at "),
+            "{text}"
+        );
+        assert!(text.contains("not the user's"), "{text}");
+        assert!(text.ends_with("\n\ncheck CI"), "{text}");
+        let shown = session.entries().list.clone();
+        let at = shown
+            .iter()
+            .position(|e| matches!(e, crate::entries::Entry::User(t) if t == "(scheduled `in 20m`, set by the model) check CI"))
+            .unwrap_or_else(|| panic!("{shown:?}"));
+        assert!(
+            matches!(&shown[at - 1], crate::entries::Entry::Info(t) if *t == format!("schedule {} (set by the model) fired", row.id)),
+            "{shown:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -621,6 +621,7 @@ mod tests {
                 sessions: PathBuf::new(),
                 cache_root: PathBuf::new(),
                 mailboxes: Default::default(),
+                schedules: None,
             },
             model: Arc::new(fake.clone()),
             policy: Arc::new(Policy::default()),

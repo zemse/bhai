@@ -395,6 +395,15 @@ allow it.",
         client.clone(),
         judge.model.clone(),
     ));
+    // Only a run that stays up fires schedules, so only there may the model set one.
+    let schedules = (args.workflow.is_none() && args.exec.is_none())
+        .then(|| project_schedules(&cwd))
+        .flatten()
+        .map(Arc::new);
+    let delegation = Delegation {
+        schedules: schedules.clone(),
+        ..delegation
+    };
     let (session, events) = start(
         client,
         prompt,
@@ -438,7 +447,7 @@ allow it.",
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         session.entries().restore(&history);
-        if let Some(schedules) = project_schedules(&cwd) {
+        if let Some(schedules) = schedules {
             session.run_schedules(schedules);
         }
         for notice in &notices {
@@ -517,6 +526,7 @@ allow it.",
         designer,
         defaults,
         requests,
+        schedules,
     )
     .await;
     drop(guard);
@@ -755,6 +765,8 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
         cache_root: bhai,
         // Replaced with the session's own once there is a session to type into.
         mailboxes: agent::Mailboxes::default(),
+        // Set once the run is one that fires them.
+        schedules: None,
         // Children reuse the session's MCP connections, narrowed to their identity.
         prompt: {
             let (config, roots) = (config.clone(), roots.clone());
@@ -1598,6 +1610,7 @@ async fn run(
     designer: Arc<dyn statusline::Design>,
     defaults: (String, String),
     askpass: Option<mpsc::UnboundedReceiver<askpass::Request>>,
+    schedules: Option<Arc<schedules::Schedules>>,
 ) -> Result<()> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -1686,7 +1699,7 @@ async fn run(
             .extend(notices.into_iter().map(app::Entry::Info));
     }
     // After the transcript is restored, so a missed schedule's turn follows it.
-    if let Some(schedules) = project_schedules(&std::env::current_dir().unwrap_or_default()) {
+    if let Some(schedules) = schedules {
         session.run_schedules(schedules);
     }
     if let Some(listener) = listener {
@@ -1816,9 +1829,14 @@ fn attention(event: &session::Event, root: &std::path::Path) -> Option<String> {
             Some(format!("bhai · {dir}: {tool} needs approval"))
         }
         session::Event::TurnEnd => Some(format!("bhai · {dir}: done")),
-        session::Event::Scheduled { spec, text, .. } => {
-            Some(format!("bhai · {dir}: `{spec}` fired: {text}"))
-        }
+        session::Event::Scheduled {
+            spec, text, origin, ..
+        } => Some(match origin {
+            schedules::Origin::User => format!("bhai · {dir}: `{spec}` fired: {text}"),
+            schedules::Origin::Model => {
+                format!("bhai · {dir}: `{spec}` the model set fired: {text}")
+            }
+        }),
         _ => None,
     }
 }
@@ -1924,6 +1942,7 @@ mod tests {
         );
         let fired = session::Event::Scheduled {
             id: "abc123".to_string(),
+            origin: schedules::Origin::User,
             spec: "in 20m".to_string(),
             text: "check CI".to_string(),
             missed: false,

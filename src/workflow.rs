@@ -1521,6 +1521,7 @@ mod tests {
             sessions: PathBuf::new(),
             cache_root: PathBuf::new(),
             mailboxes: Default::default(),
+            schedules: None,
         }
     }
 

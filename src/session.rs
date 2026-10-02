@@ -144,6 +144,7 @@ pub enum Event {
     /// `queued` behind the running one. `missed` is a slot that passed while no bhai ran.
     Scheduled {
         id: String,
+        origin: crate::schedules::Origin,
         spec: String,
         text: String,
         missed: bool,
@@ -691,9 +692,9 @@ impl Session {
     /// with it.
     pub fn run_schedules(
         self: &Arc<Self>,
-        schedules: crate::schedules::Schedules,
+        schedules: impl Into<Arc<crate::schedules::Schedules>>,
     ) -> tokio::task::JoinHandle<()> {
-        let schedules = Arc::new(schedules);
+        let schedules = schedules.into();
         let _ = self.schedules.set(Arc::clone(&schedules));
         tokio::spawn(crate::schedules::run(Arc::downgrade(self), schedules))
     }

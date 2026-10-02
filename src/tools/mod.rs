@@ -23,6 +23,7 @@ pub mod models;
 pub mod patch;
 pub mod plan;
 pub mod read;
+pub mod schedule;
 pub mod skill;
 pub mod ssrf;
 pub mod stdin;
@@ -32,7 +33,7 @@ pub mod web;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 12] = [
+pub const NAMES: [&str; 13] = [
     bash::NAME,
     read::NAME,
     write::NAME,
@@ -45,6 +46,7 @@ pub const NAMES: [&str; 12] = [
     memory::NAME,
     web::NAME,
     fetch::NAME,
+    schedule::NAME,
 ];
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
@@ -355,6 +357,12 @@ impl Registry {
     /// `remember`, appending to the memory file at `path`, for the main agent.
     pub fn with_memory(mut self, path: std::path::PathBuf) -> Self {
         self.tools.push(Box::new(memory::Remember { path }));
+        self
+    }
+
+    /// `schedule`, for the main agent of a session that fires the schedules it sets.
+    pub fn with_schedule(mut self, schedule: schedule::Schedule) -> Self {
+        self.tools.push(Box::new(schedule));
         self
     }
 

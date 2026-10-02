@@ -101,13 +101,20 @@ impl Entries {
             // that queues may land mid-answer, and its prompt says it was scheduled.
             Event::Scheduled {
                 id,
+                origin,
                 missed,
                 queued: false,
                 ..
-            } => self.push(Entry::Info(match missed {
-                true => format!("schedule {id} fired late"),
-                false => format!("schedule {id} fired"),
-            })),
+            } => {
+                let by = match origin {
+                    crate::schedules::Origin::User => "",
+                    crate::schedules::Origin::Model => " (set by the model)",
+                };
+                self.push(Entry::Info(match missed {
+                    true => format!("schedule {id}{by} fired late"),
+                    false => format!("schedule {id}{by} fired"),
+                }))
+            }
             Event::Scheduled { queued: true, .. } => {}
             Event::Text(delta) => self.append(delta, Stream::Assistant),
             Event::Commentary(delta) => self.append(delta, Stream::Commentary),

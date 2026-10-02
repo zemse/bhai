@@ -478,6 +478,9 @@ pub struct Delegation {
     pub cache_root: PathBuf,
     /// Shared with the session, so what is typed into a pane reaches that child.
     pub mailboxes: Mailboxes,
+    /// The project's schedules, for the main agent's `schedule` tool; `None` where
+    /// nothing fires them, and for a child.
+    pub schedules: Option<Arc<crate::schedules::Schedules>>,
 }
 
 /// One child agent's usage, as the profiler reports it.
@@ -809,6 +812,11 @@ pub(crate) async fn run_configured(
             && prompt.identity.allows_tool(tools::memory::NAME)
         {
             registry = registry.with_memory(crate::memory::path(&delegation.cache_root));
+        }
+        if let Some(schedules) = delegation.as_ref().and_then(|d| d.schedules.clone())
+            && prompt.identity.allows_tool(tools::schedule::NAME)
+        {
+            registry = registry.with_schedule(tools::schedule::Schedule { schedules });
         }
         registry
             .with_goal(tools::goal::Goal {
@@ -4408,6 +4416,7 @@ mod tests {
             sessions: dir.clone(),
             cache_root: dir.clone(),
             mailboxes: Default::default(),
+            schedules: None,
         };
         let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
@@ -4825,6 +4834,7 @@ mod tests {
             sessions: dir.clone(),
             cache_root: dir.clone(),
             mailboxes: Default::default(),
+            schedules: None,
         };
         let rules = Rules {
             deny: vec![Rule::parse("Bash(rm:*)").unwrap()],
@@ -6325,6 +6335,7 @@ mod tests {
             sessions: dir.clone(),
             cache_root: dir.clone(),
             mailboxes: Default::default(),
+            schedules: None,
         };
         let policy = Arc::new(Policy::new(Mode::Ask, Rules::default(), None, dir.clone()));
         let cancel = Arc::new(Cancel::default());
@@ -7358,6 +7369,7 @@ mod tests {
                 sessions: dir.clone(),
                 cache_root: dir.clone(),
                 mailboxes: Default::default(),
+                schedules: None,
             }),
             None,
             Limits::default(),

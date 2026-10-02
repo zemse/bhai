@@ -16,7 +16,7 @@ pub mod rules;
 pub mod settings;
 pub mod trust;
 
-use crate::tools::{fetch, image_gen, patch, ssrf, view_image};
+use crate::tools::{fetch, image_gen, patch, schedule, ssrf, view_image};
 use rules::Base;
 pub use rules::Rule;
 pub use trust::Trust;
@@ -93,6 +93,8 @@ pub enum Reserved {
     /// Input typed into a session that is not a plain shell, or that holds keys which
     /// edit the line, by the session's command: nothing here can tell what it runs.
     Typed(String),
+    /// A schedule the model sets, which starts a turn later with nobody watching.
+    Scheduled,
     /// The judge does not run here at all: this is not `auto`, or the project is not
     /// trusted. Neither reaches the agent, since `auto` implies a trusted project and
     /// every other mode prompts.
@@ -112,6 +114,9 @@ impl Reserved {
             }
             Reserved::Typed(command) => {
                 format!("only the user may approve what is typed into `{command}`")
+            }
+            Reserved::Scheduled => {
+                "only the user may approve a schedule, which starts a turn later with nobody watching".to_string()
             }
             Reserved::Untrusted => "this project is not trusted".to_string(),
         }
@@ -738,6 +743,7 @@ impl Checker<'_> {
                 Some(host) => self.check_fetch(&host, needs_approval),
                 None => Decision::Ask,
             },
+            schedule::NAME => self.check_other(tool, needs_approval && !schedule::reads_only(args)),
             _ => self.check_other(tool, needs_approval),
         }
     }
@@ -1094,6 +1100,7 @@ impl Checker<'_> {
                 })
             }
             crate::tools::stdin::NAME => self.judgeable_typing(tool, &Typing::of(args)),
+            schedule::NAME => Err(Reserved::Scheduled),
             // The guard refuses a private address when the fetch runs; one written into
             // the URL is kept from the judge too, so it is never what the judge approved.
             fetch::NAME => {
@@ -2047,6 +2054,44 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    #[test]
+    fn a_schedule_the_model_sets_asks_and_is_never_judged() {
+        let create = json!({ "action": "create", "when": "in 20m", "prompt": "x" });
+        let list = json!({ "action": "list" });
+        let cancel = json!({ "action": "cancel", "id": "abc123" });
+        let ask = policy(Mode::Ask, &[], &[], &[]);
+        assert_eq!(ask.check("schedule", &create, true), Decision::Ask);
+        assert_eq!(ask.offers("schedule", &create), Offers::default());
+        let auto = policy(Mode::Auto, &[], &[], &[]);
+        assert_eq!(auto.check("schedule", &create, true), Decision::Ask);
+        assert_eq!(
+            auto.judgeable("schedule", &create),
+            Err(Reserved::Scheduled)
+        );
+        for args in [&list, &cancel] {
+            assert_eq!(
+                auto.check("schedule", args, true),
+                Decision::Allow(String::new())
+            );
+        }
+        let denied = policy(Mode::Auto, &[], &["Schedule"], &[]);
+        assert!(matches!(
+            denied.check("schedule", &list, true),
+            Decision::Deny(_)
+        ));
+        // Bypass lets everything run, and the user's own rule lets it run in `auto`.
+        let bypass = policy(Mode::Bypass, &[], &[], &[]);
+        assert!(matches!(
+            bypass.check("schedule", &create, true),
+            Decision::Allow(_)
+        ));
+        let allowed = policy(Mode::Auto, &["Schedule"], &[], &[]);
+        assert_eq!(
+            allowed.check("schedule", &create, true),
+            Decision::Allow("rule Schedule".to_string())
+        );
     }
 
     #[test]

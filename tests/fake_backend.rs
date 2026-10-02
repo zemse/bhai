@@ -1697,7 +1697,7 @@ async fn a_schedule_missed_while_bhai_was_down_fires_at_startup_framed_as_late()
     let fired = events.until("scheduled").await;
     assert_eq!(
         fired["data"],
-        json!({"id": "late01", "spec": "in 1h", "text": "check the deploy", "missed": true, "queued": false})
+        json!({"id": "late01", "origin": "user", "spec": "in 1h", "text": "check the deploy", "missed": true, "queued": false})
     );
     let user = events.until("user").await;
     let shown = user["data"].as_str().unwrap();
@@ -1786,4 +1786,144 @@ async fn a_schedule_set_over_http_is_listed_kept_and_cancelled_without_a_model_c
     let (status, gone) = bhai.post("/schedule/cancel", json!({ "id": id })).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{gone}");
     assert!(fake.responses().is_empty());
+}
+
+/// The model calling `schedule` with `args`.
+fn schedules(call_id: &str, args: Value) -> String {
+    sse(&[
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "schedule",
+                "call_id": call_id,
+                "arguments": args.to_string()
+            }
+        }),
+        completed(),
+    ])
+}
+
+#[tokio::test]
+async fn the_model_sets_a_schedule_only_once_the_user_approves_it_and_lists_without_asking() {
+    let fake = Arc::new(Fake::default());
+    queue(
+        &fake,
+        [
+            schedules(
+                "call_s",
+                json!({"action": "create", "when": "in 20m", "prompt": "check CI"}),
+            ),
+            schedules("call_l", json!({"action": "list"})),
+            says("set"),
+        ],
+    );
+    let bhai = Bhai::start(&serve_fake(fake.clone()).await).await;
+    let mut events = bhai.events().await;
+    bhai.post("/prompt", json!({ "text": "watch CI" })).await;
+
+    let approval = events.until("approval").await;
+    assert_eq!(approval["data"]["tool"], "schedule", "{approval}");
+    assert_eq!(approval["data"]["command"], "schedule `in 20m`: check CI");
+    let listed = || async {
+        let listed: Value = bhai
+            .http
+            .get(format!("{}/schedules", bhai.base))
+            .header("x-bhai-token", &bhai.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        listed["schedules"].as_array().unwrap().clone()
+    };
+    assert!(listed().await.is_empty());
+    bhai.post("/approve", json!({ "id": approval["data"]["id"] }))
+        .await;
+    events.until("turn_end").await;
+    // The list ran unasked: only the one approval came up.
+    assert_eq!(
+        events.kinds().iter().filter(|k| **k == "approval").count(),
+        1
+    );
+
+    let rows = listed().await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (&rows[0]["origin"], &rows[0]["text"]),
+        (&json!("model"), &json!("check CI"))
+    );
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 3, "{sent:#?}");
+    assert!(tool_names(&sent[0].body).contains(&"schedule"));
+    let output = |body: &Value, id: &str| {
+        items(body, "function_call_output")
+            .iter()
+            .find(|o| o["call_id"] == id)
+            .and_then(|o| o["output"].as_str())
+            .unwrap()
+            .to_string()
+    };
+    let set = output(&sent[1].body, "call_s");
+    assert!(
+        set.starts_with("Set ") && set.contains("set by the model"),
+        "{set}"
+    );
+    let list = output(&sent[2].body, "call_l");
+    assert!(
+        list.starts_with("1 schedule(s):") && list.contains("check CI"),
+        "{list}"
+    );
+}
+
+#[tokio::test]
+async fn a_schedule_the_model_set_fires_as_its_own_note_and_not_the_users_words() {
+    let fake = Arc::new(Fake::default());
+    fake.replies.lock().unwrap().push_back(says("looked"));
+    let now = chrono::Utc::now();
+    let rows = json!([{
+        "id": "mine01",
+        "spec": "in 1h",
+        "text": "check CI",
+        "origin": "model",
+        "created": now - chrono::Duration::hours(2),
+        "next": now - chrono::Duration::hours(1),
+    }]);
+    let bhai = Bhai::start_prepared(
+        &serve_fake(fake.clone()).await,
+        &[],
+        &[],
+        None,
+        |home, project| {
+            let store = bhai::schedules::Schedules::new(&home.join(".config/bhai"), project)
+                .path()
+                .to_path_buf();
+            std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+            std::fs::write(&store, rows.to_string()).unwrap();
+        },
+    )
+    .await;
+    let mut events = bhai.events().await;
+
+    let fired = events.until("scheduled").await;
+    assert_eq!(fired["data"]["origin"], "model", "{fired}");
+    let user = events.until("user").await;
+    let shown = user["data"].as_str().unwrap();
+    assert!(shown.starts_with("(missed `in 1h`, due "), "{shown}");
+    assert!(shown.ends_with(", set by the model) check CI"), "{shown}");
+    events.until("turn_end").await;
+
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 1, "{sent:#?}");
+    let body = &sent[0].body;
+    assert!(
+        mentions(body, "[scheduled: a note you left yourself at "),
+        "{body}"
+    );
+    assert!(
+        mentions(body, "These are your own words, not the user's"),
+        "{body}"
+    );
+    assert!(!mentions(body, "the user set this"), "{body}");
 }
