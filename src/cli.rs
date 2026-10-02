@@ -438,7 +438,9 @@ allow it.",
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         session.entries().restore(&history);
-        session.run_schedules(schedules::Schedules::new(&cwd));
+        if let Some(schedules) = project_schedules(&cwd) {
+            session.run_schedules(schedules);
+        }
         for notice in &notices {
             eprintln!("bhai: {notice}");
         }
@@ -786,6 +788,12 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
 
 /// The policy from the config, Claude Code's settings and remembered approvals, plus
 /// notices about rules that were skipped.
+/// The schedules of `cwd`, kept under bhai's config directory; none without a home.
+fn project_schedules(cwd: &std::path::Path) -> Option<schedules::Schedules> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    Some(schedules::Schedules::new(&home.join(".config/bhai"), cwd))
+}
+
 fn permissions(config: Config, home: Option<PathBuf>, cwd: PathBuf) -> (Policy, Vec<String>) {
     let mut rules = config.permissions;
     let mut notices = Vec::new();
@@ -1678,9 +1686,9 @@ async fn run(
             .extend(notices.into_iter().map(app::Entry::Info));
     }
     // After the transcript is restored, so a missed schedule's turn follows it.
-    session.run_schedules(schedules::Schedules::new(
-        &std::env::current_dir().unwrap_or_default(),
-    ));
+    if let Some(schedules) = project_schedules(&std::env::current_dir().unwrap_or_default()) {
+        session.run_schedules(schedules);
+    }
     if let Some(listener) = listener {
         let addr = listener.local_addr()?;
         let token = server::mint();

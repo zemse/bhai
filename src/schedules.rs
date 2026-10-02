@@ -1,5 +1,8 @@
-//! The schedules of a project, kept in `.bhai/schedules.json`, and the runner that fires
-//! each into the session as it falls due.
+//! The schedules of a project, kept in bhai's config directory under a name drawn from
+//! the project's root, and the runner that fires each into the session as it falls due.
+//!
+//! The store is never in the project: a schedule starts a turn with nobody at the
+//! keyboard, framed as the user's, and a clone can commit anything under `.bhai`.
 //!
 //! A fire is claimed under the store's lock before it is submitted: the row is moved on
 //! or removed and the file saved first, so two bhai processes in one project never both
@@ -13,17 +16,21 @@ use std::sync::{Arc, Weak};
 use chrono::{DateTime, Duration, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::schedule::Spec;
 use crate::session::{Event, Prompt, Session};
 use crate::worktrees::Lock;
 
-/// The store, under the project's `.bhai`.
-pub const FILE: &str = "schedules.json";
-const LOCK: &str = "schedules.lock";
+/// The stores, one per project, under bhai's config directory.
+pub const DIR: &str = "schedules";
 /// How long a recurring row lives when nothing else is asked for.
 pub const EXPIRY: Duration = Duration::days(7);
+/// The longest a recurring row may live.
+pub const LASTS_MAX: Duration = Duration::days(30);
+/// The most fires a recurring row may be given.
+pub const TIMES_MAX: u32 = 1000;
 /// The longest prompt a row carries, in bytes.
 pub const TEXT_MAX: usize = 8192;
 /// The longest the runner sleeps before reading the store again: another process may
@@ -133,17 +140,21 @@ struct Pass {
 
 /// A project's schedules.
 pub struct Schedules {
-    bhai: PathBuf,
+    /// The store; its lock sits beside it.
+    path: PathBuf,
     clock: Clock,
     /// Wakes the runner when a row changes here, so it never sleeps past a new one.
     poke: Notify,
 }
 
 impl Schedules {
-    /// For bhai running in `project`.
-    pub fn new(project: &Path) -> Self {
+    /// For bhai running in `project`, with its config directory at `config_dir`.
+    pub fn new(config_dir: &Path, project: &Path) -> Self {
+        let root = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+        let key = Sha256::digest(root.as_os_str().as_encoded_bytes());
+        let name = format!("{:x}", key)[..16].to_string();
         Self {
-            bhai: project.join(".bhai"),
+            path: config_dir.join(DIR).join(format!("{name}.json")),
             clock: Arc::new(Utc::now),
             poke: Notify::new(),
         }
@@ -157,28 +168,30 @@ impl Schedules {
         (self.clock)()
     }
 
-    fn path(&self) -> PathBuf {
-        self.bhai.join(FILE)
+    /// The store's file.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Held across every read-modify-write, by this process and any other in the project.
     fn lock(&self) -> Result<Lock, String> {
-        crate::sessions::private_dir(&self.bhai).map_err(|e| e.to_string())?;
-        let file = crate::sessions::private_append(&self.bhai.join(LOCK))
+        if let Some(dir) = self.path.parent() {
+            crate::sessions::private_dir(dir).map_err(|e| e.to_string())?;
+        }
+        let file = crate::sessions::private_append(&self.path.with_extension("lock"))
             .map_err(|e| format!("could not open the schedules lock: {e}"))?;
         Lock::take(file, "the schedules")
     }
 
-    /// The rows as written, each checked by [`checked`] before use, since a clone can
-    /// commit `.bhai` and a schedule is a way into the session.
+    /// The rows as written, each checked by [`checked`] before use.
     fn load(&self) -> Result<Vec<Value>, String> {
         let unparsed =
-            |e: serde_json::Error| format!("{} does not parse: {e}", self.path().display());
-        match std::fs::read_to_string(self.path()) {
+            |e: serde_json::Error| format!("{} does not parse: {e}", self.path.display());
+        match std::fs::read_to_string(&self.path) {
             Ok(text) if text.trim().is_empty() => Ok(Vec::new()),
             Ok(text) => serde_json::from_str(&text).map_err(unparsed),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(format!("could not read {}: {e}", self.path().display())),
+            Err(e) => Err(format!("could not read {}: {e}", self.path.display())),
         }
     }
 
@@ -186,11 +199,20 @@ impl Schedules {
     fn save(&self, rows: &[Value]) -> Result<(), String> {
         let text = serde_json::to_string_pretty(rows).map_err(|e| e.to_string())?;
         let aside = self
-            .bhai
-            .join(format!(".{FILE}.{}.tmp", std::process::id()));
+            .path
+            .with_extension(format!("{}.tmp", std::process::id()));
         crate::sessions::private_write(&aside, &text)
-            .and_then(|()| std::fs::rename(&aside, self.path()))
-            .map_err(|e| format!("could not write {}: {e}", self.path().display()))
+            .and_then(|()| std::fs::rename(&aside, &self.path))
+            .map_err(|e| format!("could not write {}: {e}", self.path.display()))
+    }
+
+    /// The line for row `at` of the store, left alone for `why`.
+    fn skipped(&self, at: usize, why: &str) -> String {
+        format!(
+            "row {} of {} was left alone: {why}",
+            at + 1,
+            self.path.display()
+        )
     }
 
     /// Change the rows under the lock, and save them when `change` succeeds.
@@ -220,6 +242,12 @@ impl Schedules {
             (true, Some(lasts)) if lasts <= Duration::zero() => {
                 return Err("a schedule has to last some time".to_string());
             }
+            (true, Some(lasts)) if lasts > LASTS_MAX => {
+                return Err(format!(
+                    "a schedule lasts at most {} days",
+                    LASTS_MAX.num_days()
+                ));
+            }
             (true, lasts) => now.checked_add_signed(lasts.unwrap_or(EXPIRY)),
         };
         if expires.is_some_and(|end| next > end) {
@@ -227,6 +255,9 @@ impl Schedules {
         }
         let fires_left = match (recurs, new.times) {
             (_, Some(0)) => return Err("a schedule has to fire at least once".to_string()),
+            (true, Some(times)) if times > TIMES_MAX => {
+                return Err(format!("a schedule fires at most {TIMES_MAX} times"));
+            }
             (true, times) => times,
             (false, _) => None,
         };
@@ -249,7 +280,7 @@ impl Schedules {
                 paused: false,
             };
             let value = serde_json::to_value(&row).map_err(|e| e.to_string())?;
-            checked(&value)?;
+            checked(&value, now)?;
             rows.push(value);
             Ok(row)
         })
@@ -257,11 +288,12 @@ impl Schedules {
 
     /// Every row that is a schedule, and a line for each row that is not.
     pub fn list(&self) -> Result<(Vec<Row>, Vec<String>), String> {
+        let now = self.now();
         let mut found = (Vec::new(), Vec::new());
         for (at, row) in self.load()?.iter().enumerate() {
-            match checked(row) {
+            match checked(row, now) {
                 Ok(row) => found.0.push(row),
-                Err(why) => found.1.push(skipped(at, &why)),
+                Err(why) => found.1.push(self.skipped(at, &why)),
             }
         }
         Ok(found)
@@ -269,9 +301,10 @@ impl Schedules {
 
     /// Remove schedule `id`.
     pub fn cancel(&self, id: &str) -> Result<Row, String> {
+        let now = self.now();
         self.edit(|rows| {
             let at = find(rows, id)?;
-            let row = checked(&rows[at])?;
+            let row = checked(&rows[at], now)?;
             rows.remove(at);
             Ok(row)
         })
@@ -283,7 +316,7 @@ impl Schedules {
         let now = self.now();
         self.edit(|rows| {
             let at = find(rows, id)?;
-            let mut row = checked(&rows[at])?;
+            let mut row = checked(&rows[at], now)?;
             row.paused = paused;
             if !paused && row.spec.recurs() && row.next <= now {
                 row.next = following(&row, now)
@@ -304,11 +337,11 @@ impl Schedules {
         let mut kept = Vec::with_capacity(rows.len());
         let mut changed = false;
         for (at, value) in rows.into_iter().enumerate() {
-            let mut row = match checked(&value) {
+            let mut row = match checked(&value, now) {
                 Ok(row) => row,
                 Err(why) => {
                     if startup {
-                        pass.notes.push(skipped(at, &why));
+                        pass.notes.push(self.skipped(at, &why));
                     }
                     kept.push(value);
                     continue;
@@ -439,8 +472,8 @@ fn following(row: &Row, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     }
 }
 
-/// `row` as a schedule, or why it is not one bhai could have written.
-fn checked(row: &Value) -> Result<Row, String> {
+/// `row` as a schedule, or why it is not one bhai could have written by `now`.
+fn checked(row: &Value, now: DateTime<Utc>) -> Result<Row, String> {
     let row: Row = serde_json::from_value(row.clone()).map_err(|e| e.to_string())?;
     if row.id.is_empty() || row.id.len() > 16 || !row.id.chars().all(|c| c.is_ascii_alphanumeric())
     {
@@ -455,8 +488,19 @@ fn checked(row: &Value) -> Result<Row, String> {
     if row.fires_left == Some(0) {
         return Err("it has no fires left".to_string());
     }
-    if row.spec.recurs() && row.expires.is_none() {
-        return Err("it recurs with no expiry".to_string());
+    if row.fires_left.is_some_and(|n| n > TIMES_MAX) {
+        return Err(format!("it has over {TIMES_MAX} fires left"));
+    }
+    if row.created > now {
+        return Err("it was set later than now".to_string());
+    }
+    if row.spec.recurs() {
+        let Some(expires) = row.expires else {
+            return Err("it recurs with no expiry".to_string());
+        };
+        if expires - row.created > LASTS_MAX {
+            return Err(format!("it lasts over {} days", LASTS_MAX.num_days()));
+        }
     }
     Ok(row)
 }
@@ -466,11 +510,6 @@ fn find(rows: &[Value], id: &str) -> Result<usize, String> {
     rows.iter()
         .position(|row| row["id"] == id)
         .ok_or_else(|| format!("no schedule {id}"))
-}
-
-/// The line for row `at` of the store, left alone for `why`.
-fn skipped(at: usize, why: &str) -> String {
-    format!("row {} of .bhai/{FILE} was left alone: {why}", at + 1)
 }
 
 /// An instant as the local wall clock reads it.
@@ -516,8 +555,9 @@ mod tests {
         Arc::new(move || base() + Duration::from_std(start.elapsed()).unwrap())
     }
 
-    fn schedules(project: &Path) -> Schedules {
-        Schedules::new(project).with_clock(paused_clock())
+    /// The store of `dir`, with its config directory there too.
+    fn schedules(dir: &Path) -> Schedules {
+        Schedules::new(dir, dir).with_clock(paused_clock())
     }
 
     fn new(spec: &str, text: &str) -> New {
@@ -561,7 +601,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(dir.join(".bhai").join(FILE))
+            let mode = std::fs::metadata(store.path())
                 .unwrap()
                 .permissions()
                 .mode();
@@ -722,12 +762,9 @@ mod tests {
             row("every1", "every 25m", "recurring"),
             json_junk(),
         ];
-        crate::sessions::private_dir(&dir.join(".bhai")).unwrap();
-        std::fs::write(
-            dir.join(".bhai").join(FILE),
-            serde_json::to_string_pretty(&rows).unwrap(),
-        )
-        .unwrap();
+        let path = schedules(dir).path().to_path_buf();
+        crate::sessions::private_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_string_pretty(&rows).unwrap()).unwrap();
     }
 
     fn json_junk() -> Value {
@@ -759,13 +796,12 @@ mod tests {
         );
         // An unreadable row is named, and kept as it was.
         assert!(
-            notes.iter().any(|n| n.contains(
-                "row 3 of .bhai/schedules.json was left alone: it recurs with no expiry"
-            )),
+            notes.iter().any(|n| n.starts_with("schedules: row 3 of ")
+                && n.ends_with(".json was left alone: it recurs with no expiry")),
             "{notes:?}"
         );
         let saved: Vec<Value> =
-            serde_json::from_str(&std::fs::read_to_string(dir.join(".bhai").join(FILE)).unwrap())
+            serde_json::from_str(&std::fs::read_to_string(schedules(&dir).path()).unwrap())
                 .unwrap();
         assert_eq!(saved.len(), 2);
         assert_eq!(saved[1], json_junk());
@@ -783,18 +819,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_store_that_does_not_parse_is_reported_and_left_alone() {
         let dir = crate::tools::temp_dir();
-        crate::sessions::private_dir(&dir.join(".bhai")).unwrap();
-        std::fs::write(dir.join(".bhai").join(FILE), "{ not json").unwrap();
         let store = schedules(&dir);
+        crate::sessions::private_dir(store.path().parent().unwrap()).unwrap();
+        std::fs::write(store.path(), "{ not json").unwrap();
         assert!(store.add(new("in 5m", "x")).is_err());
         let (session, _rx) = session();
         session.run_schedules(schedules(&dir));
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert!(infos(&session).iter().any(|i| i.contains("does not parse")));
-        assert_eq!(
-            std::fs::read_to_string(dir.join(".bhai").join(FILE)).unwrap(),
-            "{ not json"
-        );
+        assert_eq!(std::fs::read_to_string(store.path()).unwrap(), "{ not json");
     }
 
     #[test]
@@ -811,7 +844,7 @@ mod tests {
             paused: false,
         })
         .unwrap();
-        assert!(checked(&good).is_ok());
+        assert!(checked(&good, base()).is_ok());
         for (field, value) in [
             ("id", serde_json::json!("../x")),
             ("id", serde_json::json!("")),
@@ -822,10 +855,58 @@ mod tests {
             ("spec", serde_json::json!("every 10s")),
             ("origin", serde_json::json!("someone")),
             ("next", serde_json::json!("soon")),
+            ("fires_left", serde_json::json!(TIMES_MAX + 1)),
+            ("expires", serde_json::json!("2100-01-01T00:00:00Z")),
+            ("created", serde_json::json!("2026-10-03T12:01:00Z")),
         ] {
             let mut row = good.clone();
             row[field] = value;
-            assert!(checked(&row).is_err(), "{field}: {row}");
+            assert!(checked(&row, base()).is_err(), "{field}: {row}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_schedule_cannot_last_or_fire_without_bound() {
+        let dir = crate::tools::temp_dir();
+        let store = schedules(&dir);
+        let long = New {
+            lasts: Some(LASTS_MAX + Duration::minutes(1)),
+            ..new("every 1h", "x")
+        };
+        assert!(store.add(long).is_err());
+        let many = New {
+            times: Some(TIMES_MAX + 1),
+            ..new("every 1h", "x")
+        };
+        assert!(store.add(many).is_err());
+        let most = New {
+            lasts: Some(LASTS_MAX),
+            times: Some(TIMES_MAX),
+            ..new("every 1h", "x")
+        };
+        assert!(store.add(most).is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_store_lives_outside_the_project_one_per_project() {
+        let dir = crate::tools::temp_dir();
+        let (config, a, b) = (dir.join("config"), dir.join("a"), dir.join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d.join(".bhai")).unwrap();
+        }
+        // What a clone could commit; bhai never reads it.
+        std::fs::write(
+            a.join(".bhai").join("schedules.json"),
+            serde_json::to_string(&vec![json_junk()]).unwrap(),
+        )
+        .unwrap();
+        let store = Schedules::new(&config, &a).with_clock(paused_clock());
+        assert!(store.path().starts_with(config.join(DIR)));
+        assert_eq!(store.list().unwrap(), (Vec::new(), Vec::new()));
+        store.add(new("in 5m", "only a")).unwrap();
+        let other = Schedules::new(&config, &b).with_clock(paused_clock());
+        assert_ne!(store.path(), other.path());
+        assert!(other.list().unwrap().0.is_empty());
+        assert_eq!(Schedules::new(&config, &a.join(".")).path(), store.path());
     }
 }
