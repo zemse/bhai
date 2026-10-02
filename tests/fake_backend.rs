@@ -53,6 +53,8 @@ struct Fake {
     close_after_reply: AtomicBool,
     /// Responses given an id so far, which numbers the next.
     ids: AtomicUsize,
+    /// OTLP export bodies, for the build that has it.
+    traces: Mutex<Vec<Bytes>>,
 }
 
 impl Fake {
@@ -191,6 +193,11 @@ async fn usage(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Response {
     axum::Json(json!({})).into_response()
 }
 
+async fn traces(State(fake): State<Arc<Fake>>, body: Bytes) -> StatusCode {
+    fake.traces.lock().unwrap().push(body);
+    StatusCode::OK
+}
+
 async fn serve_fake(fake: Arc<Fake>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -198,6 +205,7 @@ async fn serve_fake(fake: Arc<Fake>) -> String {
         .route("/codex/responses", post(responses).get(upgrade))
         .route("/wham/usage", get(usage))
         .route("/codex/alpha/search", post(search))
+        .route("/v1/traces", post(traces))
         .with_state(fake);
     tokio::spawn(async move { axum::serve(listener, app).await });
     format!("http://{addr}")
@@ -351,11 +359,16 @@ impl Bhai {
     }
 
     async fn start_with(backend: &str, env: &[(&str, &str)]) -> Bhai {
-        Self::start_in(backend, env, None).await
+        Self::start_in(backend, &[], env, None).await
     }
 
-    /// With `config` as the global config file.
-    async fn start_in(backend: &str, env: &[(&str, &str)], config: Option<&str>) -> Bhai {
+    /// With `flags` after the server's, and `config` as the global config file.
+    async fn start_in(
+        backend: &str,
+        flags: &[&str],
+        env: &[(&str, &str)],
+        config: Option<&str>,
+    ) -> Bhai {
         let dir = std::env::temp_dir().join(format!("bhai-fake-{}", uuid::Uuid::new_v4()));
         let (home, codex) = logged_in(&dir);
         if let Some(config) = config {
@@ -368,6 +381,7 @@ impl Bhai {
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_bhai"))
             .args(["--serve", "0", "--headless"])
+            .args(flags)
             .current_dir(&project)
             .env("HOME", &home)
             .env("CODEX_HOME", &codex)
@@ -376,6 +390,8 @@ impl Bhai {
             .env_remove("BHAI_MODE")
             .env_remove("BHAI_EFFORT")
             .env_remove("BHAI_STARTUP_TIMING")
+            .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -584,7 +600,7 @@ async fn request_controls_are_sent_on_every_call_only_when_the_config_sets_them(
         .unwrap()
         .extend([says("aside"), says("one"), says("two")]);
     let config = "reasoning_context = \"all_turns\"\nverbosity = \"low\"\n";
-    let bhai = Bhai::start_in(&serve_fake(fake.clone()).await, &[], Some(config)).await;
+    let bhai = Bhai::start_in(&serve_fake(fake.clone()).await, &[], &[], Some(config)).await;
     let mut events = bhai.events().await;
 
     bhai.post("/prompt", json!({ "text": "/btw why?" })).await;
@@ -798,6 +814,82 @@ async fn startup_timing_names_each_stage_in_order_before_the_server_line() {
 
     let quiet = Bhai::start(&backend).await;
     assert!(!quiet.said.contains("\"stage\""), "{}", quiet.said);
+}
+
+#[tokio::test]
+async fn profile_traces_the_turn_to_a_file_without_the_prompt() {
+    let fake = Arc::new(Fake::default());
+    fake.replies
+        .lock()
+        .unwrap()
+        .push_back(says("ok from the fake"));
+    let bhai = Bhai::start_in(&serve_fake(fake.clone()).await, &["--profile"], &[], None).await;
+    let mut events = bhai.events().await;
+
+    let (status, answer) = bhai.post("/prompt", json!({ "text": "say ok" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    events.until("turn_end").await;
+
+    let path = bhai.project().join(".bhai/debug/trace.jsonl");
+    let file = std::fs::read_to_string(&path).unwrap();
+    let spans: Vec<Value> = file
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let turn = spans.iter().find(|s| s["name"] == "turn").expect("a turn");
+    assert!(turn["fields"]["session.id"].is_string(), "{turn}");
+    let call = spans.iter().find(|s| s["name"] == "model.call").unwrap();
+    assert_eq!(call["parent"], turn["id"], "{file}");
+    assert_eq!(call["fields"]["input"], 120, "{call}");
+    assert_eq!(call["fields"]["output"], 7, "{call}");
+    // Only bhai's own spans: reqwest's and axum's never reach the file.
+    assert!(
+        spans
+            .iter()
+            .all(|s| ["turn", "model.call"].contains(&s["name"].as_str().unwrap())),
+        "{file}"
+    );
+    for said in ["say ok", "ok from the fake", ACCESS_TOKEN] {
+        assert!(!file.contains(said), "{said} in {file}");
+    }
+}
+
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn otlp_exports_the_turn_without_the_prompt() {
+    let fake = Arc::new(Fake::default());
+    fake.replies
+        .lock()
+        .unwrap()
+        .push_back(says("ok from the fake"));
+    let base = serve_fake(fake.clone()).await;
+    let env = [
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", base.as_str()),
+        ("OTEL_BSP_SCHEDULE_DELAY", "50"),
+    ];
+    let bhai = Bhai::start_with(&base, &env).await;
+    let mut events = bhai.events().await;
+
+    let (status, answer) = bhai.post("/prompt", json!({ "text": "say ok" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    events.until("turn_end").await;
+
+    let exported = timeout(WAIT, async {
+        loop {
+            let sent: Vec<u8> = fake.traces.lock().unwrap().concat();
+            let has = |what: &[u8]| sent.windows(what.len()).any(|w| w == what);
+            if has(b"model.call") && has(b"turn") {
+                return sent;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the turn's spans were never exported");
+    let has = |what: &[u8]| exported.windows(what.len()).any(|w| w == what);
+    for said in ["say ok", "ok from the fake", ACCESS_TOKEN] {
+        assert!(!has(said.as_bytes()), "{said} was exported");
+    }
 }
 
 #[tokio::test]
@@ -1236,7 +1328,7 @@ async fn a_web_search_goes_to_the_search_endpoint_with_the_conversation_and_runs
         searches.push_back((200, found.to_string()));
     }
     let backend = serve_fake(fake.clone()).await;
-    let bhai = Bhai::start_in(&backend, &[], Some("web_search = true\n")).await;
+    let bhai = Bhai::start_in(&backend, &[], &[], Some("web_search = true\n")).await;
     assert!(bhai.said.contains("web_search: on"), "{}", bhai.said);
     let mut events = bhai.events().await;
 
@@ -1304,7 +1396,7 @@ async fn a_web_search_goes_to_the_search_endpoint_with_the_conversation_and_runs
 /// Two turns on `websocket = true`, each answered with `says`, and what went out.
 async fn two_turns_over_a_socket(fake: &Arc<Fake>) -> Events {
     let backend = serve_fake(fake.clone()).await;
-    let bhai = Bhai::start_in(&backend, &[], Some("websocket = true\n")).await;
+    let bhai = Bhai::start_in(&backend, &[], &[], Some("websocket = true\n")).await;
     let mut events = bhai.events().await;
     bhai.post("/prompt", json!({ "text": "first" })).await;
     events.until("turn_end").await;
@@ -1435,7 +1527,7 @@ async fn a_socket_lost_mid_response_is_retried_on_a_new_one_with_the_history_who
     let cut = sse(&[json!({ "type": "response.output_text.delta", "delta": "cut o" })]);
     queue(&fake, [cut, says("whole")]);
     let backend = serve_fake(fake.clone()).await;
-    let bhai = Bhai::start_in(&backend, &[], Some("websocket = true\n")).await;
+    let bhai = Bhai::start_in(&backend, &[], &[], Some("websocket = true\n")).await;
     let mut events = bhai.events().await;
     bhai.post("/prompt", json!({ "text": "go" })).await;
     let retrying = events.until("retrying").await;
@@ -1460,7 +1552,7 @@ async fn a_reply_on_the_socket_at_the_default_tier_turns_fast_off() {
     let fake = Arc::new(Fake::default());
     queue(&fake, [says_at("one", "default"), says("two")]);
     let backend = serve_fake(fake.clone()).await;
-    let bhai = Bhai::start_in(&backend, &[], Some("websocket = true\n")).await;
+    let bhai = Bhai::start_in(&backend, &[], &[], Some("websocket = true\n")).await;
     let mut events = bhai.events().await;
 
     bhai.post("/fast", json!({ "on": true })).await;
@@ -1484,7 +1576,7 @@ async fn a_tool_call_inside_a_turn_sends_only_its_output_on_the_socket() {
     let fake = Arc::new(Fake::default());
     queue(&fake, [runs("call_1", "true"), says("done")]);
     let backend = serve_fake(fake.clone()).await;
-    let bhai = Bhai::start_in(&backend, &[], Some("websocket = true\n")).await;
+    let bhai = Bhai::start_in(&backend, &[], &[], Some("websocket = true\n")).await;
     let mut events = bhai.events().await;
     bhai.post("/prompt", json!({ "text": "run it" })).await;
     let approval = events.until("approval").await;

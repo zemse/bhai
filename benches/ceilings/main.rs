@@ -119,6 +119,8 @@ mod title;
 mod tokens;
 #[path = "../../src/tools/mod.rs"]
 mod tools;
+#[path = "../../src/trace.rs"]
+mod trace;
 #[path = "../../src/ui.rs"]
 mod ui;
 #[path = "../../src/websocket.rs"]

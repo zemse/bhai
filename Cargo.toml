@@ -30,6 +30,9 @@ libc = "0.2.189"
 lol_html = "2.9.0"
 merman-ascii = "0.7.0"
 merman-core = "0.7.0"
+opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"], optional = true }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"], optional = true }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = "0.30.2"
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem"] }
@@ -45,6 +48,9 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process"
 tokio-rustls = { version = "0.26.4", default-features = false }
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
 toml = "1.1.6"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-opentelemetry = { version = "0.33.0", default-features = false, optional = true }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 tui-input = "0.15.3"
 unicode-width = "0.2.2"
 url = "2.5.8"
@@ -53,6 +59,8 @@ uuid = { version = "1.24.0", features = ["v4"] }
 [features]
 # ctrl+space dictation through local recorder and whisper commands, set in `[dictation]`.
 dictation = []
+# OTLP/HTTP export of the trace spans, off by default for the binary's size.
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }

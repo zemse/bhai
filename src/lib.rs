@@ -93,6 +93,7 @@ mod syntax;
 mod title;
 pub mod tokens;
 pub mod tools;
+mod trace;
 mod ui;
 mod websocket;
 pub mod workflow;

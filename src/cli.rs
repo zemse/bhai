@@ -5,7 +5,7 @@ use crate::{
     agent, app, askpass, cache, childenv, client, config, egress, external, identity, input,
     instructions, judge, limits, mcp, memory, models, notify, permissions, profile, sandbox,
     search, server, session, sessions, skills, startup, statusline, syntax, title, tokens, tools,
-    ui, workflow,
+    trace, ui, workflow,
 };
 
 use std::path::PathBuf;
@@ -168,6 +168,11 @@ pub async fn entry() -> Result<()> {
             std::process::exit(2);
         }
     };
+    let _trace = trace::init(
+        args.profile
+            .then(|| profile::debug_dir().join("trace.jsonl"))
+            .as_deref(),
+    )?;
     let cwd = std::env::current_dir()?;
     let dir = cwd.join(sessions::DIR);
     let resume = match args.pick {
@@ -648,7 +653,8 @@ struct Args {
     /// Port for the debug server, when `--serve` is given.
     serve: Option<u16>,
     headless: bool,
-    /// Log every model call's usage to `.bhai/debug/usage.jsonl`.
+    /// Log every model call's usage to `.bhai/debug/usage.jsonl`, and its spans to
+    /// `trace.jsonl` beside it.
     profile: bool,
     /// Refuse to send a request that breaks the prompt cache.
     strict_cache: bool,

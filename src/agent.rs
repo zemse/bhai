@@ -12,6 +12,8 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
+use tracing::field::Empty;
+use tracing::{Instrument as _, Span, info_span};
 
 use crate::cache::{self, CacheBreak, CacheMonitor, Hit};
 use crate::client::{self, Client, Delta, Usage};
@@ -1252,6 +1254,14 @@ pub(crate) async fn run_configured(
             hard: message.is_none(),
         };
         let charged = lock_goal(&goal).as_ref().is_some_and(Goal::active);
+        // A root per turn; `session.id` is what ties a session's turns together.
+        let span = info_span!(
+            parent: None,
+            "turn",
+            session.id = session_id.as_str(),
+            model = model.name(),
+            steps = Empty,
+        );
         let result = {
             let turn = turn(
                 model.as_ref(),
@@ -1273,7 +1283,8 @@ pub(crate) async fn run_configured(
                 None,
                 charged.then_some(&budget),
                 Some(limits),
-            );
+            )
+            .instrument(span);
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -1669,6 +1680,7 @@ async fn turn(
     let mut step = 0usize;
     loop {
         step += 1;
+        Span::current().record("steps", step);
         // Checked before each call rather than after, so the tool results of the last
         // one are in the history and nothing is left half done.
         if budget.is_some_and(Budget::spent) {
@@ -1803,10 +1815,28 @@ async fn turn(
         let prompt = prompt_tokens(model.name(), instructions, tools, history);
         let _ = tx.send(AgentEvent::Sending(prompt));
         let _ = tx.send(AgentEvent::Streaming(true));
+        let span = info_span!(
+            "model.call",
+            model = model.name(),
+            step,
+            prompt.tokens = prompt,
+            input = Empty,
+            cached = Empty,
+            output = Empty,
+            ok = Empty,
+        );
         let answer = model
             .respond(instructions, tools, history, &mut on_delta, cancel)
+            .instrument(span.clone())
             .await;
         let _ = tx.send(AgentEvent::Streaming(false));
+        span.record("ok", answer.is_ok());
+        if let Some(usage) = &finished {
+            span.record("input", usage.input)
+                .record("cached", usage.cached)
+                .record("output", usage.output);
+        }
+        drop(span);
         let items = match answer {
             Ok(items) => items,
             // An interrupt is the user's decision, not an error worth reporting.
@@ -1908,6 +1938,15 @@ async fn turn(
                         let custom = tools::custom_call(call);
                         let run = search.as_ref().or(custom.as_ref()).unwrap_or(call);
                         let mut images = Vec::new();
+                        // The name and id only: the arguments and the output are what was
+                        // said, and so is a name the model made up.
+                        let tool = run
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .filter(|name| registry.get(name).is_some())
+                            .unwrap_or("unknown");
+                        let span =
+                            info_span!("tool.call", tool, call.id = call_id.as_str(), ok = Empty);
                         let (output, ok) = execute(
                             registry,
                             policy,
@@ -1918,7 +1957,10 @@ async fn turn(
                             cancel,
                             &mut images,
                         )
+                        .instrument(span.clone())
                         .await;
+                        span.record("ok", ok);
+                        drop(span);
                         let _ = events.send(AgentEvent::Item(first + index));
                         // Only a function call's output may carry images; neither of the
                         // others ever brings one.
@@ -2677,6 +2719,11 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             None,
             None,
         )
+        .instrument(info_span!(
+            "turn",
+            model = child.model.name(),
+            steps = Empty
+        ))
         .await;
         (result, history)
     };
@@ -5500,6 +5547,55 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_turn_is_traced_without_what_was_said_in_it() {
+        use crate::judge::fake::Answers;
+
+        let recorded = crate::trace::tests::Recorded::start();
+        let run = judged(
+            Answers::Verdict(Verdict::Approve {
+                reason: "writes a note inside the project".to_string(),
+            }),
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(run.outputs.len(), 1);
+        let spans = recorded.spans();
+        let named =
+            |name: &str| -> Vec<&Value> { spans.iter().filter(|s| s["name"] == name).collect() };
+        let turn = named("turn")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("no turn in {spans:?}"));
+        assert_eq!(turn["parent"], Value::Null);
+        assert_eq!(turn["fields"]["session.id"], "sess");
+        assert_eq!(turn["fields"]["steps"], 2);
+        let calls = named("model.call");
+        assert_eq!(calls.len(), 2, "{spans:?}");
+        for (step, call) in calls.iter().enumerate() {
+            assert_eq!(call["parent"], turn["id"]);
+            assert_eq!(call["fields"]["step"], step + 1);
+            assert_eq!(call["fields"]["ok"], true);
+            assert!(call["fields"]["input"].is_u64(), "{call}");
+        }
+        let tools = named("tool.call");
+        assert_eq!(tools.len(), 1, "{spans:?}");
+        assert_eq!(tools[0]["parent"], turn["id"]);
+        assert_eq!(tools[0]["fields"]["tool"], "write");
+        assert_eq!(tools[0]["fields"]["ok"], true);
+        // The task, the call's arguments and its output are what was said, not its shape.
+        let file = std::fs::read_to_string(&recorded.path).unwrap();
+        for said in [
+            "write down what the parser does",
+            "notes.txt",
+            "splits on commas",
+            "Wrote ",
+        ] {
+            assert!(!file.contains(said), "{said} in {file}");
+        }
     }
 
     #[tokio::test]

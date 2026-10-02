@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, mpsc};
+use tracing::Instrument as _;
 
 use super::{BoxFuture, Tool, string_arg, truncate};
 use crate::agent::{
@@ -268,7 +269,8 @@ impl Agent {
         let results = self.results.clone();
         // Forked now, so the child starts from what the session had done when it asked.
         let judge = self.judge.as_ref().map(|judge| judge.child(&id, &task));
-        tokio::spawn(async move {
+        let span = crate::trace::child(&id, &identity.name);
+        let run = async move {
             // Past `MAX_RUNNING` the child waits here rather than the parent waiting
             // for the call, so the model is never blocked on a slot.
             let Ok(_slot) = slots.acquire().await else {
@@ -333,7 +335,8 @@ impl Agent {
                 description,
                 text,
             });
-        });
+        };
+        tokio::spawn(run.instrument(span));
     }
 
     /// Where the identity a child was started as is kept, beside its transcript.
@@ -691,6 +694,55 @@ mod tests {
             out.ends_with("(general) was stopped before it started."),
             "{out}"
         );
+        harness.cleanup();
+    }
+
+    #[tokio::test]
+    async fn a_childs_spans_trace_back_to_the_call_that_started_it() {
+        let recorded = crate::trace::tests::Recorded::start();
+        let fake = Fake::new(vec![
+            vec![call("read", json!({"path": "/etc/hosts"}))],
+            vec![say("the hosts file maps localhost")],
+        ]);
+        let mut harness = tool(&fake, false);
+        let args = json!({"description": "read hosts", "prompt": "go"});
+        let span = tracing::info_span!("tool.call", tool = NAME);
+        harness.report(args).instrument(span).await;
+        // The report is posted from inside the child's span, which closes just after.
+        let mut spans = recorded.spans();
+        for _ in 0..100 {
+            if spans.iter().any(|s| s["name"] == "child") {
+                break;
+            }
+            tokio::task::yield_now().await;
+            spans = recorded.spans();
+        }
+        let named =
+            |name: &str| -> Vec<&Value> { spans.iter().filter(|s| s["name"] == name).collect() };
+        let origin = named("tool.call")
+            .into_iter()
+            .find(|s| s["fields"]["tool"] == NAME)
+            .unwrap();
+        let child = named("child")[0];
+        assert_eq!(child["parent"], Value::Null);
+        assert_eq!(child["follows"], json!([origin["id"]]));
+        assert_eq!(child["fields"]["agent.identity"], "general");
+        let turn = named("turn")[0];
+        assert_eq!(turn["parent"], child["id"]);
+        assert_eq!(turn["fields"]["steps"], 2);
+        let calls = named("model.call");
+        assert_eq!(calls.len(), 2, "{spans:?}");
+        assert!(calls.iter().all(|c| c["parent"] == turn["id"]));
+        assert!(calls.iter().all(|c| c["root"] == child["id"]));
+        let read = named("tool.call")
+            .into_iter()
+            .find(|s| s["fields"]["tool"] == "read")
+            .unwrap();
+        assert_eq!(read["parent"], turn["id"]);
+        assert_eq!(read["fields"]["ok"], true);
+        let file = std::fs::read_to_string(&recorded.path).unwrap();
+        assert!(!file.contains("/etc/hosts"), "{file}");
+        assert!(!file.contains("maps localhost"), "{file}");
         harness.cleanup();
     }
 

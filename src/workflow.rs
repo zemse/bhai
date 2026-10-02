@@ -22,6 +22,7 @@ use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
+use tracing::Instrument as _;
 
 use crate::agent::{self, AgentEvent, Child, Children, Delegation};
 use crate::client::Usage;
@@ -1322,6 +1323,7 @@ async fn step(
         contract: step.contract.clone(),
         history: Vec::new(),
     })
+    .instrument(crate::trace::child(&id, &identity.name))
     .await;
     let output = match &finished.result {
         Ok(text) => tools::truncate(&tools::agent::sanitize(text)),
