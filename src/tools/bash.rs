@@ -951,6 +951,28 @@ pub fn kill_all() {
     }
 }
 
+/// [`kill_all`] for a panic hook: a panic raised while this thread holds the sessions
+/// would wait forever on its own lock, so after a short wait it gives up instead.
+pub fn kill_all_panicking() {
+    let begun = Instant::now();
+    let mut sessions = loop {
+        match SESSIONS.try_lock() {
+            Ok(sessions) => break sessions,
+            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) if begun.elapsed() < PANIC_WAIT => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
+    };
+    for (_, session) in std::mem::take(&mut sessions.live) {
+        kill_group(session.group);
+    }
+}
+
+/// How long [`kill_all_panicking`] waits for another thread to let go of the sessions.
+const PANIC_WAIT: Duration = Duration::from_millis(100);
+
 /// Make a hangup, an interrupt or a terminate end every session before bhai dies of it,
 /// as it still does: the sessions' process groups would outlive it, holding their ports.
 pub fn kill_all_on_signal() -> io::Result<()> {
@@ -1469,6 +1491,15 @@ mod tests {
         );
         write(id, "\u{4}", Duration::from_secs(5), quiet()).await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_panic_holding_the_sessions_does_not_wait_on_itself() {
+        let held = sessions();
+        let begun = Instant::now();
+        kill_all_panicking();
+        assert!(begun.elapsed() < Duration::from_secs(5));
+        drop(held);
     }
 
     /// Set in the copy of the test binary that `a_signal_ends_the_sessions_with_bhai`

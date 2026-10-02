@@ -77,6 +77,8 @@ impl Runtime {
     ///
     /// Drain `events` concurrently and answer approval oneshots, or use `session::pump`.
     /// Interrupt a turn through `cancel`; retain the task handle and await shutdown.
+    /// Bash sessions outlive it, being process-wide; [`crate::tools::bash::kill_all`]
+    /// ends them.
     pub async fn run(
         self,
         user: mpsc::Receiver<UserInput>,

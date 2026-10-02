@@ -14,6 +14,12 @@ It does not parse arguments, load credentials, start MCP servers or open a termi
   Errors are events, not a return value. `TurnEnd` closes a turn, not the runtime.
 - Drop the user-input sender to end the loop, and await its task. Interrupt an active
   turn first if needed. Hosts own any MCP hubs they start and must shut them down.
+- A bash command still running after its yield time stays alive as a session in its
+  own process group, and sessions are process-wide: ending a runtime or exiting the
+  process does not kill them. Call `tools::bash::kill_all()` once the host's runtimes
+  are done, `tools::bash::kill_all_panicking()` from a panic hook, and
+  `tools::bash::kill_all_on_signal()` at startup to cover hangup, interrupt and
+  terminate.
 - `Runtime` fields opt into persistence (`Saved`), delegation, judging, naming, usage
   logging, compaction limits and a queued-input inbox. These are off by default except
   for compaction and the existing built-in tools.
