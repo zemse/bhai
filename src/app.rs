@@ -876,7 +876,9 @@ impl App {
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
         let at = Position::new(mouse.column, mouse.row);
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) && self.pending.is_none() {
-            if self.chip.is_some_and(|chip| chip.contains(at)) {
+            // The picker and search take every key, ctrl+s too, and draw no list over them.
+            let prompt_taken = self.picker.is_some() || self.search.is_some();
+            if !prompt_taken && self.chip.is_some_and(|chip| chip.contains(at)) {
                 self.toggle_bg();
                 return true;
             }

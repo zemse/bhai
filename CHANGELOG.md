@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-03
 
+- A click on the bg chip does nothing while the /model picker or the history or mention search is open, so the background list can no longer open hidden behind them and take their keys.
 - No user-visible change: a test now proves that listing kept bash sessions does not consume the output the next poll returns.
 - Schedules: the model sets, lists and cancels its own schedules with a `schedule` tool. Setting one always asks the user and never the judge. It may hold 10 at once, 5 minutes between fires and 1024 bytes each with known secrets blanked, and cancel reaches only its own. A fired one arrives framed as the model's own note rather than the user's words, marked "set by the model" in `/schedule`, the transcript, the notifier and `/events`.
 - Schedules: `/remind <when> <prompt>` sets one and `/schedule` lists, cancels, pauses and resumes them. The status bar counts the ones still to fire (`$scheduled` in a template). A fire rings the notifier, shows on `/events` as `scheduled`, and is marked in the transcript when it starts a turn. The debug server has `GET /schedules`, `POST /schedule` and `POST /schedule/cancel`, behind the same token.

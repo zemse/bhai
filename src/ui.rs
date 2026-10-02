@@ -4701,6 +4701,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_chip_does_nothing_while_the_picker_or_search_holds_the_prompt() {
+        let mut app = with_background();
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        app.on_event(Event::Background(4));
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(app.search.is_some());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let chip = app.chip.unwrap();
+        click(&mut app, chip.x + 1, chip.y);
+        assert!(app.bg.is_none(), "no list the screen would not show");
+        // The keys still reach the search on screen.
+        key(&mut app, KeyCode::Esc);
+        assert!(app.search.is_none());
+
+        app.picker = Some(Picker::new("m", "medium"));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let chip = app.chip.unwrap();
+        click(&mut app, chip.x + 1, chip.y);
+        assert!(app.bg.is_none());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none());
+
+        // With the prompt back, the chip opens the list again.
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let chip = app.chip.unwrap();
+        assert!(click(&mut app, chip.x + 1, chip.y));
+        assert!(app.bg.is_some());
+    }
+
+    #[tokio::test]
     async fn cancelling_a_schedule_from_the_list_removes_it() {
         let mut app = App::detached();
         let dir = crate::tools::temp_dir();
