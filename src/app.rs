@@ -721,8 +721,17 @@ impl App {
         true
     }
 
-    /// Attach `image` and type its placeholder at the cursor.
+    /// Attach `image`, as the model is sent it, and type its placeholder at the cursor.
     fn attach(&mut self, image: crate::tools::Image) {
+        let image = match crate::images::prepare_image(&image) {
+            Ok(prepared) => {
+                if let Some(note) = prepared.note {
+                    self.note(Entry::Info(note));
+                }
+                prepared.image
+            }
+            Err(e) => return self.note(Entry::Error(format!("could not attach the image: {e}"))),
+        };
         let placeholder = self.attachments.add(image);
         self.input.insert(&placeholder);
         self.refresh_menu();
@@ -3879,19 +3888,29 @@ mod tests {
 
     #[test]
     fn a_pasted_image_or_image_path_is_attached_and_sent_with_the_prompt() {
-        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+        let encoded = |width, height, format| {
+            let image = image::RgbaImage::from_pixel(width, height, image::Rgba([9, 9, 9, 255]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut out, format).unwrap();
+            out.into_inner()
+        };
+        let png = encoded(3000, 1500, image::ImageFormat::Png);
         let (mut app, mut user, _control) = connected();
         type_text(&mut app, "compare ");
         // ctrl+v with an image on the clipboard, and a terminal's empty paste of one.
-        clipboard::set_image(Some(PNG.to_vec()));
+        clipboard::set_image(Some(png.clone()));
         app.on_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL));
         app.on_paste("");
         clipboard::set_image(None);
         // A file dropped on the terminal arrives as its path.
         let dir = crate::tools::temp_dir();
         let gif = dir.join("a shot.gif");
-        std::fs::write(&gif, b"GIF89a..").unwrap();
+        std::fs::write(&gif, encoded(4, 4, image::ImageFormat::Gif)).unwrap();
         app.on_paste(&format!("'{}'", gif.display()));
+        // One that does not decode is not attached.
+        let broken = dir.join("broken.png");
+        std::fs::write(&broken, b"\x89PNG\r\n\x1a\n").unwrap();
+        app.on_paste(&broken.display().to_string());
         // A path to something that is not an image stays text.
         let notes = dir.join("notes.txt");
         std::fs::write(&notes, "plain").unwrap();
@@ -3911,6 +3930,16 @@ mod tests {
         assert!(sent.text.starts_with("compare [image #1] and [image #3]"));
         let mimes: Vec<&str> = sent.images.iter().map(|i| i.mime.as_str()).collect();
         assert_eq!(mimes, ["image/png", "image/gif"]);
+        // The large one goes scaled, as the model is sent it.
+        let scaled = crate::images::prepare(&png).unwrap();
+        assert_eq!(sent.images[0], scaled.image);
+        let said = app.session.entries().list.iter().any(|entry| {
+            matches!(entry, Entry::Info(note) if note == "[image scaled from 3000x1500 to 1773x886]")
+        });
+        assert!(said);
+        assert!(app.session.entries().list.iter().any(|entry| {
+            matches!(entry, Entry::Error(e) if e.contains("could not attach the image"))
+        }));
 
         // Nothing carries over to the next prompt.
         type_text(&mut app, "and now [image #1]");

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::{BoxFuture, Image, Live, MAX_IMAGE_BYTES, Tool, path_arg, with_images};
+use super::{BoxFuture, Image, Live, MAX_IMAGE_INPUT, Tool, path_arg, with_images};
 
 pub const NAME: &str = "view_image";
 
@@ -81,21 +81,21 @@ pub(crate) fn load(path: &Path) -> Result<(String, Image), String> {
     }
     let too_large = || {
         format!(
-            "{} is larger than {MAX_IMAGE_BYTES} bytes; scale it down first.",
+            "{} is larger than {MAX_IMAGE_INPUT} bytes; scale it down first.",
             path.display()
         )
     };
-    if meta.len() > MAX_IMAGE_BYTES as u64 {
+    if meta.len() > MAX_IMAGE_INPUT as u64 {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
     // Bounded again in case the file grew since the check.
     std::fs::File::open(path)
         .map_err(|e| fail(&e))?
-        .take(MAX_IMAGE_BYTES as u64 + 1)
+        .take(MAX_IMAGE_INPUT as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| fail(&e))?;
-    if bytes.len() > MAX_IMAGE_BYTES {
+    if bytes.len() > MAX_IMAGE_INPUT {
         return Err(too_large());
     }
     let image = image(&bytes)

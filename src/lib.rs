@@ -60,6 +60,7 @@ mod files;
 mod frontmatter;
 pub mod goal;
 pub mod identity;
+mod images;
 mod input;
 pub mod instructions;
 pub mod judge;

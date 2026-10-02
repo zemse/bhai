@@ -18,6 +18,7 @@ use crate::client::{self, Client, Delta, Usage};
 use crate::compact::{self, Limits};
 use crate::goal::{self, Goal};
 use crate::identity::Identity;
+use crate::images;
 use crate::judge::{self, Judge, Undecided, Verdict};
 use crate::limits::RateLimits;
 use crate::permissions::{Answer, Decision, Mode, Offers, Policy};
@@ -1810,6 +1811,13 @@ async fn turn(
             Ok(items) => items,
             // An interrupt is the user's decision, not an error worth reporting.
             Err(_) if cancel.load(Ordering::Relaxed) => return Turn::ended(step, truncated),
+            // Left in the history, a refused image would fail every call after this one.
+            Err(e)
+                if images::refused(&e)
+                    && repair_images(model, history, ledger, monitor, sink, tx) =>
+            {
+                continue;
+            }
             Err(e) => {
                 return Turn {
                     steps: step,
@@ -2021,6 +2029,37 @@ fn evict_between_steps(
         summary: None,
         freed: before.saturating_sub(after),
     });
+}
+
+/// Take the images the backend refused out of `history` so the call can go again, and
+/// say so. False when there were none to take out.
+fn repair_images(
+    model: &dyn Model,
+    history: &mut [Value],
+    ledger: &mut Vec<Call>,
+    monitor: &mut CacheMonitor,
+    sink: &mut Sink<'_>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) -> bool {
+    let tokenizer = tokens::for_model(model.name());
+    let before = compact::estimate(history, tokenizer);
+    let removed = images::repair(history);
+    if removed == 0 {
+        return false;
+    }
+    let after = compact::estimate(history, tokenizer);
+    model.reset("an image was refused");
+    ledger.clear();
+    *monitor = CacheMonitor::default();
+    if let Sink::Session(writer) = sink
+        && let Err(e) = writer.compact("image refused", before, after, history)
+    {
+        let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+    }
+    let _ = tx.send(AgentEvent::Info(format!(
+        "the backend refused an image, so {removed} image(s) left the history and the call goes again"
+    )));
+    true
 }
 
 /// What a bounded turn is told on its last step.
@@ -3094,7 +3133,20 @@ as-is. Try a different approach, or ask the user."
         cancel,
         conversation,
     };
-    let (output, ok, brought) = tool.execute_images(&args, live).await;
+    let (mut output, ok, brought) = tool.execute_images(&args, live).await;
+    // Decoding and scaling is CPU work, kept off the runtime's threads.
+    let (brought, lines) = match brought.is_empty() {
+        true => (brought, Vec::new()),
+        false => tokio::task::spawn_blocking(move || images::prepare_all(brought))
+            .await
+            .unwrap_or_else(|_| (Vec::new(), vec!["[image: could not be prepared]".into()])),
+    };
+    for line in lines {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&line);
+    }
     if let Some(judge) = judge {
         judge.note(&format!(
             "{summary} -> {}",
@@ -3212,6 +3264,8 @@ pub mod fake {
     pub const REFUSE: &str = "fake.refuse";
     /// A script step the backend refuses as longer than the context window.
     pub const OVERFLOW: &str = "fake.overflow";
+    /// A script step the backend refuses for an image in the request.
+    pub const REFUSE_IMAGE: &str = "fake.refuse_image";
     /// Leads a script step that ends on `end_turn: false`.
     pub const CONTINUES: &str = "fake.continues";
     /// Leads a script step whose call completes with no usage block.
@@ -3429,6 +3483,10 @@ pub mod fake {
                     }
                     Some(REFUSE) => {
                         let refused = "400 Bad Request: Invalid value".to_string();
+                        return Err(crate::client::BadRequest(refused).into());
+                    }
+                    Some(REFUSE_IMAGE) => {
+                        let refused = "400 Bad Request: Invalid image.".to_string();
                         return Err(crate::client::BadRequest(refused).into());
                     }
                     Some(HANG) => {
@@ -3730,23 +3788,130 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_image_a_tool_brings_in_reaches_the_model_and_the_transcript_names_it() {
+    async fn an_image_a_tool_brings_in_reaches_the_model_scaled_and_the_transcript_names_it() {
         use fake::{Fake, call, say};
 
         let dir = tools::temp_dir();
         let shot = dir.join("shot.png");
-        std::fs::write(&shot, b"\x89PNG\r\n\x1a\n").unwrap();
+        let bytes = png(2100, 1000);
+        std::fs::write(&shot, &bytes).unwrap();
         let fake = Fake::new(vec![
             vec![call("view_image", json!({"path": shot}))],
             vec![say("a red button")],
         ]);
+        let (mut history, Turn { result, .. }, events) = run_turn(&fake, &dir).await;
+        assert!(result.is_ok());
+        let parts = history[2]["output"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "input_text");
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(
+            text.ends_with("\n[image scaled from 2100x1000 to 1817x865]"),
+            "{text}"
+        );
+        let sent = images::prepare(&bytes).unwrap().image;
+        assert_eq!(
+            parts[1],
+            json!({"type": "input_image",
+                   "image_url": format!("data:image/png;base64,{}", sent.data)})
+        );
+        assert!(sent.data.len() < crate::clipboard::base64(&bytes).len());
+        // The second request carried it.
+        let bodies = fake.bodies.lock().unwrap().clone();
+        let sent = bodies.last().unwrap().1["input"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(sent.iter().any(|i| i["output"] == history[2]["output"]));
+        let shown: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolOutput(output) => Some(output),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown.len(), 1);
+        assert!(
+            shown[0].ends_with("865]\n[image image/png]"),
+            "{}",
+            shown[0]
+        );
+
+        // What cannot be decoded never reaches the history as an image.
+        std::fs::write(&shot, b"\x89PNG\r\n\x1a\n").unwrap();
+        let fake = Fake::new(vec![
+            vec![call("view_image", json!({"path": shot}))],
+            vec![say("nothing there")],
+        ]);
+        (history, _, _) = run_turn(&fake, &dir).await;
+        let output = history[2]["output"].as_str().unwrap();
+        assert!(
+            output.contains("[image image/png: could not be decoded"),
+            "{output}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_image_the_backend_refuses_leaves_the_history_and_the_call_goes_again() {
+        use fake::{Fake, REFUSE_IMAGE, call, say, step};
+
+        let dir = tools::temp_dir();
+        let shot = dir.join("shot.png");
+        let bytes = png(4, 4);
+        std::fs::write(&shot, &bytes).unwrap();
+        let fake = Fake::new(vec![
+            vec![call("view_image", json!({"path": shot}))],
+            step(REFUSE_IMAGE),
+            vec![say("it would not take the image")],
+        ]);
+        let (history, Turn { result, .. }, events) = run_turn(&fake, &dir).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            tools::output_text(&history[2]["output"]),
+            format!(
+                "{} (image/png, {} bytes)\n[image image/png removed: the backend refused it]",
+                shot.display(),
+                bytes.len()
+            )
+        );
+        let bodies = fake.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[1].1.to_string().contains("input_image"));
+        assert!(!bodies[2].1.to_string().contains("input_image"));
+        let resets = fake.resets.lock().unwrap().clone();
+        assert!(
+            resets
+                .iter()
+                .any(|(_, _, why)| why == "an image was refused")
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Info(said) if said.contains("the backend refused an image")
+        )));
+
+        // A refusal with no image left to take out fails the turn as it did.
+        let fake = Fake::new(vec![step(REFUSE_IMAGE)]);
+        let (_, Turn { result, .. }, _) = run_turn(&fake, &dir).await;
+        assert!(result.is_err_and(|e| images::refused(&e)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(width, height, image::Rgba([200, 30, 30, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    /// One turn of `fake` on a history holding one user message, in ask mode in `dir`.
+    async fn run_turn(fake: &fake::Fake, dir: &Path) -> (Vec<Value>, Turn, Vec<AgentEvent>) {
         let registry = Registry::new(Vec::new());
         let schemas = registry.schemas();
         let policy = Policy::new(
             Mode::Ask,
             crate::permissions::Rules::default(),
             None,
-            dir.clone(),
+            dir.to_path_buf(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut history = vec![json!({
@@ -3754,8 +3919,8 @@ mod tests {
             "role": "user",
             "content": [{ "type": "input_text", "text": "look" }],
         })];
-        let Turn { result, .. } = turn(
-            &fake,
+        let done = turn(
+            fake,
             &registry,
             &policy,
             None,
@@ -3775,30 +3940,11 @@ mod tests {
             None,
         )
         .await;
-        assert!(result.is_ok());
-        let parts = history[2]["output"].as_array().unwrap();
-        assert_eq!(parts[0]["type"], "input_text");
-        assert_eq!(
-            parts[1],
-            json!({"type": "input_image",
-                   "image_url": format!("data:image/png;base64,{}", crate::clipboard::base64(b"\x89PNG\r\n\x1a\n"))})
-        );
-        // The second request carried it.
-        let bodies = fake.bodies.lock().unwrap().clone();
-        let sent = bodies.last().unwrap().1["input"]
-            .as_array()
-            .unwrap()
-            .clone();
-        assert!(sent.iter().any(|i| i["output"] == history[2]["output"]));
-        let mut shown = Vec::new();
+        let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            if let AgentEvent::ToolOutput(output) = event {
-                shown.push(output);
-            }
+            events.push(event);
         }
-        assert_eq!(shown.len(), 1);
-        assert!(shown[0].ends_with("\n[image image/png]"), "{}", shown[0]);
-        std::fs::remove_dir_all(dir).unwrap();
+        (history, done, events)
     }
 
     /// Waits on `b` when called as `a`, so two `a`/`b` calls only finish if they overlap.

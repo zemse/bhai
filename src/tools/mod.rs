@@ -52,6 +52,10 @@ pub(crate) const MAX_OUTPUT: usize = 20_000;
 /// compaction took it out.
 pub(crate) const MAX_IMAGE_BYTES: usize = 10 << 20;
 
+/// An image past this many bytes is not taken in at all; under it, one too large to send
+/// is scaled down first.
+pub(crate) const MAX_IMAGE_INPUT: usize = 32 << 20;
+
 /// The image types the Responses API reads.
 const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
@@ -72,9 +76,9 @@ impl Image {
         }
         let data: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
         let bytes = data.len() / 4 * 3;
-        if bytes > MAX_IMAGE_BYTES {
+        if bytes > MAX_IMAGE_INPUT {
             return Err(format!(
-                "[image {mime}: {bytes} bytes, past the {MAX_IMAGE_BYTES} the model is sent]"
+                "[image {mime}: {bytes} bytes, past the {MAX_IMAGE_INPUT} bhai takes in]"
             ));
         }
         Ok(Self { mime, data })
@@ -675,7 +679,7 @@ mod tests {
     fn an_image_the_model_cannot_take_is_refused_with_a_reason() {
         let svg = Image::new("image/svg+xml", "PHN2Zz4=").unwrap_err();
         assert!(svg.contains("not a type the model reads"), "{svg}");
-        let huge = "A".repeat(MAX_IMAGE_BYTES / 3 * 4 + 8);
+        let huge = "A".repeat(MAX_IMAGE_INPUT / 3 * 4 + 8);
         let large = Image::new("image/png", &huge).unwrap_err();
         assert!(large.contains("past the"), "{large}");
         assert_eq!(with_images("", &[]), "");
