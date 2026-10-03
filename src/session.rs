@@ -756,6 +756,50 @@ impl Session {
         crate::background::snapshot(rows)
     }
 
+    /// Stop the background row `id`, of `kind` or of whichever kind has it: a bash
+    /// session is stopped, a child interrupted, a schedule cancelled. Says what it did.
+    pub fn stop_background(
+        &self,
+        kind: Option<crate::background::Kind>,
+        id: &str,
+    ) -> Result<String, crate::background::Refused> {
+        use crate::background::{Kind, Refused};
+        match crate::background::resolve(&self.background(), kind, id)? {
+            Kind::Bash => match id.parse() {
+                Ok(n) if crate::tools::bash::stop(n) => Ok(format!("stopped bash session {id}")),
+                Ok(_) => Err(Refused::Missing(format!(
+                    "bash session {id} has already ended"
+                ))),
+                Err(_) => Err(Refused::Missing(format!("no bash session {id}"))),
+            },
+            Kind::Child => match self.interrupt_child(id) {
+                true => Ok(format!("stopped child {id}")),
+                false => Err(Refused::Missing(format!("no child agent {id} is running"))),
+            },
+            Kind::Schedule => {
+                let Some(schedules) = self.schedules() else {
+                    return Err(Refused::Missing(
+                        "schedules are off here: there is no home directory to keep them in"
+                            .to_string(),
+                    ));
+                };
+                let row = schedules.cancel(id).map_err(Refused::Missing)?;
+                let now = schedules.now();
+                Ok(format!(
+                    "cancelled {}",
+                    crate::schedules::describe(&row, now)
+                ))
+            }
+            Kind::Mcp => Err(Refused::Fixed(format!(
+                "mcp server {id} is not stopped here; /mcp reload {id} restarts it"
+            ))),
+            kind @ (Kind::Proxy | Kind::Chrome) => Err(Refused::Fixed(format!(
+                "{} {id} ends with what started it; /bg kill stops a bash session, a child or a schedule",
+                kind.name()
+            ))),
+        }
+    }
+
     /// The tokens a call on the compacted copy would read, while there is one.
     pub fn fork(&self) -> Option<u64> {
         self.lock().fork
@@ -1822,6 +1866,68 @@ mod tests {
         drop(session);
         step().await;
         assert!(watching.is_finished());
+    }
+
+    #[tokio::test]
+    async fn a_background_row_is_stopped_by_id_and_by_kind_where_ids_collide() {
+        use crate::background::{Kind, Refused, tests::Fake, tests::row};
+        let (session, _rx) = session();
+        let dir = crate::tools::temp_dir();
+        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+        let store = session.schedules().unwrap();
+        let reminder = store.remind("in 20m check CI").unwrap();
+        let fake = Fake::default();
+        fake.0.lock().unwrap().extend([
+            row(Kind::Mcp, "fs", "connected"),
+            row(Kind::Proxy, "egress", "running"),
+            row(Kind::Bash, "900002", "running"),
+            row(Kind::Chrome, "900002", "rendering"),
+        ]);
+        session.watch_background(vec![Box::new(fake)]);
+        session.on_agent(AgentEvent::ChildStarted {
+            id: "c1".to_string(),
+            identity: "general".to_string(),
+            description: "read the tests".to_string(),
+            task: "go".to_string(),
+        });
+        let flag = session.cancel.child("c1");
+
+        assert_eq!(
+            session.stop_background(None, "c1"),
+            Ok("stopped child c1".to_string())
+        );
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        let said = session.stop_background(None, &reminder.id).unwrap();
+        assert!(
+            said.starts_with(&format!("cancelled {}", reminder.id)),
+            "{said}"
+        );
+        assert!(store.list().unwrap().0.is_empty());
+        assert!(matches!(
+            session.stop_background(Some(Kind::Schedule), &reminder.id),
+            Err(Refused::Missing(_))
+        ));
+        assert!(matches!(
+            session.stop_background(None, "900002"),
+            Err(Refused::Ambiguous(_))
+        ));
+        // Not a session of the real table, so it has ended as far as stopping goes.
+        assert_eq!(
+            session.stop_background(Some(Kind::Bash), "900002"),
+            Err(Refused::Missing(
+                "bash session 900002 has already ended".to_string()
+            ))
+        );
+        for id in ["fs", "egress"] {
+            assert!(
+                matches!(session.stop_background(None, id), Err(Refused::Fixed(_))),
+                "{id}"
+            );
+        }
+        assert!(matches!(
+            session.stop_background(None, "nope"),
+            Err(Refused::Missing(_))
+        ));
     }
 
     #[test]

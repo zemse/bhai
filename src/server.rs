@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+use crate::background::{Kind, Refused};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::session::{self, Session, SubmitError, Submitted};
 
@@ -68,6 +69,8 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/schedules", get(schedules))
         .route("/schedule", post(schedule))
         .route("/schedule/cancel", post(cancel_schedule))
+        .route("/background", get(background))
+        .route("/background/kill", post(kill_background))
         .layer(middleware::from_fn(move |request, next| {
             let token = token.clone();
             async move { local_only(&token, request, next).await }
@@ -166,6 +169,13 @@ struct ScheduleBody {
 #[derive(Deserialize)]
 struct CancelBody {
     id: String,
+}
+
+#[derive(Deserialize)]
+struct KillBody {
+    id: String,
+    /// Needed only where rows of two kinds share the id.
+    kind: Option<Kind>,
 }
 
 #[derive(Deserialize)]
@@ -614,6 +624,24 @@ async fn cancel_schedule(
     match store.cancel(body.id.trim()) {
         Ok(row) => Json(json!({ "ok": true, "cancelled": row })).into_response(),
         Err(e) => error(StatusCode::NOT_FOUND, &e),
+    }
+}
+
+/// What runs in the background, as the tui's list shows it, with known secrets blanked.
+async fn background(State(session): State<Arc<Session>>) -> Response {
+    Json(json!({ "background": session.background() })).into_response()
+}
+
+/// `/bg kill`: stop a bash session, interrupt a child or cancel a schedule.
+async fn kill_background(
+    State(session): State<Arc<Session>>,
+    Json(body): Json<KillBody>,
+) -> Response {
+    match session.stop_background(body.kind, body.id.trim()) {
+        Ok(said) => Json(json!({ "ok": true, "stopped": said })).into_response(),
+        Err(e @ Refused::Missing(_)) => error(StatusCode::NOT_FOUND, &e.to_string()),
+        Err(e @ Refused::Ambiguous(_)) => error(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e @ Refused::Fixed(_)) => error(StatusCode::CONFLICT, &e.to_string()),
     }
 }
 
@@ -1395,5 +1423,74 @@ mod tests {
             .unwrap()
             .status();
         assert_ne!(status.as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn background_is_listed_redacted_and_one_row_killed_over_http() {
+        use crate::background::{Kind, tests::Fake, tests::row};
+        let (base, session) = quiet().await;
+        let http = reqwest::Client::new();
+        assert_eq!(
+            get_json(&http, format!("{base}/background")).await,
+            json!({ "background": [] })
+        );
+        let dir = crate::tools::temp_dir();
+        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+        let reminder = session
+            .schedules()
+            .unwrap()
+            .remind("in 20m check CI")
+            .unwrap();
+        crate::redact::register("server-bg-secret-4d7a");
+        let mut bash = row(Kind::Bash, "900003", "running");
+        bash.detail = "token server-bg-secret-4d7a\n".to_string();
+        let fake = Fake::default();
+        fake.0.lock().unwrap().extend([
+            bash,
+            row(Kind::Mcp, "fs", "connected"),
+            row(Kind::Chrome, "900003", "rendering"),
+        ]);
+        session.watch_background(vec![Box::new(fake)]);
+
+        let listed = get_json(&http, format!("{base}/background")).await;
+        let rows = listed["background"].as_array().unwrap();
+        let kinds: Vec<_> = rows.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["bash", "schedule", "mcp", "chrome"], "{listed}");
+        assert_eq!(rows[0]["detail"], "token [REDACTED]\n");
+        assert_eq!(rows[1]["id"], reminder.id.as_str());
+
+        let kill = |body: Value| post(&http, format!("{base}/background/kill"), body);
+        let cancel = json!({ "id": reminder.id });
+        assert_eq!(kill(cancel.clone()).await, StatusCode::OK);
+        assert_eq!(kill(cancel).await, StatusCode::NOT_FOUND);
+        assert_eq!(kill(json!({ "id": "fs" })).await, StatusCode::CONFLICT);
+        assert_eq!(
+            kill(json!({ "id": "900003" })).await,
+            StatusCode::BAD_REQUEST
+        );
+        // Not in the real table, so already ended.
+        assert_eq!(
+            kill(json!({ "id": "900003", "kind": "bash" })).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            kill(json!({ "id": "1", "kind": "dog" })).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let status = http
+            .post(format!("{base}/background/kill"))
+            .json(&json!({ "id": "fs" }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 403);
+        let status = http
+            .get(format!("{base}/background"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 403);
     }
 }

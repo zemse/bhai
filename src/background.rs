@@ -6,13 +6,18 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// How often the session looks for a change in what runs.
 pub const POLL: Duration = Duration::from_secs(1);
 
+pub const BG_USAGE: &str = "/bg [list] | kill [bash|child|schedule] <id>";
+
+/// The last lines of a bash session's output `/bg` shows.
+const TAIL: usize = 5;
+
 /// What a row is, in the order the list shows them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Bash,
@@ -21,6 +26,124 @@ pub enum Kind {
     Mcp,
     Proxy,
     Chrome,
+}
+
+impl Kind {
+    const ALL: [Kind; 6] = [
+        Kind::Bash,
+        Kind::Child,
+        Kind::Schedule,
+        Kind::Mcp,
+        Kind::Proxy,
+        Kind::Chrome,
+    ];
+
+    /// The word the list, `/bg` and the server use for it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Bash => "bash",
+            Kind::Child => "child",
+            Kind::Schedule => "schedule",
+            Kind::Mcp => "mcp",
+            Kind::Proxy => "proxy",
+            Kind::Chrome => "chrome",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|kind| kind.name() == word)
+    }
+}
+
+/// Why `/bg kill` stopped nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// Nothing of that kind and id runs.
+    Missing(String),
+    /// Rows of more than one kind have that id.
+    Ambiguous(String),
+    /// It runs, but is not something `/bg kill` stops.
+    Fixed(String),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Missing(why) | Refused::Ambiguous(why) | Refused::Fixed(why) => {
+                f.write_str(why)
+            }
+        }
+    }
+}
+
+/// What `/bg kill` was given: `<id>`, or `<kind> <id>` where ids of two kinds collide.
+pub fn target(args: &str) -> Result<(Option<Kind>, String), String> {
+    let words: Vec<&str> = args.split_whitespace().collect();
+    match words[..] {
+        [id] => Ok((None, id.to_string())),
+        [kind, id] => match Kind::parse(kind) {
+            Some(kind) => Ok((Some(kind), id.to_string())),
+            None => Err(BG_USAGE.to_string()),
+        },
+        _ => Err(BG_USAGE.to_string()),
+    }
+}
+
+/// The kind of the row `id` names: `kind` when it was given, else the one row of that
+/// id among `rows`.
+pub fn resolve(rows: &[Row], kind: Option<Kind>, id: &str) -> Result<Kind, Refused> {
+    if let Some(kind) = kind {
+        return Ok(kind);
+    }
+    let kinds: Vec<Kind> = rows.iter().filter(|r| r.id == id).map(|r| r.kind).collect();
+    match kinds[..] {
+        [] => Err(Refused::Missing(format!(
+            "nothing in the background has id {id}; /bg lists what does"
+        ))),
+        [kind] => Ok(kind),
+        _ => {
+            let names: Vec<&str> = kinds.iter().map(|k| k.name()).collect();
+            Err(Refused::Ambiguous(format!(
+                "{id} is the id of a {}; say which, as /bg kill <kind> {id}",
+                names.join(" and a ")
+            )))
+        }
+    }
+}
+
+/// What `/bg` prints: a line for each row, with a bash session's latest output and any
+/// other row's detail under it.
+pub fn report(rows: &[Row], now: SystemTime) -> String {
+    if rows.is_empty() {
+        return "background: nothing runs".to_string();
+    }
+    let mut out = format!(
+        "background: {} · /bg kill <id> stops a bash session, a child or a schedule",
+        rows.len()
+    );
+    let width = rows.iter().map(|r| r.id.chars().count()).max().unwrap_or(0);
+    for row in rows {
+        out.push_str(&format!(
+            "\n  {:<8} {:<width$}  {}  {}  {}",
+            row.kind.name(),
+            row.id,
+            row.label,
+            crate::bgview::age(row.started, now),
+            row.state
+        ));
+        if let Some(pid) = row.pid {
+            out.push_str(&format!("  pid {pid}"));
+        }
+        let lines: Vec<&str> = row.detail.lines().collect();
+        let shown = match row.kind {
+            Kind::Bash => &lines[lines.len().saturating_sub(TAIL)..],
+            _ => &lines[..],
+        };
+        for line in shown {
+            out.push_str(&format!("\n      {line}"));
+        }
+    }
+    out
 }
 
 /// One thing running.
@@ -312,6 +435,56 @@ pub(crate) mod tests {
             rows[0].detail
         );
         assert_eq!(rows[0].started, Some(kept.created.into()));
+    }
+
+    #[test]
+    fn bg_lists_each_row_with_its_id_and_a_bash_sessions_last_lines() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert_eq!(report(&[], now), "background: nothing runs");
+        let mut bash = row(Kind::Bash, "3", "running");
+        bash.label = "npm run dev".to_string();
+        bash.started = Some(now - Duration::from_secs(125));
+        bash.pid = Some(4242);
+        bash.detail = (1..=7).map(|n| format!("line {n}\n")).collect();
+        let mut schedule = row(Kind::Schedule, "s9", "scheduled");
+        schedule.detail = "s9 `in 20m` next 17:30".to_string();
+        assert_eq!(
+            report(&[bash, schedule], now),
+            "background: 2 · /bg kill <id> stops a bash session, a child or a schedule\
+             \n  bash     3   npm run dev  2m  running  pid 4242\
+             \n      line 3\n      line 4\n      line 5\n      line 6\n      line 7\
+             \n  schedule s9  s9 label  -  scheduled\
+             \n      s9 `in 20m` next 17:30"
+        );
+    }
+
+    #[test]
+    fn a_kill_names_an_id_and_a_kind_only_where_two_kinds_share_it() {
+        assert_eq!(target("3"), Ok((None, "3".to_string())));
+        assert_eq!(
+            target(" child  a1b2 "),
+            Ok((Some(Kind::Child), "a1b2".to_string()))
+        );
+        for bad in ["", "dog 3", "bash 3 4"] {
+            assert_eq!(target(bad), Err(BG_USAGE.to_string()), "{bad:?}");
+        }
+        let rows = [
+            row(Kind::Bash, "7", "running"),
+            row(Kind::Schedule, "7", "scheduled"),
+            row(Kind::Mcp, "fs", "connected"),
+        ];
+        assert_eq!(resolve(&rows, None, "fs"), Ok(Kind::Mcp));
+        assert_eq!(resolve(&rows, Some(Kind::Bash), "7"), Ok(Kind::Bash));
+        assert_eq!(
+            resolve(&rows, None, "7"),
+            Err(Refused::Ambiguous(
+                "7 is the id of a bash and a schedule; say which, as /bg kill <kind> 7".to_string()
+            ))
+        );
+        assert!(matches!(
+            resolve(&rows, None, "9"),
+            Err(Refused::Missing(_))
+        ));
     }
 
     #[test]

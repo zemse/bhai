@@ -15,6 +15,7 @@ use tui_input::InputRequest;
 use tui_input::backend::crossterm::to_input_request;
 
 use crate::askpass::{self, Secret};
+use crate::background;
 use crate::bgview::{Act, BgView};
 use crate::branch::Branch;
 use crate::client::Usage;
@@ -1046,27 +1047,38 @@ impl App {
                     self.open_child(&id);
                 }
             }
-            Act::Kill(id) => {
-                let said = match crate::tools::bash::stop(id) {
-                    true => Entry::Info(format!("stopped bash session {id}")),
-                    false => Entry::Error(format!("bash session {id} has already ended")),
-                };
-                self.note(said);
-                self.refresh_bg();
+            Act::Kill(id) => self.stop_background(Some(background::Kind::Bash), &id.to_string()),
+            Act::Cancel(id) => self.stop_background(Some(background::Kind::Schedule), &id),
+        }
+    }
+
+    /// Stop one background row, from the list or `/bg kill`, and say how it went.
+    fn stop_background(&mut self, kind: Option<background::Kind>, id: &str) {
+        self.note(match self.session.stop_background(kind, id) {
+            Ok(said) => Entry::Info(said),
+            Err(e) => Entry::Error(e.to_string()),
+        });
+        self.refresh_bg();
+    }
+
+    /// `/bg` lists what runs in the background; `/bg kill [kind] <id>` stops one.
+    fn bg_command(&mut self, rest: &str) {
+        let rest = rest.trim();
+        let (verb, args) = rest
+            .split_once(char::is_whitespace)
+            .map_or((rest, ""), |(verb, args)| (verb, args.trim()));
+        match (verb, args) {
+            ("" | "list", "") => {
+                let rows = self.session.background();
+                self.background = rows.len();
+                let report = background::report(&rows, std::time::SystemTime::now());
+                self.note(Entry::Info(report));
             }
-            Act::Cancel(id) => {
-                let said = self.with_schedules(|schedules| {
-                    schedules.cancel(&id).map(|row| {
-                        let now = schedules.now();
-                        format!("cancelled {}", crate::schedules::describe(&row, now))
-                    })
-                });
-                self.note(match said {
-                    Ok(said) => Entry::Info(said),
-                    Err(e) => Entry::Error(e),
-                });
-                self.refresh_bg();
-            }
+            ("kill", args) => match background::target(args) {
+                Ok((kind, id)) => self.stop_background(kind, &id),
+                Err(usage) => self.note(Entry::Error(usage)),
+            },
+            _ => self.note(Entry::Error(background::BG_USAGE.to_string())),
         }
     }
 
@@ -2014,6 +2026,13 @@ impl App {
                 Ok(text) => Entry::Info(text),
                 Err(e) => Entry::Error(e),
             });
+            return;
+        }
+        if let Some(rest) = message.strip_prefix("/bg")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            self.bg_command(rest);
             return;
         }
         if let Some(rest) = message.strip_prefix("/queue")
@@ -3276,6 +3295,64 @@ mod tests {
         app.input.set("/allow not a rule".to_string());
         app.submit();
         assert!(last(&mut app).contains("expected a tool name"));
+    }
+
+    #[tokio::test]
+    async fn bg_lists_what_runs_and_bg_kill_stops_one() {
+        use crate::background::{Kind, tests::Fake, tests::row};
+        let mut app = App::detached();
+        let last = |app: &mut App| app.entries().list.last().cloned();
+        app.input.set("/bg".to_string());
+        app.submit();
+        assert!(matches!(last(&mut app), Some(Entry::Info(t)) if t == "background: nothing runs"));
+        let dir = crate::tools::temp_dir();
+        app.session
+            .run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+        let store = app.session.schedules().unwrap();
+        let reminder = store.remind("in 20m check CI").unwrap();
+        let mut mcp = row(Kind::Mcp, "fs", "connected");
+        mcp.detail = "project, 4 tools".to_string();
+        let fake = Fake::default();
+        fake.0.lock().unwrap().push(mcp);
+        app.session.watch_background(vec![Box::new(fake)]);
+
+        app.input.set("/bg list".to_string());
+        app.submit();
+        let Some(Entry::Info(listed)) = last(&mut app) else {
+            panic!("{:?}", last(&mut app));
+        };
+        assert!(listed.starts_with("background: 2 · "), "{listed}");
+        assert!(
+            listed.contains(&format!("\n  schedule {}  check CI  ", reminder.id)),
+            "{listed}"
+        );
+        // Schedule ids are six characters, so the server's is padded to line up.
+        assert!(
+            listed.contains("\n  mcp      fs      fs label  -  connected\n      project, 4 tools"),
+            "{listed}"
+        );
+        // Nothing reached the model.
+        assert!(app.session.queued().is_empty() && !app.working);
+
+        app.input.set(format!("/bg kill {}", reminder.id));
+        app.submit();
+        assert!(
+            matches!(last(&mut app), Some(Entry::Info(t)) if t.starts_with(&format!("cancelled {}", reminder.id)))
+        );
+        assert!(store.list().unwrap().0.is_empty());
+        app.input.set("/bg kill fs".to_string());
+        app.submit();
+        assert!(
+            matches!(last(&mut app), Some(Entry::Error(e)) if e.starts_with("mcp server fs is not stopped here"))
+        );
+        for bad in ["/bg kill", "/bg stop 3", "/bg kill dog 3"] {
+            app.input.set(bad.to_string());
+            app.submit();
+            assert!(
+                matches!(last(&mut app), Some(Entry::Error(e)) if e == crate::background::BG_USAGE),
+                "{bad}"
+            );
+        }
     }
 
     #[tokio::test]

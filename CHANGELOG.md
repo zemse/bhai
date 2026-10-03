@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-03
 
+- `/bg` lists what runs in the background in the transcript, each row with its id and a bash session's last 5 output lines, and `/bg kill [kind] <id>` stops a bash session, interrupts a child or cancels a schedule. The debug server serves the same redacted rows at `GET /background` and stops one at `POST /background/kill`, behind the same token.
 - A click on the bg chip does nothing while the /model picker or the history or mention search is open, so the background list can no longer open hidden behind them and take their keys.
 - No user-visible change: a test now proves that listing kept bash sessions does not consume the output the next poll returns.
 - Schedules: the model sets, lists and cancels its own schedules with a `schedule` tool. Setting one always asks the user and never the judge. It may hold 10 at once, 5 minutes between fires and 1024 bytes each with known secrets blanked, and cancel reaches only its own. A fired one arrives framed as the model's own note rather than the user's words, marked "set by the model" in `/schedule`, the transcript, the notifier and `/events`.

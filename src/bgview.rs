@@ -179,7 +179,7 @@ impl BgView {
         };
         let title = match &opened {
             None => format!(" background ({}) ", self.rows.len()),
-            Some(row) => format!(" {} {} ", name(row.kind), row.id),
+            Some(row) => format!(" {} {} ", row.kind.name(), row.id),
         };
         let block = Block::bordered()
             .border_style(dim)
@@ -211,7 +211,7 @@ impl BgView {
         let top = (self.selected + 1).saturating_sub(rows);
         let mut lines = Vec::new();
         for (at, row) in self.rows.iter().enumerate().skip(top).take(rows) {
-            let head = format!(" {:<8} ", name(row.kind));
+            let head = format!(" {:<8} ", row.kind.name());
             let tail = format!(" {:>4}  {:<9} ", age(row.started, now), row.state);
             let room = width
                 .saturating_sub(head.chars().count() + tail.chars().count())
@@ -321,17 +321,6 @@ fn action(row: &Row) -> Option<&'static str> {
         Kind::Bash => Some("kill"),
         Kind::Schedule => Some("cancel"),
         _ => None,
-    }
-}
-
-fn name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Bash => "bash",
-        Kind::Child => "child",
-        Kind::Schedule => "schedule",
-        Kind::Mcp => "mcp",
-        Kind::Proxy => "proxy",
-        Kind::Chrome => "chrome",
     }
 }
 

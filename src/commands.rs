@@ -122,6 +122,12 @@ pub const COMMANDS: &[Command] = &[
         args: "",
         help: "the schedules /remind set, /schedule cancel|pause|resume <id>",
     },
+    // No args hint, though it takes `kill [kind] <id>`: the list is the usual way in.
+    Command {
+        name: "bg",
+        args: "",
+        help: "what runs in the background, /bg kill <id> to stop one",
+    },
     Command {
         name: "queue",
         args: " [clear]",
