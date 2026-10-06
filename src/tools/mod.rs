@@ -28,6 +28,7 @@ pub mod skill;
 pub mod ssrf;
 pub mod stdin;
 pub mod submit;
+pub mod title;
 pub mod view_image;
 pub mod web;
 pub mod write;

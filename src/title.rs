@@ -1,10 +1,8 @@
-//! The terminal's title: the project the session is in, then a few words on what it is
-//! doing. A tab is narrow and cuts the front off what it cannot fit, keeping the end, so
-//! the half worth reading goes last and the directory goes in front of it.
+//! The terminal's title: a few words on what the session is doing, then its state.
 //!
-//! The name comes from one small model call on the session's first message. Only the
-//! terminal ever shows it, so a call that fails leaves the directory standing on its own
-//! rather than being worth reporting.
+//! The initial name comes from one small model call on the session's first message;
+//! `update_title` can change it as the topic changes. A naming call that fails leaves
+//! `bhai` standing on its own rather than being worth reporting.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -107,7 +105,12 @@ impl Tab {
 
     /// The title for `state`, or `None` when it is the one already showing.
     pub fn refresh(&mut self, state: State) -> Option<String> {
-        let title = compose(&self.root, self.work.as_deref());
+        let title = self
+            .work
+            .as_deref()
+            .map(tidy)
+            .filter(|name| !name.is_empty());
+        let title = title.unwrap_or_else(|| "bhai".to_string());
         let title = match state {
             State::Idle => title,
             State::Working => format!("{title} · working"),
@@ -235,7 +238,7 @@ mod tests {
 
     #[test]
     fn the_state_goes_last_and_is_written_only_when_it_changes() {
-        let mut tab = Tab::new(PathBuf::from("/home/u/bhai"));
+        let mut tab = Tab::new(PathBuf::from("/home/u/project"));
         assert_eq!(tab.refresh(State::Idle).as_deref(), Some("bhai"));
         assert_eq!(tab.refresh(State::Idle), None);
         assert_eq!(
@@ -245,17 +248,14 @@ mod tests {
         tab.named("fix cache");
         assert_eq!(
             tab.refresh(State::Working).as_deref(),
-            Some("bhai · fix cache · working")
+            Some("fix cache · working")
         );
         assert_eq!(
             tab.refresh(State::Approval).as_deref(),
-            Some("bhai · fix cache · approval?")
+            Some("fix cache · approval?")
         );
         assert_eq!(tab.refresh(State::Approval), None);
-        assert_eq!(
-            tab.refresh(State::Idle).as_deref(),
-            Some("bhai · fix cache")
-        );
+        assert_eq!(tab.refresh(State::Idle).as_deref(), Some("fix cache"));
     }
 
     #[test]

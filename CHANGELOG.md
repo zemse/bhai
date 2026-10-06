@@ -4,6 +4,11 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-06
+
+- The main agent can change the terminal topic with approval-free `update_title`; the system prompt asks it to update only when the title no longer represents the conversation. A late initial naming call cannot overwrite a tool update.
+- Terminal titles now show only the topic and state, falling back to `bhai` before naming, without repeating the directory already shown by the terminal.
+
 ## 2026-10-03
 
 - `/bg` lists what runs in the background in the transcript, each row with its id and a bash session's last 5 output lines, and `/bg kill [kind] <id>` stops a bash session, interrupts a child or cancels a schedule. The debug server serves the same redacted rows at `GET /background` and stops one at `POST /background/kill`, behind the same token.

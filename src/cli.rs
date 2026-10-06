@@ -1894,7 +1894,7 @@ mod tests {
         );
         assert_eq!(
             step(&mut app, session::Event::Titled("fix cache".to_string())).as_deref(),
-            Some("bhai · fix cache · working")
+            Some("fix cache · working")
         );
         let approval = session::Event::Approval {
             id: 1,
@@ -1905,7 +1905,7 @@ mod tests {
         };
         assert_eq!(
             step(&mut app, approval).as_deref(),
-            Some("bhai · fix cache · approval?")
+            Some("fix cache · approval?")
         );
         // Text streaming while the approval waits leaves the title alone.
         assert_eq!(step(&mut app, session::Event::Text("hi".to_string())), None);
@@ -1916,11 +1916,11 @@ mod tests {
         };
         assert_eq!(
             step(&mut app, resolved).as_deref(),
-            Some("bhai · fix cache · working")
+            Some("fix cache · working")
         );
         assert_eq!(
             step(&mut app, session::Event::TurnEnd).as_deref(),
-            Some("bhai · fix cache")
+            Some("fix cache")
         );
     }
 

@@ -150,9 +150,8 @@ pub enum AgentEvent {
     /// through, or a tool broke the loop. The history still stands, so the same turn can
     /// be run again without the user retyping anything.
     TurnFailed(String),
-    /// What this session is working on, in a few words, for the terminal's title. It
-    /// arrives once, a moment after the first message, and only the TUI does anything
-    /// with it.
+    /// What this session is working on, from initial naming or `update_title`.
+    /// Only the TUI puts it in the terminal's title.
     Titled(String),
     /// A turn started on its own, on the reports of children that finished while the
     /// session was idle or on the goal; the string says on what.
@@ -773,6 +772,7 @@ pub(crate) async fn run_configured(
     let goal: goal::Shared = Arc::default();
     let plan: crate::plan::Shared = Arc::default();
     // The file this session is saved as, which a resume names after the session it continues.
+    let title_updated = Arc::new(std::sync::Mutex::new(false));
     let own = saved
         .as_ref()
         .map_or_else(|| session_id.clone(), |s| s.writer.header.session.clone());
@@ -826,6 +826,10 @@ pub(crate) async fn run_configured(
                 plan: Arc::clone(&plan),
                 tx: tx.clone(),
             })
+            .with_tool(Box::new(tools::title::UpdateTitle {
+                updated: Arc::clone(&title_updated),
+                tx: tx.clone(),
+            }))
     };
     let mut registry = build(&model);
     let tools = registry.schemas();
@@ -1231,15 +1235,16 @@ pub(crate) async fn run_configured(
             if let Some(judge) = &judge {
                 judge.start_turn(&message.text);
             }
-            // The session is named once, off its first message: a title that changed
-            // under the user every turn would be worse than one that is a little stale,
-            // and naming is a model call. It runs beside the turn rather than in front
-            // of it, since nothing waits on a tab title.
+            // The initial name runs beside the turn; a tool update takes precedence.
             if let Some(namer) = namer.take() {
+                let updated = Arc::clone(&title_updated);
                 let (tx, message) = (tx.clone(), message.text.clone());
                 tokio::spawn(async move {
                     if let Some(name) = namer.name(&message).await {
-                        let _ = tx.send(AgentEvent::Titled(name));
+                        let updated = updated.lock().unwrap_or_else(|e| e.into_inner());
+                        if !*updated {
+                            let _ = tx.send(AgentEvent::Titled(name));
+                        }
                     }
                 });
             }
@@ -5723,9 +5728,52 @@ mod tests {
         }
     }
 
-    /// The terminal's title is named once, off the session's first message. A title
-    /// that changed under the user every turn would be worse than a slightly stale one,
-    /// and each one is a model call.
+    #[tokio::test]
+    async fn the_main_agent_can_update_the_terminal_title_without_approval() {
+        use fake::{Fake, call, say};
+
+        let fake = Fake::new(vec![
+            vec![call(
+                "update_title",
+                json!({"title": "fix terminal titles"}),
+            )],
+            vec![say("done")],
+        ]);
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        let events = drive(&tx_user, &mut rx, &cancel, "rename the title", &[]).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Titled(t) if t == "fix terminal titles"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Approval { .. }))
+        );
+    }
+
+    /// Automatic naming runs only on the first message; later changes use `update_title`.
     #[tokio::test]
     async fn the_session_is_named_once_off_its_first_message() {
         use fake::{Fake, say};
