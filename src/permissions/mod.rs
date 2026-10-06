@@ -16,7 +16,7 @@ pub mod rules;
 pub mod settings;
 pub mod trust;
 
-use crate::tools::{fetch, image_gen, patch, schedule, ssrf, view_image};
+use crate::tools::{fetch, image_gen, monitor, patch, schedule, ssrf, view_image};
 use rules::Base;
 pub use rules::Rule;
 pub use trust::Trust;
@@ -95,6 +95,8 @@ pub enum Reserved {
     Typed(String),
     /// A schedule the model sets, which starts a turn later with nobody watching.
     Scheduled,
+    /// An observer repeatedly executes a command and can wake the loop.
+    Monitor,
     /// The judge does not run here at all: this is not `auto`, or the project is not
     /// trusted. Neither reaches the agent, since `auto` implies a trusted project and
     /// every other mode prompts.
@@ -115,6 +117,7 @@ impl Reserved {
             Reserved::Typed(command) => {
                 format!("only the user may approve what is typed into `{command}`")
             }
+            Reserved::Monitor => "only the user may approve a monitor command and its wake hooks".to_string(),
             Reserved::Scheduled => {
                 "only the user may approve a schedule, which starts a turn later with nobody watching".to_string()
             }
@@ -743,6 +746,20 @@ impl Checker<'_> {
                 Some(host) => self.check_fetch(&host, needs_approval),
                 None => Decision::Ask,
             },
+            monitor::NAME => {
+                if !monitor::reads_only(args) {
+                    let command = args
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let workdir = args.get("workdir").and_then(Value::as_str);
+                    let bash = self.check_bash(command, workdir);
+                    if matches!(bash, Decision::Deny(_)) {
+                        return bash;
+                    }
+                }
+                self.check_other(tool, needs_approval && !monitor::reads_only(args))
+            }
             schedule::NAME => self.check_other(tool, needs_approval && !schedule::reads_only(args)),
             _ => self.check_other(tool, needs_approval),
         }
@@ -1100,6 +1117,7 @@ impl Checker<'_> {
                 })
             }
             crate::tools::stdin::NAME => self.judgeable_typing(tool, &Typing::of(args)),
+            monitor::NAME => Err(Reserved::Monitor),
             schedule::NAME => Err(Reserved::Scheduled),
             // The guard refuses a private address when the fetch runs; one written into
             // the URL is kept from the judge too, so it is never what the judge approved.
@@ -2092,6 +2110,31 @@ mod tests {
             allowed.check("schedule", &create, true),
             Decision::Allow("rule Schedule".to_string())
         );
+    }
+
+    #[test]
+    fn monitors_ask_for_registration_and_respect_bash_denials() {
+        let create = json!({"action":"create", "name":"bench", "command":"cat /tmp/progress.json", "workdir":"/tmp"});
+        let auto = policy(Mode::Auto, &[], &[], &[]);
+        assert_eq!(auto.check("monitor", &create, true), Decision::Ask);
+        assert_eq!(auto.judgeable("monitor", &create), Err(Reserved::Monitor));
+        assert_eq!(auto.offers("monitor", &create), Offers::default());
+        for action in ["list", "pause", "resume", "stop", "dismiss"] {
+            assert_eq!(
+                auto.check("monitor", &json!({"action":action,"id":"m1"}), true),
+                Decision::Allow(String::new())
+            );
+        }
+        let denied = policy(Mode::Auto, &["Monitor"], &["Bash(cat:*)"], &[]);
+        assert!(matches!(
+            denied.check("monitor", &create, true),
+            Decision::Deny(_)
+        ));
+        let denied = policy(Mode::Auto, &[], &["Monitor"], &[]);
+        assert!(matches!(
+            denied.check("monitor", &json!({"action":"list"}), true),
+            Decision::Deny(_)
+        ));
     }
 
     #[test]

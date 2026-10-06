@@ -1522,6 +1522,7 @@ mod tests {
             cache_root: PathBuf::new(),
             mailboxes: Default::default(),
             schedules: None,
+            monitors: None,
         }
     }
 

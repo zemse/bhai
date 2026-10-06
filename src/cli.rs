@@ -769,6 +769,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
         mailboxes: agent::Mailboxes::default(),
         // Set once the run is one that fires them.
         schedules: None,
+        monitors: None,
         // Children reuse the session's MCP connections, narrowed to their identity.
         prompt: {
             let (config, roots) = (config.clone(), roots.clone());
@@ -1054,6 +1055,7 @@ fn start(
     // reaches the child the agent is running.
     let delegation = Delegation {
         mailboxes: session.mailboxes(),
+        monitors: Some(session.monitors()),
         ..delegation
     };
     // A panic in the loop or in a tool would otherwise end the task with the session still

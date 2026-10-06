@@ -236,7 +236,11 @@ impl Entries {
                         None => Entry::User(text("content")),
                     },
                 },
-                Some("message") if crate::environment::is_context(item) => continue,
+                Some("message")
+                    if crate::environment::is_context(item) || crate::monitor::is_context(item) =>
+                {
+                    continue;
+                }
                 Some("message") if let Some(note) = crate::instructions::note(item) => {
                     Entry::Info(note)
                 }

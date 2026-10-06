@@ -480,6 +480,8 @@ pub struct Delegation {
     /// The project's schedules, for the main agent's `schedule` tool; `None` where
     /// nothing fires them, and for a child.
     pub schedules: Option<Arc<crate::schedules::Schedules>>,
+    /// Session-scoped observers; not offered to children or workflow steps.
+    pub monitors: Option<Arc<crate::monitor::Monitors>>,
 }
 
 /// One child agent's usage, as the profiler reports it.
@@ -817,6 +819,11 @@ pub(crate) async fn run_configured(
             && prompt.identity.allows_tool(tools::schedule::NAME)
         {
             registry = registry.with_schedule(tools::schedule::Schedule { schedules });
+        }
+        if let Some(monitors) = delegation.as_ref().and_then(|d| d.monitors.clone())
+            && prompt.identity.allows_tool(tools::monitor::NAME)
+        {
+            registry = registry.with_tool(Box::new(tools::monitor::Monitor { monitors }));
         }
         registry
             .with_goal(tools::goal::Goal {
@@ -1185,6 +1192,12 @@ pub(crate) async fn run_configured(
                 }
                 history.push(update);
             }
+        }
+        if opens
+            && let Some(monitors) = delegation.as_ref().and_then(|d| d.monitors.as_ref())
+            && let Some(context) = monitors.context()
+        {
+            history.push(context);
         }
         let mut update_at = None;
         if opens && let Some(update) = effort_change(model.as_ref(), &history) {
@@ -4422,6 +4435,7 @@ mod tests {
             cache_root: dir.clone(),
             mailboxes: Default::default(),
             schedules: None,
+            monitors: None,
         };
         let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
@@ -4840,6 +4854,7 @@ mod tests {
             cache_root: dir.clone(),
             mailboxes: Default::default(),
             schedules: None,
+            monitors: None,
         };
         let rules = Rules {
             deny: vec![Rule::parse("Bash(rm:*)").unwrap()],
@@ -6384,6 +6399,7 @@ mod tests {
             cache_root: dir.clone(),
             mailboxes: Default::default(),
             schedules: None,
+            monitors: None,
         };
         let policy = Arc::new(Policy::new(Mode::Ask, Rules::default(), None, dir.clone()));
         let cancel = Arc::new(Cancel::default());
@@ -7418,6 +7434,7 @@ mod tests {
                 cache_root: dir.clone(),
                 mailboxes: Default::default(),
                 schedules: None,
+                monitors: None,
             }),
             None,
             Limits::default(),

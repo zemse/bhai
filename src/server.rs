@@ -69,6 +69,7 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/schedules", get(schedules))
         .route("/schedule", post(schedule))
         .route("/schedule/cancel", post(cancel_schedule))
+        .route("/monitors", get(monitors))
         .route("/background", get(background))
         .route("/background/kill", post(kill_background))
         .layer(middleware::from_fn(move |request, next| {
@@ -625,6 +626,11 @@ async fn cancel_schedule(
         Ok(row) => Json(json!({ "ok": true, "cancelled": row })).into_response(),
         Err(e) => error(StatusCode::NOT_FOUND, &e),
     }
+}
+
+/// The live observer snapshots, without consuming any sampler output.
+async fn monitors(State(session): State<Arc<Session>>) -> Response {
+    Json(json!({ "monitors": session.monitors().views() })).into_response()
 }
 
 /// What runs in the background, as the tui's list shows it, with known secrets blanked.
@@ -1423,6 +1429,55 @@ mod tests {
             .unwrap()
             .status();
         assert_ne!(status.as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn monitors_are_live_redacted_and_authenticated_over_http() {
+        let (base, session) = quiet().await;
+        let http = reqwest::Client::new();
+        assert_eq!(
+            get_json(&http, format!("{base}/monitors")).await,
+            json!({"monitors":[]})
+        );
+        crate::redact::register("server-monitor-secret-72e1");
+        let store = session.monitors();
+        let id = store.add(crate::monitor::Spec {
+            name:"bench".into(), command:"printf '%s' '{\"summary\":\"server-monitor-secret-72e1\",\"tracks\":[{\"id\":\"baseline\",\"current\":63,\"total\":65}]}'".into(),
+            workdir:std::env::temp_dir(), interval_secs:1, timeout_secs:2, hooks:vec![],
+        }).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.views()[0].snapshot.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let listed = get_json(&http, format!("{base}/monitors")).await;
+        assert_eq!(
+            listed["monitors"][0]["snapshot"]["tracks"][0]["current"],
+            63.0
+        );
+        assert!(!listed.to_string().contains("server-monitor-secret-72e1"));
+        assert_eq!(
+            http.get(format!("{base}/monitors"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            403
+        );
+        assert_eq!(
+            post(
+                &http,
+                format!("{base}/background/kill"),
+                json!({"kind":"monitor","id":id})
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(store.views()[0].state, "stopped");
+        store.control(&id, "dismiss").unwrap();
     }
 
     #[tokio::test]

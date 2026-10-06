@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// How often the session looks for a change in what runs.
 pub const POLL: Duration = Duration::from_secs(1);
 
-pub const BG_USAGE: &str = "/bg [list] | kill [bash|child|schedule] <id>";
+pub const BG_USAGE: &str = "/bg [list] | kill [bash|child|schedule|monitor] <id>";
 
 /// The last lines of a bash session's output `/bg` shows.
 const TAIL: usize = 5;
@@ -23,16 +23,18 @@ pub enum Kind {
     Bash,
     Child,
     Schedule,
+    Monitor,
     Mcp,
     Proxy,
     Chrome,
 }
 
 impl Kind {
-    const ALL: [Kind; 6] = [
+    const ALL: [Kind; 7] = [
         Kind::Bash,
         Kind::Child,
         Kind::Schedule,
+        Kind::Monitor,
         Kind::Mcp,
         Kind::Proxy,
         Kind::Chrome,
@@ -44,6 +46,7 @@ impl Kind {
             Kind::Bash => "bash",
             Kind::Child => "child",
             Kind::Schedule => "schedule",
+            Kind::Monitor => "monitor",
             Kind::Mcp => "mcp",
             Kind::Proxy => "proxy",
             Kind::Chrome => "chrome",
@@ -117,10 +120,12 @@ pub fn report(rows: &[Row], now: SystemTime) -> String {
     if rows.is_empty() {
         return "background: nothing runs".to_string();
     }
-    let mut out = format!(
-        "background: {} · /bg kill <id> stops a bash session, a child or a schedule",
-        rows.len()
-    );
+    let stops = if rows.iter().any(|row| row.kind == Kind::Monitor) {
+        "a bash session, a child, a schedule or a monitor"
+    } else {
+        "a bash session, a child or a schedule"
+    };
+    let mut out = format!("background: {} · /bg kill <id> stops {stops}", rows.len());
     let width = rows.iter().map(|r| r.id.chars().count()).max().unwrap_or(0);
     for row in rows {
         out.push_str(&format!(

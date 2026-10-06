@@ -24,6 +24,8 @@ pub enum Act {
     Kill(u32),
     /// Cancel this schedule.
     Cancel(String),
+    /// Stop this observer, not its observed task.
+    Monitor(String),
 }
 
 #[derive(Debug, Default)]
@@ -34,6 +36,8 @@ pub struct BgView {
     pub open: Option<(Kind, String)>,
     /// The kill or cancel was asked for once on the open row; the second ask does it.
     pub armed: bool,
+    /// Offset in the monitor inspector's details.
+    detail_scroll: u16,
     /// Each list row's area and index, filled in by the renderer.
     list: Vec<(Rect, usize)>,
     /// The way back to the list and the open row's action, filled in by the renderer.
@@ -85,6 +89,14 @@ impl BgView {
             return match code {
                 KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('q') => {
                     self.open = None;
+                    Act::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                    Act::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
                     Act::None
                 }
                 KeyCode::Char('x') if again => self.act(),
@@ -147,6 +159,7 @@ impl BgView {
             return Act::Child(row.id.clone());
         }
         self.open = Some((row.kind, row.id.clone()));
+        self.detail_scroll = 0;
         self.armed = false;
         Act::None
     }
@@ -156,6 +169,7 @@ impl BgView {
         match self.opened() {
             Some(row) if row.kind == Kind::Bash => row.id.parse().map_or(Act::None, Act::Kill),
             Some(row) if row.kind == Kind::Schedule => Act::Cancel(row.id.clone()),
+            Some(row) if row.kind == Kind::Monitor => Act::Monitor(row.id.clone()),
             _ => Act::None,
         }
     }
@@ -171,6 +185,13 @@ impl BgView {
         let opened = self.opened().cloned();
         let hint = match &opened {
             None => " ↑↓ select · enter open · esc close ".to_string(),
+            Some(row) if row.kind == Kind::Monitor => {
+                if self.armed {
+                    " ↑↓ scroll · x again to stop · esc back ".into()
+                } else {
+                    " ↑↓ scroll · x stop · esc back ".into()
+                }
+            }
             Some(row) => match action(row) {
                 Some(verb) if self.armed => format!(" x again to {verb} · esc back "),
                 Some(verb) => format!(" x {verb} · esc back "),
@@ -279,6 +300,7 @@ impl BgView {
             Kind::Schedule => "prompt",
             Kind::Mcp => "server",
             Kind::Chrome => "page",
+            Kind::Monitor => "monitor",
             Kind::Child | Kind::Proxy => "what",
         };
         lines.push(field(what, row.label.clone(), Style::new()));
@@ -301,6 +323,11 @@ impl BgView {
                     .iter()
                     .map(|text| Line::raw(format!("  {text}"))),
             );
+        } else if row.kind == Kind::Monitor {
+            let room = width.saturating_sub(2).max(1);
+            for text in crate::wrap::wrap(&row.detail, room) {
+                lines.push(Line::raw(format!("  {text}")));
+            }
         } else if !row.detail.is_empty() {
             let name = match row.kind {
                 Kind::Schedule => "when",
@@ -311,7 +338,20 @@ impl BgView {
                 lines.push(field(name, text.to_string(), Style::new()));
             }
         }
-        frame.render_widget(Paragraph::new(lines), inner);
+        if row.kind == Kind::Monitor && inner.height > 1 {
+            let top = lines.remove(0);
+            frame.render_widget(
+                Paragraph::new(top),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+            let rest = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+            self.detail_scroll = self
+                .detail_scroll
+                .min(lines.len().saturating_sub(rest.height as usize) as u16);
+            frame.render_widget(Paragraph::new(lines).scroll((self.detail_scroll, 0)), rest);
+        } else {
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
     }
 }
 
@@ -320,6 +360,7 @@ fn action(row: &Row) -> Option<&'static str> {
     match row.kind {
         Kind::Bash => Some("kill"),
         Kind::Schedule => Some("cancel"),
+        Kind::Monitor => Some("stop"),
         _ => None,
     }
 }

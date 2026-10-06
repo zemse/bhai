@@ -1049,6 +1049,7 @@ impl App {
             }
             Act::Kill(id) => self.stop_background(Some(background::Kind::Bash), &id.to_string()),
             Act::Cancel(id) => self.stop_background(Some(background::Kind::Schedule), &id),
+            Act::Monitor(id) => self.stop_background(Some(background::Kind::Monitor), &id),
         }
     }
 
@@ -2028,6 +2029,42 @@ impl App {
             });
             return;
         }
+        if let Some(rest) = message.strip_prefix("/monitor")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            let words: Vec<_> = rest.split_whitespace().collect();
+            match words.as_slice() {
+                [] | ["list"] => {
+                    self.bg = Some(BgView::new(self.session.background()));
+                    self.refresh_bg();
+                }
+                [action @ ("pause" | "resume" | "stop" | "dismiss"), id] => {
+                    let result = self.session.monitors().control(id, action);
+                    self.note(match result {
+                        Ok(()) => Entry::Info(format!("monitor {id}: {action}")),
+                        Err(error) => Entry::Error(error),
+                    });
+                    self.refresh_bg();
+                }
+                [id] => {
+                    let rows = self.session.background();
+                    if rows
+                        .iter()
+                        .any(|r| r.kind == background::Kind::Monitor && r.id == *id)
+                    {
+                        let mut view = BgView::new(rows);
+                        view.open = Some((background::Kind::Monitor, id.to_string()));
+                        self.bg = Some(view);
+                    } else {
+                        self.note(Entry::Error(format!("no monitor {id}")));
+                    }
+                }
+                _ => self.note(Entry::Error(
+                    "/monitor [list|<id>] | pause|resume|stop|dismiss <id>".into(),
+                )),
+            }
+            return;
+        }
         if let Some(rest) = message.strip_prefix("/bg")
             && (rest.is_empty() || rest.starts_with(' '))
         {
@@ -2316,6 +2353,11 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     /// The checklist `update_plan` set, for its panel.
     pub fn plan(&self) -> Option<crate::plan::Plan> {
         self.session.plan()
+    }
+
+    /// The live observers, for their cards.
+    pub fn monitors(&self) -> Vec<crate::monitor::View> {
+        self.session.monitors().views()
     }
 
     /// What the working row says the turn is doing.

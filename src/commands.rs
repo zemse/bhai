@@ -129,6 +129,11 @@ pub const COMMANDS: &[Command] = &[
         help: "what runs in the background, /bg kill <id> to stop one",
     },
     Command {
+        name: "monitor",
+        args: "",
+        help: "live observers, /monitor <id> or pause|resume|stop|dismiss <id>",
+    },
+    Command {
         name: "queue",
         args: " [clear]",
         help: "prompts waiting behind the turn",

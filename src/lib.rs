@@ -73,6 +73,8 @@ pub mod mcp;
 pub mod memory;
 mod mermaid;
 pub mod models;
+pub mod monitor;
+mod monitorview;
 mod notify;
 mod ollama;
 mod palette;

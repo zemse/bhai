@@ -550,6 +550,15 @@ pub struct Session {
     /// Where [`Session::background`] reads what else runs, once
     /// [`Session::watch_background`] is given them.
     sources: std::sync::OnceLock<Vec<Box<dyn crate::background::Source>>>,
+    monitors: std::sync::OnceLock<Arc<crate::monitor::Monitors>>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(monitors) = self.monitors.get() {
+            monitors.shutdown();
+        }
+    }
 }
 
 impl Session {
@@ -582,6 +591,7 @@ impl Session {
             judge,
             schedules: std::sync::OnceLock::new(),
             sources: std::sync::OnceLock::new(),
+            monitors: std::sync::OnceLock::new(),
         })
     }
 
@@ -739,6 +749,14 @@ impl Session {
         })
     }
 
+    /// The observers owned by this session, created on first use.
+    pub fn monitors(self: &Arc<Self>) -> Arc<crate::monitor::Monitors> {
+        Arc::clone(
+            self.monitors
+                .get_or_init(|| crate::monitor::Monitors::new(Arc::downgrade(self))),
+        )
+    }
+
     /// Everything running that the user did not start by typing, known secrets blanked.
     pub fn background(&self) -> Vec<crate::background::Row> {
         let mut rows: Vec<_> = self
@@ -749,6 +767,9 @@ impl Session {
             .collect();
         if let Some(schedules) = self.schedules.get() {
             rows.extend(crate::background::schedules(schedules));
+        }
+        if let Some(monitors) = self.monitors.get() {
+            rows.extend(monitors.background());
         }
         for source in self.sources.get().into_iter().flatten() {
             rows.extend(source.rows());
@@ -788,6 +809,16 @@ impl Session {
                 Ok(format!(
                     "cancelled {}",
                     crate::schedules::describe(&row, now)
+                ))
+            }
+            Kind::Monitor => {
+                let monitors = self
+                    .monitors
+                    .get()
+                    .ok_or_else(|| Refused::Missing(format!("no monitor {id}")))?;
+                monitors.control(id, "stop").map_err(Refused::Missing)?;
+                Ok(format!(
+                    "stopped monitor {id}; its observed task is still running"
                 ))
             }
             Kind::Mcp => Err(Refused::Fixed(format!(

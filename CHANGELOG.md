@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-06
 
+- Session-scoped `monitor` observers sample approved commands without model calls and show live cards with independent progress tracks, details and custom metrics. `/monitor` inspects, pauses, resumes, stops or dismisses them; optional condition hooks wake the loop with fixed prompts, sustained thresholds, cooldowns and a bounded queue. Sampling is non-overlapping, bounded and sandboxed like bash, errors retain a stale snapshot with backoff, and the system prompt asks the agent to set monitors up proactively.
 - The main agent can change the terminal topic with approval-free `update_title`; the system prompt asks it to update only when the title no longer represents the conversation. A late initial naming call cannot overwrite a tool update.
 - Terminal titles now show only the topic and state, falling back to `bhai` before naming, without repeating the directory already shown by the terminal.
 - The status bar's background badge now reads `1 process` or `N processes`, with bold black text on a cyan background even when not hovered.

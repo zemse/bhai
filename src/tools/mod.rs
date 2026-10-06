@@ -20,6 +20,7 @@ pub mod image_gen;
 pub mod mcp;
 pub mod memory;
 pub mod models;
+pub mod monitor;
 pub mod patch;
 pub mod plan;
 pub mod read;
@@ -34,7 +35,7 @@ pub mod web;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 13] = [
+pub const NAMES: [&str; 14] = [
     bash::NAME,
     read::NAME,
     write::NAME,
@@ -48,6 +49,7 @@ pub const NAMES: [&str; 13] = [
     web::NAME,
     fetch::NAME,
     schedule::NAME,
+    monitor::NAME,
 ];
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.

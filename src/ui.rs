@@ -277,9 +277,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .as_ref()
         .map_or(0, |plan| plan.steps.len().min(MAX_PLAN_ROWS) as u16 + 2);
 
+    let monitors = app.monitors();
+    let monitor_height = crate::monitorview::height(&monitors, frame.area().height);
+
     let [
         transcript_area,
         plan_area,
+        monitor_area,
         children_area,
         queued_area,
         menu_area,
@@ -289,6 +293,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     ] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(plan_height),
+        Constraint::Length(monitor_height),
         Constraint::Length(children_height),
         Constraint::Length(queued_height),
         Constraint::Length(menu_height),
@@ -314,6 +319,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.input_area = None;
         // The pane covered those rows, so they go back on top.
         render_plan(frame, plan_area, plan.as_ref());
+        crate::monitorview::render(frame, monitor_area, &monitors);
         render_children(frame, children_area, app, &children);
         render_queued(frame, queued_area, app);
         render_working(frame, working_area, app);
@@ -334,6 +340,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         None => render_transcript(frame, transcript_area, app),
     }
     render_plan(frame, plan_area, plan.as_ref());
+    crate::monitorview::render(frame, monitor_area, &monitors);
     render_children(frame, children_area, app, &children);
     render_queued(frame, queued_area, app);
     if menu_height > 0 {
@@ -4037,6 +4044,65 @@ mod tests {
         session.on_agent(crate::agent::AgentEvent::Goal(None));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!status(&terminal).contains("goal"), "{}", status(&terminal));
+    }
+
+    #[tokio::test]
+    async fn monitor_cards_update_while_the_session_is_idle() {
+        let mut app = App::detached();
+        let session = std::sync::Arc::clone(app.session());
+        let monitors = session.monitors();
+        let dir = crate::tools::temp_dir();
+        let path = dir.join("progress.json");
+        let snapshot = |newupdate, baseline| {
+            serde_json::json!({
+            "summary":"Benchmarking matrix multiply",
+            "tracks":[{"id":"newupdate","current":newupdate,"total":65},{"id":"baseline","current":baseline,"total":65}],
+            "metrics":[{"label":"RAM","value":2.1,"unit":"GB"}],
+            "details":["sample 3 of 10"]
+        }).to_string()
+        };
+        std::fs::write(&path, snapshot(31, 63)).unwrap();
+        let id = monitors
+            .add(crate::monitor::Spec {
+                name: "Benchmark".into(),
+                command: format!("cat '{}'", path.display()),
+                workdir: dir.clone(),
+                interval_secs: 1,
+                timeout_secs: 2,
+                hooks: vec![],
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while monitors.views()[0].snapshot.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("31/65") && text.contains("63/65"), "{text}");
+        assert!(
+            text.contains("RAM: 2.1 GB") && text.contains("sample 3 of 10"),
+            "{text}"
+        );
+        assert!(!app.working);
+        std::fs::write(&path, snapshot(32, 64)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while monitors.views()[0].snapshot.as_ref().unwrap().tracks[0].current != 32.0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("32/65") && text.contains("64/65"), "{text}");
+        monitors.control(&id, "dismiss").unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("monitors · /monitor"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

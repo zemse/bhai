@@ -81,6 +81,10 @@ mod memory;
 mod mermaid;
 #[path = "../../src/models.rs"]
 mod models;
+#[path = "../../src/monitor.rs"]
+mod monitor;
+#[path = "../../src/monitorview.rs"]
+mod monitorview;
 #[path = "../../src/notify.rs"]
 mod notify;
 #[path = "../../src/ollama.rs"]
@@ -97,6 +101,8 @@ mod profile;
 mod prompt;
 #[path = "../../src/redact.rs"]
 mod redact;
+#[path = "../../src/runtime.rs"]
+mod runtime;
 #[path = "../../src/sandbox.rs"]
 mod sandbox;
 #[path = "../../src/schedule.rs"]
@@ -139,6 +145,8 @@ mod workflow;
 mod worktrees;
 #[path = "../../src/wrap.rs"]
 mod wrap;
+
+pub use title::Name;
 
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
