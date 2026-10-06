@@ -8,6 +8,7 @@ carries the shape of what is there.
 
 - The main agent can change the terminal topic with approval-free `update_title`; the system prompt asks it to update only when the title no longer represents the conversation. A late initial naming call cannot overwrite a tool update.
 - Terminal titles now show only the topic and state, falling back to `bhai` before naming, without repeating the directory already shown by the terminal.
+- The status bar's background badge now reads `1 process` or `N processes`, with bold black text on a cyan background even when not hovered.
 
 ## 2026-10-03
 

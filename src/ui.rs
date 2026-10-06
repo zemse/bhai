@@ -631,24 +631,30 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// `bg 3` at the right end of the bar while anything runs in the background, kept in
+/// `3 processes` at the right end of the bar while anything runs in the background, kept in
 /// `app.chip` so a click on it opens the list. Returns what is left of the bar.
 fn render_chip(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
     if app.background == 0 {
         app.chip = None;
         return area;
     }
-    let text = format!(" bg {} ", app.background);
+    let noun = if app.background == 1 {
+        "process"
+    } else {
+        "processes"
+    };
+    let text = format!(" {} {noun} ", app.background);
     let width = (text.chars().count() as u16).min(area.width);
     let [rest, chip] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).areas(area);
     app.chip = Some(chip);
-    // Lit as a link is while the pointer is on it, and while the list is open.
+    let style = Style::new()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let style = match app.pointing_at(chip) || app.bg.is_some() {
-        true => Style::new()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::UNDERLINED),
-        false => Style::new(),
+        true => style.add_modifier(Modifier::UNDERLINED),
+        false => style,
     };
     frame.render_widget(Paragraph::new(Span::styled(text, style)), chip);
     rest
@@ -4450,19 +4456,26 @@ mod tests {
         let mut app = App::detached();
         let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert!(!status(&terminal).contains("bg "), "{}", status(&terminal));
+        assert!(
+            !status(&terminal).contains("process"),
+            "{}",
+            status(&terminal)
+        );
         assert!(app.chip.is_none());
 
         app.on_event(Event::Background(3));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(
-            status(&terminal).ends_with(" bg 3"),
+            status(&terminal).ends_with(" 3 processes"),
             "{}",
             status(&terminal)
         );
         let chip = app.chip.unwrap();
         assert_eq!((chip.right(), chip.y), (80, 9));
-        let cell = status_cell(&terminal, "bg 3");
+        let cell = status_cell(&terminal, "3 processes");
+        assert_eq!(cell.fg, Color::Black);
+        assert_eq!(cell.bg, Color::Cyan);
+        assert!(cell.modifier.contains(Modifier::BOLD));
         assert!(!cell.modifier.contains(Modifier::UNDERLINED));
 
         assert!(
@@ -4470,8 +4483,9 @@ mod tests {
             "onto the chip redraws"
         );
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let cell = status_cell(&terminal, "bg 3");
-        assert_eq!(cell.fg, Color::Cyan);
+        let cell = status_cell(&terminal, "3 processes");
+        assert_eq!(cell.fg, Color::Black);
+        assert_eq!(cell.bg, Color::Cyan);
         assert!(cell.modifier.contains(Modifier::UNDERLINED));
         assert!(
             !app.on_mouse(moved(chip.x + 2, chip.y)),
@@ -4479,9 +4493,17 @@ mod tests {
         );
         assert!(app.on_mouse(moved(2, 2)), "off it redraws");
 
+        app.on_event(Event::Background(1));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(status(&terminal).ends_with(" 1 process"));
+
         app.on_event(Event::Background(0));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert!(!status(&terminal).contains("bg "), "{}", status(&terminal));
+        assert!(
+            !status(&terminal).contains("process"),
+            "{}",
+            status(&terminal)
+        );
         assert!(app.chip.is_none());
     }
 
@@ -4610,7 +4632,7 @@ mod tests {
             shown.join("\n")
         );
         assert!(
-            status(&terminal).ends_with(" bg 4"),
+            status(&terminal).ends_with(" 4 processes"),
             "{}",
             status(&terminal)
         );
