@@ -1455,10 +1455,18 @@ impl Session {
                 Event::Cleared
             }
             AgentEvent::Goal(goal) => {
+                if goal.is_some() || inner.goal.is_some() {
+                    inner.plan = goal.as_ref().and_then(|g| g.plan.clone());
+                }
                 inner.goal = goal.clone();
                 Event::Goal(goal)
             }
             AgentEvent::Plan(plan) => {
+                if let Some(goal) = inner.goal.as_mut()
+                    && goal.state != crate::goal::State::Complete
+                {
+                    goal.plan = plan.clone();
+                }
                 inner.plan = plan.clone();
                 Event::Plan(plan)
             }
@@ -1814,6 +1822,35 @@ mod tests {
             ),
             rx_user,
         )
+    }
+
+    #[test]
+    fn goal_and_plan_projections_stay_consistent_without_mutating_finished_goals() {
+        let (session, _rx) = session();
+        session.on_agent(AgentEvent::Goal(Some(crate::goal::Goal::new("ship", 0, 0))));
+        let plan = crate::plan::Plan::parse(
+            &serde_json::json!({"plan": [{"step": "verify", "status": "completed"}]}),
+        )
+        .unwrap();
+        session.on_agent(AgentEvent::Plan(plan.clone()));
+        assert_eq!(session.state().goal.unwrap().plan, plan);
+        let mut goal = session.goal().unwrap();
+        goal.state = crate::goal::State::Complete;
+        session.on_agent(AgentEvent::Goal(Some(goal.clone())));
+        let standalone = crate::plan::Plan::parse(
+            &serde_json::json!({"plan": [{"step": "analyse", "status": "pending"}]}),
+        )
+        .unwrap();
+        session.on_agent(AgentEvent::Plan(standalone.clone()));
+        assert_eq!(session.state().goal, Some(goal));
+        assert_eq!(session.state().plan, standalone);
+        session.on_agent(AgentEvent::Goal(Some(crate::goal::Goal::new(
+            "new task", 0, 0,
+        ))));
+        assert!(session.state().plan.is_none());
+        assert!(session.state().goal.unwrap().plan.is_none());
+        session.on_agent(AgentEvent::Goal(None));
+        assert!(session.state().plan.is_none());
     }
 
     /// A panic in the loop ends its task with no error and no `TurnEnd` of its own, so

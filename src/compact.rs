@@ -184,7 +184,14 @@ pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
         "{SUMMARY_PREFIX}\n{}",
         summary.trim()
     )));
-    folded.extend_from_slice(&history[last..]);
+    folded.extend(crate::goal::restated(history));
+    folded.extend(crate::plan::restated_context(history));
+    folded.extend(
+        history[last..]
+            .iter()
+            .filter(|item| !crate::goal::is_context(item) && !crate::plan::is_context(item))
+            .cloned(),
+    );
     Some(folded)
 }
 
@@ -223,6 +230,8 @@ pub fn install(
     installed.extend(crate::instructions::restated(history));
     installed.extend(kept);
     installed.push(compaction);
+    installed.extend(crate::goal::restated(history));
+    installed.extend(crate::plan::restated_context(history));
     installed
 }
 
@@ -459,6 +468,77 @@ mod tests {
         assert_eq!(folded[0], restated(&history).unwrap());
         assert_eq!(folded[1], user_message("one"));
         assert_eq!(update(&folded, &env("2026-10-03")), None);
+    }
+
+    #[test]
+    fn both_compaction_paths_keep_the_latest_focused_progress() {
+        let mut plan = crate::plan::Plan::parse(&json!({"plan": [
+            {"step": "inspect", "status": "completed"}, {"step": "verify", "status": "pending"}
+        ]}))
+        .unwrap()
+        .unwrap();
+        let mut history = vec![crate::plan::context(&[], Some(&plan)).unwrap()];
+        turn(&mut history, "work", 1);
+        turn(&mut history, "also verify", 1);
+        plan.steps[1].status = crate::plan::Status::InProgress;
+        history.extend(crate::plan::context(&history, Some(&plan)));
+        let expected = crate::plan::restated_context(&history).unwrap();
+        let folded = fold(&history, "summary").unwrap();
+        let installed = install(
+            &history,
+            json!({"type": "compaction", "encrypted_content": "opaque"}),
+            0,
+            &ByteEstimate,
+        );
+        for kept in [folded, installed] {
+            assert_eq!(
+                kept.iter()
+                    .filter(|item| crate::plan::is_context(item))
+                    .collect::<Vec<_>>(),
+                [&expected]
+            );
+            assert!(crate::plan::context(&kept, Some(&plan)).is_none());
+        }
+    }
+
+    #[test]
+    fn both_compaction_paths_keep_only_the_latest_goal_specification() {
+        use crate::goal::{Goal, Specification, context, is_context};
+
+        let mut goal = Goal::new("build a generator", 0, 0);
+        goal.update(
+            Specification::parse(&json!({
+                "objective": "build a generator",
+                "requirements": ["Yul and Huff"],
+                "verification": ["run tests"]
+            }))
+            .unwrap(),
+        );
+        let mut history = vec![context(&[], Some(&goal)).unwrap()];
+        turn(&mut history, "build it", 1);
+        goal.requirements
+            .push("use state_4 directories".to_string());
+        history.extend(context(&history, Some(&goal)));
+        turn(&mut history, "also compare the outputs", 1);
+        goal.verification
+            .push("compare state_4 outputs".to_string());
+        history.extend(context(&history, Some(&goal)));
+        let expected = crate::goal::restated(&history).unwrap();
+        let folded = fold(&history, "summary omitted all goal details").unwrap();
+        let installed = install(
+            &history,
+            json!({"type": "compaction", "encrypted_content": "opaque"}),
+            0,
+            &ByteEstimate,
+        );
+        for kept in [folded, installed] {
+            let specs: Vec<_> = kept.iter().filter(|item| is_context(item)).collect();
+            assert_eq!(specs, [&expected]);
+            assert!(context(&kept, Some(&goal)).is_none());
+            let text = specs[0]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("state_4 directories"));
+            assert!(text.contains("compare state_4 outputs"));
+        }
     }
 
     #[test]

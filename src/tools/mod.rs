@@ -332,8 +332,8 @@ impl Registry {
         self
     }
 
-    /// `goal`, for the main agent. Added past the identity's narrowing, since without it
-    /// a goal can only end on its budget.
+    /// `goal`, for the main agent. Added past the identity's narrowing, so every
+    /// persistent objective can be completed or blocked.
     pub fn with_goal(mut self, goal: goal::Goal) -> Self {
         self.tools.push(Box::new(goal));
         self

@@ -270,9 +270,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
         rows => rows.min(MAX_QUEUED_ROWS) as u16 + 2,
     };
 
-    // The plan sits above the subagents. A finished one stays while the turn that
-    // finished it runs, then goes: a checklist with nothing left on it is not news.
-    let plan = app.plan().filter(|plan| app.working || !plan.done());
+    // Goal-owned progress stays visible after completion; standalone lists hide at idle.
+    let plan = app.plan().filter(|plan| {
+        app.goal().is_some_and(|g| g.plan.as_ref() == Some(plan)) || app.working || !plan.done()
+    });
     let plan_height = plan
         .as_ref()
         .map_or(0, |plan| plan.steps.len().min(MAX_PLAN_ROWS) as u16 + 2);
@@ -365,7 +366,16 @@ fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>) 
     };
     let dim = Style::new().fg(Color::DarkGray);
     let mut block = Block::bordered().border_style(dim).title(Line::styled(
-        format!(" plan {}/{} ", plan.completed(), plan.steps.len()),
+        format!(
+            " plan {}/{}{} ",
+            plan.completed() + plan.skipped(),
+            plan.steps.len(),
+            if plan.skipped() > 0 {
+                format!(", {} skipped", plan.skipped())
+            } else {
+                String::new()
+            }
+        ),
         dim,
     ));
     let room = area.width.saturating_sub(6) as usize;
@@ -383,12 +393,8 @@ fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>) 
     // The step to keep in view: the one in progress, else the first still to do.
     let focus = plan
         .current()
-        .or_else(|| {
-            plan.steps
-                .iter()
-                .position(|s| s.status != Status::Completed)
-        })
-        .unwrap_or(0);
+        .or_else(|| plan.steps.iter().position(|s| !s.status.resolved()))
+        .unwrap_or(plan.steps.len().saturating_sub(1));
     let top = focus
         .saturating_sub(1)
         .min(plan.steps.len().saturating_sub(rows));
@@ -402,12 +408,23 @@ fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>) 
                 Status::Completed => ("✓", Style::new().fg(Color::Green), dim),
                 Status::InProgress => ("▸", Style::new().fg(Color::Yellow), Style::new().bold()),
                 Status::Pending => ("○", dim, Style::new()),
+                Status::Skipped => ("⊘", dim, dim),
             };
             let head = format!(" {mark} ");
             let room = width.saturating_sub(head.chars().count()).max(1);
             Line::from(vec![
                 Span::styled(head, mark_style),
-                Span::styled(clip(&step.step, room), text_style),
+                Span::styled(
+                    clip(
+                        &if step.reason.is_empty() {
+                            step.step.clone()
+                        } else {
+                            format!("{}: {}", step.step, step.reason)
+                        },
+                        room,
+                    ),
+                    text_style,
+                ),
             ])
         })
         .collect();
@@ -547,7 +564,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
                 format!(
                     "goal {state}{}/{}",
                     compact(goal.spent),
-                    compact(goal.budget)
+                    if goal.budget == 0 {
+                        "∞".to_string()
+                    } else {
+                        compact(goal.budget)
+                    }
                 ),
                 match goal.active() {
                     true => Style::new().fg(Color::Cyan),
@@ -4017,6 +4038,16 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!status(&terminal).contains("goal"), "{}", status(&terminal));
 
+        session.on_agent(crate::agent::AgentEvent::Goal(Some(
+            crate::goal::Goal::new("ship it", crate::goal::DEFAULT_BUDGET, 0),
+        )));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            status(&terminal).contains("goal 0/∞ "),
+            "{}",
+            status(&terminal)
+        );
+
         let mut goal = crate::goal::Goal::new("ship it", 50_000, 0);
         goal.charge(&Usage {
             input: 12_000,
@@ -4151,6 +4182,21 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(
             !screen(&terminal).contains(" plan "),
+            "{}",
+            screen(&terminal)
+        );
+        let mut goal = crate::goal::Goal::new("ship", 0, 0);
+        goal.plan = plan(10, 10);
+        goal.state = crate::goal::State::Complete;
+        session.on_agent(crate::agent::AgentEvent::Goal(Some(goal)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            screen(&terminal).contains(" plan 10/10 "),
+            "{}",
+            screen(&terminal)
+        );
+        assert!(
+            screen(&terminal).contains("✓ step 9"),
             "{}",
             screen(&terminal)
         );

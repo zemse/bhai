@@ -104,6 +104,11 @@ pub const COMMANDS: &[Command] = &[
         args: " <name> [input]",
         help: "hand a workflow to the agent",
     },
+    Command {
+        name: "plan",
+        args: "",
+        help: "show every progress step, including completed and skipped work",
+    },
     // No args hint, though it takes an objective: on its own it shows the goal.
     Command {
         name: "goal",

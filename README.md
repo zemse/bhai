@@ -56,6 +56,18 @@ live cards stay visible while the session works or sits idle. omit `total` for a
 
 optional hooks pair a named condition with a fixed approved prompt. they fire when the condition becomes true, optionally after `sustained_secs`, with `cooldown_secs` (default 60, minimum 30). `repeat` opts into repeated wakes while true; terminal snapshots fire each hook at most once. the session allows one monitor wake per 30 seconds and at most one queued monitor notification. routine samples never enter chat; a bounded snapshot reaches the agent when its next turn starts.
 
+## goals
+
+an explicit implementation task in chat can become a persistent goal without `/goal`. the agent adopts it with the `goal` tool and keeps opening turns until the objective is verified or genuinely blocked. follow-up requests steer the same objective. a reply resolving a blocker lets the agent resume it; unrelated questions do not. questions and analysis alone are not adopted as implementation tasks.
+
+the saved specification holds only an objective, requirements and verification, limited to 1024 characters of text. the objective is at most 240 characters; each list has up to five items of 160 characters each. `goal` status `update` replaces it when follow-ups change the task, preserving unchanged constraints and accounting. a developer context snapshot is appended only when the specification changes, kept verbatim through local and server compaction, and saved before the next model call. continuation turns use a short reminder instead of copying the specification again. completion is still the model's judgment, with instructions to check every requirement and cite verification results.
+
+the plan belongs to the goal but stays outside its small specification. `update_plan` supports up to 500 steps, incremental `changes` by step name and `append` for newly discovered work. existing goal steps stay visible; unnecessary work is marked `skipped` with a reason instead of silently dropped. goal completion is refused while steps are pending or in progress, and resolved checkboxes still do not replace verification. specification updates, pause and resume preserve progress; replacing or clearing a goal resets it. saved sessions and forks carry the goal and its plan together.
+
+the live panel follows the current work and retains finished goal progress. `/plan` shows every step without a model call. the model's plan context is limited to a 12-step window for large plans; `update_plan` without edits reads other steps using zero-based `offset` and `limit` (default 20, maximum 50). standalone analysis lists do not start a goal or modify a finished goal's progress.
+
+goals have no token limit by default. `/goal <objective>` sets an objective explicitly, `/goal pause|resume|clear` controls it, `/goal budget 50k` adds a token limit, and `/goal budget none` removes it. interrupts, failed turns and three autonomous turns without work tool calls pause the goal rather than restarting indefinitely. user pauses and interrupts require `/goal resume`.
+
 ## openai and ollama support
 
 inference runs on the codex cli's chatgpt-subscription credentials (`~/.codex/auth.json`), so log in with codex first, then run `bhai` in the directory you want to work in. or point it at a model on your own machine with `bhai --model ollama:<name>`.

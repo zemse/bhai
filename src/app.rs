@@ -1991,6 +1991,14 @@ impl App {
             self.note(Entry::Info(skills_report(&self.skills)));
             return;
         }
+        if message == "/plan" {
+            self.follow = true;
+            let text = self.plan().map_or("There is no plan.".to_string(), |plan| {
+                format!("{}\n{}", plan.line(), plan.text())
+            });
+            self.note(Entry::Info(text));
+            return;
+        }
         if let Some(rest) = message.strip_prefix("/goal")
             && (rest.is_empty() || rest.starts_with(' '))
         {
@@ -3337,6 +3345,25 @@ mod tests {
         app.input.set("/allow not a rule".to_string());
         app.submit();
         assert!(last(&mut app).contains("expected a tool name"));
+    }
+
+    #[test]
+    fn plan_inspection_shows_all_progress_without_calling_the_model() {
+        let mut app = App::detached();
+        let plan = crate::plan::Plan::parse(&serde_json::json!({"plan": [
+            {"step": "inspect", "status": "completed"},
+            {"step": "old approach", "status": "skipped", "reason": "superseded"},
+            {"step": "verify", "status": "pending"}
+        ]}))
+        .unwrap();
+        app.session.on_agent(crate::agent::AgentEvent::Plan(plan));
+        app.input.set("/plan".to_string());
+        app.submit();
+        let entries = app.entries();
+        assert!(
+            matches!(entries.list.last(), Some(Entry::Info(text)) if text.contains("[x] inspect") && text.contains("[-] old approach: superseded") && text.contains("[ ] verify"))
+        );
+        assert!(!app.working);
     }
 
     #[tokio::test]

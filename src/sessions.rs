@@ -200,6 +200,9 @@ impl Writer {
             return Ok(());
         }
         self.write(json!({ "type": "goal", "goal": goal }))?;
+        if goal.is_some() || self.goal.is_some() {
+            self.plan = goal.as_ref().and_then(|g| g.plan.clone());
+        }
         self.goal = goal.clone();
         Ok(())
     }
@@ -248,7 +251,16 @@ impl Writer {
             }
             fork.write(record)?;
         }
-        if let Some(plan) = plan {
+        if let Some(goal) = &self.goal {
+            let mut goal = goal.clone();
+            if goal.state != crate::goal::State::Complete {
+                goal.plan = plan.cloned();
+            }
+            fork.goal(&Some(goal.clone()))?;
+            if goal.state == crate::goal::State::Complete && plan != goal.plan.as_ref() {
+                fork.plan(&plan.cloned())?;
+            }
+        } else if let Some(plan) = plan {
             fork.plan(&Some(plan.clone()))?;
         }
         fork.sync()?;
@@ -378,8 +390,9 @@ pub fn load(path: &Path) -> Result<Loaded> {
     let mut warnings = Vec::new();
     // The model the session ends on, which a `/model` record later in the file moves.
     let (mut model, mut effort) = (header.model.clone(), header.effort.clone());
-    let mut goal = None;
+    let mut goal: Option<crate::goal::Goal> = None;
     let mut plan = None;
+    let mut legacy_goal = false;
     while let Some(line) = lines.next() {
         let record = serde_json::from_str::<Value>(line)
             .ok()
@@ -425,11 +438,37 @@ pub fn load(path: &Path) -> Result<Loaded> {
             }
             (model, effort) = (switched, to);
         } else if kind == Some("goal") {
-            goal = serde_json::from_value(record.get("goal").cloned().unwrap_or_default())
+            let saved = record.get("goal").cloned().unwrap_or_default();
+            let had_goal = goal.is_some();
+            legacy_goal = saved.is_object() && saved.get("plan").is_none();
+            goal = serde_json::from_value(saved)
                 .with_context(|| format!("{}: goal record {id} is not a goal", path.display()))?;
+            if let Some(goal) = goal.as_mut() {
+                if legacy_goal {
+                    goal.plan = plan.clone();
+                }
+                plan = goal.plan.clone();
+            } else if had_goal {
+                plan = None;
+            }
         } else if kind == Some("plan") {
-            plan = serde_json::from_value(record.get("plan").cloned().unwrap_or_default())
-                .with_context(|| format!("{}: plan record {id} is not a plan", path.display()))?;
+            let saved: Option<crate::plan::Plan> =
+                serde_json::from_value(record.get("plan").cloned().unwrap_or_default())
+                    .with_context(|| {
+                        format!("{}: plan record {id} is not a plan", path.display())
+                    })?;
+            if let Some(goal) = goal.as_mut() {
+                if legacy_goal {
+                    goal.plan = saved.clone();
+                }
+                plan = if goal.state == crate::goal::State::Complete {
+                    saved
+                } else {
+                    goal.plan.clone()
+                };
+            } else {
+                plan = saved;
+            }
         } else {
             let Some(item) = record.get("item") else {
                 bail!("{}: record {id} has no item", path.display());
@@ -934,6 +973,14 @@ mod tests {
         let path = write(&dir, "s1", &items());
         let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
         let mut goal = crate::goal::Goal::new("ship it", 1_000, 0);
+        goal.update(
+            crate::goal::Specification::parse(&json!({
+                "objective": "ship it",
+                "requirements": ["preserve existing behavior"],
+                "verification": ["run offline tests"]
+            }))
+            .unwrap(),
+        );
         writer.goal(&Some(goal.clone())).unwrap();
         // The same goal again writes nothing.
         writer.goal(&Some(goal.clone())).unwrap();
@@ -950,6 +997,80 @@ mod tests {
         let mut writer = Writer::resume(&dir, &loaded).unwrap();
         writer.goal(&None).unwrap();
         assert_eq!(load(&path).unwrap().goal, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn owned_progress_is_atomic_restored_and_forked_with_the_goal() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+        let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
+        let mut goal = crate::goal::Goal::new("ship", 0, 0);
+        goal.plan = crate::plan::Plan::parse(&json!({"plan": [
+            {"step": "inspect", "status": "completed"},
+            {"step": "verify", "status": "skipped", "reason": "superseded by integration checks"}
+        ]}))
+        .unwrap();
+        goal.pause("interrupted");
+        writer.goal(&Some(goal.clone())).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.goal, Some(goal.clone()));
+        assert_eq!(loaded.plan, goal.plan);
+        let records = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !records.contains(r#""type":"plan""#),
+            "one goal record owns the plan"
+        );
+        let fork = writer.fork(&loaded.items, loaded.plan.as_ref()).unwrap();
+        let copied = load(&super::path(&dir, &fork)).unwrap();
+        assert_eq!(copied.goal, Some(goal.clone()));
+        assert_eq!(copied.plan, loaded.plan);
+        goal.state = crate::goal::State::Complete;
+        writer.goal(&Some(goal.clone())).unwrap();
+        let standalone =
+            crate::plan::Plan::parse(&json!({"plan": [{"step": "analysis", "status": "pending"}]}))
+                .unwrap();
+        writer.plan(&standalone).unwrap();
+        let finished = load(&path).unwrap();
+        assert_eq!(finished.goal, Some(goal.clone()));
+        assert_eq!(finished.plan, standalone);
+        let fork = writer
+            .fork(&finished.items, finished.plan.as_ref())
+            .unwrap();
+        let copied = load(&super::path(&dir, &fork)).unwrap();
+        assert_eq!(copied.goal, Some(goal));
+        assert_eq!(copied.plan, standalone);
+        writer.goal(&None).unwrap();
+        let cleared = load(&path).unwrap();
+        assert!(cleared.goal.is_none() && cleared.plan.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_plans_migrate_but_do_not_attach_to_replacement_goals() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+        let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
+        let mut legacy = json!(crate::goal::Goal::new("old", 0, 0));
+        legacy.as_object_mut().unwrap().remove("plan");
+        writer
+            .write(json!({"type": "goal", "goal": legacy}))
+            .unwrap();
+        let plan =
+            crate::plan::Plan::parse(&json!({"plan": [{"step": "old work", "status": "pending"}]}))
+                .unwrap();
+        writer.plan(&plan).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.goal.as_ref().unwrap().plan, plan);
+        assert_eq!(loaded.plan, plan);
+        drop(writer);
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        writer
+            .goal(&Some(crate::goal::Goal::new("new", 0, 0)))
+            .unwrap();
+        let replaced = load(&path).unwrap();
+        assert!(replaced.goal.unwrap().plan.is_none());
+        assert!(replaced.plan.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

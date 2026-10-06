@@ -772,9 +772,10 @@ pub(crate) async fn run_configured(
     // hand the session a second set of slots while the first set is still running.
     let slots = Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING));
     let goal: goal::Shared = Arc::default();
-    let plan: crate::plan::Shared = Arc::default();
-    // The file this session is saved as, which a resume names after the session it continues.
+    let goal_requested = Arc::new(AtomicBool::new(false));
+    let plan = crate::plan::Shared::new(Arc::clone(&goal));
     let title_updated = Arc::new(std::sync::Mutex::new(false));
+    // The file this session is saved as, which a resume names after the session it continues.
     let own = saved
         .as_ref()
         .map_or_else(|| session_id.clone(), |s| s.writer.header.session.clone());
@@ -828,9 +829,12 @@ pub(crate) async fn run_configured(
         registry
             .with_goal(tools::goal::Goal {
                 goal: Arc::clone(&goal),
+                plan: plan.clone(),
+                children: Arc::clone(&children),
+                requested: Arc::clone(&goal_requested),
             })
             .with_plan(tools::plan::UpdatePlan {
-                plan: Arc::clone(&plan),
+                plan: plan.clone(),
                 tx: tx.clone(),
             })
             .with_tool(Box::new(tools::title::UpdateTitle {
@@ -875,8 +879,12 @@ pub(crate) async fn run_configured(
     });
     let mut shown: Option<Goal> = None;
     // The checklist carries on as it was: unlike a goal, it never starts anything.
-    *lock_plan(&plan) = writer.as_ref().and_then(|w| w.plan.clone());
-    if let Some(was) = lock_plan(&plan).clone() {
+    plan.restore_standalone(writer.as_ref().and_then(|w| match &w.goal {
+        None => w.plan.clone(),
+        Some(g) if g.state == goal::State::Complete && w.plan != g.plan => w.plan.clone(),
+        _ => None,
+    }));
+    if let Some(was) = plan.get() {
         let _ = tx.send(AgentEvent::Plan(Some(was)));
     }
     let mut calls: Vec<Call> = Vec::new();
@@ -939,9 +947,8 @@ pub(crate) async fn run_configured(
                         history.clear();
                         drop_fork(&mut fork, &tx);
                         // The plan was for the conversation that is gone.
-                        if lock_plan(&plan).take().is_some() {
-                            let _ = tx.send(AgentEvent::Plan(None));
-                        }
+                        steer_goal(&goal, &plan, goal::Command::Clear, &children, &tx);
+                        persist(&goal, writer.as_mut(), &tx);
                         persist_plan(&plan, writer.as_mut(), &tx);
                         (calls, monitor) = (Vec::new(), CacheMonitor::default());
                         model.reset("cleared");
@@ -1035,7 +1042,7 @@ pub(crate) async fn run_configured(
                         continue;
                     }
                     Control::Goal(command) => {
-                        steer_goal(&goal, command, &children, &tx);
+                        steer_goal(&goal, &plan, command, &children, &tx);
                         continue;
                     }
                     Control::Compact(prompt) => {
@@ -1084,7 +1091,7 @@ pub(crate) async fn run_configured(
                 tx: &tx,
                 cancel: &cancel,
                 asked: None,
-                plan: lock_plan(&plan).clone(),
+                plan: plan.get(),
             };
             match pass.fork(&history).await {
                 Ok(Some(made)) => {
@@ -1151,7 +1158,7 @@ pub(crate) async fn run_configured(
                 tx: &tx,
                 cancel: &cancel,
                 asked: asked.take(),
-                plan: lock_plan(&plan).clone(),
+                plan: plan.get(),
             };
             if let Err(e) = pass.run(&mut history, Trigger::Asked, &mut sink).await {
                 let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
@@ -1250,8 +1257,8 @@ pub(crate) async fn run_configured(
             }
             // The initial name runs beside the turn; a tool update takes precedence.
             if let Some(namer) = namer.take() {
-                let updated = Arc::clone(&title_updated);
                 let (tx, message) = (tx.clone(), message.text.clone());
+                let updated = Arc::clone(&title_updated);
                 tokio::spawn(async move {
                     if let Some(name) = namer.name(&message).await {
                         let updated = updated.lock().unwrap_or_else(|e| e.into_inner());
@@ -1271,16 +1278,17 @@ pub(crate) async fn run_configured(
             record(&mut sink, &history[from..], &tx);
         }
 
+        goal_requested.store(message.is_some(), Ordering::Relaxed);
         // The turn holds the history, so mid-turn requests see it as the turn started.
         let (before, calls_before) = (history.clone(), calls.clone());
         // Every call while the goal is active is charged to it, but only a turn nobody
         // typed is stopped by its budget: the user's own question is answered.
         let budget = Budget {
             goal: &goal,
+            plan: &plan,
             children: &children,
             hard: message.is_none(),
         };
-        let charged = lock_goal(&goal).as_ref().is_some_and(Goal::active);
         // A root per turn; `session.id` is what ties a session's turns together.
         let span = info_span!(
             parent: None,
@@ -1308,7 +1316,7 @@ pub(crate) async fn run_configured(
                 Some(&mut rx_results),
                 // The user is watching this one and can interrupt it.
                 None,
-                charged.then_some(&budget),
+                Some(&budget),
                 Some(limits),
             )
             .instrument(span);
@@ -1328,7 +1336,7 @@ pub(crate) async fn run_configured(
                         }
                         // The goal is shared with the turn, which reads it between steps.
                         Control::Goal(command) => {
-                            steer_goal(&goal, command, &children, &tx);
+                            steer_goal(&goal, &plan, command, &children, &tx);
                             announce(&goal, &mut shown, &tx);
                         }
                         // The session refuses either while a turn runs, so neither can
@@ -1381,6 +1389,17 @@ pub(crate) async fn run_configured(
                     g.pause("interrupted");
                 } else if !overflowed && on_goal.as_ref().is_some_and(|on| on.spent == g.spent) {
                     g.pause("its last turn spent no tokens");
+                } else if on_goal.is_some() {
+                    let acted = history[before.len()..].iter().any(|item| {
+                        matches!(
+                            item["type"].as_str(),
+                            Some("function_call" | "custom_tool_call" | "tool_search_call")
+                        ) && !matches!(
+                            item["name"].as_str(),
+                            Some("goal" | "update_plan" | "update_title")
+                        )
+                    });
+                    g.progress(acted);
                 }
             }
         }
@@ -1450,7 +1469,7 @@ pub(crate) async fn run_configured(
                 tx: &tx,
                 cancel: &cancel,
                 asked: asked.take(),
-                plan: lock_plan(&plan).clone(),
+                plan: plan.get(),
             };
             let trigger = match size {
                 _ if overflowed => Trigger::Overflow,
@@ -1492,17 +1511,13 @@ fn lock_goal(goal: &goal::Shared) -> std::sync::MutexGuard<'_, Option<Goal>> {
     goal.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn lock_plan(plan: &crate::plan::Shared) -> std::sync::MutexGuard<'_, Option<crate::plan::Plan>> {
-    plan.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Record the plan in the session file, so a resume shows it again.
 fn persist_plan(
     plan: &crate::plan::Shared,
     writer: Option<&mut Writer>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
 ) {
-    let now = lock_plan(plan).clone();
+    let now = plan.get();
     if let Some(writer) = writer
         && let Err(e) = writer.plan(&now)
     {
@@ -1511,7 +1526,7 @@ fn persist_plan(
 }
 
 /// What every child of the session has cost so far, as a goal counts it.
-fn children_spent(children: &Children) -> u64 {
+pub(crate) fn children_spent(children: &Children) -> u64 {
     children
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1523,6 +1538,7 @@ fn children_spent(children: &Children) -> u64 {
 /// Apply `/goal`; a plain `/goal` says where the goal stands.
 fn steer_goal(
     goal: &goal::Shared,
+    plan: &crate::plan::Shared,
     command: goal::Command,
     children: &Children,
     tx: &mpsc::UnboundedSender<AgentEvent>,
@@ -1538,8 +1554,17 @@ fn steer_goal(
             None => format!("no goal. {}", goal::USAGE),
         }));
     }
-    if let Err(e) = goal::apply(&mut goal, command, total) {
-        let _ = tx.send(AgentEvent::Error(e));
+    let resets = matches!(command, goal::Command::Set(_) | goal::Command::Clear);
+    match goal::apply(&mut goal, command, total) {
+        Err(e) => {
+            let _ = tx.send(AgentEvent::Error(e));
+        }
+        Ok(()) if resets => {
+            plan.clear_standalone();
+            let _ = tx.send(AgentEvent::Goal(goal.clone()));
+            let _ = tx.send(AgentEvent::Plan(None));
+        }
+        Ok(()) => {}
     }
 }
 
@@ -1584,6 +1609,7 @@ fn persist(
 /// The goal a turn charges its calls to, and whether running it out stops the turn.
 struct Budget<'a> {
     goal: &'a goal::Shared,
+    plan: &'a crate::plan::Shared,
     children: &'a Children,
     hard: bool,
 }
@@ -1593,6 +1619,9 @@ impl Budget<'_> {
     fn charge(&self, usage: &Usage) -> Option<Goal> {
         let mut goal = lock_goal(self.goal);
         let goal = goal.as_mut()?;
+        if !goal.active() {
+            return None;
+        }
         goal.charge(usage);
         Some(goal.clone())
     }
@@ -1769,6 +1798,26 @@ async fn turn(
                 let _ = tx.send(AgentEvent::CacheStalled(cache::MAX_MISSES));
             }
             monitor.resume();
+        }
+        if let Some(budget) = budget {
+            let now = lock_goal(budget.goal).clone();
+            if let Some(context) = goal::context(history, now.as_ref()) {
+                let from = history.len();
+                history.push(context);
+                record(sink, &history[from..], tx);
+                let _ = tx.send(AgentEvent::Goal(now.clone()));
+            }
+            if let Sink::Session(writer) = sink
+                && let Err(e) = writer.goal(&now)
+            {
+                let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+            }
+            let plan = budget.plan.get();
+            if let Some(context) = crate::plan::context(history, plan.as_ref()) {
+                let from = history.len();
+                history.push(context);
+                record(sink, &history[from..], tx);
+            }
         }
         if let Some(limits) = limits {
             evict_between_steps(model, limits, history, ledger, monitor, sink, tx);
@@ -2020,6 +2069,11 @@ async fn turn(
 
         error_rounds = if all_failed { error_rounds + 1 } else { 0 };
         if error_rounds >= MAX_ERROR_ROUNDS {
+            if let Some(budget) = budget
+                && let Some(goal) = lock_goal(budget.goal).as_mut()
+            {
+                goal.pause("the last few tool calls all failed");
+            }
             let _ = tx.send(AgentEvent::Error(
                 "stopped: the last few tool calls all failed".to_string(),
             ));
@@ -2589,7 +2643,7 @@ fn fork_session(
         Some(_) if history.is_empty() => {
             AgentEvent::Error("nothing to fork: the conversation has not started".to_string())
         }
-        Some(writer) => match writer.fork(history, lock_plan(plan).as_ref()) {
+        Some(writer) => match writer.fork(history, plan.get().as_ref()) {
             Ok(id) => AgentEvent::Info(format!(
                 "forked into session {id} ({} items), which carries on from here: bhai --resume {id}",
                 history.len()
@@ -5285,9 +5339,9 @@ mod tests {
         );
         let second = settle(&mut rx).await;
         assert!(
-            info(&second)
-                .iter()
-                .any(|i| i.starts_with("goal complete: read the hosts file (24 of")),
+            info(&second).iter().any(|i| i.starts_with(
+                "goal complete: read the hosts file (24 tokens spent, no token limit)"
+            )),
             "{second:?}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -5295,8 +5349,239 @@ mod tests {
         assert_eq!(calls.len(), 4, "an ended goal opens no more turns");
         assert!(calls[0].contains(goal::CONTINUE), "{}", calls[0]);
         // Each turn on it says what it has spent so far: two calls of 8.
-        assert!(calls[2].contains("Spent 16 of"), "{}", calls[2]);
+        assert!(
+            calls[2].contains("16 tokens spent, no token limit"),
+            "{}",
+            calls[2]
+        );
         assert!(fake.offered.lock().unwrap()[0].contains(&"goal".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_chat_task_continues_without_another_do_it_and_resumes_on_a_reply() {
+        use fake::{Fake, call, say};
+
+        let fake = Fake::new(vec![
+            vec![call(
+                "goal",
+                json!({"status": "adopt", "reason": "user requested a generator", "spec": {
+                    "objective": "build a generator",
+                    "requirements": ["support state_4"],
+                    "verification": ["compare state_4 outputs"]
+                }}),
+            )],
+            vec![say("still working")],
+            vec![call(
+                "goal",
+                json!({"status": "blocked", "reason": "needs a key"}),
+            )],
+            vec![say("please supply the key")],
+            vec![call(
+                "goal",
+                json!({"status": "resume", "reason": "key supplied"}),
+            )],
+            vec![say("checking")],
+            vec![call(
+                "goal",
+                json!({"status": "complete", "reason": "verified"}),
+            )],
+            vec![say("done")],
+        ]);
+        let (mut rx, user, _control, _cancel) = goal_session(&fake, Vec::new());
+        user.send("build a generator".into()).await.unwrap();
+        settle(&mut rx).await;
+        let blocked = settle(&mut rx).await;
+        assert!(
+            info(&blocked)
+                .iter()
+                .any(|s| s.starts_with("goal blocked: build a generator")),
+            "{blocked:?}"
+        );
+        assert_eq!(parent_calls(&fake).len(), 4);
+        user.send("the key is now available".into()).await.unwrap();
+        settle(&mut rx).await;
+        let complete = settle(&mut rx).await;
+        assert!(
+            info(&complete)
+                .iter()
+                .any(|s| s.starts_with("goal complete: build a generator")),
+            "{complete:?}"
+        );
+        assert_eq!(parent_calls(&fake).len(), 8);
+    }
+
+    #[tokio::test]
+    async fn goal_specification_updates_reach_the_next_call_without_repeated_snapshots() {
+        use fake::{Fake, call, say};
+
+        let spec = json!({
+            "objective": "build a generator",
+            "requirements": ["Yul and Huff"],
+            "verification": ["run tests"]
+        });
+        let mut updated = spec.clone();
+        updated["requirements"] = json!(["Yul and Huff", "use state_4 directories"]);
+        updated["verification"] = json!(["run tests", "compare state_4 outputs"]);
+        let fake = Fake::new(vec![
+            vec![call(
+                "goal",
+                json!({"status": "adopt", "reason": "user requested it", "spec": spec}),
+            )],
+            vec![call("read", json!({"path": "/etc/hosts"}))],
+            vec![call(
+                "goal",
+                json!({"status": "update", "reason": "capture output comparison", "spec": updated}),
+            )],
+            vec![call("read", json!({"path": "/etc/hosts"}))],
+            vec![call(
+                "goal",
+                json!({"status": "complete", "reason": "verified"}),
+            )],
+            vec![say("done")],
+        ]);
+        let (mut rx, user, _control, _cancel) = goal_session(&fake, Vec::new());
+        user.send(
+            "build Yul and Huff generators in state_4 directories and compare outputs".into(),
+        )
+        .await
+        .unwrap();
+        settle(&mut rx).await;
+        let inputs: Vec<Value> = parent_calls(&fake)
+            .iter()
+            .map(|call| serde_json::from_str(call).unwrap())
+            .collect();
+        let counts: Vec<_> = inputs
+            .iter()
+            .map(|items| {
+                items
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| goal::is_context(item))
+                    .count()
+            })
+            .collect();
+        assert_eq!(counts, [0, 1, 1, 2, 2, 2]);
+        let latest = goal::restated(inputs[3].as_array().unwrap()).unwrap();
+        let text = latest["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("use state_4 directories"));
+        assert!(text.contains("compare state_4 outputs"));
+    }
+
+    #[tokio::test]
+    async fn a_goal_pauses_after_three_narration_only_turns() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![vec![say("still thinking")]; 5]);
+        let (mut rx, _user, _control, _cancel) = goal_session(&fake, vec![set_goal("work")]);
+        settle(&mut rx).await;
+        settle(&mut rx).await;
+        let events = settle(&mut rx).await;
+        assert!(
+            info(&events)
+                .iter()
+                .any(|s| s.contains("three consecutive turns without work tool calls")),
+            "{events:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(parent_calls(&fake).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn repeated_tool_failures_pause_an_unlimited_goal() {
+        use fake::{Fake, call};
+
+        let fake = Fake::new(vec![
+            vec![call("missing_tool", json!({}))];
+            MAX_ERROR_ROUNDS + 2
+        ]);
+        let (mut rx, _user, _control, _cancel) = goal_session(&fake, vec![set_goal("work")]);
+        let events = settle(&mut rx).await;
+        assert!(
+            info(&events)
+                .iter()
+                .any(|s| s.starts_with("goal paused: work")
+                    && s.contains("the last few tool calls all failed")),
+            "{events:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(parent_calls(&fake).len(), MAX_ERROR_ROUNDS);
+    }
+
+    #[test]
+    fn goal_controls_preserve_progress_on_pause_and_clear_it_on_replacement() {
+        let goal: goal::Shared = Arc::default();
+        let plan = crate::plan::Shared::new(Arc::clone(&goal));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let children = Children::default();
+        steer_goal(
+            &goal,
+            &plan,
+            goal::Command::Set("ship".to_string()),
+            &children,
+            &tx,
+        );
+        plan.update(&json!({"append": [{"step": "inspect", "status": "completed"}]}))
+            .unwrap();
+        let progress = plan.get();
+        steer_goal(&goal, &plan, goal::Command::Pause, &children, &tx);
+        assert_eq!(plan.get(), progress);
+        steer_goal(&goal, &plan, goal::Command::Resume, &children, &tx);
+        assert_eq!(plan.get(), progress);
+        steer_goal(
+            &goal,
+            &plan,
+            goal::Command::Set("new".to_string()),
+            &children,
+            &tx,
+        );
+        assert!(plan.get().is_none());
+        plan.update(&json!({"append": [{"step": "new work", "status": "pending"}]}))
+            .unwrap();
+        steer_goal(&goal, &plan, goal::Command::Clear, &children, &tx);
+        assert!(plan.get().is_none());
+        assert!(lock_goal(&goal).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_owned_plan_prevents_premature_goal_completion() {
+        use fake::{Fake, call, say};
+        let fake = Fake::new(vec![
+            vec![call(
+                "update_plan",
+                json!({"append": [{"step": "verify", "status": "in_progress"}]}),
+            )],
+            vec![call(
+                "goal",
+                json!({"status": "complete", "reason": "done"}),
+            )],
+            vec![call(
+                "update_plan",
+                json!({"changes": [{"step": "verify", "status": "completed"}]}),
+            )],
+            vec![call(
+                "goal",
+                json!({"status": "complete", "reason": "checks passed"}),
+            )],
+            vec![say("done")],
+        ]);
+        let (mut rx, _user, _control, _cancel) = goal_session(&fake, vec![set_goal("verify work")]);
+        let events = settle(&mut rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolOutput(s) if s.contains("unfinished steps"))),
+            "{events:?}"
+        );
+        let done = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Goal(Some(g)) if g.state == goal::State::Complete => Some(g),
+                _ => None,
+            })
+            .unwrap();
+        assert!(done.plan.as_ref().unwrap().done());
+        assert_eq!(parent_calls(&fake).len(), 5);
     }
 
     #[tokio::test]

@@ -1,6 +1,5 @@
-//! `update_plan`, for the main agent: replace the checklist the user sees above the
-//! prompt. Codex-trained models call it by habit. It touches nothing outside the
-//! session, so it needs no approval.
+//! `update_plan`, for the main agent: progress on the goal, or a standalone checklist
+//! for analysis. It touches nothing outside the session, so it needs no approval.
 
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -23,36 +22,38 @@ impl Tool for UpdatePlan {
     }
 
     fn schema(&self) -> Value {
+        let step = json!({
+            "type": "object",
+            "properties": {
+                "step": { "type": "string", "description": "Unique step name; use its exact existing name for changes." },
+                "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "skipped"] },
+                "reason": { "type": "string", "description": "Required when skipped: why the work is no longer necessary." }
+            },
+            "required": ["step", "status"],
+            "additionalProperties": false
+        });
         json!({
             "type": "function",
             "name": NAME,
-            "description": "Updates the task plan the user sees.\nProvide an optional explanation \
-        and the whole list of plan items, each with a step and status; it replaces the last one, \
-        and an empty list clears it.\nAt most one step can be in_progress at a time. Skip it for \
-        work of a step or two.",
+            "description": "Update live progress on the current goal, or a standalone plan for \
+        analysis (never creates a goal). Use `changes` to update existing steps by name and \
+        `append` to add discovered work; neither resends the whole list. Alternatively `plan` \
+        replaces the list. Keep completed work and existing steps on a goal; mark unnecessary \
+        steps `skipped` with a reason instead of dropping them. Up to 500 steps, one in_progress. \
+        Adapt affected steps when goal requirements change. Completing the plan does not \
+        complete the goal or replace verification. With no edits, read steps using offset \
+        (zero-based) and limit (default 20, maximum 50). Empty plan clears standalone lists only.",
             "strict": false,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "explanation": { "type": "string" },
-                    "plan": {
-                        "type": "array",
-                        "description": "The list of steps",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "step": { "type": "string" },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"]
-                                }
-                            },
-                            "required": ["step", "status"],
-                            "additionalProperties": false
-                        }
-                    }
+                    "plan": { "type": "array", "items": step },
+                    "changes": { "type": "array", "items": step },
+                    "append": { "type": "array", "items": step },
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
                 },
-                "required": ["plan"],
                 "additionalProperties": false
             }
         })
@@ -63,64 +64,126 @@ impl Tool for UpdatePlan {
     }
 
     fn describe(&self, args: &Value) -> Result<String, String> {
-        Ok(match Plan::parse(args)? {
-            Some(plan) => plan.line(),
-            None => "plan cleared".to_string(),
-        })
+        if args.get("plan").is_some() {
+            return Ok(Plan::parse(args)?.map_or("plan cleared".to_string(), |p| p.line()));
+        }
+        Ok(if editing(args) {
+            "plan updated"
+        } else {
+            "read plan"
+        }
+        .to_string())
     }
 
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
         Box::pin(async move {
-            let plan = match Plan::parse(args) {
+            if !editing(args) {
+                let Some(plan) = self.plan.get() else {
+                    return ("There is no plan.".to_string(), true);
+                };
+                let offset = match args.get("offset") {
+                    None => 0,
+                    Some(value) => match value.as_u64().and_then(|n| usize::try_from(n).ok()) {
+                        Some(n) => n,
+                        None => {
+                            return ("offset must be a nonnegative integer.".to_string(), false);
+                        }
+                    },
+                };
+                let limit = match args.get("limit") {
+                    None => 20,
+                    Some(value) => match value.as_u64() {
+                        Some(n @ 1..=50) => n as usize,
+                        _ => return ("limit must be 1..50.".to_string(), false),
+                    },
+                };
+                let text = plan
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|(i, s)| format!("{}: {}", i + 1, s.text()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return (format!("{}\n{text}", plan.line()), true);
+            }
+            let plan = match self.plan.update(args) {
                 Ok(plan) => plan,
                 Err(e) => return (e, false),
             };
-            *self.plan.lock().unwrap_or_else(|e| e.into_inner()) = plan.clone();
             let _ = self.tx.send(AgentEvent::Plan(plan));
             ("Plan updated".to_string(), true)
         })
     }
 }
 
+fn editing(args: &Value) -> bool {
+    ["plan", "changes", "append"]
+        .iter()
+        .any(|key| args.get(key).is_some())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
 
     #[tokio::test]
+    async fn incremental_updates_and_paged_reads_keep_the_full_list() {
+        let shared = Shared::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let tool = UpdatePlan {
+            plan: shared.clone(),
+            tx,
+        };
+        assert!(tool.execute(&json!({"append": [
+            {"step": "inspect", "status": "in_progress"}, {"step": "verify", "status": "pending"}
+        ]})).await.1);
+        assert!(tool.execute(&json!({"changes": [
+            {"step": "inspect", "status": "completed"}, {"step": "verify", "status": "in_progress"}
+        ]})).await.1);
+        let before = shared.get();
+        let (out, ok) = tool.execute(&json!({"offset": 1, "limit": 1})).await;
+        assert!(
+            ok && out.contains("2: [>] verify") && !out.contains("[x] inspect"),
+            "{out}"
+        );
+        assert_eq!(shared.get(), before);
+        assert!(!tool.execute(&json!({"limit": 51})).await.1);
+        assert!(!tool.execute(&json!({"offset": -1})).await.1);
+    }
+
+    #[tokio::test]
     async fn a_call_replaces_the_plan_and_says_so_and_a_bad_one_changes_nothing() {
-        let shared: Shared = Arc::default();
+        let shared = Shared::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let tool = UpdatePlan {
-            plan: Arc::clone(&shared),
+            plan: shared.clone(),
             tx,
         };
         assert!(!tool.needs_approval());
         let args = json!({"plan": [
             {"step": "a", "status": "completed"},
-            {"step": "b", "status": "in_progress"},
+            {"step": "b", "status": "in_progress"}
         ]});
         assert_eq!(tool.describe(&args).unwrap(), "plan 1/2 done: b");
-        let (out, ok) = tool.execute(&args).await;
-        assert!(ok, "{out}");
-        let set = shared.lock().unwrap().clone().unwrap();
+        assert!(tool.execute(&args).await.1);
+        let set = shared.get().unwrap();
         assert_eq!(set.steps.len(), 2);
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::Plan(Some(p))) if p == set));
-
-        let (out, ok) = tool
-            .execute(&json!({"plan": [
-                {"step": "a", "status": "in_progress"},
-                {"step": "b", "status": "in_progress"},
-            ]}))
-            .await;
-        assert!(!ok, "{out}");
-        assert_eq!(shared.lock().unwrap().as_ref(), Some(&set));
+        assert!(
+            !tool
+                .execute(&json!({"plan": [
+                    {"step": "a", "status": "in_progress"},
+                    {"step": "b", "status": "in_progress"}
+                ]}))
+                .await
+                .1
+        );
+        assert_eq!(shared.get(), Some(set));
         assert!(rx.try_recv().is_err());
-
-        let (_, ok) = tool.execute(&json!({"plan": []})).await;
-        assert!(ok);
-        assert!(shared.lock().unwrap().is_none());
+        assert!(tool.execute(&json!({"plan": []})).await.1);
+        assert!(shared.get().is_none());
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::Plan(None))));
     }
 }
