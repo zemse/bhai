@@ -505,7 +505,7 @@ mod tests {
     fn both_compaction_paths_keep_only_the_latest_goal_specification() {
         use crate::goal::{Goal, Specification, context, is_context};
 
-        let mut goal = Goal::new("build a generator", 0, 0);
+        let mut goal = Goal::new("build a generator");
         goal.update(
             Specification::parse(&json!({
                 "objective": "build a generator",

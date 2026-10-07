@@ -972,7 +972,7 @@ mod tests {
         let dir = temp_dir();
         let path = write(&dir, "s1", &items());
         let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
-        let mut goal = crate::goal::Goal::new("ship it", 1_000, 0);
+        let mut goal = crate::goal::Goal::new("ship it");
         goal.update(
             crate::goal::Specification::parse(&json!({
                 "objective": "ship it",
@@ -1001,11 +1001,42 @@ mod tests {
     }
 
     #[test]
+    fn legacy_exhausted_goals_load_and_resume_without_accounting() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+        let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
+        writer
+            .write(json!({"type": "goal", "goal": {
+                "objective": "finish stages", "state": "spent", "budget": 200000, "spent": 242276,
+                "plan": {"steps": [{"step": "Stage 4", "status": "in_progress"}]}
+            }}))
+            .unwrap();
+        drop(writer);
+        let mut loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.goal.as_ref().unwrap().state,
+            crate::goal::State::Paused
+        );
+        let progress = loaded.plan.clone();
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        crate::goal::apply(&mut loaded.goal, crate::goal::Command::Resume).unwrap();
+        writer.goal(&loaded.goal).unwrap();
+        drop(writer);
+        let resumed = load(&path).unwrap();
+        assert!(resumed.goal.as_ref().unwrap().active());
+        assert_eq!(resumed.plan, progress);
+        let saved = serde_json::to_value(resumed.goal.unwrap()).unwrap();
+        assert!(saved.get("budget").is_none());
+        assert!(saved.get("spent").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn owned_progress_is_atomic_restored_and_forked_with_the_goal() {
         let dir = temp_dir();
         let path = write(&dir, "s1", &items());
         let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
-        let mut goal = crate::goal::Goal::new("ship", 0, 0);
+        let mut goal = crate::goal::Goal::new("ship");
         goal.plan = crate::plan::Plan::parse(&json!({"plan": [
             {"step": "inspect", "status": "completed"},
             {"step": "verify", "status": "skipped", "reason": "superseded by integration checks"}
@@ -1051,7 +1082,7 @@ mod tests {
         let dir = temp_dir();
         let path = write(&dir, "s1", &items());
         let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
-        let mut legacy = json!(crate::goal::Goal::new("old", 0, 0));
+        let mut legacy = json!(crate::goal::Goal::new("old"));
         legacy.as_object_mut().unwrap().remove("plan");
         writer
             .write(json!({"type": "goal", "goal": legacy}))
@@ -1065,9 +1096,7 @@ mod tests {
         assert_eq!(loaded.plan, plan);
         drop(writer);
         let mut writer = Writer::resume(&dir, &loaded).unwrap();
-        writer
-            .goal(&Some(crate::goal::Goal::new("new", 0, 0)))
-            .unwrap();
+        writer.goal(&Some(crate::goal::Goal::new("new"))).unwrap();
         let replaced = load(&path).unwrap();
         assert!(replaced.goal.unwrap().plan.is_none());
         assert!(replaced.plan.is_none());

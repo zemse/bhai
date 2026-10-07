@@ -552,24 +552,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
             Span::styled(format!("{label}:{percent:.0}%"), headroom(percent)),
         );
     }
-    // What the goal has spent of its budget; only an active one is still spending.
     if let Some(goal) = app.goal() {
-        let state = match goal.active() {
-            true => String::new(),
-            false => format!("{} ", goal.state.label()),
-        };
         segment(
             &mut bar,
             Span::styled(
-                format!(
-                    "goal {state}{}/{}",
-                    compact(goal.spent),
-                    if goal.budget == 0 {
-                        "∞".to_string()
-                    } else {
-                        compact(goal.budget)
-                    }
-                ),
+                format!("goal {}", goal.state.label()),
                 match goal.active() {
                     true => Style::new().fg(Color::Cyan),
                     false => dim,
@@ -4038,7 +4025,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_shows_what_the_goal_has_spent() {
+    fn status_bar_shows_the_goal_state_without_accounting() {
         let (tx_user, _) = tokio::sync::mpsc::channel(1);
         let (tx_control, _) = tokio::sync::mpsc::channel(1);
         let session = crate::session::Session::new(
@@ -4057,36 +4044,22 @@ mod tests {
         assert!(!status(&terminal).contains("goal"), "{}", status(&terminal));
 
         session.on_agent(crate::agent::AgentEvent::Goal(Some(
-            crate::goal::Goal::new("ship it", crate::goal::DEFAULT_BUDGET, 0),
+            crate::goal::Goal::new("ship it"),
         )));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(
-            status(&terminal).contains("goal 0/∞ "),
+            status(&terminal).contains("goal active "),
             "{}",
             status(&terminal)
         );
 
-        let mut goal = crate::goal::Goal::new("ship it", 50_000, 0);
-        goal.charge(&Usage {
-            input: 12_000,
-            cached: 2_000,
-            cache_write: 0,
-            output: 500,
-            reasoning: 0,
-        });
-        session.on_agent(crate::agent::AgentEvent::Goal(Some(goal.clone())));
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert!(
-            status(&terminal).contains("goal 10.5k/50.0k "),
-            "{}",
-            status(&terminal)
-        );
-
+        assert!(!status(&terminal).contains('∞'), "{}", status(&terminal));
+        let mut goal = crate::goal::Goal::new("ship it");
         goal.pause("interrupted");
         session.on_agent(crate::agent::AgentEvent::Goal(Some(goal)));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(
-            status(&terminal).contains("goal paused 10.5k/50.0k "),
+            status(&terminal).contains("goal paused "),
             "{}",
             status(&terminal)
         );
@@ -4203,7 +4176,7 @@ mod tests {
             "{}",
             screen(&terminal)
         );
-        let mut goal = crate::goal::Goal::new("ship", 0, 0);
+        let mut goal = crate::goal::Goal::new("ship");
         goal.plan = plan(10, 10);
         goal.state = crate::goal::State::Complete;
         session.on_agent(crate::agent::AgentEvent::Goal(Some(goal)));

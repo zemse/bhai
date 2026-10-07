@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-07
 
+- Goals no longer have token budgets, spend accounting or budget commands. The status bar shows lifecycle state only; saved exhausted goals load as paused and resume with their specification and progress intact.
 - Subagent rows show the actual model alongside the identity and task, including in the open pane and debug state.
 
 ## 2026-10-06

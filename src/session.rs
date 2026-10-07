@@ -178,7 +178,7 @@ pub enum Event {
     /// A compacted copy of the history is ready for `/compact-then`, and a call on it
     /// would read this many tokens; `None` once it no longer stands for the history.
     Fork(Option<u64>),
-    /// The goal as it now stands, credits included; `None` once there is none.
+    /// The goal as it now stands; `None` once there is none.
     Goal(Option<crate::goal::Goal>),
     /// The plan `update_plan` set, as it now stands; `None` once there is none.
     Plan(Option<crate::plan::Plan>),
@@ -304,7 +304,7 @@ pub struct State {
     pub last_cache_break: Option<CacheBreak>,
     /// The latest rate-limit headroom, once the backend has reported it.
     pub rate_limits: Option<RateLimits>,
-    /// What `/goal` set, and what it has spent.
+    /// The goal's specification, progress and lifecycle state.
     pub goal: Option<crate::goal::Goal>,
     /// The checklist the model keeps with `update_plan`.
     pub plan: Option<crate::plan::Plan>,
@@ -1834,7 +1834,7 @@ mod tests {
     #[test]
     fn goal_and_plan_projections_stay_consistent_without_mutating_finished_goals() {
         let (session, _rx) = session();
-        session.on_agent(AgentEvent::Goal(Some(crate::goal::Goal::new("ship", 0, 0))));
+        session.on_agent(AgentEvent::Goal(Some(crate::goal::Goal::new("ship"))));
         let plan = crate::plan::Plan::parse(
             &serde_json::json!({"plan": [{"step": "verify", "status": "completed"}]}),
         )
@@ -1851,9 +1851,7 @@ mod tests {
         session.on_agent(AgentEvent::Plan(standalone.clone()));
         assert_eq!(session.state().goal, Some(goal));
         assert_eq!(session.state().plan, standalone);
-        session.on_agent(AgentEvent::Goal(Some(crate::goal::Goal::new(
-            "new task", 0, 0,
-        ))));
+        session.on_agent(AgentEvent::Goal(Some(crate::goal::Goal::new("new task"))));
         assert!(session.state().plan.is_none());
         assert!(session.state().goal.unwrap().plan.is_none());
         session.on_agent(AgentEvent::Goal(None));

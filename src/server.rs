@@ -149,7 +149,7 @@ struct FastBody {
 
 #[derive(Deserialize)]
 struct GoalBody {
-    /// What follows `/goal`: an objective, `pause`, `resume`, `budget <n>`, `clear`, or
+    /// What follows `/goal`: an objective, `pause`, `resume`, `clear`, or
     /// nothing to have it shown.
     #[serde(default)]
     text: String,
@@ -1278,18 +1278,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_goal_is_set_over_http_and_a_bad_budget_refused() {
+    async fn a_goal_is_set_over_http() {
         let (base, _) = start().await;
         let http = reqwest::Client::new();
-        assert_eq!(
-            post(
-                &http,
-                format!("{base}/goal"),
-                json!({"text": "budget lots"})
-            )
-            .await,
-            StatusCode::BAD_REQUEST
-        );
         assert_eq!(
             post(
                 &http,

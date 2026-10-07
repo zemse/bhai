@@ -157,7 +157,7 @@ pub enum AgentEvent {
     /// A turn started on its own, on the reports of children that finished while the
     /// session was idle or on the goal; the string says on what.
     Resumed(String),
-    /// The goal as it now stands, credits included; `None` once there is none.
+    /// The goal as it now stands; `None` once there is none.
     Goal(Option<Goal>),
     /// The plan `update_plan` set, as it now stands; `None` once there is none.
     Plan(Option<crate::plan::Plan>),
@@ -232,7 +232,7 @@ pub enum Control {
         workflow: Arc<Workflow>,
         input: String,
     },
-    /// Set, pause, resume, re-budget or clear the goal, or show it, for `/goal`.
+    /// Set, pause, resume or clear the goal, or show it, for `/goal`.
     Goal(goal::Command),
     /// Talk to this model from the next call on, for `/model`. `window` is the model's
     /// context window where the backend says, so compaction still knows when to run.
@@ -831,7 +831,6 @@ pub(crate) async fn run_configured(
             .with_goal(tools::goal::Goal {
                 goal: Arc::clone(&goal),
                 plan: plan.clone(),
-                children: Arc::clone(&children),
                 requested: Arc::clone(&goal_requested),
             })
             .with_plan(tools::plan::UpdatePlan {
@@ -902,14 +901,8 @@ pub(crate) async fn run_configured(
     let mut forked_at: Option<Instant> = None;
 
     loop {
-        // Woken while idle, so the goal's spend takes in the detached children's too.
-        let wake = !cancel.load(Ordering::Relaxed) && {
-            let total = children_spent(&children);
-            lock_goal(&goal).as_mut().is_some_and(|g| {
-                g.settle(total);
-                g.active()
-            })
-        };
+        let wake =
+            !cancel.load(Ordering::Relaxed) && lock_goal(&goal).as_ref().is_some_and(Goal::active);
         announce(&goal, &mut shown, &tx);
         persist(&goal, writer.as_mut(), &tx);
         // Only a backend with a prompt cache has one to lapse, and only a conversation
@@ -948,7 +941,7 @@ pub(crate) async fn run_configured(
                         history.clear();
                         drop_fork(&mut fork, &tx);
                         // The plan was for the conversation that is gone.
-                        steer_goal(&goal, &plan, goal::Command::Clear, &children, &tx);
+                        steer_goal(&goal, &plan, goal::Command::Clear, &tx);
                         persist(&goal, writer.as_mut(), &tx);
                         persist_plan(&plan, writer.as_mut(), &tx);
                         (calls, monitor) = (Vec::new(), CacheMonitor::default());
@@ -1043,7 +1036,7 @@ pub(crate) async fn run_configured(
                         continue;
                     }
                     Control::Goal(command) => {
-                        steer_goal(&goal, &plan, command, &children, &tx);
+                        steer_goal(&goal, &plan, command, &tx);
                         continue;
                     }
                     Control::Compact(prompt) => {
@@ -1282,13 +1275,9 @@ pub(crate) async fn run_configured(
         goal_requested.store(message.is_some(), Ordering::Relaxed);
         // The turn holds the history, so mid-turn requests see it as the turn started.
         let (before, calls_before) = (history.clone(), calls.clone());
-        // Every call while the goal is active is charged to it, but only a turn nobody
-        // typed is stopped by its budget: the user's own question is answered.
-        let budget = Budget {
+        let goal_context = GoalContext {
             goal: &goal,
             plan: &plan,
-            children: &children,
-            hard: message.is_none(),
         };
         // A root per turn; `session.id` is what ties a session's turns together.
         let span = info_span!(
@@ -1317,7 +1306,7 @@ pub(crate) async fn run_configured(
                 Some(&mut rx_results),
                 // The user is watching this one and can interrupt it.
                 None,
-                Some(&budget),
+                Some(&goal_context),
                 Some(limits),
             )
             .instrument(span);
@@ -1337,7 +1326,7 @@ pub(crate) async fn run_configured(
                         }
                         // The goal is shared with the turn, which reads it between steps.
                         Control::Goal(command) => {
-                            steer_goal(&goal, &plan, command, &children, &tx);
+                            steer_goal(&goal, &plan, command, &tx);
                             announce(&goal, &mut shown, &tx);
                         }
                         // The session refuses either while a turn runs, so neither can
@@ -1376,20 +1365,14 @@ pub(crate) async fn run_configured(
             .result
             .as_ref()
             .is_err_and(crate::client::context_overflow);
-        // A goal stops on an interrupt or a failure rather than carrying on past either,
-        // and on a turn of its own that cost nothing, which would otherwise loop. An
-        // overflow is a failure only once the retry is ruled out, below, and its refused
-        // call charged nothing, so it says nothing of what the turn costs.
+        // An overflow is a failure only once the retry is ruled out, below.
+        // Autonomous turns without work pause rather than repeating narration.
         {
-            let total = children_spent(&children);
             if let Some(g) = lock_goal(&goal).as_mut() {
-                g.settle(total);
                 if result.result.is_err() && !overflowed {
                     g.pause("the turn failed");
                 } else if cancel.load(Ordering::Relaxed) {
                     g.pause("interrupted");
-                } else if !overflowed && on_goal.as_ref().is_some_and(|on| on.spent == g.spent) {
-                    g.pause("its last turn spent no tokens");
                 } else if on_goal.is_some() {
                     let acted = history[before.len()..].iter().any(|item| {
                         matches!(
@@ -1526,37 +1509,22 @@ fn persist_plan(
     }
 }
 
-/// What every child of the session has cost so far, as a goal counts it.
-pub(crate) fn children_spent(children: &Children) -> u64 {
-    children
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .map(|c| c.input_tokens.saturating_sub(c.cached_tokens) + c.output_tokens)
-        .sum()
-}
-
 /// Apply `/goal`; a plain `/goal` says where the goal stands.
 fn steer_goal(
     goal: &goal::Shared,
     plan: &crate::plan::Shared,
     command: goal::Command,
-    children: &Children,
     tx: &mpsc::UnboundedSender<AgentEvent>,
 ) {
-    let total = children_spent(children);
     let mut goal = lock_goal(goal);
     if command == goal::Command::Show {
         let _ = tx.send(AgentEvent::Info(match goal.as_mut() {
-            Some(goal) => {
-                goal.settle(total);
-                goal.line()
-            }
+            Some(goal) => goal.line(),
             None => format!("no goal. {}", goal::USAGE),
         }));
     }
     let resets = matches!(command, goal::Command::Set(_) | goal::Command::Clear);
-    match goal::apply(&mut goal, command, total) {
+    match goal::apply(&mut goal, command) {
         Err(e) => {
             let _ = tx.send(AgentEvent::Error(e));
         }
@@ -1569,8 +1537,7 @@ fn steer_goal(
     }
 }
 
-/// Tell the consumers the goal as it now stands, with a notice when more than its spend
-/// moved.
+/// Tell the consumers the goal as it now stands, with a notice when its state moved.
 fn announce(goal: &goal::Shared, shown: &mut Option<Goal>, tx: &mpsc::UnboundedSender<AgentEvent>) {
     let now = lock_goal(goal).clone();
     if now == *shown {
@@ -1578,8 +1545,7 @@ fn announce(goal: &goal::Shared, shown: &mut Option<Goal>, tx: &mpsc::UnboundedS
     }
     let moved = match (&now, &*shown) {
         (Some(now), Some(was)) => {
-            (&now.objective, now.budget, now.state, &now.note)
-                != (&was.objective, was.budget, was.state, &was.note)
+            (&now.objective, now.state, &now.note) != (&was.objective, was.state, &was.note)
         }
         _ => true,
     };
@@ -1593,7 +1559,7 @@ fn announce(goal: &goal::Shared, shown: &mut Option<Goal>, tx: &mpsc::UnboundedS
     *shown = now;
 }
 
-/// Record the goal in the session file, so a resume knows what it had spent.
+/// Record the goal in the session file, so a resume restores its specification and state.
 fn persist(
     goal: &goal::Shared,
     writer: Option<&mut Writer>,
@@ -1607,38 +1573,10 @@ fn persist(
     }
 }
 
-/// The goal a turn charges its calls to, and whether running it out stops the turn.
-struct Budget<'a> {
+/// The goal and progress whose context a turn keeps current.
+struct GoalContext<'a> {
     goal: &'a goal::Shared,
     plan: &'a crate::plan::Shared,
-    children: &'a Children,
-    hard: bool,
-}
-
-impl Budget<'_> {
-    /// Charge one call, handing back the goal as it now stands.
-    fn charge(&self, usage: &Usage) -> Option<Goal> {
-        let mut goal = lock_goal(self.goal);
-        let goal = goal.as_mut()?;
-        if !goal.active() {
-            return None;
-        }
-        goal.charge(usage);
-        Some(goal.clone())
-    }
-
-    /// Whether the turn has to stop before its next call: the budget is spent, the
-    /// children's calls counted.
-    fn spent(&self) -> bool {
-        if !self.hard {
-            return false;
-        }
-        let total = children_spent(self.children);
-        lock_goal(self.goal).as_mut().is_some_and(|goal| {
-            goal.settle(total);
-            goal.state == goal::State::Spent
-        })
-    }
 }
 
 /// The update a model that takes them needs before the next turn: the effort it runs at,
@@ -1724,8 +1662,8 @@ async fn turn(
     mut results: Option<&mut mpsc::UnboundedReceiver<ChildResult>>,
     // Steps this turn may take, for one nobody is watching; `None` for no bound.
     limit: Option<usize>,
-    // The goal its calls are charged to, while one is active.
-    budget: Option<&Budget<'_>>,
+    // The goal and progress whose context stays current between calls.
+    goal_context: Option<&GoalContext<'_>>,
     // When old tool outputs are evicted between steps; `None` for never.
     limits: Option<Limits>,
 ) -> Turn {
@@ -1738,14 +1676,6 @@ async fn turn(
     loop {
         step += 1;
         Span::current().record("steps", step);
-        // Checked before each call rather than after, so the tool results of the last
-        // one are in the history and nothing is left half done.
-        if budget.is_some_and(Budget::spent) {
-            let _ = tx.send(AgentEvent::Info(
-                "stopped: the goal's token budget is spent".to_string(),
-            ));
-            return Turn::ended(step - 1, truncated);
-        }
         // The last step is spent answering, not calling: a bound that cuts the turn off
         // mid-tool throws away everything it found, so it is told to finish first.
         if let Some(limit) = limit {
@@ -1800,8 +1730,8 @@ async fn turn(
             }
             monitor.resume();
         }
-        if let Some(budget) = budget {
-            let now = lock_goal(budget.goal).clone();
+        if let Some(context) = goal_context {
+            let now = lock_goal(context.goal).clone();
             if let Some(context) = goal::context(history, now.as_ref()) {
                 let from = history.len();
                 history.push(context);
@@ -1813,7 +1743,7 @@ async fn turn(
             {
                 let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
             }
-            let plan = budget.plan.get();
+            let plan = context.plan.get();
             if let Some(context) = crate::plan::context(history, plan.as_ref()) {
                 let from = history.len();
                 history.push(context);
@@ -1855,9 +1785,6 @@ async fn turn(
                         let _ = tx.send(AgentEvent::Error(format!("usage log: {e:#}")));
                     }
                     let _ = tx.send(AgentEvent::Usage(usage));
-                    if let Some(now) = budget.and_then(|b| b.charge(&usage)) {
-                        let _ = tx.send(AgentEvent::Goal(Some(now)));
-                    }
                     if hit.hit_ratio.is_none() {
                         return;
                     }
@@ -2070,8 +1997,8 @@ async fn turn(
 
         error_rounds = if all_failed { error_rounds + 1 } else { 0 };
         if error_rounds >= MAX_ERROR_ROUNDS {
-            if let Some(budget) = budget
-                && let Some(goal) = lock_goal(budget.goal).as_mut()
+            if let Some(context) = goal_context
+                && let Some(goal) = lock_goal(context.goal).as_mut()
             {
                 goal.pause("the last few tool calls all failed");
             }
@@ -5341,22 +5268,61 @@ mod tests {
         );
         let second = settle(&mut rx).await;
         assert!(
-            info(&second).iter().any(|i| i.starts_with(
-                "goal complete: read the hosts file (24 tokens spent, no token limit)"
-            )),
+            info(&second)
+                .iter()
+                .any(|i| i.starts_with("goal complete: read the hosts file")),
             "{second:?}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let calls = parent_calls(&fake);
         assert_eq!(calls.len(), 4, "an ended goal opens no more turns");
         assert!(calls[0].contains(goal::CONTINUE), "{}", calls[0]);
-        // Each turn on it says what it has spent so far: two calls of 8.
-        assert!(
-            calls[2].contains("16 tokens spent, no token limit"),
-            "{}",
-            calls[2]
-        );
+        assert!(calls[2].contains(goal::CONTINUE), "{}", calls[2]);
+        assert!(!calls[2].contains("tokens spent"), "{}", calls[2]);
+        assert!(!calls[2].contains("token limit"), "{}", calls[2]);
         assert!(fake.offered.lock().unwrap()[0].contains(&"goal".to_string()));
+    }
+
+    #[tokio::test]
+    async fn goal_continuation_does_not_depend_on_token_usage() {
+        use fake::{Fake, call, say};
+
+        for usage in [
+            Usage::default(),
+            Usage {
+                input: 10,
+                output: 1_000_000,
+                ..Usage::default()
+            },
+        ] {
+            let fake = Fake::new(vec![
+                vec![say("still working")],
+                vec![call("read", json!({"path": "/etc/hosts"}))],
+                vec![call(
+                    "goal",
+                    json!({"status": "complete", "reason": "verified"}),
+                )],
+                vec![say("done")],
+            ])
+            .with_usage(usage);
+            let (mut rx, _user, _control, _cancel) = goal_session(&fake, vec![set_goal("verify")]);
+            settle(&mut rx).await;
+            let finished = settle(&mut rx).await;
+            let goal = finished
+                .iter()
+                .find_map(|event| match event {
+                    AgentEvent::Goal(Some(goal)) if goal.state == goal::State::Complete => {
+                        Some(goal)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(goal.objective, "verify");
+            assert_eq!(parent_calls(&fake).len(), 4);
+            let saved = serde_json::to_value(goal).unwrap();
+            assert!(saved.get("budget").is_none());
+            assert!(saved.get("spent").is_none());
+        }
     }
 
     #[tokio::test]
@@ -5515,32 +5481,19 @@ mod tests {
         let goal: goal::Shared = Arc::default();
         let plan = crate::plan::Shared::new(Arc::clone(&goal));
         let (tx, _rx) = mpsc::unbounded_channel();
-        let children = Children::default();
-        steer_goal(
-            &goal,
-            &plan,
-            goal::Command::Set("ship".to_string()),
-            &children,
-            &tx,
-        );
+        steer_goal(&goal, &plan, goal::Command::Set("ship".to_string()), &tx);
         plan.update(&json!({"append": [{"step": "inspect", "status": "completed"}]}))
             .unwrap();
         let progress = plan.get();
-        steer_goal(&goal, &plan, goal::Command::Pause, &children, &tx);
+        steer_goal(&goal, &plan, goal::Command::Pause, &tx);
         assert_eq!(plan.get(), progress);
-        steer_goal(&goal, &plan, goal::Command::Resume, &children, &tx);
+        steer_goal(&goal, &plan, goal::Command::Resume, &tx);
         assert_eq!(plan.get(), progress);
-        steer_goal(
-            &goal,
-            &plan,
-            goal::Command::Set("new".to_string()),
-            &children,
-            &tx,
-        );
+        steer_goal(&goal, &plan, goal::Command::Set("new".to_string()), &tx);
         assert!(plan.get().is_none());
         plan.update(&json!({"append": [{"step": "new work", "status": "pending"}]}))
             .unwrap();
-        steer_goal(&goal, &plan, goal::Command::Clear, &children, &tx);
+        steer_goal(&goal, &plan, goal::Command::Clear, &tx);
         assert!(plan.get().is_none());
         assert!(lock_goal(&goal).is_none());
     }
@@ -5584,38 +5537,6 @@ mod tests {
             .unwrap();
         assert!(done.plan.as_ref().unwrap().done());
         assert_eq!(parent_calls(&fake).len(), 5);
-    }
-
-    #[tokio::test]
-    async fn a_goal_stops_mid_turn_once_its_budget_is_spent() {
-        use fake::{Fake, call};
-
-        let fake = Fake::new(vec![vec![call("read", json!({"path": "/etc/hosts"}))]; 10]);
-        let (mut rx, _user, _control, _cancel) = goal_session(
-            &fake,
-            vec![
-                set_goal("keep reading"),
-                Control::Goal(goal::Command::Budget(20)),
-            ],
-        );
-        let events = settle(&mut rx).await;
-        let notices = info(&events);
-        assert!(
-            notices.contains(&"stopped: the goal's token budget is spent"),
-            "{events:?}"
-        );
-        assert!(
-            notices
-                .iter()
-                .any(|i| i.starts_with("goal budget spent: keep reading (24 of 20 tokens)")),
-            "{events:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(
-            parent_calls(&fake).len(),
-            3,
-            "8 a call, so the third spends it"
-        );
     }
 
     #[tokio::test]
@@ -5672,58 +5593,6 @@ mod tests {
             .map(|item| item["content"][0]["text"].as_str().unwrap())
             .collect();
         assert_eq!(said, ["go", TURN_ABORTED, "again"]);
-    }
-
-    #[tokio::test]
-    async fn the_users_own_turn_goes_before_the_goal_and_is_charged_but_not_cut() {
-        use fake::{Fake, call, say};
-
-        let fake = Fake::new(vec![
-            vec![call("read", json!({"path": "/etc/hosts"}))],
-            vec![call("read", json!({"path": "/etc/hosts"}))],
-            vec![say("here it is")],
-            vec![say("should not run")],
-        ]);
-        let (mut rx, user, _control, _cancel) = goal_session(
-            &fake,
-            vec![set_goal("tidy"), Control::Goal(goal::Command::Budget(10))],
-        );
-        user.send("what is in hosts?".into()).await.unwrap();
-        let events = settle(&mut rx).await;
-        assert!(
-            !events.iter().any(|e| matches!(e, AgentEvent::Resumed(_))),
-            "{events:?}"
-        );
-        let notices = info(&events);
-        assert!(
-            !notices.iter().any(|i| i.starts_with("stopped:")),
-            "{events:?}"
-        );
-        assert!(
-            notices
-                .iter()
-                .any(|i| i.starts_with("goal budget spent: tidy (16 of 10 tokens)")),
-            "{events:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(parent_calls(&fake).len(), 3);
-    }
-
-    #[tokio::test]
-    async fn a_goal_turn_that_cost_nothing_pauses_rather_than_looping() {
-        use fake::{Fake, say};
-
-        let fake = Fake::new(vec![vec![say("hm")], vec![say("hm")]]).with_usage(Usage::default());
-        let (mut rx, _user, _control, _cancel) = goal_session(&fake, vec![set_goal("think")]);
-        let events = settle(&mut rx).await;
-        assert!(
-            info(&events)
-                .iter()
-                .any(|i| i.contains("its last turn spent no tokens")),
-            "{events:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(parent_calls(&fake).len(), 1);
     }
 
     /// A turn run again on the history as it stands, as `Session::retry` asks for it.

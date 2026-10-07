@@ -113,7 +113,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "goal",
         args: "",
-        help: "work on its own until done, /goal <objective>, pause, resume, budget <n>, clear",
+        help: "work on its own until done, /goal <objective>, pause, resume, clear",
     },
     Command {
         name: "remind",

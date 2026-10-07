@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn goal_owned_edits_preserve_progress_and_never_drop_steps() {
-        let goal = Arc::new(Mutex::new(Some(crate::goal::Goal::new("ship", 50_000, 0))));
+        let goal = Arc::new(Mutex::new(Some(crate::goal::Goal::new("ship"))));
         let shared = Shared::new(Arc::clone(&goal));
         shared
             .update(&json!({"plan": [
@@ -429,7 +429,7 @@ mod tests {
             goal.lock().unwrap().as_ref().unwrap().active(),
             "checkboxes do not complete a goal"
         );
-        assert_eq!(goal.lock().unwrap().as_ref().unwrap().budget, 50_000);
+        assert_eq!(goal.lock().unwrap().as_ref().unwrap().objective, "ship");
     }
 
     #[test]
@@ -441,7 +441,7 @@ mod tests {
         assert!(shared.goal.lock().unwrap().is_none());
         shared.update(&json!({"plan": []})).unwrap();
         assert!(shared.get().is_none());
-        let mut saved = crate::goal::Goal::new("finished", 0, 0);
+        let mut saved = crate::goal::Goal::new("finished");
         saved.plan =
             Plan::parse(&json!({"plan": [{"step": "old", "status": "completed"}]})).unwrap();
         saved.state = crate::goal::State::Complete;
