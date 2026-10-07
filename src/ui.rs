@@ -1607,7 +1607,10 @@ fn child_row(child: &ChildRow, width: usize, spinner: usize, open: bool) -> Line
     };
     let head = format!(" {mark} {} ", child.id);
     let quiet = quiet(child);
-    let mut tail = format!("{} · {}", child.identity, child.description);
+    let mut tail = format!(
+        "{} · {} · {}",
+        child.identity, child.model, child.description
+    );
     // The open row is the way back out, which nothing said until it said so: the close
     // reads as a button and the whole row is what a click lands on.
     let close = if open { CLOSE } else { "" };
@@ -2549,6 +2552,7 @@ mod tests {
         app.session().publish(Event::ChildStarted {
             id: "a1".to_string(),
             identity: "worker".to_string(),
+            model: "gpt-5.5".to_string(),
             description: "read the docs".to_string(),
             task: "go".to_string(),
         });
@@ -2568,6 +2572,7 @@ mod tests {
         let started = |id: &str, description: &str| Event::ChildStarted {
             id: id.to_string(),
             identity: "worker".to_string(),
+            model: "gpt-5.5".to_string(),
             description: description.to_string(),
             task: "go".to_string(),
         };
@@ -2583,8 +2588,14 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
         assert!(shown.contains("subagents"), "{shown}");
-        assert!(shown.contains("✓ a1 worker · read the docs"), "{shown}");
-        assert!(shown.contains("b2 worker · count the files"), "{shown}");
+        assert!(
+            shown.contains("✓ a1 worker · gpt-5.5 · read the docs"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("b2 worker · gpt-5.5 · count the files"),
+            "{shown}"
+        );
 
         // Going inside one says so on the prompt, since that is where it now types, and
         // the row it is the pane of offers the way back out.
@@ -2592,6 +2603,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
         assert!(shown.contains("to worker · count the files"), "{shown}");
+        assert!(shown.contains("b2 worker · gpt-5.5"), "{shown}");
         assert!(shown.contains("✕ close"), "{shown}");
         assert!(shown.contains("esc close"), "{shown}");
 
@@ -2609,6 +2621,7 @@ mod tests {
         app.session().publish(Event::ChildStarted {
             id: "b2c9".to_string(),
             identity: "worker".to_string(),
+            model: "gpt-5.5".to_string(),
             description: "count the files".to_string(),
             task: "go".to_string(),
         });
@@ -2630,6 +2643,7 @@ mod tests {
         app.session().publish(Event::ChildStarted {
             id: "a1".to_string(),
             identity: "worker".to_string(),
+            model: "gpt-5.5".to_string(),
             description: "read the docs".to_string(),
             task: "go".to_string(),
         });
@@ -2664,6 +2678,7 @@ mod tests {
         app.session().publish(Event::ChildStarted {
             id: "a1".to_string(),
             identity: "worker".to_string(),
+            model: "gpt-5.5".to_string(),
             description: "read the docs".to_string(),
             task: "go".to_string(),
         });
@@ -2673,7 +2688,10 @@ mod tests {
         app.on_event(Event::TurnEnd);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
-        assert!(shown.contains("a1 worker · read the docs"), "{shown}");
+        assert!(
+            shown.contains("a1 worker · gpt-5.5 · read the docs"),
+            "{shown}"
+        );
         assert_eq!(app.child_rows.len(), 1);
 
         app.session().publish(Event::ChildEnded {
@@ -4643,6 +4661,7 @@ mod tests {
         app.session().publish(Event::ChildStarted {
             id: "c1".to_string(),
             identity: "worker".to_string(),
+            model: "gpt-5.5".to_string(),
             description: "read the tests".to_string(),
             task: "go".to_string(),
         });

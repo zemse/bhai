@@ -3135,6 +3135,7 @@ mod tests {
         let started = |id: &str| Event::ChildStarted {
             id: id.to_string(),
             identity: "worker".to_string(),
+            model: "gpt-5.5".to_string(),
             description: "read the docs".to_string(),
             task: "go".to_string(),
         };
@@ -3188,6 +3189,7 @@ mod tests {
             app.session().publish(Event::ChildStarted {
                 id: id.to_string(),
                 identity: "worker".to_string(),
+                model: "gpt-5.5".to_string(),
                 description: "read the docs".to_string(),
                 task: "go".to_string(),
             });
@@ -3218,6 +3220,7 @@ mod tests {
         app.session().publish(Event::ChildStarted {
             id: "a1".to_string(),
             identity: "worker".to_string(),
+            model: "gpt-5.5".to_string(),
             description: "read the docs".to_string(),
             task: "go".to_string(),
         });

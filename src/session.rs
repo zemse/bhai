@@ -110,6 +110,7 @@ pub enum Event {
     ChildStarted {
         id: String,
         identity: String,
+        model: String,
         description: String,
         task: String,
     },
@@ -219,6 +220,7 @@ pub enum ChildState {
 pub struct ChildRow {
     pub id: String,
     pub identity: String,
+    pub model: String,
     pub description: String,
     pub state: ChildState,
     /// Events heard from this child. A coarse sign of progress, since a child that is
@@ -1386,11 +1388,13 @@ impl Session {
             AgentEvent::ChildStarted {
                 id,
                 identity,
+                model,
                 description,
                 task,
             } => Event::ChildStarted {
                 id,
                 identity,
+                model,
                 description,
                 task,
             },
@@ -1562,6 +1566,7 @@ impl Session {
             Event::ChildStarted {
                 id,
                 identity,
+                model,
                 description,
                 task,
             } => {
@@ -1576,6 +1581,7 @@ impl Session {
                     }
                 };
                 if let Some(mut pane) = kept {
+                    pane.row.model = model.clone();
                     pane.row.description = description.clone();
                     pane.row.state = ChildState::Running;
                     pane.row.last = Instant::now();
@@ -1596,6 +1602,7 @@ impl Session {
                     row: ChildRow {
                         id: id.clone(),
                         identity: identity.clone(),
+                        model: model.clone(),
                         description: description.clone(),
                         state: ChildState::Running,
                         steps: 0,
@@ -1897,6 +1904,7 @@ mod tests {
         session.on_agent(AgentEvent::ChildStarted {
             id: "c1".to_string(),
             identity: "general".to_string(),
+            model: "gpt-5.5".to_string(),
             description: "read the tests".to_string(),
             task: "go".to_string(),
         });
@@ -1955,6 +1963,7 @@ mod tests {
         session.on_agent(AgentEvent::ChildStarted {
             id: "c1".to_string(),
             identity: "general".to_string(),
+            model: "gpt-5.5".to_string(),
             description: "read the tests".to_string(),
             task: "go".to_string(),
         });
@@ -2040,6 +2049,7 @@ mod tests {
         session.on_agent(AgentEvent::ChildStarted {
             id: id.to_string(),
             identity: "worker".to_string(),
+            model: "gpt-5.5".to_string(),
             description: "look around".to_string(),
             task: task.to_string(),
         });
@@ -2119,10 +2129,22 @@ mod tests {
         session.publish(Event::User("something else".to_string()));
         assert!(session.children().is_empty());
 
-        child(&session, "a1", "now fix it");
+        assert_eq!(session.child_logs()[0].row.model, "gpt-5.5");
+        session.on_agent(AgentEvent::ChildStarted {
+            id: "a1".to_string(),
+            identity: "worker".to_string(),
+            model: "ollama:qwen3".to_string(),
+            description: "look around".to_string(),
+            task: "now fix it".to_string(),
+        });
         let rows = session.children();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, ChildState::Running);
+        assert_eq!(rows[0].model, "ollama:qwen3");
+        assert_eq!(
+            serde_json::to_value(&rows[0]).unwrap()["model"],
+            "ollama:qwen3"
+        );
         let logs = session.child_logs();
         assert_eq!(logs.len(), 1, "one pane, not a second one beside the first");
         let tasks: Vec<&str> = logs[0]

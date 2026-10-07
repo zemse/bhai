@@ -473,6 +473,7 @@ mod tests {
             row: ChildRow {
                 id: "74b01e".to_string(),
                 identity: "general".to_string(),
+                model: "gpt-5.5".to_string(),
                 description: "build the circuits".to_string(),
                 state: ChildState::Done,
                 steps: 14,

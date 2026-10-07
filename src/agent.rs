@@ -111,6 +111,7 @@ pub enum AgentEvent {
     ChildStarted {
         id: String,
         identity: String,
+        model: String,
         description: String,
         task: String,
     },
@@ -2766,6 +2767,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     let _ = child.tx.send(AgentEvent::ChildStarted {
         id: child.id.to_string(),
         identity: identity.clone(),
+        model: child.model.name().to_string(),
         description: child.description.to_string(),
         task: child.task.to_string(),
     });

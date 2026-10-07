@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-07
+
+- Subagent rows show the actual model alongside the identity and task, including in the open pane and debug state.
+
 ## 2026-10-06
 
 - The turn status reads `dhuā uḍārau` and `dhuā uḍā diyā`, without the trailing nasal on `dhuā`.
