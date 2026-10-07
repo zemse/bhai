@@ -415,6 +415,14 @@ impl Registry {
         self
     }
 
+    /// Where automation for this registry runs, including a child's worktree.
+    pub(crate) fn workdir<'a>(&'a self, fallback: &'a std::path::Path) -> &'a std::path::Path {
+        self.rooted
+            .as_ref()
+            .map(|rooted| rooted.workdir.as_path())
+            .unwrap_or(fallback)
+    }
+
     /// `args` for a call to `name`, moved into the worktree when there is one.
     pub fn rooted(&self, name: &str, args: Value) -> Value {
         match &self.rooted {

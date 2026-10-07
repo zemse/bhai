@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-07
 
+- Command and HTTP tool hooks load from dedicated global and trusted project JSON files, with pre-call blocking, input revalidation, post-success/failure context, bounded output, deadlines and cancellation. The lifecycle schema names the remaining events but warns that their built-in integration is pending; other handler types are not yet supported.
 - Goals no longer have token budgets, spend accounting or budget commands. The status bar shows lifecycle state only; saved exhausted goals load as paused and resume with their specification and progress intact.
 - Subagent rows show the actual model alongside the identity and task, including in the open pane and debug state.
 

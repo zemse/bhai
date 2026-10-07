@@ -3008,12 +3008,40 @@ async fn execute(
         .get("arguments")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let (args, summary) = match tools::parse_arguments(arguments)
-        .map(|args| registry.rooted(name, args))
-        .and_then(|args| tool.describe(&args).map(|summary| (args, summary)))
-    {
-        Ok(parsed) => parsed,
+    let mut args = match tools::parse_arguments(arguments) {
+        Ok(args) => registry.rooted(name, args),
         Err(e) => return (format!("Invalid tool call: {e}"), false),
+    };
+    let (home, cwd, trusted) = policy.hook_roots();
+    let (hooks, notices) = crate::hooks::Hooks::load(home, cwd, trusted).await;
+    let hooks = hooks.with_workdir(registry.workdir(cwd));
+    for notice in notices {
+        let _ = tx.send(AgentEvent::Info(notice));
+    }
+    let Some(before) = client::unless_cancelled(
+        hooks.fire(
+            crate::hooks::Event::PreToolUse,
+            name,
+            json!({"tool_name": name, "tool_input": args, "tool_use_id": call.get("call_id"), "session_id": conversation.map(|c| c.id)}),
+        ),
+        cancel,
+    )
+    .await
+    else {
+        return ("Not executed: the user interrupted the turn.".into(), false);
+    };
+    for notice in &before.notices {
+        let _ = tx.send(AgentEvent::Info(notice.clone()));
+    }
+    if let Some(reason) = before.blocked {
+        return (format!("Blocked by a PreToolUse hook: {reason}"), false);
+    }
+    if let Some(updated) = before.updated_input {
+        args = registry.rooted(name, updated);
+    }
+    let summary = match tool.describe(&args) {
+        Ok(summary) => summary,
+        Err(e) => return (format!("Invalid tool call after hooks: {e}"), false),
     };
 
     let audit = |outcome, by, reason: &str| policy.audit(name, &summary, outcome, by, reason);
@@ -3022,8 +3050,15 @@ async fn execute(
     // written against.
     let checked = registry.checked(name, &args);
 
+    // Hooks may tighten the policy, never relax it.
+    let decision = policy.check(name, &checked, tool.needs_approval());
+    let decision = match decision {
+        Decision::Allow(_) if before.ask => Decision::Ask,
+        other => other,
+    };
+    let judge = if before.ask { None } else { judge };
     // The policy answers first; only `Ask` reaches the prompt.
-    match policy.check(name, &checked, tool.needs_approval()) {
+    match decision {
         Decision::Allow(reason) => {
             // A tool that needs no approval is allowed before any rule is consulted, so
             // there is no reason to carry; the log says which it was rather than nothing.
@@ -3201,6 +3236,35 @@ as-is. Try a different approach, or ask the user."
         conversation,
     };
     let (mut output, ok, brought) = tool.execute_images(&args, live).await;
+    let event = if ok {
+        crate::hooks::Event::PostToolUse
+    } else {
+        crate::hooks::Event::PostToolUseFailure
+    };
+    let after = client::unless_cancelled(
+        hooks.fire(
+            event,
+            name,
+            json!({"tool_name": name, "tool_input": args, "tool_use_id": call.get("call_id"), "session_id": conversation.map(|c| c.id),
+                "tool_response": output, "error": if ok { None } else { Some(&output) }}),
+        ),
+        cancel,
+    )
+    .await;
+    for context in before.context.into_iter().chain(
+        after
+            .as_ref()
+            .into_iter()
+            .flat_map(|result| result.context.iter().cloned()),
+    ) {
+        output.push_str("\n[hook context]\n");
+        output.push_str(&context);
+    }
+    if let Some(after) = after {
+        for notice in after.notices {
+            let _ = tx.send(AgentEvent::Info(notice));
+        }
+    }
     // Decoding and scaling is CPU work, kept off the runtime's threads.
     let (brought, lines) = match brought.is_empty() {
         true => (brought, Vec::new()),
@@ -6107,6 +6171,61 @@ mod tests {
         }
         // The write ran, so the log is not claiming something that did not happen.
         assert!(repo.join("notes.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_block_writes_and_recheck_modified_arguments() {
+        use crate::permissions::{Rule, Rules};
+        let dir = tools::temp_dir();
+        let home = dir.join("home");
+        let repo = dir.join("repo");
+        let config = home.join(".config/bhai");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let path = repo.join("notes.txt");
+        let forbidden = repo.join("forbidden.txt");
+        let rules = Rules {
+            deny: vec![Rule::parse("Write(/forbidden.txt)").unwrap()],
+            ..Rules::default()
+        };
+        let policy = Policy::new(Mode::Bypass, rules, Some(home), repo.clone());
+        let registry = Registry::new(Vec::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let call = fake::call("write", json!({"path":path,"content":"ok"}));
+        std::fs::write(config.join("hooks.json"), serde_json::to_vec(&json!({"hooks":{"PreToolUse":[{"matcher":"write","hooks":[{"type":"command","command":"echo denied >&2; exit 2"}]}]}})).unwrap()).unwrap();
+        let (output, ok) = execute(
+            &registry,
+            &policy,
+            None,
+            &call,
+            None,
+            &tx,
+            &cancel,
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(!ok);
+        assert!(output.contains("PreToolUse hook"));
+        assert!(!path.exists());
+        let response = json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"path":forbidden,"content":"bad"}}});
+        let command = format!("cat >/dev/null; printf '%s' '{}'", response);
+        std::fs::write(config.join("hooks.json"), serde_json::to_vec(&json!({"hooks":{"PreToolUse":[{"matcher":"write","hooks":[{"type":"command","command":command}]}]}})).unwrap()).unwrap();
+        let (output, ok) = execute(
+            &registry,
+            &policy,
+            None,
+            &call,
+            None,
+            &tx,
+            &cancel,
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(!ok, "{output}");
+        assert!(output.contains("deny rule"), "{output}");
+        assert!(!forbidden.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A child in a worktree answers to the rules as the same call in the checkout, so a

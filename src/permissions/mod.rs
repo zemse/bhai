@@ -561,6 +561,15 @@ impl Policy {
         self.trust.is_none() || self.trusted.load(Ordering::Relaxed)
     }
 
+    /// Roots for executable hook configuration; project hooks need recorded trust.
+    pub(crate) fn hook_roots(&self) -> (Option<&Path>, &Path, bool) {
+        (
+            self.home.as_deref(),
+            &self.cwd,
+            self.trust.is_some() && self.trusted(),
+        )
+    }
+
     /// What `/permissions` prints: the mode, then each rule, where it came from and
     /// whether the mode ignores it.
     pub fn describe(&self) -> String {

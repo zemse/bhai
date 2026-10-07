@@ -61,6 +61,7 @@ mod external;
 mod files;
 mod frontmatter;
 pub mod goal;
+pub mod hooks;
 pub mod identity;
 mod images;
 mod input;

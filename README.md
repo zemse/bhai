@@ -12,7 +12,7 @@
 - subagents with agent to agent support (only between parent child).
 - prompt caching and optional compaction just before cache expiry.
 - token accounting to clearly see what op consumed what.
-- hooks for tool calls and skill invocations.
+- command and HTTP hooks before tool calls and after tool success or failure, including the skill tool.
 - live monitors with multiple progress tracks, custom metrics and rate-limited wake hooks.
 - daemon for centralised session management.
 - graph based memory.
@@ -55,6 +55,29 @@ live cards stay visible while the session works or sits idle. omit `total` for a
 `/monitor` opens the background inspector; `/monitor <id>` opens one monitor. `/monitor pause|resume|stop|dismiss <id>` controls it. stopping the observer does not stop the task it watches. monitors last only for this session and do not restart when it is resumed. the debug server exposes the same live snapshots at `GET /monitors`.
 
 optional hooks pair a named condition with a fixed approved prompt. they fire when the condition becomes true, optionally after `sustained_secs`, with `cooldown_secs` (default 60, minimum 30). `repeat` opts into repeated wakes while true; terminal snapshots fire each hook at most once. the session allows one monitor wake per 30 seconds and at most one queued monitor notification. routine samples never enter chat; a bounded snapshot reaches the agent when its next turn starts.
+
+## tool hooks
+
+hooks are opt-in through `~/.config/bhai/hooks.json` and `.bhai/hooks.json`. project hooks require `/trust`; hooks from Claude Code's settings are not loaded automatically. both files use a top-level `hooks` object with event names mapping to matcher groups:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": "write|edit",
+      "hooks": [{ "type": "command", "command": "cat >/dev/null; cargo fmt", "timeout": 30 }]
+    }]
+  }
+}
+```
+
+`PreToolUse`, `PostToolUse` and `PostToolUseFailure` fire for built-in and resolved MCP calls, including calls made by subagents. matchers use bhai's case-sensitive tool names; omit the matcher or use `*` for all tools. exact names and `|` alternatives are supported, not regular expressions. handlers run sequentially in file order, global before project.
+
+command handlers receive JSON on stdin: `hook_event_name`, `cwd`, `tool_name`, `tool_input` and `tool_use_id`. post hooks also receive `tool_response`, and failure hooks receive `error`. exit 2 blocks a pre hook's tool call, with stderr as the reason; other nonzero exits and malformed output produce notices. exit 0 may return JSON with `hookSpecificOutput.hookEventName`, `additionalContext`, and, for pre hooks, `permissionDecision`, `permissionDecisionReason` and `updatedInput`. `deny` blocks, `ask` requires user approval, and `allow` never bypasses bhai's permission policy. modified input is validated and permission-checked again. hook context is appended to the tool result.
+
+HTTP handlers use `type: "http"`, `url`, optional `headers` and `timeout`. they POST the same JSON and return decision JSON in a successful response body; redirects are not followed. timeouts default to 60 seconds (1 to 600 allowed), and stdout, stderr, settings files and HTTP responses are limited to 64 KiB each. command environments withhold credential-looking variables like bash does. commands are user-configured automation, not sandboxed tool calls; they run without individual approval. hook commands and HTTP requests end when their deadline expires or the turn is interrupted.
+
+this is the first stage of lifecycle hooks, not full Claude Code parity. the event schema also names session, prompt, compaction, model, workspace, task and subagent lifecycle events, but the built-in runtime does not fire them yet and reports a notice if configured. prompt, agent and MCP-tool handlers, async hooks, regex matchers and skill/subagent-frontmatter configuration remain pending.
 
 ## goals
 
