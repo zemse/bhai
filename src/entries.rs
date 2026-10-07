@@ -589,7 +589,7 @@ pub const VERBS: &[(&str, &str)] = &[
     ("katl-e-ām machārau", "katl-e-ām machā diyā"),
     ("gadar machārau", "gadar machā diyā"),
     ("lankā lagārau", "lankā lagā dī"),
-    ("dhuāṃ uḍārau", "dhuāṃ uḍā diyā"),
+    ("dhuā uḍārau", "dhuā uḍā diyā"),
     ("tabāhī machārau", "tabāhī machā dī"),
     ("bhasaḍ machārau", "bhasaḍ machā dī"),
     ("kāṇḍ kar rau", "kāṇḍ kar diyā"),

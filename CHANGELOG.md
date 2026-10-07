@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-06
 
+- The turn status reads `dhuā uḍārau` and `dhuā uḍā diyā`, without the trailing nasal on `dhuā`.
 - Plans belong to their goals and support up to 500 steps with incremental changes, appends and paged reads. Existing steps remain as progress history, skipped work requires a reason, and unfinished plans block goal completion. Pause and specification updates preserve progress; replacement and clear reset it, and sessions and forks save both together. Large plan context uses a focused 12-step window; the live panel retains completed goal progress and `/plan` shows the full list without inference.
 - Goals carry a compact objective, requirements and verification specification (1024 characters total), updated with `goal` status `update` without resetting state or spend. Changed specifications append a developer context snapshot, persist before the next model call and survive both compaction paths verbatim; unchanged continuation turns use a short reminder instead of repeating the specification.
 - The main agent can adopt implementation tasks from ordinary chat as persistent goals and resume a blocked objective on the user's reply without another 'do it'. Independent work continues before clarification; user pauses remain explicit, and three autonomous turns without work tool calls pause narration-only loops. Goals have no default token limit; `/goal budget <tokens>` adds one and `/goal budget none` removes it.
