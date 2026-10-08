@@ -57,6 +57,8 @@ mod files;
 mod frontmatter;
 #[path = "../../src/goal.rs"]
 mod goal;
+#[path = "../../src/hooks.rs"]
+mod hooks;
 #[path = "../../src/identity.rs"]
 mod identity;
 #[path = "../../src/images.rs"]

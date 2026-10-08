@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-09
 
+- The ceilings benchmark declares the hooks module used by the agent loop, so it compiles with lifecycle automation enabled.
 - Project instructions load `AGENTS.local.md` alongside `AGENTS.md`; the nonstandard `AGENT.md` alias is no longer discovered.
 - Goal completion and blocking return concise status text without agent-only instructions in the displayed tool result.
 - The auto judge extracts scoped permissions and restrictions from original user messages, then merges source-backed notes before deciding commands. Authorization survives session resume, compaction and forks, is shared with running children, and invalidates cached verdicts; failed updates stay pending and cannot use stale approvals. Both summary stages have separate prompt-cache keys, and automatic wake prompts grant no new authority. Plain SSH identity-file authentication can reach the judge while key disclosure remains protected; authorized server cleanup includes stopping, not deleting it.
