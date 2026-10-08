@@ -20,7 +20,7 @@ const WARN_TOTAL: usize = 32 * 1024;
 /// Project instruction files looked for in each directory, in this order.
 const PROJECT_FILES: [&str; 5] = [
     "AGENTS.md",
-    "AGENT.md",
+    "AGENTS.local.md",
     "CLAUDE.md",
     ".claude/CLAUDE.md",
     "CLAUDE.local.md",
@@ -465,7 +465,7 @@ mod tests {
         f.write("home/repo/CLAUDE.local.md", "root local");
         f.write("home/repo/AGENTS.md", "root agents");
         f.write("home/repo/sub/.claude/CLAUDE.md", "sub dot claude");
-        f.write("home/repo/sub/AGENT.md", "sub agent");
+        f.write("home/repo/sub/AGENTS.local.md", "sub agent");
         f.write("home/repo/sub/CLAUDE.md", "sub claude");
     }
 
@@ -485,12 +485,37 @@ mod tests {
                 codex.as_str(),
                 "~/repo/AGENTS.md",
                 "~/repo/CLAUDE.local.md",
-                "./AGENT.md",
+                "./AGENTS.local.md",
                 "./CLAUDE.md",
                 "./.claude/CLAUDE.md",
             ]
         );
         assert_eq!(files[0].content, "global claude");
+    }
+
+    #[test]
+    fn agents_local_loads_from_root_to_cwd_and_singular_agent_is_ignored() {
+        let f = Fixture::new();
+        f.write("home/repo/AGENTS.md", "root agents");
+        f.write("home/repo/AGENTS.local.md", "root local");
+        f.write("home/repo/AGENT.md", "ignored root alias");
+        f.write("home/repo/sub/AGENTS.md", "sub agents");
+        f.write("home/repo/sub/AGENTS.local.md", "sub local");
+        f.write("home/repo/sub/AGENT.md", "ignored sub alias");
+        let loaded = load(&project_only(), &f.roots);
+        let labels: Vec<_> = loaded.files.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "~/repo/AGENTS.md",
+                "~/repo/AGENTS.local.md",
+                "./AGENTS.md",
+                "./AGENTS.local.md",
+            ]
+        );
+        assert_eq!(loaded.files[1].content, "root local");
+        assert_eq!(loaded.files[3].content, "sub local");
+        assert!(loaded.skipped.is_empty());
     }
 
     #[test]
@@ -590,14 +615,14 @@ mod tests {
         f.write("home/repo/sub/CLAUDE.md", &half);
         assert!(load(&project_only(), &f.roots).skipped.is_empty());
 
-        f.write("home/repo/sub/AGENT.md", &"x".repeat(MAX_FILE + 1));
+        f.write("home/repo/sub/AGENTS.local.md", &"x".repeat(MAX_FILE + 1));
         f.write("home/repo/sub/.claude/CLAUDE.md", "one more byte");
         let loaded = load(&project_only(), &f.roots);
         assert_eq!(loaded.files.len(), 3);
         assert_eq!(
             loaded.skipped,
             [
-                "skipped ./AGENT.md (64 KiB, over the 64 KiB an instruction file may be)",
+                "skipped ./AGENTS.local.md (64 KiB, over the 64 KiB an instruction file may be)",
                 "instruction files total 32 KiB, over the 32 KiB they should be together",
             ]
         );
@@ -690,7 +715,7 @@ mod tests {
         f.write("home/repo/sub/CLAUDE.md", "@AGENTS.md\n@./AGENTS.md\n");
         std::os::unix::fs::symlink(
             f.dir.join("home/repo/sub/AGENTS.md"),
-            f.dir.join("home/repo/sub/AGENT.md"),
+            f.dir.join("home/repo/sub/AGENTS.local.md"),
         )
         .unwrap();
         let project = Config {

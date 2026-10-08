@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-09
 
+- Project instructions load `AGENTS.local.md` alongside `AGENTS.md`; the nonstandard `AGENT.md` alias is no longer discovered.
 - Goal completion and blocking return concise status text without agent-only instructions in the displayed tool result.
 
 ## 2026-10-08
