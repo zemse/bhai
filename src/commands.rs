@@ -317,7 +317,7 @@ pub fn skill<'a>(name: &str, skills: &'a [Skill]) -> Option<&'a Skill> {
     skills.iter().find(|s| s.name == name)
 }
 
-/// What `/<skill> [input]` sends: the agent loads the skill through the `skill` tool
+/// What `/<skill> [input]` sends: the agent loads the skill through the `register_skills` tool
 /// and follows it, so this is a prompt rather than a command.
 pub fn skill_prompt(name: &str, input: &str) -> String {
     match input.is_empty() {

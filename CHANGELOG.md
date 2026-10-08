@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-08
+
+- The `register_skills` tool discovers repo-local skills on demand with `from`, returning their listing in a new tool result without changing the system prompt or earlier history. `from` plus `name` loads a scoped skill, including after session resume; discovery checks only the repo's skill roots, and the tool is available with no startup skills. Existing `Skill` and `Load_skill` permission rules and identity tool lists still apply.
+
 ## 2026-10-07
 
 - Command and HTTP tool hooks load from dedicated global and trusted project JSON files, with pre-call blocking, input revalidation, post-success/failure context, bounded output, deadlines and cancellation. The lifecycle schema names the remaining events but warns that their built-in integration is pending; other handler types are not yet supported.

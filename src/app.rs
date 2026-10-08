@@ -2088,7 +2088,7 @@ impl App {
             return;
         }
         // `/<skill>` is the one slash form that reaches the model: it asks for the skill
-        // by name, and the agent loads it through the `skill` tool. The transcript keeps
+        // by name, and the agent loads it through the `register_skills` tool. The transcript keeps
         // showing what was typed, not the sentence it turns into.
         let prompt = match command(&message) {
             Some((name, input)) if commands::skill(name, &self.skills).is_some() => {

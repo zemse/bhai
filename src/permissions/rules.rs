@@ -141,7 +141,11 @@ impl Rule {
     /// `Edit` rules cover every tool that changes files, as in Claude Code. `mcp__server`
     /// and `mcp__server__*` cover every tool of that server.
     pub fn applies_to(&self, tool: &str) -> bool {
-        if self.tool == tool || (self.tool == "edit" && tool == "write") {
+        if self.tool == tool
+            || (self.tool == "edit" && tool == "write")
+            || (matches!(self.tool.as_str(), "skill" | "load_skill")
+                && tool == crate::tools::skill::NAME)
+        {
             return true;
         }
         let Some(rest) = self.tool.strip_prefix("mcp__") else {
@@ -685,7 +689,18 @@ mod tests {
         assert!(Rule::parse("Read").unwrap().is_any());
         assert!(Rule::parse("Bash(*)").unwrap().is_any());
         assert!(Rule::parse("Bash(:*)").unwrap().is_any());
-        assert!(Rule::parse("Skill").unwrap().applies_to("skill"));
+        assert!(Rule::parse("Skill").unwrap().applies_to("register_skills"));
+        assert!(
+            Rule::parse("Load_skill")
+                .unwrap()
+                .applies_to("register_skills")
+        );
+        assert!(
+            Rule::parse("Register_skills")
+                .unwrap()
+                .applies_to("register_skills")
+        );
+        assert!(!Rule::parse("Skill").unwrap().applies_to("read"));
         assert!(Rule::parse("Edit(x)").unwrap().applies_to("write"));
         assert!(!Rule::parse("Write(x)").unwrap().applies_to("edit"));
         for bad in [

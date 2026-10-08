@@ -3330,7 +3330,8 @@ mod tests {
             summary: summary.to_string(),
         };
         app.entries().push(call("bash", "git status"));
-        app.entries().push(call("skill", "skill chrome"));
+        app.entries()
+            .push(call("register_skills", "register_skills chrome"));
         app.entries().push(call("read", "read /tmp/x.rs"));
         app.entries().push(call("agent", "agent worker: check it"));
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
@@ -3338,8 +3339,8 @@ mod tests {
         let text = screen(&terminal);
         assert!(text.contains("$ git status\n"), "{text}");
         // Only the shell gets the shell's prompt.
-        assert!(!text.contains("$ skill"), "{text}");
-        assert!(text.contains("✦ skill chrome\n"), "{text}");
+        assert!(!text.contains("$ register_skills"), "{text}");
+        assert!(text.contains("✦ register_skills chrome\n"), "{text}");
         assert!(text.contains("▸ read /tmp/x.rs\n"), "{text}");
         assert!(text.contains("⇢ agent worker: check it\n"), "{text}");
     }

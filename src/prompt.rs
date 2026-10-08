@@ -18,7 +18,7 @@ use crate::tools::{bash, edit, read, write};
 pub struct SystemPrompt {
     pub text: String,
     pub sources: Vec<Source>,
-    /// The skills listed, which the `skill` tool loads.
+    /// The skills listed, which the `register_skills` tool loads.
     pub skills: Vec<Skill>,
     /// Bytes the skills listing adds to the prompt.
     pub skills_bytes: usize,
@@ -194,7 +194,7 @@ pub fn system_prompt_for(tools: &[&str], files: &[File], skills: Vec<Skill>) -> 
     if !skills.is_empty() {
         text.push_str(
             "\n\n# Skills\n\nSkills are task-specific instructions. Before using one, call the \
-`skill` tool with its name to load its full instructions.\n",
+`register_skills` tool with its name to load its full instructions.\n",
         );
         for skill in &skills {
             let _ = write!(text, "\n{}", skill.entry());
@@ -389,7 +389,7 @@ mod tests {
         let prompt = system_prompt(&files, vec![skill]);
         assert!(prompt.text.starts_with(&without.text));
         assert!(prompt.text.ends_with(
-            "`skill` tool with its name to load its full instructions.\n\n- pdf: Read PDFs."
+            "`register_skills` tool with its name to load its full instructions.\n\n- pdf: Read PDFs."
         ));
         assert_eq!(without.text.len() + prompt.skills_bytes, prompt.text.len());
         assert_eq!(prompt.skills.len(), 1);
@@ -431,7 +431,7 @@ applied.\n\n"
                 "Your tools are `bash`. Use `bash` for everything (searching with `rg`"
             )
         );
-        assert_eq!(tools_paragraph(&["skill", "agent"]), "");
+        assert_eq!(tools_paragraph(&["register_skills", "agent"]), "");
         let bare = base(&[]);
         assert!(bare.contains("- Shell: bash\n\nRules:"), "{bare}");
     }

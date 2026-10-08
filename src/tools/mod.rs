@@ -271,7 +271,7 @@ impl Registry {
         }
     }
 
-    /// Every built-in tool, plus `skill` when there are skills to load.
+    /// Every built-in tool, including `register_skills` for startup and on-demand repo skills.
     pub fn new(skills: Vec<crate::skills::Skill>) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(bash::Bash),
@@ -283,9 +283,7 @@ impl Registry {
             Box::new(stdin::WriteStdin),
             Box::new(fetch::Fetch::default()),
         ];
-        if !skills.is_empty() {
-            tools.push(Box::new(skill::Skill { skills }));
-        }
+        tools.push(Box::new(skill::Skill { skills }));
         Self {
             tools,
             native: None,
@@ -382,7 +380,7 @@ impl Registry {
         self
     }
 
-    /// The built-in tools and `skill`, narrowed to an identity's tools.
+    /// The built-in tools and `register_skills`, narrowed to an identity's tools.
     pub fn for_identity(
         skills: Vec<crate::skills::Skill>,
         identity: &crate::identity::Identity,
@@ -622,7 +620,8 @@ mod tests {
                 "apply_patch",
                 "view_image",
                 "write_stdin",
-                "fetch"
+                "fetch",
+                "register_skills"
             ]
         );
     }
@@ -642,10 +641,10 @@ mod tests {
         }
         assert!(!registry.get("read").unwrap().needs_approval());
         assert!(!registry.get("view_image").unwrap().needs_approval());
-        assert!(!registry.get("skill").unwrap().needs_approval());
+        assert!(!registry.get("register_skills").unwrap().needs_approval());
         // The policy asks about what it types; a poll is not asked about.
         assert!(!registry.get("write_stdin").unwrap().needs_approval());
-        assert!(Registry::new(Vec::new()).get("skill").is_none());
+        assert!(Registry::new(Vec::new()).get("register_skills").is_some());
     }
 
     #[test]

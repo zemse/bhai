@@ -1,5 +1,5 @@
 //! Skills: `<name>/SKILL.md` directories whose name and description go in the system
-//! prompt, with the body loaded on demand through the `skill` tool.
+//! prompt, with the body loaded on demand through the `register_skills` tool.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ const SKILL_DIRS: [(&str, Source); 2] = [
 
 /// Descriptions longer than this are cut in the listing.
 const MAX_DESCRIPTION: usize = 250;
-/// Names longer than this are cut. A name is what the `skill` tool is called with, so it
+/// Names longer than this are cut. A name is what the `register_skills` tool is called with, so it
 /// is short by nature; a long one is a file saying whatever it likes into the prompt.
 const MAX_NAME: usize = 64;
 

@@ -2151,12 +2151,15 @@ mod tests {
         let args = json!({ "name": "x" });
         let deny = policy(Mode::Bypass, &[], &["Skill"], &[]);
         assert_eq!(
-            deny.check("skill", &args, false),
+            deny.check("register_skills", &args, false),
             Decision::Deny("deny rule Skill".to_string())
         );
         let ask = policy(Mode::Bypass, &[], &[], &["Skill"]);
-        assert_eq!(ask.check("skill", &args, false), Decision::Ask);
-        assert_eq!(Policy::default().check("skill", &args, false), allowed(""));
+        assert_eq!(ask.check("register_skills", &args, false), Decision::Ask);
+        assert_eq!(
+            Policy::default().check("register_skills", &args, false),
+            allowed("")
+        );
     }
 
     #[test]
@@ -2413,7 +2416,10 @@ mod tests {
             offers("image_gen", json!({"path": "/home/u/repo/assets/logo.png"})),
             both("Write(/assets/logo.png)", "Edit(/assets/**)")
         );
-        assert_eq!(offers("skill", json!({"name": "x"})), Offers::default());
+        assert_eq!(
+            offers("register_skills", json!({"name": "x"})),
+            Offers::default()
+        );
     }
 
     #[test]

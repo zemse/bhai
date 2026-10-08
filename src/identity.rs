@@ -97,9 +97,13 @@ impl Identity {
             return self.allows_tool(tools::bash::NAME);
         }
         let mcp = [tools::mcp::SEARCH, tools::mcp::CALL].contains(&name);
-        self.tools
-            .as_ref()
-            .is_none_or(|tools| tools.iter().any(|t| t == name || (mcp && t == MCP)))
+        self.tools.as_ref().is_none_or(|tools| {
+            tools.iter().any(|t| {
+                t == name
+                    || (mcp && t == MCP)
+                    || (name == tools::skill::NAME && matches!(t.as_str(), "skill" | "load_skill"))
+            })
+        })
     }
 
     /// Included by some pattern (or there are none) and excluded by none.
@@ -613,7 +617,7 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
         f.skill("ios-dev");
         f.skill("pdf");
         let apple = Identity {
-            tools: Some(vec!["read".into(), "skill".into()]),
+            tools: Some(vec!["read".into(), "register_skills".into()]),
             skills: vec!["ios*".into()],
             prompt: "Apple only.".into(),
             ..Identity::builtin("apple", "")
@@ -635,9 +639,17 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
             .iter()
             .map(|s| s["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, ["read", "view_image", "skill"]);
+        assert_eq!(names, ["read", "view_image", "register_skills"]);
+        for name in ["skill", "load_skill"] {
+            let legacy = Identity {
+                tools: Some(vec![name.into()]),
+                ..apple.clone()
+            };
+            assert!(legacy.allows_tool(tools::skill::NAME));
+            assert!(!legacy.allows_tool(tools::bash::NAME));
+        }
         assert!(registry.get("bash").is_none());
-        let skill = registry.get("skill").unwrap();
+        let skill = registry.get("register_skills").unwrap();
         assert!(
             skill
                 .describe(&serde_json::json!({"name": "ios-dev"}))
@@ -650,7 +662,11 @@ instructions: [project, nope]\n---\n\nBe Swift-y.\n",
 
         let router = build(&Config::default(), &f.roots, &router(), &[]);
         assert!(router.skills.is_empty());
-        assert!(Registry::for_prompt(&router).get("skill").is_none());
+        assert!(
+            Registry::for_prompt(&router)
+                .get("register_skills")
+                .is_none()
+        );
         assert_eq!(router.identity.name, "router");
     }
 
