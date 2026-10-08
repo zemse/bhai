@@ -27,6 +27,7 @@ pub mod read;
 pub mod schedule;
 pub mod skill;
 pub mod ssrf;
+pub mod status;
 pub mod stdin;
 pub mod submit;
 pub mod title;
@@ -35,7 +36,7 @@ pub mod web;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 14] = [
+pub const NAMES: [&str; 15] = [
     bash::NAME,
     read::NAME,
     write::NAME,
@@ -50,6 +51,7 @@ pub const NAMES: [&str; 14] = [
     fetch::NAME,
     schedule::NAME,
     monitor::NAME,
+    status::NAME,
 ];
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.

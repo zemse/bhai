@@ -74,6 +74,8 @@ struct Attribution {
 pub struct Entries {
     pub list: Vec<Entry>,
     pub tokens: HashMap<usize, Tokens>,
+    /// What the last model call read, including in a child pane.
+    pub last_usage: Option<Usage>,
     attribution: Attribution,
 }
 
@@ -163,6 +165,7 @@ impl Entries {
                 child.output += usage.output;
                 child.reasoning += usage.reasoning;
             }
+            Event::Usage(usage) => self.last_usage = Some(*usage),
             Event::Call(call) => self.on_call(call),
             Event::Item(index) => self.on_item(*index),
             Event::Cache(Some(found)) => self.push(Entry::Error(format!(

@@ -506,24 +506,17 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     let dim = Style::new().fg(Color::DarkGray);
-    let window = app.limits.window(&app.model);
+    let (model, window, used) = app.status_context();
     // The effort rides along with the model, since `/model` can change either.
     let mut bar = vec![(
         ALWAYS,
         Span::styled(
-            match crate::client::Provider::of(&app.model) {
-                crate::client::Provider::Codex => {
+            match crate::client::Provider::of(&model) {
+                crate::client::Provider::Codex if app.inside.is_none() => {
                     let fast = if app.fast { " fast" } else { "" };
-                    format!(
-                        " {} {}{fast} ({} context)",
-                        app.model,
-                        app.effort,
-                        size(window)
-                    )
+                    format!(" {model} {}{fast} ({} context)", app.effort, size(window))
                 }
-                crate::client::Provider::Ollama => {
-                    format!(" {} ({} context)", app.model, size(window))
-                }
+                _ => format!(" {model} ({} context)", size(window)),
             },
             dim,
         ),
@@ -543,8 +536,8 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
     // How full the window is, from what the last call actually read: the number
     // compaction watches, and the only one here that says how much room is left.
     // While the prompt starts with `/compact-then`, the compacted copy it would run on.
-    let fork = app.forked();
-    if let Some(used) = fork.or(app.last_usage.map(|usage| usage.input)) {
+    let fork = app.forked().filter(|_| app.inside.is_none());
+    if let Some(used) = used {
         let percent = 100.0 * used as f64 / window as f64;
         let label = if fork.is_some() { "fork ctx" } else { "ctx" };
         segment(
@@ -3909,6 +3902,53 @@ mod tests {
         );
         // Past the point compaction waits for, so it is not drawn as an idle number.
         assert_eq!(status_cell(&terminal, "ctx:").fg, Color::Yellow);
+    }
+
+    #[test]
+    fn status_bar_follows_the_open_child() {
+        for template in [None, Some("$model · ctx:$ctx")] {
+            let mut app = App::detached();
+            app.statusline = template.map(|text| crate::statusline::Template::parse(text).unwrap());
+            app.limits.window = Some(100_000);
+            app.last_usage = Some(usage(82_000, 0, 10, 0));
+            app.session().publish(Event::ChildStarted {
+                id: "a1".to_string(),
+                identity: "worker".to_string(),
+                model: "gpt-5.5".to_string(),
+                description: "read the docs".to_string(),
+                task: "go".to_string(),
+            });
+            let mut terminal = Terminal::new(TestBackend::new(200, 12)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let main = status(&terminal);
+            assert!(main.contains("ctx:82%"), "{main}");
+
+            app.open_child("a1");
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let bar = status(&terminal);
+            assert!(bar.contains("gpt-5.5"), "{bar}");
+            assert!(!bar.contains("82%"), "no child usage yet: {bar}");
+            let window = crate::compact::Limits::default().window("gpt-5.5");
+            for percent in [50, 90] {
+                app.session().publish(Event::Child {
+                    id: "a1".to_string(),
+                    event: Box::new(Event::Usage(usage(window * percent / 100, 0, 10, 0))),
+                });
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                let bar = status(&terminal);
+                assert!(bar.contains(&format!("ctx:{percent}%")), "{bar}");
+            }
+            app.session().publish(Event::ChildEnded {
+                id: "a1".to_string(),
+                ok: true,
+            });
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert!(status(&terminal).contains("ctx:90%"));
+
+            app.open_child("a1");
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(status(&terminal), main);
+        }
     }
 
     #[test]

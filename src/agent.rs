@@ -830,6 +830,13 @@ pub(crate) async fn run_configured(
         {
             registry = registry.with_tool(Box::new(tools::monitor::Monitor { monitors }));
         }
+        if prompt.identity.allows_tool(tools::status::NAME) {
+            registry = registry.with_tool(Box::new(tools::status::Status {
+                children: Arc::clone(&children),
+                cancel: Arc::clone(&stop),
+                monitors: delegation.as_ref().and_then(|d| d.monitors.clone()),
+            }));
+        }
         registry
             .with_goal(tools::goal::Goal {
                 goal: Arc::clone(&goal),
@@ -2855,6 +2862,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
         while let Some(event) = rx_child.recv().await {
             let event = match event {
                 AgentEvent::Usage(u) => {
+                    let _ = child.tx.send(inside(AgentEvent::Usage(u)));
                     usage += u;
                     attribute(child.children, child.id, u);
                     AgentEvent::ChildUsage(u)
@@ -5138,6 +5146,14 @@ mod tests {
             .filter(|e| matches!(e, AgentEvent::ChildUsage(u) if *u == fake::USAGE))
             .count();
         assert_eq!(child_usage, 2);
+        let pane_usage = events
+            .iter()
+            .filter(|e| {
+                matches!(e, AgentEvent::Child { id: child, event }
+                if child == &id && matches!(&**event, AgentEvent::Usage(u) if *u == fake::USAGE))
+            })
+            .count();
+        assert_eq!(pane_usage, 2);
         // Only the parent's own calls and items reach the transcript's attribution.
         let items: Vec<usize> = events
             .iter()
@@ -5397,6 +5413,38 @@ mod tests {
             Limits::default(),
         ));
         (rx, tx_user, tx_control, cancel)
+    }
+
+    #[tokio::test]
+    async fn the_main_agent_can_pull_status_without_approval() {
+        use fake::{Fake, call, say};
+
+        let fake = Fake::new(vec![
+            vec![call("status", json!({}))],
+            vec![say("checked status")],
+        ]);
+        let (mut rx, user, _control, _cancel) = goal_session(&fake, Vec::new());
+        user.send("check background work".into()).await.unwrap();
+        let events = settle(&mut rx).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Approval { .. }))
+        );
+        let bodies = fake.bodies.lock().unwrap();
+        assert!(
+            bodies[0].1["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "status")
+        );
+        assert!(bodies[1].1["input"].as_array().unwrap().iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["output"]
+                    .as_str()
+                    .is_some_and(|s| serde_json::from_str::<Value>(s).is_ok())
+        }));
     }
 
     fn set_goal(objective: &str) -> Control {

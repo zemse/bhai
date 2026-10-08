@@ -13,7 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
 use crate::app::App;
-use crate::client::{Client, Provider, Usage};
+use crate::client::{Client, Provider};
 use crate::limits::{self, RateLimits};
 use crate::tools::BoxFuture;
 
@@ -409,21 +409,24 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
     let mut set = |name: &'static str, value: Value| {
         values.insert(name, value);
     };
-    let provider = Provider::of(&app.model);
-    set("model", Value::plain(&app.model));
+    let (model, window, input) = app.status_context();
+    let provider = Provider::of(&model);
+    set("model", Value::plain(&model));
     set(
         "effort",
         Value::plain(match provider {
-            Provider::Codex => app.effort.as_str(),
-            Provider::Ollama => "",
+            Provider::Codex if app.inside.is_none() => app.effort.as_str(),
+            _ => "",
         }),
     );
     set(
         "fast",
-        Value::plain(match provider == Provider::Codex && app.fast {
-            true => "fast",
-            false => "",
-        }),
+        Value::plain(
+            match provider == Provider::Codex && app.fast && app.inside.is_none() {
+                true => "fast",
+                false => "",
+            },
+        ),
     );
     set(
         "provider",
@@ -458,10 +461,9 @@ pub fn values(app: &App) -> HashMap<&'static str, Value> {
             },
         ),
     );
-    let window = app.limits.window(&app.model);
     set("ctx_window", Value::plain(compact(window)));
-    let fork = app.forked();
-    match fork.or(app.last_usage.map(|Usage { input, .. }| input)) {
+    let fork = app.forked().filter(|_| app.inside.is_none());
+    match input {
         Some(input) => {
             let percent = 100.0 * input as f64 / window as f64;
             set(

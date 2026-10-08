@@ -159,6 +159,7 @@ pub struct TrustGate {
 /// types into it rather than into the session.
 pub struct Inside {
     pub id: String,
+    pub model: String,
     pub identity: String,
     pub description: String,
     entries: Arc<Mutex<Entries>>,
@@ -2609,6 +2610,31 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         }
     }
 
+    /// The model, window and last input count of the pane on screen.
+    pub fn status_context(&self) -> (String, u64, Option<u64>) {
+        match &self.inside {
+            Some(inside) => {
+                let model = self
+                    .children()
+                    .into_iter()
+                    .find(|row| row.id == inside.id)
+                    .map(|row| row.model)
+                    .unwrap_or_else(|| inside.model.clone());
+                let window = crate::compact::Limits::default().window(&model);
+                (
+                    model,
+                    window,
+                    self.entries().last_usage.map(|usage| usage.input),
+                )
+            }
+            None => (
+                self.model.clone(),
+                self.limits.window(&self.model),
+                self.forked().or(self.last_usage.map(|usage| usage.input)),
+            ),
+        }
+    }
+
     /// The child agents of the running turn, for the panel.
     pub fn children(&self) -> Vec<ChildRow> {
         self.session.children()
@@ -2634,6 +2660,7 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         };
         self.inside = Some(Inside {
             id: row.id.clone(),
+            model: row.model.clone(),
             identity: row.identity.clone(),
             description: row.description.clone(),
             entries,

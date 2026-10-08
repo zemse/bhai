@@ -6,22 +6,24 @@ carries the shape of what is there.
 
 ## 2026-10-09
 
-- The auto judge extracts scoped permissions and restrictions from original user messages, then merges source-backed notes before deciding commands. Authorization survives session resume, compaction and forks, is shared with running children, and invalidates cached verdicts; failed updates stay pending and cannot use stale approvals. Both summary stages have separate prompt-cache keys, and automatic wake prompts grant no new authority. Plain SSH identity-file authentication can reach the judge while key disclosure remains protected; authorized server cleanup includes stopping, not deleting it.
 - Project instructions load `AGENTS.local.md` alongside `AGENTS.md`; the nonstandard `AGENT.md` alias is no longer discovered.
 - Goal completion and blocking return concise status text without agent-only instructions in the displayed tool result.
+- The auto judge extracts scoped permissions and restrictions from original user messages, then merges source-backed notes before deciding commands. Authorization survives session resume, compaction and forks, is shared with running children, and invalidates cached verdicts; failed updates stay pending and cannot use stale approvals. Both summary stages have separate prompt-cache keys, and automatic wake prompts grant no new authority. Plain SSH identity-file authentication can reach the judge while key disclosure remains protected; authorized server cleanup includes stopping, not deleting it.
+- Opening a subagent updates the status bar's model and context fill, including custom templates. Child usage stays live in its pane; returning restores the main session's details.
 
 ## 2026-10-08
 
-- The `register_skills` tool discovers repo-local skills on demand with `from`, returning their listing in a new tool result without changing the system prompt or earlier history. `from` plus `name` loads a scoped skill, including after session resume; discovery checks only the repo's skill roots, and the tool is available with no startup skills. Existing `Skill` and `Load_skill` permission rules and identity tool lists still apply.
 - Schedules belong to the saved session, not just its project directory. Other sessions cannot list, modify or fire them; resuming keeps them. Old ownerless project stores stay untouched and are no longer loaded.
+- The `register_skills` tool discovers repo-local skills on demand with `from`, returning their listing in a new tool result without changing the system prompt or earlier history. `from` plus `name` loads a scoped skill, including after session resume; discovery checks only the repo's skill roots, and the tool is available with no startup skills. Existing `Skill` and `Load_skill` permission rules and identity tool lists still apply.
+- The main agent's read-only `status` tool returns compact JSON for bash sessions, active children and monitors. Exited commands point to result collection, empty sections are omitted, and reads leave results and push updates untouched.
 
 ## 2026-10-07
 
+- The built-in prompt allows retrying rejected calls after user authorization and no longer forbids correcting failed commands with small variations.
+- The built-in prompt no longer forbids commits unless explicitly requested; project and user instructions govern the commit workflow.
 - Command and HTTP tool hooks load from dedicated global and trusted project JSON files, with pre-call blocking, input revalidation, post-success/failure context, bounded output, deadlines and cancellation. The lifecycle schema names the remaining events but warns that their built-in integration is pending; other handler types are not yet supported.
 - Goals no longer have token budgets, spend accounting or budget commands. The status bar shows lifecycle state only; saved exhausted goals load as paused and resume with their specification and progress intact.
 - Subagent rows show the actual model alongside the identity and task, including in the open pane and debug state.
-- The built-in prompt allows retrying rejected calls after user authorization and no longer forbids correcting failed commands with small variations.
-- The built-in prompt no longer forbids commits unless explicitly requested; project and user instructions govern the commit workflow.
 
 ## 2026-10-06
 

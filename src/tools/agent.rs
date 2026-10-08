@@ -301,6 +301,19 @@ impl Agent {
         // still be stopped by an interrupt that lands before it gets a slot.
         let (tx, cancel) = (self.tx.clone(), self.cancel.child(&id));
         let (children, slots) = (Arc::clone(&self.children), Arc::clone(&self.slots));
+        // Status includes a child waiting for a slot, before its loop starts.
+        {
+            let mut rows = children.lock().unwrap_or_else(|e| e.into_inner());
+            match rows.iter_mut().find(|row| row.id == id) {
+                Some(row) => row.description = description.clone(),
+                None => rows.push(agent::ChildUsage {
+                    id: id.clone(),
+                    identity: identity.name.clone(),
+                    description: description.clone(),
+                    ..agent::ChildUsage::default()
+                }),
+            }
+        }
         let results = self.results.clone();
         // Forked now, so the child starts from what the session had done when it asked.
         let judge = self.judge.as_ref().map(|judge| judge.child(&id, &task));
@@ -952,6 +965,45 @@ mod tests {
                 "kept calling tools past its {CHILD_STEPS}-step budget"
             )),
             "{out}"
+        );
+        harness.cleanup();
+    }
+
+    #[tokio::test]
+    async fn status_includes_a_child_waiting_for_a_slot() {
+        let fake = Fake::new(Vec::new());
+        let mut harness = tool(&fake, false);
+        let slots = Arc::clone(&harness.agent.slots);
+        let lease = slots.acquire_many(MAX_RUNNING as u32).await.unwrap();
+        let (out, ok) = harness
+            .agent
+            .execute(&json!({
+                "description": "queued review", "prompt": "go"
+            }))
+            .await;
+        assert!(ok, "{out}");
+        let status = crate::tools::status::Status {
+            children: Arc::clone(&harness.agent.children),
+            cancel: Arc::clone(&harness.agent.cancel),
+            monitors: None,
+        };
+        let (text, ok) = status.execute(&json!({})).await;
+        assert!(ok);
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let rows = value["children"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["task"], "queued review");
+        assert_eq!(rows[0]["state"], "running");
+        harness.agent.cancel.stop();
+        drop(lease);
+        assert!(
+            harness
+                .results
+                .recv()
+                .await
+                .unwrap()
+                .text
+                .contains("stopped before it started")
         );
         harness.cleanup();
     }
