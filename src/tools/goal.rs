@@ -157,13 +157,7 @@ impl Tool for Goal {
                         State::Blocked
                     };
                     goal.note = reason.to_string();
-                    (
-                        format!(
-                            "Goal marked {}. Tell the user and end your turn.",
-                            goal.state.label()
-                        ),
-                        true,
-                    )
+                    (format!("Goal {}.", goal.state.label()), true)
                 }
                 Some(goal) => (
                     format!(
@@ -328,6 +322,22 @@ mod tests {
         assert!(tool.execute(&adopt("next task")).await.1);
         assert!(tool.goal.lock().unwrap().as_ref().unwrap().plan.is_none());
         assert!(tool.plan.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_status_returns_only_the_goal_status() {
+        for (status, state) in [("complete", State::Complete), ("blocked", State::Blocked)] {
+            let tool = tool(Some(goal::Goal::new("ship")), false);
+            let (out, ok) = tool
+                .execute(&json!({"status": status, "reason": "verified outcome"}))
+                .await;
+            assert!(ok);
+            assert_eq!(out, format!("Goal {status}."));
+            let goal = tool.goal.lock().unwrap();
+            let goal = goal.as_ref().unwrap();
+            assert_eq!(goal.state, state);
+            assert_eq!(goal.note, "verified outcome");
+        }
     }
 
     #[tokio::test]

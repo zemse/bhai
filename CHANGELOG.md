@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-09
+
+- Goal completion and blocking return concise status text without agent-only instructions in the displayed tool result.
+
 ## 2026-10-08
 
 - The `register_skills` tool discovers repo-local skills on demand with `from`, returning their listing in a new tool result without changing the system prompt or earlier history. `from` plus `name` loads a scoped skill, including after session resume; discovery checks only the repo's skill roots, and the tool is available with no startup skills. Existing `Skill` and `Load_skill` permission rules and identity tool lists still apply.
