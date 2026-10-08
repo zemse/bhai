@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-09
 
+- Repo-local agent instructions require verified commits, main-branch integration and safe cleanup before reporting completed work.
 - The ceilings benchmark declares the hooks module used by the agent loop, so it compiles with lifecycle automation enabled.
 - Project instructions load `AGENTS.local.md` alongside `AGENTS.md`; the nonstandard `AGENT.md` alias is no longer discovered.
 - Goal completion and blocking return concise status text without agent-only instructions in the displayed tool result.
