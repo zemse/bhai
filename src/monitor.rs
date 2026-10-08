@@ -525,7 +525,7 @@ impl Monitors {
             clean(&hook.condition),
             clean(&hook.prompt)
         );
-        if session.submit(Prompt::shown_as(text, shown)).is_ok() {
+        if session.submit(Prompt::automatic(text, shown)).is_ok() {
             *last = Some(now);
             true
         } else {
@@ -901,6 +901,7 @@ mod tests {
         let message = input.recv().await.unwrap();
         assert!(message.text.contains("Compare benchmark results"));
         assert!(message.text.contains("Untrusted monitor observations"));
+        assert!(message.user_text.is_none());
         assert_eq!(store.views()[0].snapshot.as_ref().unwrap().tracks.len(), 2);
         assert!(input.try_recv().is_err());
         let context = store.context().unwrap();

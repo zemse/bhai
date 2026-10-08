@@ -1021,10 +1021,10 @@ fn start(
     let (tx_agent, rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(agent::Cancel::default());
     let policy = Arc::new(policy);
-    // Built whatever the mode is, since `shift+tab` cycles into `auto` mid-session; the
-    // policy is what decides that a call may reach it at all.
+    // Keep recording user sources even with judging off; re-enabling it must see
+    // restrictions stated while it was disabled.
     let settings_model = settings.model.clone();
-    let judge = settings.on.then(|| {
+    let judge = Some({
         let backend = Arc::new(ModelJudge::new(client.clone(), &settings));
         let root = std::env::current_dir().unwrap_or_default();
         Arc::new(

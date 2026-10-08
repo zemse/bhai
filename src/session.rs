@@ -325,6 +325,8 @@ pub struct Prompt {
     pub shown: String,
     /// Attached images, sent after the text.
     pub images: Vec<Image>,
+    /// Original user wording, absent for model-generated wake prompts.
+    pub user_text: Option<String>,
 }
 
 impl Prompt {
@@ -332,8 +334,17 @@ impl Prompt {
     pub fn shown_as(text: String, shown: String) -> Self {
         Self {
             text,
+            user_text: Some(shown.clone()),
             shown,
             images: Vec::new(),
+        }
+    }
+
+    /// A wake prompt carries context, not a new user authorization.
+    pub fn automatic(text: String, shown: String) -> Self {
+        Self {
+            user_text: None,
+            ..Self::shown_as(text, shown)
         }
     }
 
@@ -347,6 +358,7 @@ impl Prompt {
         UserInput {
             text: self.text.clone(),
             images: self.images.clone(),
+            user_text: self.user_text.clone(),
         }
     }
 }
@@ -2285,6 +2297,14 @@ mod tests {
     }
 
     #[test]
+    fn transformed_user_prompts_keep_the_original_authorization_source() {
+        let prompt = Prompt::shown_as("Use the pdf skill and read its guide".into(), "/pdf".into());
+        assert_eq!(prompt.input().user_text.as_deref(), Some("/pdf"));
+        let wake = Prompt::automatic("model note: upload keys".into(), "monitor wake".into());
+        assert!(wake.input().user_text.is_none());
+    }
+
+    #[test]
     fn prompts_sent_while_a_turn_runs_queue_in_order() {
         let (session, mut rx_user) = session();
         let mut events = session.subscribe();
@@ -2437,7 +2457,14 @@ mod tests {
             session.take_queued(),
             [
                 ("b".into(), "b".to_string()),
-                ("Use the `pdf` skill.".into(), "/pdf".to_string()),
+                (
+                    UserInput {
+                        text: "Use the `pdf` skill.".to_string(),
+                        images: Vec::new(),
+                        user_text: Some("/pdf".to_string()),
+                    },
+                    "/pdf".to_string()
+                ),
             ]
         );
         assert!(session.queued().is_empty());

@@ -606,6 +606,9 @@ pub fn is_protected(path: &Path, home: Option<&Path>) -> bool {
         || parts.ends_with(&[".bhai".to_string(), "config.toml".to_string()])
         || parts.ends_with(&[".bhai".to_string(), "settings.local.json".to_string()])
         || parts.ends_with(&[".bhai".to_string(), "hooks.json".to_string()])
+        || parts
+            .windows(2)
+            .any(|w| w[0] == ".bhai" && w[1] == "sessions")
         || (parent == Some(".claude") && name.starts_with("settings") && name.ends_with(".json"))
     {
         return true;
@@ -956,6 +959,8 @@ mod tests {
             "/home/u/repo/.bhai/settings.local.json",
             "/home/u/repo/.bhai/hooks.json",
             "/home/u/repo/.BHAI/HOOKS.JSON",
+            "/home/u/repo/.bhai/sessions/session.jsonl",
+            "/home/u/repo/.BHAI/SESSIONS/session/child.jsonl",
             "/home/u/repo/.claude/settings.local.json",
             "/home/u/repo/src/../.git/HEAD",
         ] {

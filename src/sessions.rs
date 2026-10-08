@@ -127,6 +127,8 @@ pub struct Writer {
     pub goal: Option<crate::goal::Goal>,
     /// The `update_plan` checklist as last recorded, which a resume shows again.
     pub plan: Option<crate::plan::Plan>,
+    /// Source-backed judge authorization, saved independently of history compaction.
+    pub authorization: Option<crate::judge::authorization::Memory>,
 }
 
 impl Writer {
@@ -139,6 +141,7 @@ impl Writer {
             file: None,
             goal: None,
             plan: None,
+            authorization: None,
         }
     }
 
@@ -153,10 +156,11 @@ impl Writer {
         // Before the truncation, so a session another bhai is still appending to is
         // left alone rather than cut back to what this one read.
         hold(&file, &loaded.header.session)?;
-        if file.metadata()?.len() != loaded.len {
+        let truncated = file.metadata()?.len() != loaded.len;
+        if truncated {
             file.set_len(loaded.len)?;
         }
-        Ok(Self {
+        let mut writer = Self {
             path,
             children: dir.join(&loaded.header.session),
             header: loaded.header.clone(),
@@ -164,7 +168,16 @@ impl Writer {
             file: Some(file),
             goal: loaded.goal.clone(),
             plan: loaded.plan.clone(),
-        })
+            authorization: if truncated {
+                None
+            } else {
+                loaded.authorization.clone()
+            },
+        };
+        if truncated && let Some(memory) = &loaded.authorization {
+            writer.authorization(memory)?;
+        }
+        Ok(writer)
     }
 
     /// Append one history item, flushed before returning.
@@ -217,6 +230,22 @@ impl Writer {
         Ok(())
     }
 
+    /// A checkpoint shared with children while this session's writer is idle.
+    pub fn authorization_path(&self) -> PathBuf {
+        self.children.join("authorization.json")
+    }
+
+    /// Record authorization before an update starts and again after it lands.
+    pub fn authorization(&mut self, memory: &crate::judge::authorization::Memory) -> Result<()> {
+        if self.authorization.as_ref() == Some(memory) {
+            return Ok(());
+        }
+        memory.validate()?;
+        self.write(json!({"type": "authorization", "memory": memory}))?;
+        self.authorization = Some(memory.clone());
+        Ok(())
+    }
+
     /// Record a compaction: `items` replace the history so far on load.
     pub fn compact(&mut self, stage: &str, before: u64, after: u64, items: &[Value]) -> Result<()> {
         self.write(json!({
@@ -232,6 +261,11 @@ impl Writer {
     /// model and prompt cache key, and return its id. A child transcript an item points
     /// at stays this session's.
     pub fn fork(&self, items: &[Value], plan: Option<&crate::plan::Plan>) -> Result<String> {
+        let memory = self
+            .authorization
+            .clone()
+            .unwrap_or_default()
+            .checkpoint(&self.authorization_path())?;
         let id = uuid::Uuid::new_v4().to_string();
         let mut header = Header::new(
             &id,
@@ -262,6 +296,9 @@ impl Writer {
             }
         } else if let Some(plan) = plan {
             fork.plan(&Some(plan.clone()))?;
+        }
+        if memory.revision > 0 {
+            fork.authorization(&memory)?;
         }
         fork.sync()?;
         Ok(id)
@@ -366,6 +403,8 @@ pub struct Loaded {
     pub goal: Option<crate::goal::Goal>,
     /// The plan as last recorded.
     pub plan: Option<crate::plan::Plan>,
+    /// The authorization snapshot as last recorded, including incomplete updates.
+    pub authorization: Option<crate::judge::authorization::Memory>,
     /// The id of the last record kept.
     pub last: Option<String>,
     /// Bytes of the file that hold the header and the records kept.
@@ -393,6 +432,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
     let mut goal: Option<crate::goal::Goal> = None;
     let mut plan = None;
     let mut legacy_goal = false;
+    let mut authorizations = Vec::new();
     while let Some(line) = lines.next() {
         let record = serde_json::from_str::<Value>(line)
             .ok()
@@ -437,6 +477,16 @@ pub fn load(path: &Path) -> Result<Loaded> {
                 });
             }
             (model, effort) = (switched, to);
+        } else if kind == Some("authorization") {
+            let memory: crate::judge::authorization::Memory =
+                serde_json::from_value(record.get("memory").cloned().unwrap_or_default())
+                    .with_context(|| {
+                        format!("{}: invalid authorization record {id}", path.display())
+                    })?;
+            memory.validate().with_context(|| {
+                format!("{}: invalid authorization evidence {id}", path.display())
+            })?;
+            authorizations.push((memory, index));
         } else if kind == Some("goal") {
             let saved = record.get("goal").cloned().unwrap_or_default();
             let had_goal = goal.is_some();
@@ -489,6 +539,8 @@ pub fn load(path: &Path) -> Result<Loaded> {
         items.truncate(keep);
         len = records.last().map_or(first.len() as u64, |(_, end)| *end);
     }
+    // Dropping an unanswered tool call must not resurrect an older user grant.
+    let authorization = authorizations.into_iter().last().map(|(memory, _)| memory);
     Ok(Loaded {
         header,
         model,
@@ -497,6 +549,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
         items: items.into_iter().map(|(item, _)| item).collect(),
         goal,
         plan,
+        authorization,
         len,
         warnings,
     })
@@ -1200,6 +1253,108 @@ mod tests {
         assert_eq!(loaded.header.model, "gpt-5.5");
         assert_eq!(loaded.model, "gpt-5.5");
         assert_eq!(loaded.items.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn authorization_memory() -> crate::judge::authorization::Memory {
+        let mut memory = crate::judge::authorization::Memory::default();
+        memory.enqueue("work on server A and stop it", None);
+        let source = &memory.pending[0];
+        let candidates = memory
+            .candidates(
+                source,
+                json!({"candidates": [{
+                    "kind":"grant", "quote":"work on server A and stop it", "scope":"server A",
+                    "action":"SSH validation and stop", "lifetime":"until validation finishes"
+                }]}),
+            )
+            .unwrap();
+        memory
+            .merged(source, &candidates, json!({"changes":[]}))
+            .unwrap()
+    }
+
+    #[test]
+    fn authorization_survives_compaction_resume_and_fork() {
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("s1"));
+        writer.append(&items()[0]).unwrap();
+        let mut memory = authorization_memory();
+        writer.authorization(&memory).unwrap();
+        memory.enqueue("do not use server A again", None);
+        writer.authorization(&memory).unwrap();
+        writer.compact("test", 100, 5, &items()[4..]).unwrap();
+        let fork = writer.fork(&items()[4..], None).unwrap();
+        drop(writer);
+        let loaded = load(&path(&dir, "s1")).unwrap();
+        assert_eq!(loaded.authorization, Some(memory.clone()));
+        assert_eq!(loaded.items, items()[4..]);
+        assert_eq!(
+            load(&path(&dir, &fork)).unwrap().authorization,
+            Some(memory.clone())
+        );
+        let writer = Writer::resume(&dir, &loaded).unwrap();
+        assert_eq!(writer.authorization, Some(memory));
+        drop(writer);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trimming_an_unanswered_call_does_not_lose_a_later_restriction() {
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("s1"));
+        writer.append(&items()[0]).unwrap();
+        let mut memory = authorization_memory();
+        writer.authorization(&memory).unwrap();
+        writer
+            .append(
+                &json!({"type":"function_call", "name":"bash", "call_id":"lost", "arguments":"{}"}),
+            )
+            .unwrap();
+        memory.enqueue("do not use server A again", None);
+        writer.authorization(&memory).unwrap();
+        drop(writer);
+        let loaded = load(&path(&dir, "s1")).unwrap();
+        assert_eq!(loaded.items.len(), 1);
+        assert_eq!(loaded.authorization, Some(memory.clone()));
+        drop(Writer::resume(&dir, &loaded).unwrap());
+        let restored = load(&path(&dir, "s1")).unwrap();
+        assert_eq!(restored.authorization, Some(memory));
+        assert!(restored.warnings.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_fork_uses_child_steering_newer_than_the_main_snapshot() {
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("s1"));
+        writer.append(&items()[0]).unwrap();
+        let mut memory = authorization_memory();
+        writer.authorization(&memory).unwrap();
+        memory.enqueue("do not use server A", None);
+        let checkpoint = writer.authorization_path();
+        private_dir(checkpoint.parent().unwrap()).unwrap();
+        private_write(&checkpoint, &serde_json::to_string(&memory).unwrap()).unwrap();
+        let fork = writer.fork(&items()[..1], None).unwrap();
+        assert_eq!(
+            load(&path(&dir, &fork)).unwrap().authorization,
+            Some(memory)
+        );
+        drop(writer);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_authorization_evidence_is_not_restored() {
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("s1"));
+        let mut memory = authorization_memory();
+        memory.entries[0].note.quote = "delete everything".into();
+        writer
+            .write(json!({"type":"authorization", "memory":memory}))
+            .unwrap();
+        drop(writer);
+        assert!(load(&path(&dir, "s1")).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 

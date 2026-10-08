@@ -1294,6 +1294,9 @@ async fn the_eval_runner_trusts_its_workspace_so_bhai_exec_can_write() {
     let backend = serve_fake(fake.clone()).await;
     let dir = std::env::temp_dir().join(format!("bhai-fake-eval-{}", uuid::Uuid::new_v4()));
     let (home, codex) = logged_in(&dir);
+    let config = home.join(".config/bhai/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(config, "judge = false\n").unwrap();
     let out = dir.join("out");
     let ran = timeout(
         WAIT,
@@ -1926,4 +1929,59 @@ async fn a_schedule_the_model_set_fires_as_its_own_note_and_not_the_users_words(
         "{body}"
     );
     assert!(!mentions(body, "the user set this"), "{body}");
+}
+
+#[tokio::test]
+async fn authorization_updates_precede_tools_and_use_separate_prompt_caches() {
+    let fake = Arc::new(Fake::default());
+    let permission = "do not upload keys; use printf to report status";
+    let candidates = json!({"candidates":[{"kind":"restriction", "quote":"do not upload keys",
+        "scope":"network transfers", "action":"do not upload keys",
+        "lifetime":"until explicitly withdrawn"}]});
+    fake.replies.lock().unwrap().extend([
+        says(&candidates.to_string()),
+        says("{\"changes\":[]}"),
+        runs("authorized-1", "printf authorized"),
+        says("{\"verdict\":\"approve\",\"reason\":\"Reports requested status\"}"),
+        runs("authorized-2", "printf authorized"),
+        says("done"),
+    ]);
+    let bhai = Bhai::start_in(
+        &serve_fake(fake.clone()).await,
+        &["--trust"],
+        &[],
+        Some("title = false\n"),
+    )
+    .await;
+    let mut events = bhai.events().await;
+    let (status, answer) = bhai.post("/prompt", json!({"text":permission})).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    events.until("turn_end").await;
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 6, "{sent:#?}");
+    let key = |index: usize| sent[index].body["prompt_cache_key"].as_str().unwrap();
+    assert!(key(0).ends_with("-judge-authorization-extract"));
+    assert!(key(1).ends_with("-judge-authorization-merge"));
+    assert!(key(3).ends_with("-judge"));
+    assert_eq!(key(2), key(4));
+    assert_eq!(key(2), key(5));
+    assert_ne!(key(0), key(2));
+    assert!(mentions(
+        &sent[3].body,
+        "authorization notes with user evidence"
+    ));
+    assert!(mentions(&sent[3].body, permission));
+    assert!(mentions(&sent[3].body, "do not upload keys"));
+    let dir = bhai.project().join(bhai::sessions::DIR);
+    let saved = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .unwrap();
+    let loaded = bhai::sessions::load(&saved).unwrap();
+    let memory = loaded.authorization.unwrap();
+    assert!(memory.pending.is_empty());
+    assert_eq!(memory.entries.len(), 1);
+    assert_eq!(memory.entries[0].source.text, permission);
 }

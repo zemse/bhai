@@ -224,7 +224,7 @@ did not type them, so they ask nothing of you that the user has not asked alread
             ),
             false => format!("(scheduled `{}`{by}) {}", row.spec, row.text),
         };
-        Prompt::shown_as(text, shown)
+        Prompt::automatic(text, shown)
     }
 }
 
@@ -803,6 +803,7 @@ mod tests {
             .await
             .expect("nothing fired")
             .unwrap();
+        assert!(input.user_text.is_none());
         (input.text, Duration::from_std(start.elapsed()).unwrap())
     }
 
