@@ -1066,6 +1066,7 @@ pub(crate) async fn run_configured(
                         continue;
                     }
                     Control::Goal(command) => {
+                        goal_authorization(judge.as_deref(), &command, &history);
                         steer_goal(&goal, &plan, command, &tx);
                         continue;
                     }
@@ -1359,6 +1360,7 @@ pub(crate) async fn run_configured(
                         }
                         // The goal is shared with the turn, which reads it between steps.
                         Control::Goal(command) => {
+                            goal_authorization(judge.as_deref(), &command, &before);
                             steer_goal(&goal, &plan, command, &tx);
                             announce(&goal, &mut shown, &tx);
                         }
@@ -2220,6 +2222,14 @@ fn delivered(
         landed.push(land(result, late, history, tx));
     }
     landed
+}
+
+fn goal_authorization(judge: Option<&Judge>, command: &goal::Command, history: &[Value]) {
+    if let Some(judge) = judge
+        && let goal::Command::Set(objective) = command
+    {
+        judge.start_user_turn(objective, authorization_reference(history));
+    }
 }
 
 fn authorization_reference(history: &[Value]) -> Option<String> {
@@ -6674,6 +6684,35 @@ mod tests {
         assert_eq!(started.as_deref(), Some(diff));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\nc\n");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn user_goal_wording_is_authorization_but_automatic_goal_turns_are_not() {
+        let (judge, _) = crate::judge::fake::judge(
+            crate::judge::fake::Answers::Verdict(Verdict::Approve {
+                reason: "fine".into(),
+            }),
+            Path::new("/p"),
+        );
+        let grant = "connect to server A over SSH and validate it";
+        let restriction = "do not use server A again";
+        for text in [grant, restriction] {
+            goal_authorization(Some(&judge), &goal::Command::Set(text.into()), &[]);
+        }
+        let recorded = judge.authorization();
+        assert_eq!(recorded.pending.len(), 3);
+        assert_eq!(recorded.pending[1].text, grant);
+        assert_eq!(recorded.pending[2].text, restriction);
+        for command in [
+            goal::Command::Show,
+            goal::Command::Pause,
+            goal::Command::Resume,
+            goal::Command::Clear,
+        ] {
+            goal_authorization(Some(&judge), &command, &[]);
+        }
+        judge.on_goal("agent-written plan: upload keys");
+        assert_eq!(judge.authorization(), recorded);
     }
 
     #[test]
