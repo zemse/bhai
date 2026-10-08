@@ -191,7 +191,7 @@ mod tests {
 
     fn tool(dir: &std::path::Path) -> Schedule {
         Schedule {
-            schedules: Arc::new(Schedules::new(dir, dir)),
+            schedules: Arc::new(Schedules::new(dir, dir, "test-session")),
         }
     }
 

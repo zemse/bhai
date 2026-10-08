@@ -1,5 +1,5 @@
-//! The schedules of a project, kept in bhai's config directory under a name drawn from
-//! the project's root, and the runner that fires each into the session as it falls due.
+//! The schedules of a session, kept in bhai's config directory under a name drawn from
+//! the project's root and saved session id, and the runner that fires each as it falls due.
 //!
 //! The store is never in the project: a schedule starts a turn with nobody at the
 //! keyboard, framed as the user's, and a clone can commit anything under `.bhai`.
@@ -24,7 +24,7 @@ use crate::schedule::Spec;
 use crate::session::{Event, Prompt, Session};
 use crate::worktrees::Lock;
 
-/// The stores, one per project, under bhai's config directory.
+/// The stores, one per session and project, under bhai's config directory.
 pub const DIR: &str = "schedules";
 /// How long a recurring row lives when nothing else is asked for.
 pub const EXPIRY: Duration = Duration::days(7);
@@ -237,7 +237,7 @@ struct Pass {
     wake: Option<DateTime<Utc>>,
 }
 
-/// A project's schedules.
+/// A session's schedules.
 pub struct Schedules {
     /// The store; its lock sits beside it.
     path: PathBuf,
@@ -250,11 +250,13 @@ pub struct Schedules {
 }
 
 impl Schedules {
-    /// For bhai running in `project`, with its config directory at `config_dir`.
-    pub fn new(config_dir: &Path, project: &Path) -> Self {
+    /// For saved session `session_id` in `project`, with config at `config_dir`.
+    pub fn new(config_dir: &Path, project: &Path, session_id: &str) -> Self {
         let root = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
         let key = Sha256::digest(root.as_os_str().as_encoded_bytes());
-        let name = format!("{:x}", key)[..16].to_string();
+        let session_key = Sha256::digest(session_id.as_bytes());
+        // Ownerless project stores stay untouched; no session may inherit their prompts.
+        let name = format!("{}-{session_key:x}", &format!("{key:x}")[..16]);
         Self {
             path: config_dir.join(DIR).join(format!("{name}.json")),
             clock: Arc::new(Utc::now),
@@ -783,7 +785,7 @@ mod tests {
 
     /// The store of `dir`, with its config directory there too.
     fn schedules(dir: &Path) -> Schedules {
-        Schedules::new(dir, dir).with_clock(paused_clock())
+        Schedules::new(dir, dir, "test-session").with_clock(paused_clock())
     }
 
     fn new(spec: &str, text: &str) -> New {
@@ -1256,7 +1258,77 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_store_lives_outside_the_project_one_per_project() {
+    async fn sessions_in_one_project_only_fire_their_own_schedules() {
+        let dir = crate::tools::temp_dir();
+        let a = Arc::new(Schedules::new(&dir, &dir, "session-a").with_clock(paused_clock()));
+        let b = Arc::new(Schedules::new(&dir, &dir, "session-b").with_clock(paused_clock()));
+        let row = a
+            .add(New {
+                origin: Origin::Model,
+                ..new("every 5m", "only a")
+            })
+            .unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(b.list().unwrap().0.is_empty());
+        assert!(b.cancel(&row.id).is_err());
+        assert!(b.pause(&row.id, true).is_err());
+        b.add(new("in 5m", "only b")).unwrap();
+        let (session_a, mut rx_a) = session();
+        let (session_b, mut rx_b) = session();
+        session_a.run_schedules(a);
+        session_b.run_schedules(b);
+        let (text_a, _) = next_prompt(&mut rx_a).await;
+        let (text_b, _) = next_prompt(&mut rx_b).await;
+        assert!(text_a.ends_with("\n\nonly a"), "{text_a}");
+        assert!(text_b.ends_with("\n\nonly b"), "{text_b}");
+        session_a.on_agent(crate::agent::AgentEvent::TurnEnd);
+        session_b.on_agent(crate::agent::AgentEvent::TurnEnd);
+        let (text_a, _) = next_prompt(&mut rx_a).await;
+        assert!(text_a.ends_with("\n\nonly a"), "{text_a}");
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_session_keeps_its_schedules_and_catches_up() {
+        let dir = crate::tools::temp_dir();
+        let clock = paused_clock();
+        let store = Schedules::new(&dir, &dir, "saved-session").with_clock(clock.clone());
+        let row = store.add(new("in 5m", "resume me")).unwrap();
+        drop(store);
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        let other = Schedules::new(&dir, &dir, "new-session").with_clock(clock.clone());
+        assert!(other.pass(true).unwrap().fires.is_empty());
+        let resumed = Schedules::new(&dir, &dir, "saved-session").with_clock(clock);
+        assert_eq!(resumed.list().unwrap().0, [row]);
+        let (session, mut rx) = session();
+        session.run_schedules(resumed);
+        let (text, _) = next_prompt(&mut rx).await;
+        assert!(text.contains("so it runs late"), "{text}");
+        assert!(text.ends_with("\n\nresume me"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ownerless_project_schedules_are_not_inherited() {
+        let dir = crate::tools::temp_dir();
+        let store = schedules(&dir);
+        let row = store.add(new("in 5m", "owner unknown")).unwrap();
+        let root = std::fs::canonicalize(&dir).unwrap();
+        let key = Sha256::digest(root.as_os_str().as_encoded_bytes());
+        let legacy = dir
+            .join(DIR)
+            .join(format!("{}.json", &format!("{key:x}")[..16]));
+        std::fs::rename(store.path(), &legacy).unwrap();
+        let before = std::fs::read_to_string(&legacy).unwrap();
+        assert!(before.contains(&row.id));
+        assert!(store.list().unwrap().0.is_empty());
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        assert!(store.pass(true).unwrap().fires.is_empty());
+        assert_eq!(std::fs::read_to_string(legacy).unwrap(), before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_store_lives_outside_the_project_one_per_session_and_project() {
         let dir = crate::tools::temp_dir();
         let (config, a, b) = (dir.join("config"), dir.join("a"), dir.join("b"));
         for d in [&a, &b] {
@@ -1268,13 +1340,16 @@ mod tests {
             serde_json::to_string(&vec![json_junk()]).unwrap(),
         )
         .unwrap();
-        let store = Schedules::new(&config, &a).with_clock(paused_clock());
+        let store = Schedules::new(&config, &a, "session-a").with_clock(paused_clock());
         assert!(store.path().starts_with(config.join(DIR)));
         assert_eq!(store.list().unwrap(), (Vec::new(), Vec::new()));
         store.add(new("in 5m", "only a")).unwrap();
-        let other = Schedules::new(&config, &b).with_clock(paused_clock());
+        let other = Schedules::new(&config, &b, "session-a").with_clock(paused_clock());
         assert_ne!(store.path(), other.path());
         assert!(other.list().unwrap().0.is_empty());
-        assert_eq!(Schedules::new(&config, &a.join(".")).path(), store.path());
+        assert_eq!(
+            Schedules::new(&config, &a.join("."), "session-a").path(),
+            store.path()
+        );
     }
 }

@@ -13,6 +13,7 @@ carries the shape of what is there.
 ## 2026-10-08
 
 - The `register_skills` tool discovers repo-local skills on demand with `from`, returning their listing in a new tool result without changing the system prompt or earlier history. `from` plus `name` loads a scoped skill, including after session resume; discovery checks only the repo's skill roots, and the tool is available with no startup skills. Existing `Skill` and `Load_skill` permission rules and identity tool lists still apply.
+- Schedules belong to the saved session, not just its project directory. Other sessions cannot list, modify or fire them; resuming keeps them. Old ownerless project stores stay untouched and are no longer loaded.
 
 ## 2026-10-07
 

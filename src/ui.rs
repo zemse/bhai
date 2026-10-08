@@ -4005,7 +4005,7 @@ mod tests {
             status(&terminal)
         );
         let dir = crate::tools::temp_dir();
-        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir, "test-session"));
         let store = session.schedules().unwrap();
         store.remind("in 20m a").unwrap();
         let paused = store.remind("every 1h b").unwrap();
@@ -4862,7 +4862,7 @@ mod tests {
         let mut app = App::detached();
         let dir = crate::tools::temp_dir();
         app.session()
-            .run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+            .run_schedules(crate::schedules::Schedules::new(&dir, &dir, "test-session"));
         let store = app.session().schedules().unwrap();
         let row = store.remind("in 20m check CI").unwrap();
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();

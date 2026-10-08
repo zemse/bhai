@@ -424,7 +424,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn schedules_that_will_fire_are_rows_and_paused_ones_are_not() {
         let dir = crate::tools::temp_dir();
-        let store = crate::schedules::Schedules::new(&dir, &dir);
+        let store = crate::schedules::Schedules::new(&dir, &dir, "test-session");
         let kept = store.remind("in 20m check CI\nand the logs").unwrap();
         let paused = store.remind("every 2h poll the queue").unwrap();
         store.pause(&paused.id, true).unwrap();

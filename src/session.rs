@@ -559,7 +559,7 @@ pub struct Session {
     policy: Arc<Policy>,
     /// The auto-approval judge, when one runs; it owns its own usage and budget.
     judge: Option<Arc<Judge>>,
-    /// The project's schedules, once [`Session::run_schedules`] fires them into this one.
+    /// This session's schedules, once [`Session::run_schedules`] fires them into it.
     schedules: std::sync::OnceLock<Arc<crate::schedules::Schedules>>,
     /// Where [`Session::background`] reads what else runs, once
     /// [`Session::watch_background`] is given them.
@@ -1959,7 +1959,7 @@ mod tests {
         use crate::background::{Kind, Refused, tests::Fake, tests::row};
         let (session, _rx) = session();
         let dir = crate::tools::temp_dir();
-        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir, "test-session"));
         let store = session.schedules().unwrap();
         let reminder = store.remind("in 20m check CI").unwrap();
         let fake = Fake::default();

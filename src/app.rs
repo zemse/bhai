@@ -2109,7 +2109,7 @@ impl App {
         }
     }
 
-    /// Run `f` on the project's schedules, which only run with a home directory to keep
+    /// Run `f` on the session's schedules, which only run with a home directory to keep
     /// them in.
     fn with_schedules(
         &self,
@@ -3379,7 +3379,7 @@ mod tests {
         assert!(matches!(last(&mut app), Some(Entry::Info(t)) if t == "background: nothing runs"));
         let dir = crate::tools::temp_dir();
         app.session
-            .run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+            .run_schedules(crate::schedules::Schedules::new(&dir, &dir, "test-session"));
         let store = app.session.schedules().unwrap();
         let reminder = store.remind("in 20m check CI").unwrap();
         let mut mcp = row(Kind::Mcp, "fs", "connected");
@@ -3438,7 +3438,7 @@ mod tests {
         );
         let dir = crate::tools::temp_dir();
         app.session
-            .run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+            .run_schedules(crate::schedules::Schedules::new(&dir, &dir, "test-session"));
         app.input.set("/remind".to_string());
         app.submit();
         assert!(

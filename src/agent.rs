@@ -481,7 +481,7 @@ pub struct Delegation {
     pub cache_root: PathBuf,
     /// Shared with the session, so what is typed into a pane reaches that child.
     pub mailboxes: Mailboxes,
-    /// The project's schedules, for the main agent's `schedule` tool; `None` where
+    /// The session's schedules, for the main agent's `schedule` tool; `None` where
     /// nothing fires them, and for a child.
     pub schedules: Option<Arc<crate::schedules::Schedules>>,
     /// Session-scoped observers; not offered to children or workflow steps.

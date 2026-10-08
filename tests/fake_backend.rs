@@ -1649,6 +1649,20 @@ async fn a_tool_call_inside_a_turn_sends_only_its_output_on_the_socket() {
     assert_eq!(input[0]["call_id"], "call_1");
 }
 
+fn prepare_scheduled_session(project: &std::path::Path) {
+    let dir = project.join(bhai::sessions::DIR);
+    bhai::sessions::private_dir(&dir).unwrap();
+    let header =
+        bhai::sessions::Header::new("scheduled-session", "general", "gpt-5.5", "medium", project);
+    let mut header = serde_json::to_value(header).unwrap();
+    header["type"] = json!("header");
+    bhai::sessions::private_write(
+        &bhai::sessions::path(&dir, "scheduled-session"),
+        &format!("{header}\n"),
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn a_schedule_missed_while_bhai_was_down_fires_at_startup_framed_as_late() {
     let fake = Arc::new(Fake::default());
@@ -1681,15 +1695,19 @@ async fn a_schedule_missed_while_bhai_was_down_fires_at_startup_framed_as_late()
     let mut store = PathBuf::new();
     let bhai = Bhai::start_prepared(
         &serve_fake(fake.clone()).await,
-        &[],
+        &["--resume", "scheduled-session"],
         &[],
         None,
         |home, project| {
-            std::fs::create_dir_all(project.join(".bhai")).unwrap();
+            prepare_scheduled_session(project);
             std::fs::write(project.join(".bhai/schedules.json"), forged.to_string()).unwrap();
-            store = bhai::schedules::Schedules::new(&home.join(".config/bhai"), project)
-                .path()
-                .to_path_buf();
+            store = bhai::schedules::Schedules::new(
+                &home.join(".config/bhai"),
+                project,
+                "scheduled-session",
+            )
+            .path()
+            .to_path_buf();
             std::fs::create_dir_all(store.parent().unwrap()).unwrap();
             std::fs::write(&store, rows.to_string()).unwrap();
         },
@@ -1895,13 +1913,18 @@ async fn a_schedule_the_model_set_fires_as_its_own_note_and_not_the_users_words(
     }]);
     let bhai = Bhai::start_prepared(
         &serve_fake(fake.clone()).await,
-        &[],
+        &["--resume", "scheduled-session"],
         &[],
         None,
         |home, project| {
-            let store = bhai::schedules::Schedules::new(&home.join(".config/bhai"), project)
-                .path()
-                .to_path_buf();
+            prepare_scheduled_session(project);
+            let store = bhai::schedules::Schedules::new(
+                &home.join(".config/bhai"),
+                project,
+                "scheduled-session",
+            )
+            .path()
+            .to_path_buf();
             std::fs::create_dir_all(store.parent().unwrap()).unwrap();
             std::fs::write(&store, rows.to_string()).unwrap();
         },

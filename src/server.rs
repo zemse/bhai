@@ -1364,7 +1364,7 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         let dir = crate::tools::temp_dir();
-        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir, "test-session"));
 
         let added: Value = http
             .post(format!("{base}/schedule"))
@@ -1481,7 +1481,7 @@ mod tests {
             json!({ "background": [] })
         );
         let dir = crate::tools::temp_dir();
-        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir));
+        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir, "test-session"));
         let reminder = session
             .schedules()
             .unwrap()

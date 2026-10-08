@@ -397,7 +397,7 @@ allow it.",
     ));
     // Only a run that stays up fires schedules, so only there may the model set one.
     let schedules = (args.workflow.is_none() && args.exec.is_none())
-        .then(|| project_schedules(&cwd))
+        .then(|| session_schedules(&cwd, &session_id))
         .flatten()
         .map(Arc::new);
     let delegation = Delegation {
@@ -803,10 +803,14 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
 
 /// The policy from the config, Claude Code's settings and remembered approvals, plus
 /// notices about rules that were skipped.
-/// The schedules of `cwd`, kept under bhai's config directory; none without a home.
-fn project_schedules(cwd: &std::path::Path) -> Option<schedules::Schedules> {
+/// The schedules of a saved session, kept under bhai's config directory; none without a home.
+fn session_schedules(cwd: &std::path::Path, session_id: &str) -> Option<schedules::Schedules> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
-    Some(schedules::Schedules::new(&home.join(".config/bhai"), cwd))
+    Some(schedules::Schedules::new(
+        &home.join(".config/bhai"),
+        cwd,
+        session_id,
+    ))
 }
 
 fn permissions(config: Config, home: Option<PathBuf>, cwd: PathBuf) -> (Policy, Vec<String>) {
