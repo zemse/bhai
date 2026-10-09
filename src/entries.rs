@@ -95,6 +95,15 @@ impl Entries {
             Event::User(message) | Event::Steered(message) => {
                 self.push(Entry::User(message.clone()))
             }
+            Event::PromptEdited { text, .. } => {
+                if matches!(self.list.last(), Some(Entry::User(last)) if last == text) {
+                    let index = self.list.len() - 1;
+                    self.list.pop();
+                    self.tokens.remove(&index);
+                    self.attribution.items.retain(|_, entry| *entry < index);
+                    self.attribution.mark = self.attribution.mark.min(index);
+                }
+            }
             // Nothing was typed: the reports themselves follow, as the tool results
             // they are, so this only says why the agent started working again.
             Event::Resumed(what) => self.push(Entry::Info(format!("resumed {what}"))),

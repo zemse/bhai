@@ -48,6 +48,12 @@ const GOAL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 pub enum AgentEvent {
     Reasoning(String),
     Text(String),
+    /// Restore an unanswered prompt only if the transcript still ends with it.
+    EditPrompt {
+        text: String,
+        images: Vec<tools::Image>,
+        reply: oneshot::Sender<bool>,
+    },
     /// Text the model writes before carrying on, rather than as its answer.
     Commentary(String),
     /// The agent wants to run a tool call; `reply` carries the user's decision back.
@@ -590,6 +596,7 @@ pub type Results = mpsc::UnboundedSender<ChildResult>;
 #[derive(Default)]
 pub struct Cancel {
     turn: Arc<AtomicBool>,
+    edit: Mutex<Option<String>>,
     children: Mutex<Vec<(String, Arc<AtomicBool>)>>,
 }
 
@@ -609,6 +616,12 @@ impl Cancel {
         for (_, child) in self.lock().iter() {
             child.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Stop an unanswered turn and request its prompt back for editing.
+    pub fn edit_prompt(&self, text: String) {
+        *self.edit.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+        self.stop();
     }
 
     /// Stop child `id` alone, leaving the turn and its siblings running. False when no
@@ -1451,7 +1464,38 @@ pub(crate) async fn run_configured(
                 }
             }
         }
-        if cancel.load(Ordering::Relaxed) {
+        let edit = stop.edit.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut edited = false;
+        if let Some(text) = edit {
+            if history == before
+                && let Some(message) = message.as_ref()
+                && message.user_text.as_deref() == Some(text.as_str())
+            {
+                let (reply, ready) = oneshot::channel();
+                let _ = tx.send(AgentEvent::EditPrompt {
+                    text,
+                    images: message.images.clone(),
+                    reply,
+                });
+                if ready.await.unwrap_or(false) {
+                    history.pop();
+                    calls = calls_before.clone();
+                    monitor = CacheMonitor::default();
+                    model.reset("prompt edited");
+                    drop_fork(&mut fork, &tx);
+                    if let Sink::Session(writer) = &mut sink
+                        && let Err(e) = writer.compact("prompt-edit", 0, 0, &history)
+                    {
+                        let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+                    }
+                    edited = true;
+                }
+            }
+            if !edited {
+                let _ = tx.send(AgentEvent::Info("interrupted".to_string()));
+            }
+        }
+        if cancel.load(Ordering::Relaxed) && !edited {
             let at = history.len();
             history.push(json!({
                 "type": "message",
@@ -3026,6 +3070,10 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     failure = Some(s.clone());
                     inside(AgentEvent::Error(s))
                 }
+                AgentEvent::EditPrompt { reply, .. } => {
+                    let _ = reply.send(false);
+                    continue;
+                }
                 // Everything the child says goes to its own pane.
                 said @ (AgentEvent::Reasoning(_)
                 | AgentEvent::Text(_)
@@ -3597,6 +3645,8 @@ pub mod fake {
     pub const FAIL: &str = "fake.fail";
     /// A script step that streams a little, then waits for an interrupt.
     pub const HANG: &str = "fake.hang";
+    /// A script step that waits for an interrupt without streaming output.
+    pub const SILENT_HANG: &str = "fake.silent_hang";
     /// A script step the backend refuses as a bad request.
     pub const REFUSE: &str = "fake.refuse";
     /// A script step the backend refuses as longer than the context window.
@@ -3826,8 +3876,10 @@ pub mod fake {
                         let refused = "400 Bad Request: Invalid image.".to_string();
                         return Err(crate::client::BadRequest(refused).into());
                     }
-                    Some(HANG) => {
-                        on_delta(Delta::Text("partial".to_string()));
+                    Some(HANG | SILENT_HANG) => {
+                        if next[0]["type"] == HANG {
+                            on_delta(Delta::Text("partial".to_string()));
+                        }
                         while !cancel.load(Ordering::Relaxed) {
                             tokio::time::sleep(Duration::from_millis(5)).await;
                         }
@@ -9056,6 +9108,103 @@ mod tests {
             fake.bodies.lock().unwrap().len(),
             stalled_script().len() - 1
         );
+    }
+
+    #[tokio::test]
+    async fn editing_an_unanswered_prompt_removes_it_from_live_and_saved_history() {
+        use crate::sessions::Header;
+        use fake::{Fake, SILENT_HANG, say, step};
+
+        let dir = tools::temp_dir();
+        let fake = Fake::new(vec![step(SILENT_HANG), vec![say("fresh")]]);
+        let saved = Saved {
+            writer: Writer::create(&dir, Header::new("sess", "general", "fake", "medium", &dir)),
+            history: Vec::new(),
+        };
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            SystemPrompt::default(),
+            Arc::new(Policy::new(
+                Mode::Bypass,
+                Default::default(),
+                None,
+                dir.clone(),
+            )),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            Some(saved),
+            Limits::default(),
+        ));
+        let image = tools::Image::new("image/png", "AAAA").unwrap();
+        tx_user
+            .send(UserInput {
+                text: "original".into(),
+                user_text: Some("original".into()),
+                images: vec![image.clone()],
+            })
+            .await
+            .unwrap();
+        let mut restored = false;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                AgentEvent::Streaming(true) => cancel.edit_prompt("original".to_string()),
+                AgentEvent::EditPrompt {
+                    text,
+                    images,
+                    reply,
+                } => {
+                    assert_eq!(text, "original");
+                    assert_eq!(images.as_slice(), std::slice::from_ref(&image));
+                    restored = true;
+                    reply.send(true).unwrap();
+                }
+                AgentEvent::TurnEnd => break,
+                AgentEvent::Text(_) | AgentEvent::Error(_) | AgentEvent::TurnFailed(_) => {
+                    panic!("unexpected output: {event:?}");
+                }
+                _ => {}
+            }
+        }
+        assert!(restored);
+        let loaded = sessions::load(&dir.join("sess.jsonl")).unwrap();
+        assert!(
+            !loaded
+                .items
+                .iter()
+                .any(|item| item.to_string().contains("original"))
+        );
+        assert!(
+            !loaded
+                .items
+                .iter()
+                .any(|item| item.to_string().contains(TURN_ABORTED))
+        );
+        cancel.clear();
+        tx_user.send("edited".into()).await.unwrap();
+        settle(&mut rx).await;
+        let bodies = fake.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(!bodies[1].1.to_string().contains("original"));
+        assert!(bodies[1].1.to_string().contains("edited"));
+        drop(bodies);
+        task.abort();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

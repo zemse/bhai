@@ -1254,6 +1254,9 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             }
             AgentEvent::Reasoning(_) => {}
+            AgentEvent::EditPrompt { reply, .. } => {
+                let _ = reply.send(false);
+            }
             AgentEvent::Commentary(delta) => print!("{delta}"),
             AgentEvent::Approval { command, reply, .. } => {
                 println!("\n[would run] {command}\n[probe rejects it]");

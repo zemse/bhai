@@ -51,6 +51,12 @@ pub struct Since {
 pub enum Event {
     /// A user message was accepted and a turn started.
     User(String),
+    /// An unanswered prompt was removed from history and returned to the editor.
+    PromptEdited {
+        text: String,
+        #[serde(skip)]
+        images: Vec<Image>,
+    },
     /// A turn started on its own, on the reports of children that finished while the
     /// session was idle; the string says what they were doing. Nothing was typed, so
     /// the transcript shows the reports, not a message.
@@ -1014,6 +1020,20 @@ impl Session {
         Some(approval.id)
     }
 
+    /// Interrupt for editing only while the transcript still ends with a user prompt.
+    pub fn edit_prompt(&self) -> bool {
+        let inner = self.lock();
+        if !inner.working || !inner.queue.is_empty() || !inner.pending.is_empty() {
+            return false;
+        }
+        let entries = self.entries();
+        let Some(Entry::User(text)) = entries.list.last() else {
+            return false;
+        };
+        self.cancel.edit_prompt(text.clone());
+        true
+    }
+
     /// Stop the running turn and every child still running, rejecting every pending
     /// approval. Returns false when there was nothing to stop.
     pub fn interrupt(&self) -> bool {
@@ -1347,6 +1367,24 @@ impl Session {
     pub(crate) fn on_agent(&self, event: AgentEvent) {
         let mut inner = self.lock();
         let event = match event {
+            AgentEvent::EditPrompt {
+                text,
+                images,
+                reply,
+            } => {
+                let mut entries = self.entries();
+                let eligible =
+                    matches!(entries.list.last(), Some(Entry::User(last)) if last == &text);
+                if eligible {
+                    inner.started = None;
+                    let event = Event::PromptEdited { text, images };
+                    entries.apply(&event);
+                    self.record(&event);
+                    let _ = self.events.send(event);
+                }
+                let _ = reply.send(eligible);
+                return;
+            }
             AgentEvent::Reasoning(s) => Event::Reasoning(s),
             AgentEvent::Text(s) => Event::Text(s),
             AgentEvent::Commentary(s) => Event::Commentary(s),
@@ -2184,6 +2222,60 @@ mod tests {
             })
             .collect();
         assert_eq!(tasks, ["review it", "now fix it"]);
+    }
+
+    #[test]
+    fn editing_requires_an_unanswered_prompt_and_rechecks_racing_output() {
+        for output in [
+            None,
+            Some(Event::Text("answer".into())),
+            Some(Event::Reasoning("thinking".into())),
+            Some(Event::Info("notice".into())),
+            Some(Event::ToolStart {
+                tool: "bash".into(),
+                summary: "pwd".into(),
+                preview: None,
+            }),
+        ] {
+            let (session, _rx) = session();
+            session.submit("original".to_string()).unwrap();
+            assert!(session.edit_prompt());
+            if let Some(event) = output.clone() {
+                session.publish(event);
+                assert!(!session.edit_prompt());
+            }
+            let (reply, mut ready) = oneshot::channel();
+            session.on_agent(AgentEvent::EditPrompt {
+                text: "original".into(),
+                images: Vec::new(),
+                reply,
+            });
+            assert_eq!(ready.try_recv().unwrap(), output.is_none());
+            assert_eq!(
+                session
+                    .entries()
+                    .list
+                    .iter()
+                    .any(|entry| matches!(entry, Entry::User(_))),
+                output.is_some()
+            );
+            session.on_agent(AgentEvent::TurnEnd);
+            if output.is_none() {
+                assert!(
+                    session.entries().list.is_empty(),
+                    "no completion note for a removed turn"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn editing_does_not_remove_a_prompt_with_queued_work() {
+        let (session, _rx) = session();
+        session.submit("original".to_string()).unwrap();
+        session.submit("queued".to_string()).unwrap();
+        assert!(!session.edit_prompt());
+        assert!(!session.cancel.stopped());
     }
 
     #[test]

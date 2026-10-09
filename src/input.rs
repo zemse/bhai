@@ -478,6 +478,39 @@ impl Attachments {
         placeholder(self.images.len())
     }
 
+    /// Restore sent images without colliding with attachments in a new draft.
+    pub fn restore(&mut self, text: &str, images: Vec<crate::tools::Image>) -> String {
+        let numbered = |part: &str| {
+            part.strip_suffix(']')
+                .and_then(|part| part.rsplit_once("[image #"))
+                .and_then(|(_, number)| number.parse::<usize>().ok())
+        };
+        let numbers: std::collections::BTreeSet<_> =
+            text.split_inclusive(']').filter_map(numbered).collect();
+        let mut images = images.into_iter();
+        let replacements: std::collections::BTreeMap<_, _> = numbers
+            .into_iter()
+            .zip(images.by_ref())
+            .map(|(number, image)| (number, self.add(image)))
+            .collect();
+        let mut restored = String::new();
+        for part in text.split_inclusive(']') {
+            match numbered(part).and_then(|number| replacements.get(&number)) {
+                Some(replacement) => {
+                    let (prefix, _) = part.rsplit_once("[image #").unwrap();
+                    restored.push_str(prefix);
+                    restored.push_str(replacement);
+                }
+                None => restored.push_str(part),
+            }
+        }
+        for image in images {
+            restored.push('\n');
+            restored.push_str(&self.add(image));
+        }
+        restored
+    }
+
     /// The images whose placeholder is still in `text`, in the order they were
     /// attached; the rest are dropped with them, and numbering starts again.
     pub fn take(&mut self, text: &str) -> Vec<crate::tools::Image> {
@@ -552,6 +585,27 @@ mod tests {
         let mut editor = Editor::default();
         editor.set(text.to_string());
         editor
+    }
+
+    #[test]
+    fn restoring_images_renumbers_gaps_and_preserves_a_new_draft() {
+        let image = |data: &str| crate::tools::Image::new("image/png", data).unwrap();
+        let mut attached = Attachments::default();
+        attached.add(image("DDDD"));
+        let restored = attached.restore(
+            "see [image #3] then [image #1]",
+            vec![image("AAAA"), image("CCCC")],
+        );
+        assert_eq!(restored, "see [image #3] then [image #2]");
+        assert_eq!(
+            attached.take(&format!("{restored}\ndraft [image #1]")),
+            [image("DDDD"), image("AAAA"), image("CCCC")]
+        );
+        assert_eq!(
+            attached.restore("server image", vec![image("BBBB")]),
+            "server image\n[image #1]"
+        );
+        assert_eq!(attached.take("server image\n[image #1]"), [image("BBBB")]);
     }
 
     #[test]

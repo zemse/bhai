@@ -1570,6 +1570,15 @@ impl App {
                     self.queued.remove(0);
                 }
             }
+            Event::PromptEdited { text, images } => {
+                let text = self.attachments.restore(&text, images);
+                if self.input.is_empty() {
+                    self.input.set(text);
+                } else {
+                    self.input.set(format!("{text}\n{}", self.input.value()));
+                }
+                self.follow = true;
+            }
             // The same for a `/compact`, which starts a turn of its own.
             Event::Compacting(_) => {
                 self.working = true;
@@ -2914,8 +2923,12 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         }
     }
 
-    /// Interrupt on the second esc within `QUIT_WINDOW`; the first only says so.
+    /// Restore an unanswered prompt; otherwise interrupt on the second esc.
     fn confirm_interrupt(&mut self) {
+        if self.input.is_empty() && self.session.edit_prompt() {
+            self.esc_armed = None;
+            return;
+        }
         let now = Instant::now();
         match self.esc_armed.take() {
             Some(at) if now.duration_since(at) <= QUIT_WINDOW => self.interrupt(),
@@ -4961,6 +4974,45 @@ mod tests {
         app.quit_armed = Some(Instant::now() - QUIT_WINDOW * 2);
         app.on_key(ctrl('c'));
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn esc_returns_an_unanswered_prompt_to_the_editor_without_confirmation() {
+        let (mut app, _user, _control) = connected();
+        app.session.submit("edit me".to_string()).unwrap();
+        app.on_event(Event::User("edit me".into()));
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.esc_armed.is_none());
+        assert!(matches!(app.entries().list.last(), Some(Entry::User(text)) if text == "edit me"));
+        let (reply, mut ready) = tokio::sync::oneshot::channel();
+        app.session.on_agent(crate::agent::AgentEvent::EditPrompt {
+            text: "edit me".into(),
+            images: Vec::new(),
+            reply,
+        });
+        assert!(ready.try_recv().unwrap());
+        app.on_event(Event::PromptEdited {
+            text: "edit me".into(),
+            images: Vec::new(),
+        });
+        assert_eq!(app.input.value(), "edit me");
+        assert!(
+            !app.entries()
+                .list
+                .iter()
+                .any(|entry| matches!(entry, Entry::User(_)))
+        );
+    }
+
+    #[test]
+    fn esc_keeps_an_existing_draft_instead_of_restoring_a_prompt() {
+        let (mut app, _user, _control) = connected();
+        app.session.submit("original".to_string()).unwrap();
+        app.on_event(Event::User("original".into()));
+        app.input.set("draft".into());
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.esc_armed.is_some());
+        assert_eq!(app.input.value(), "draft");
     }
 
     #[test]
