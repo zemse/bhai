@@ -60,6 +60,8 @@ const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const MESSAGE_MARK: &str = "⏺ ";
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    app.plan_area = None;
+    app.monitor_area = None;
     draw(frame, app);
     // Last, so it sits over whatever the drag was made on.
     render_copied(frame, app);
@@ -303,12 +305,20 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let plan = app.plan().filter(|plan| {
         app.goal().is_some_and(|g| g.plan.as_ref() == Some(plan)) || app.working || !plan.done()
     });
-    let plan_height = plan
-        .as_ref()
-        .map_or(0, |plan| plan.steps.len().min(MAX_PLAN_ROWS) as u16 + 2);
+    let plan_height = plan.as_ref().map_or(0, |plan| {
+        if app.plan_collapsed {
+            1
+        } else {
+            plan.steps.len().min(MAX_PLAN_ROWS) as u16 + 2
+        }
+    });
 
     let monitors = app.monitors();
-    let monitor_height = crate::monitorview::height(&monitors, frame.area().height);
+    let monitor_height = if app.monitors_collapsed && !monitors.is_empty() {
+        1
+    } else {
+        crate::monitorview::height(&monitors, frame.area().height)
+    };
 
     let [
         transcript_area,
@@ -333,6 +343,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
+    app.plan_area = (plan_area.height > 0).then_some(plan_area);
+    app.monitor_area = (monitor_area.height > 0).then_some(monitor_area);
     render_status(frame, status_area, app);
     if let Some(diff) = &mut app.diff {
         // The pane takes the transcript and input rows; an approval still shows below.
@@ -348,8 +360,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.scrollbar = None;
         app.input_area = None;
         // The pane covered those rows, so they go back on top.
-        render_plan(frame, plan_area, plan.as_ref());
-        crate::monitorview::render(frame, monitor_area, &monitors);
+        render_plan(frame, plan_area, plan.as_ref(), app.plan_collapsed);
+        crate::monitorview::render(frame, monitor_area, &monitors, app.monitors_collapsed);
         render_children(frame, children_area, app, &children);
         render_queued(frame, queued_area, app);
         render_working(frame, working_area, app);
@@ -369,8 +381,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
         }
         None => render_transcript(frame, transcript_area, app),
     }
-    render_plan(frame, plan_area, plan.as_ref());
-    crate::monitorview::render(frame, monitor_area, &monitors);
+    render_plan(frame, plan_area, plan.as_ref(), app.plan_collapsed);
+    crate::monitorview::render(frame, monitor_area, &monitors, app.monitors_collapsed);
     render_children(frame, children_area, app, &children);
     render_queued(frame, queued_area, app);
     if menu_height > 0 {
@@ -388,7 +400,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
 /// The checklist the model keeps with `update_plan`, with the step in progress kept in
 /// view when there are more steps than rows.
-fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>) {
+fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>, collapsed: bool) {
     use crate::plan::Status;
     let Some(plan) = plan.filter(|_| area.height > 0) else {
         return;
@@ -407,6 +419,12 @@ fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>) 
         ),
         dim,
     ));
+    block =
+        block.title_top(Line::styled(if collapsed { " ▸ " } else { " ▾ " }, dim).right_aligned());
+    if collapsed {
+        frame.render_widget(block, area);
+        return;
+    }
     let room = area.width.saturating_sub(6) as usize;
     if !plan.explanation.is_empty() && room > 0 {
         block = block.title_bottom(
@@ -4239,6 +4257,14 @@ mod tests {
             "{text}"
         );
         assert!(!app.working);
+        let area = app.monitor_area.unwrap();
+        panel_click(&mut app, area);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.monitor_area.unwrap().height, 1);
+        assert!(!App::new(std::sync::Arc::clone(&session)).monitors_collapsed);
+        assert!(!app.plan_collapsed);
+        assert!(screen(&terminal).contains("monitors · /monitor"));
+        assert!(!screen(&terminal).contains("31/65"));
         std::fs::write(&path, snapshot(32, 64)).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while monitors.views()[0].snapshot.as_ref().unwrap().tracks[0].current != 32.0 {
@@ -4248,12 +4274,29 @@ mod tests {
         .await
         .unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("32/65"));
+        let area = app.monitor_area.unwrap();
+        panel_click(&mut app, area);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.monitor_area.unwrap().height > 1);
         let text = screen(&terminal);
         assert!(text.contains("32/65") && text.contains("64/65"), "{text}");
         monitors.control(&id, "dismiss").unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(!screen(&terminal).contains("monitors · /monitor"));
+        assert!(app.monitor_area.is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn panel_click(app: &mut App, area: Rect) {
+        let event = |kind| MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(event(MouseEventKind::Down(MouseButton::Left))));
+        app.on_mouse(event(MouseEventKind::Up(MouseButton::Left)));
     }
 
     #[test]
@@ -4296,6 +4339,20 @@ mod tests {
         assert!(!text.contains("step 0"), "{text}");
         assert!(text.contains(" why "), "{text}");
         assert_eq!(session.state().plan, plan(8, 10));
+        let area = app.plan_area.unwrap();
+        panel_click(&mut app, area);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.plan_area.unwrap().height, 1);
+        assert!(!App::new(std::sync::Arc::clone(&session)).plan_collapsed);
+        assert!(screen(&terminal).contains(" plan 8/10 "));
+        assert!(!screen(&terminal).contains("step 8"));
+        assert_eq!(session.state().plan, plan(8, 10));
+        assert!(!app.monitors_collapsed);
+        let area = app.plan_area.unwrap();
+        panel_click(&mut app, area);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.plan_area.unwrap().height, 8);
+        assert!(screen(&terminal).contains("▸ step 8"));
 
         // Every step done and the session idle: nothing left to watch.
         session.on_agent(crate::agent::AgentEvent::Plan(plan(10, 10)));

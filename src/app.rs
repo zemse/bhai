@@ -320,6 +320,11 @@ pub struct App {
     pub background: usize,
     /// The status bar's `bg` chip, filled in by the renderer while it is drawn.
     pub chip: Option<Rect>,
+    /// The progress panels' hit areas, filled in by the renderer.
+    pub plan_area: Option<Rect>,
+    pub monitor_area: Option<Rect>,
+    pub plan_collapsed: bool,
+    pub monitors_collapsed: bool,
     /// The background list, shown over the transcript while open.
     pub bg: Option<BgView>,
     /// The `/model` picker, shown instead of the prompt while open.
@@ -441,6 +446,10 @@ impl App {
             child_rows: Vec::new(),
             background: 0,
             chip: None,
+            plan_area: None,
+            monitor_area: None,
+            plan_collapsed: false,
+            monitors_collapsed: false,
             bg: None,
             picker: None,
             search: None,
@@ -890,6 +899,16 @@ impl App {
     /// Returns whether the screen needs a redraw.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
         let at = Position::new(mouse.column, mouse.row);
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if self.plan_area.is_some_and(|area| area.contains(at)) {
+                self.plan_collapsed = !self.plan_collapsed;
+                return true;
+            }
+            if self.monitor_area.is_some_and(|area| area.contains(at)) {
+                self.monitors_collapsed = !self.monitors_collapsed;
+                return true;
+            }
+        }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) && self.pending.is_none() {
             // The picker and search take every key, ctrl+s too, and draw no list over them.
             let prompt_taken = self.picker.is_some() || self.search.is_some();

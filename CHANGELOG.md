@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-10
 
+- Clicking the plan or monitors panel folds it into a single header row; clicking again restores its live details without changing progress or stopping monitors.
 - The CLI uses clap for command-specific help, version output and argument validation; `-p` runs a text-only turn with optional stdin, `-C` selects the project directory, and session options work before or after `exec`.
 - The model can call `compact` with an optional summary prompt; compaction waits for every tool result in the step and work continues on the compacted history. `status` reports context tokens, window size and percentage, marking estimates when backend usage is unavailable.
 - `/clear` asks whether to also kill kept processes and dismiss all monitors; conversation-only keeps them, and Escape cancels.

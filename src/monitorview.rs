@@ -29,16 +29,20 @@ pub fn height(views: &[View], available: u16) -> u16 {
     (lines.min(MAX_LINES) as u16 + 2).min(available / 3)
 }
 
-pub fn render(frame: &mut Frame, area: Rect, views: &[View]) {
+pub fn render(frame: &mut Frame, area: Rect, views: &[View], collapsed: bool) {
     if area.height == 0 || views.is_empty() {
         return;
     }
     let dim = Style::new().fg(Color::DarkGray);
     let block = Block::bordered()
         .border_style(dim)
-        .title(Line::styled(" monitors · /monitor ", dim));
+        .title(Line::styled(" monitors · /monitor ", dim))
+        .title_top(Line::styled(if collapsed { " ▸ " } else { " ▾ " }, dim).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if collapsed {
+        return;
+    }
     let width = inner.width as usize;
     let mut lines = Vec::new();
     for view in views {
@@ -117,7 +121,7 @@ mod tests {
         }];
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 80, height(&views, 24)), &views))
+            .draw(|f| render(f, Rect::new(0, 0, 80, height(&views, 24)), &views, false))
             .unwrap();
         let text: String = terminal
             .backend()
@@ -137,7 +141,7 @@ mod tests {
         assert!(text.contains("updated 1s ago"), "{text}");
         assert_eq!(height(&[], 24), 0);
         terminal
-            .draw(|f| render(f, Rect::new(0, 0, 2, 1), &views))
+            .draw(|f| render(f, Rect::new(0, 0, 2, 1), &views, false))
             .unwrap();
     }
 }
