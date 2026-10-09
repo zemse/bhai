@@ -727,6 +727,26 @@ impl Checker<'_> {
     fn check(&self, tool: &str, args: &Value, needs_approval: bool) -> Decision {
         let text = |key| args.get(key).and_then(Value::as_str);
         match tool {
+            crate::tools::aws_instance::NAME => {
+                let find = |rules: &[Rule]| rules.iter().find(|r| r.applies_to(tool)).cloned();
+                if let Some(rule) = find(&self.rules.deny) {
+                    return denied(&rule);
+                }
+                if find(&self.rules.ask).is_some() {
+                    return Decision::Ask;
+                }
+                if self.mode == Mode::Auto {
+                    return if crate::tools::aws_instance::authorized(self.base.cwd, args) {
+                        Decision::Allow(
+                            "verified scoped AWS capability (execution revalidates cloud state)"
+                                .into(),
+                        )
+                    } else {
+                        Decision::Ask
+                    };
+                }
+                self.check_other(tool, needs_approval)
+            }
             "bash" => self.check_bash(
                 text("command").unwrap_or_default(),
                 text("workdir").filter(|w| !w.is_empty()),
@@ -932,6 +952,9 @@ impl Checker<'_> {
         {
             return Decision::Ask;
         }
+        if self.mode == Mode::Auto && bash::aws_launch(command) {
+            return Decision::Ask;
+        }
         if self.guarded() && commands.iter().any(bash::mentions_protected) {
             return Decision::Ask;
         }
@@ -1041,6 +1064,13 @@ impl Checker<'_> {
     fn judgeable(&self, tool: &str, args: &Value) -> Result<(), Reserved> {
         if !self.relaxed() {
             return Err(Reserved::Untrusted);
+        }
+        if tool == crate::tools::aws_instance::NAME
+            || (tool == "bash" && bash::aws_launch(args["command"].as_str().unwrap_or_default()))
+        {
+            return Err(Reserved::Protected(
+                "AWS lifecycle: use aws_instance to arm an existing stopped instance with a cloud stop deadline; raw launch/start and unverified capabilities require the user".into(),
+            ));
         }
         // As in `check`, the `Read` or `Write` rules and the protected paths decide these.
         let tool = match tool {

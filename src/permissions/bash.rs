@@ -85,6 +85,38 @@ impl Command {
     }
 }
 
+/// Detect direct EC2 launch/start, including the wrappers this parser understands.
+pub fn aws_launch(input: &str) -> bool {
+    fn launch(command: &Command) -> bool {
+        let words = command.unwrapped();
+        ((words.first().is_some_and(|w| basename(w) == "aws")
+            || (command
+                .words
+                .first()
+                .is_some_and(|w| WRAPPERS.contains(&basename(w)))
+                && command.words.iter().any(|w| basename(w) == "aws")))
+            && command.words.iter().any(|w| w == "ec2")
+            && words
+                .iter()
+                .any(|w| matches!(w.as_str(), "start-instances" | "run-instances")))
+            || command.nested().iter().any(launch)
+    }
+    match parse(input) {
+        Some(commands) => commands.iter().any(launch),
+        None => {
+            let words: Vec<_> = input
+                .split_whitespace()
+                .map(|w| w.trim_matches(['\'', '"', ';']))
+                .collect();
+            words.iter().any(|w| basename(w) == "aws")
+                && words.contains(&"ec2")
+                && words
+                    .iter()
+                    .any(|w| matches!(*w, "start-instances" | "run-instances"))
+        }
+    }
+}
+
 /// The last path component of a command name.
 pub fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)

@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicBool;
 use serde_json::Value;
 
 pub mod agent;
+pub mod aws_instance;
 pub mod bash;
 pub mod browser;
 mod cdp;
@@ -36,7 +37,8 @@ pub mod web;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 15] = [
+pub const NAMES: [&str; 16] = [
+    aws_instance::NAME,
     bash::NAME,
     read::NAME,
     write::NAME,
@@ -277,6 +279,7 @@ impl Registry {
     pub fn new(skills: Vec<crate::skills::Skill>) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(bash::Bash),
+            Box::new(aws_instance::AwsInstance::default()),
             Box::new(read::Read),
             Box::new(write::Write),
             Box::new(edit::Edit),
@@ -616,6 +619,7 @@ mod tests {
             names,
             [
                 "bash",
+                "aws_instance",
                 "read",
                 "write",
                 "edit",
@@ -637,7 +641,7 @@ mod tests {
             source: "~/.claude/skills".to_string(),
         };
         let registry = Registry::new(vec![skill]);
-        assert_eq!(registry.schemas().len(), 9);
+        assert_eq!(registry.schemas().len(), 10);
         for name in ["bash", "write", "edit", "apply_patch", "fetch"] {
             assert!(registry.get(name).unwrap().needs_approval(), "{name}");
         }
@@ -669,7 +673,10 @@ mod tests {
         assert!(registry.get("nope").is_none());
         let out = registry.unknown("nope");
         assert!(out.contains("`nope`"), "{out}");
-        assert!(out.contains("`bash`, `read`, `write`, `edit`"), "{out}");
+        assert!(
+            out.contains("`bash`, `aws_instance`, `read`, `write`, `edit`"),
+            "{out}"
+        );
     }
 
     #[test]
