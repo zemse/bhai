@@ -2411,7 +2411,7 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
 
     /// The live observers, for their cards.
     pub fn monitors(&self) -> Vec<crate::monitor::View> {
-        self.session.monitors().views()
+        self.session.monitors().active_views()
     }
 
     /// What the working row says the turn is doing.

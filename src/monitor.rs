@@ -485,6 +485,14 @@ impl Monitors {
         )
     }
 
+    /// Observers still sampling or able to resume, for their cards.
+    pub fn active_views(&self) -> Vec<View> {
+        self.views()
+            .into_iter()
+            .filter(|view| !matches!(view.state.as_str(), "done" | "stopped" | "failed"))
+            .collect()
+    }
+
     pub fn background(&self) -> Vec<Row> {
         let views = self.views();
         let rows = self.rows.lock().unwrap();
@@ -913,7 +921,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_keeps_the_card_and_wakes_once_with_fixed_prompt() {
+    async fn cards_hide_terminal_monitors_but_keep_resumable_and_stale_ones() {
+        let (session, _input) = session();
+        let store = session.monitors();
+        let id = store.add(spec("sleep 60")).unwrap();
+        assert_eq!(store.active_views().len(), 1);
+        store.control(&id, "pause").unwrap();
+        assert_eq!(store.active_views()[0].state, "paused");
+        let row = Arc::clone(store.rows.lock().unwrap().get(&id).unwrap());
+        {
+            let mut data = row.data.lock().unwrap();
+            data.paused = false;
+            data.error = Some("bad sample".into());
+        }
+        assert_eq!(store.active_views()[0].state, "stale");
+        for status in ["done", "failed"] {
+            {
+                let mut data = row.data.lock().unwrap();
+                data.error = None;
+                data.snapshot =
+                    Some(serde_json::from_value(serde_json::json!({"status": status})).unwrap());
+            }
+            assert!(store.active_views().is_empty());
+            assert_eq!(store.views()[0].state, status);
+        }
+        store.control(&id, "stop").unwrap();
+        assert!(store.active_views().is_empty());
+        assert_eq!(store.views()[0].state, "stopped");
+        store.clear();
+    }
+
+    #[tokio::test]
+    async fn completion_keeps_the_snapshot_and_wakes_once_with_fixed_prompt() {
         let (session, mut input) = session();
         let store = session.monitors();
         let mut spec = spec(
@@ -940,7 +979,8 @@ mod tests {
         let mut entries = crate::entries::Entries::default();
         entries.restore(&[context]);
         assert!(entries.list.is_empty());
-        assert_eq!(session.background()[0].kind, Kind::Monitor);
+        assert!(store.active_views().is_empty());
+        assert!(session.background().iter().all(|r| r.kind != Kind::Monitor));
         assert!(store.control(&id, "resume").is_err());
         store.control(&id, "dismiss").unwrap();
         assert!(store.views().is_empty());

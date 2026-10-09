@@ -205,9 +205,17 @@ pub trait Source: Send + Sync {
     fn rows(&self) -> Vec<Row>;
 }
 
-/// The rows of every source, ordered by kind and redacted.
+/// The active rows of every source, ordered by kind and redacted.
 pub fn snapshot(rows: impl IntoIterator<Item = Row>) -> Vec<Row> {
-    let mut rows: Vec<Row> = rows.into_iter().map(Row::redacted).collect();
+    let mut rows: Vec<Row> = rows
+        .into_iter()
+        .filter(|row| match row.kind {
+            Kind::Bash => row.state != "exited",
+            Kind::Monitor => !matches!(row.state.as_str(), "done" | "stopped" | "failed"),
+            _ => true,
+        })
+        .map(Row::redacted)
+        .collect();
     rows.sort_by_key(|row| row.kind);
     rows
 }
@@ -393,6 +401,25 @@ pub(crate) mod tests {
         assert_eq!(rows[0].label, "curl -H [REDACTED]");
         assert_eq!(rows[0].detail, "token [REDACTED]\n");
         assert_eq!(rows[1].kind, Kind::Mcp);
+    }
+
+    #[test]
+    fn terminal_processes_and_monitors_leave_the_snapshot() {
+        let active = vec![
+            row(Kind::Bash, "1", "running"),
+            row(Kind::Monitor, "m1", "running"),
+            row(Kind::Monitor, "m2", "paused"),
+            row(Kind::Monitor, "m3", "stale"),
+        ];
+        let mut rows = active.clone();
+        rows.extend([
+            row(Kind::Bash, "2", "exited"),
+            row(Kind::Monitor, "m4", "done"),
+            row(Kind::Monitor, "m5", "stopped"),
+            row(Kind::Monitor, "m6", "failed"),
+        ]);
+        assert_eq!(snapshot(rows), active);
+        assert!(snapshot([row(Kind::Bash, "2", "exited")]).is_empty());
     }
 
     #[test]
