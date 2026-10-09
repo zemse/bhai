@@ -179,6 +179,92 @@ fn raw_prefix_rules_cannot_override_launch_guard_but_explicit_deny_and_ask_win()
 }
 
 #[tokio::test]
+async fn subsequent_user_restrictions_veto_an_existing_start_capability() {
+    let mut f = Fixture::new();
+    let id = f.arm().await;
+    let (judge, backend) = crate::judge::fake::judge(
+        crate::judge::fake::Answers::Verdict(crate::judge::Verdict::Deny {
+            reason: "user prohibited another start".into(),
+        }),
+        &f.tool.root,
+    );
+    let restriction = "do not start that instance again";
+    judge.start_user_turn(restriction, None);
+    backend.authorization_replies.lock().unwrap().insert(restriction.into(), json!({"candidates":[{
+        "kind":"restriction", "quote":restriction, "scope":"instance i-11111111111111111", "action":"do not start instance again", "lifetime":"until explicitly changed"
+    }]}));
+    f.tool.authorization = Some((
+        Arc::new(f.policy(Mode::Auto, Rules::default())),
+        Arc::new(judge),
+    ));
+    let error = f.tool.run(&f.call("start", &id)).await.unwrap_err();
+    assert!(error.contains("user prohibited"), "{error}");
+    assert_eq!(f.mutations(), "arm\n");
+    let calls = backend.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].detail.contains("123456789012"));
+    assert!(calls[0].detail.contains("us-east-1"));
+    assert!(
+        calls[0]
+            .user_context
+            .iter()
+            .any(|text| text.contains(restriction))
+    );
+}
+
+#[tokio::test]
+async fn clean_stop_does_not_call_an_unavailable_judge() {
+    let mut f = Fixture::new();
+    let id = f.arm().await;
+    let (judge, backend) =
+        crate::judge::fake::judge(crate::judge::fake::Answers::Hang, &f.tool.root);
+    judge.update_authorization().await.unwrap();
+    let classified = backend.authorization_calls.lock().unwrap().len();
+    *backend.authorization_failure.lock().unwrap() =
+        Some((crate::judge::authorization::Stage::Extract, true));
+    f.tool.authorization = Some((
+        Arc::new(f.policy(Mode::Auto, Rules::default())),
+        Arc::new(judge),
+    ));
+    f.tool.run(&f.call("stop", &id)).await.unwrap();
+    assert!(backend.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        backend.authorization_calls.lock().unwrap().len(),
+        classified
+    );
+    assert_eq!(f.mutations(), "arm\nstop\n");
+}
+
+#[tokio::test]
+async fn failed_or_changed_user_authorization_cannot_start_the_instance() {
+    let mut f = Fixture::new();
+    let id = f.arm().await;
+    let (judge, backend) = crate::judge::fake::judge(
+        crate::judge::fake::Answers::Verdict(crate::judge::Verdict::Approve {
+            reason: "fine".into(),
+        }),
+        &f.tool.root,
+    );
+    let judge = Arc::new(judge);
+    f.tool.authorization = Some((
+        Arc::new(f.policy(Mode::Auto, Rules::default())),
+        Arc::clone(&judge),
+    ));
+    let cap = load(&f.tool.root, &id).unwrap();
+    let req = Request::Start {
+        capability: id.clone(),
+    };
+    let revision = f.tool.authorize(&req, &cap).await.unwrap();
+    judge.start_user_turn("do not start the instance", None);
+    assert!(f.tool.unchanged(revision, &f.call("start", &id)).is_err());
+    *backend.authorization_failure.lock().unwrap() =
+        Some((crate::judge::authorization::Stage::Extract, false));
+    assert!(f.tool.run(&f.call("start", &id)).await.is_err());
+    assert_eq!(f.mutations(), "arm\n");
+    assert!(f.tool.root.join("schedule").exists());
+}
+
+#[tokio::test]
 async fn explicit_checkout_root_reuses_the_permission_ledger() {
     let f = Fixture::new();
     let id = f.arm().await;

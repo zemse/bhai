@@ -424,6 +424,25 @@ impl Registry {
         self
     }
 
+    pub fn with_aws_policy(
+        mut self,
+        policy: Arc<crate::permissions::Policy>,
+        judge: Option<Arc<crate::judge::Judge>>,
+    ) -> Self {
+        if let Some(tool) = self
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name() == aws_instance::NAME)
+        {
+            let aws = aws_instance::AwsInstance::at(policy.cwd().to_path_buf());
+            *tool = Box::new(match judge {
+                Some(judge) => aws.with_authorization(policy, judge),
+                None => aws,
+            });
+        }
+        self
+    }
+
     /// Move every call into a child's worktree before it is run.
     pub fn with_workdir(mut self, rooted: crate::worktrees::Rooted) -> Self {
         self.rooted = Some(rooted);

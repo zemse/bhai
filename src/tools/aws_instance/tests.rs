@@ -58,6 +58,7 @@ esac
             root,
             cli,
             timeout: Duration::from_secs(1),
+            authorization: None,
         };
         let fixture = Self { tool };
         fixture.set(
@@ -120,6 +121,7 @@ async fn arms_reloads_starts_and_only_observed_stopped_is_stopped() {
         root: f.tool.root.clone(),
         cli: f.tool.cli.clone(),
         timeout: f.tool.timeout,
+        authorization: None,
     };
     let start = f.call("start", &id);
     assert!(authorized(&f.tool.root, &start));

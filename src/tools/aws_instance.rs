@@ -1,6 +1,7 @@
 //! Scoped EC2 lifecycle backed by an independent EventBridge Scheduler stop.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -18,7 +19,7 @@ const TARGET: &str = "arn:aws:scheduler:::aws-sdk:ec2:stopInstances";
 const MIN_REMAINING: i64 = 120;
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     Arm {
@@ -223,6 +224,7 @@ pub struct AwsInstance {
     root: PathBuf,
     cli: PathBuf,
     timeout: Duration,
+    authorization: Option<(Arc<crate::permissions::Policy>, Arc<crate::judge::Judge>)>,
 }
 
 impl Default for AwsInstance {
@@ -231,6 +233,7 @@ impl Default for AwsInstance {
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             cli: PathBuf::from("aws"),
             timeout: Duration::from_secs(30),
+            authorization: None,
         }
     }
 }
@@ -241,6 +244,80 @@ impl AwsInstance {
             root,
             ..Self::default()
         }
+    }
+
+    pub fn with_authorization(
+        mut self,
+        policy: Arc<crate::permissions::Policy>,
+        judge: Arc<crate::judge::Judge>,
+    ) -> Self {
+        self.authorization = Some((policy, judge));
+        self
+    }
+
+    async fn authorize(&self, req: &Request, cap: &Capability) -> Result<Option<u64>, String> {
+        use crate::judge::{
+            Verdict,
+            authorization::{Kind, Status},
+        };
+        let Some((policy, judge)) = &self.authorization else {
+            return Ok(None);
+        };
+        if policy.mode() != crate::permissions::Mode::Auto || !judge.is_on() {
+            return Ok(None);
+        }
+        judge.update_authorization().await.map_err(|error| {
+            format!("AWS authorization is unresolved: {error:#}; cloud deadline was not cancelled")
+        })?;
+        let memory = judge.authorization();
+        if !memory.pending.is_empty() {
+            return Err(
+                "AWS authorization changed during update; cloud deadline was not cancelled".into(),
+            );
+        }
+        if memory
+            .entries
+            .iter()
+            .any(|entry| entry.status == Status::Active && entry.note.kind != Kind::Grant)
+        {
+            let target = serde_json::to_string(req).map_err(|error| error.to_string())?;
+            let detail = format!(
+                "scoped account {} profile {} region {} instance {} deadline {}",
+                cap.account, cap.profile, cap.region, cap.instance, cap.deadline
+            );
+            match judge.decide_writing(NAME, &target, &detail, &[]).await {
+                Ok(Verdict::Approve { .. }) => {}
+                Ok(Verdict::Deny { reason }) => {
+                    return Err(format!("AWS authorization veto: {reason}"));
+                }
+                Err(reason) => {
+                    return Err(format!(
+                        "AWS authorization has no verdict: {reason:?}; cloud deadline was not cancelled"
+                    ));
+                }
+            }
+        }
+        self.unchanged(
+            Some(memory.revision),
+            &serde_json::to_value(req).map_err(|error| error.to_string())?,
+        )?;
+        Ok(Some(memory.revision))
+    }
+
+    fn unchanged(&self, revision: Option<u64>, args: &Value) -> Result<(), String> {
+        if let (Some(revision), Some((policy, judge))) = (revision, &self.authorization) {
+            let memory = judge.authorization();
+            if memory.revision != revision
+                || !memory.pending.is_empty()
+                || !matches!(
+                    policy.check(NAME, args, true),
+                    crate::permissions::Decision::Allow(_)
+                )
+            {
+                return Err("AWS authorization changed during the operation; cloud deadline was not cancelled".into());
+            }
+        }
+        Ok(())
     }
 
     async fn aws(&self, cap: &Capability, args: &[String]) -> Result<Value, String> {
@@ -445,7 +522,9 @@ impl AwsInstance {
             Request::Arm { .. } => unreachable!(),
         };
         let mut cap = load(&self.root, id)?;
+        let revision = self.authorize(&req, &cap).await?;
         if matches!(req, Request::Revoke { .. }) {
+            self.unchanged(revision, args)?;
             cap.revoked = true;
             save(&self.root, &cap)?;
             return Ok(json!({"revoked": true, "stop_available": true}));
@@ -460,6 +539,7 @@ impl AwsInstance {
                     return Err("start requires stopped instance".into());
                 }
                 cap.future()?;
+                self.unchanged(revision, args)?;
                 self.aws(
                     &cap,
                     &[
@@ -474,6 +554,7 @@ impl AwsInstance {
                 return Err("use requires running instance".into());
             }
         } else if matches!(req, Request::Stop { .. }) {
+            self.unchanged(revision, args)?;
             self.aws(
                 &cap,
                 &[
@@ -486,6 +567,7 @@ impl AwsInstance {
             .await?;
         }
         let state = self.state(&cap).await?;
+        self.unchanged(revision, args)?;
         Ok(
             json!({"capability": cap.id, "account": cap.account, "region": cap.region, "instance": cap.instance, "deadline": cap.deadline, "state": state, "stopped": state == "stopped", "revoked": cap.revoked}),
         )
