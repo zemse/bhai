@@ -425,12 +425,6 @@ fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>, 
         frame.render_widget(block, area);
         return;
     }
-    let room = area.width.saturating_sub(6) as usize;
-    if !plan.explanation.is_empty() && room > 0 {
-        block = block.title_bottom(
-            Line::styled(format!(" {} ", clip(&plan.explanation, room)), dim).right_aligned(),
-        );
-    }
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -4337,7 +4331,7 @@ mod tests {
         assert!(text.contains("○ step 9"), "{text}");
         assert!(text.contains("✓ step 7"), "{text}");
         assert!(!text.contains("step 0"), "{text}");
-        assert!(text.contains(" why "), "{text}");
+        assert!(!text.contains(" why "), "{text}");
         assert_eq!(session.state().plan, plan(8, 10));
         let area = app.plan_area.unwrap();
         panel_click(&mut app, area);
