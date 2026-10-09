@@ -213,6 +213,44 @@ async fn subsequent_user_restrictions_veto_an_existing_start_capability() {
 }
 
 #[tokio::test]
+async fn an_approved_ask_rule_does_not_cancel_scoped_cleanup() {
+    let mut f = Fixture::new();
+    let id = f.arm().await;
+    let (judge, _) = crate::judge::fake::judge(crate::judge::fake::Answers::Hang, &f.tool.root);
+    judge.update_authorization().await.unwrap();
+    let mut rules = Rules::default();
+    rules.ask.push(Rule::parse("Aws_instance").unwrap());
+    let policy = Arc::new(f.policy(Mode::Auto, rules));
+    assert_eq!(
+        policy.check(NAME, &f.call("stop", &id), true),
+        Decision::Ask
+    );
+    f.tool.authorization = Some((policy, Arc::new(judge)));
+    f.tool.run(&f.call("stop", &id)).await.unwrap();
+    assert_eq!(f.mutations(), "arm\nstop\n");
+}
+
+#[tokio::test]
+async fn a_start_lease_does_not_authorize_unrelated_paid_work() {
+    let mut f = Fixture::new();
+    let id = f.arm().await;
+    let (judge, backend) = crate::judge::fake::judge(
+        crate::judge::fake::Answers::Verdict(crate::judge::Verdict::Deny {
+            reason: "paid start unrelated to local tests".into(),
+        }),
+        &f.tool.root,
+    );
+    judge.start_user_turn("only run local unit tests", None);
+    f.tool.authorization = Some((
+        Arc::new(f.policy(Mode::Auto, Rules::default())),
+        Arc::new(judge),
+    ));
+    assert!(f.tool.run(&f.call("start", &id)).await.is_err());
+    assert_eq!(backend.calls.lock().unwrap().len(), 1);
+    assert_eq!(f.mutations(), "arm\n");
+}
+
+#[tokio::test]
 async fn clean_stop_does_not_call_an_unavailable_judge() {
     let mut f = Fixture::new();
     let id = f.arm().await;
@@ -256,7 +294,11 @@ async fn failed_or_changed_user_authorization_cannot_start_the_instance() {
     };
     let revision = f.tool.authorize(&req, &cap).await.unwrap();
     judge.start_user_turn("do not start the instance", None);
-    assert!(f.tool.unchanged(revision, &f.call("start", &id)).is_err());
+    assert!(
+        f.tool
+            .unchanged(revision.as_ref(), &f.call("start", &id))
+            .is_err()
+    );
     *backend.authorization_failure.lock().unwrap() =
         Some((crate::judge::authorization::Stage::Extract, false));
     assert!(f.tool.run(&f.call("start", &id)).await.is_err());

@@ -220,6 +220,11 @@ pub fn authorized(root: &Path, args: &Value) -> bool {
     load(root, id).is_ok_and(|cap| !needs_future || cap.future().is_ok())
 }
 
+struct Authorization {
+    revision: u64,
+    decision: crate::permissions::Decision,
+}
+
 pub struct AwsInstance {
     root: PathBuf,
     cli: PathBuf,
@@ -255,7 +260,11 @@ impl AwsInstance {
         self
     }
 
-    async fn authorize(&self, req: &Request, cap: &Capability) -> Result<Option<u64>, String> {
+    async fn authorize(
+        &self,
+        req: &Request,
+        cap: &Capability,
+    ) -> Result<Option<Authorization>, String> {
         use crate::judge::{
             Verdict,
             authorization::{Kind, Status},
@@ -266,6 +275,11 @@ impl AwsInstance {
         if policy.mode() != crate::permissions::Mode::Auto || !judge.is_on() {
             return Ok(None);
         }
+        let args = serde_json::to_value(req).map_err(|error| error.to_string())?;
+        let decision = policy.check(NAME, &args, true);
+        if matches!(decision, crate::permissions::Decision::Deny(_)) {
+            return Err("AWS operation denied by current permission rules".into());
+        }
         judge.update_authorization().await.map_err(|error| {
             format!("AWS authorization is unresolved: {error:#}; cloud deadline was not cancelled")
         })?;
@@ -275,10 +289,11 @@ impl AwsInstance {
                 "AWS authorization changed during update; cloud deadline was not cancelled".into(),
             );
         }
-        if memory
-            .entries
-            .iter()
-            .any(|entry| entry.status == Status::Active && entry.note.kind != Kind::Grant)
+        if matches!(req, Request::Start { .. } | Request::Use { .. })
+            || memory
+                .entries
+                .iter()
+                .any(|entry| entry.status == Status::Active && entry.note.kind != Kind::Grant)
         {
             let target = serde_json::to_string(req).map_err(|error| error.to_string())?;
             let detail = format!(
@@ -297,22 +312,20 @@ impl AwsInstance {
                 }
             }
         }
-        self.unchanged(
-            Some(memory.revision),
-            &serde_json::to_value(req).map_err(|error| error.to_string())?,
-        )?;
-        Ok(Some(memory.revision))
+        let authorization = Authorization {
+            revision: memory.revision,
+            decision,
+        };
+        self.unchanged(Some(&authorization), &args)?;
+        Ok(Some(authorization))
     }
 
-    fn unchanged(&self, revision: Option<u64>, args: &Value) -> Result<(), String> {
-        if let (Some(revision), Some((policy, judge))) = (revision, &self.authorization) {
+    fn unchanged(&self, authorization: Option<&Authorization>, args: &Value) -> Result<(), String> {
+        if let (Some(authorization), Some((policy, judge))) = (authorization, &self.authorization) {
             let memory = judge.authorization();
-            if memory.revision != revision
+            if memory.revision != authorization.revision
                 || !memory.pending.is_empty()
-                || !matches!(
-                    policy.check(NAME, args, true),
-                    crate::permissions::Decision::Allow(_)
-                )
+                || policy.check(NAME, args, true) != authorization.decision
             {
                 return Err("AWS authorization changed during the operation; cloud deadline was not cancelled".into());
             }
@@ -524,7 +537,7 @@ impl AwsInstance {
         let mut cap = load(&self.root, id)?;
         let revision = self.authorize(&req, &cap).await?;
         if matches!(req, Request::Revoke { .. }) {
-            self.unchanged(revision, args)?;
+            self.unchanged(revision.as_ref(), args)?;
             cap.revoked = true;
             save(&self.root, &cap)?;
             return Ok(json!({"revoked": true, "stop_available": true}));
@@ -539,7 +552,7 @@ impl AwsInstance {
                     return Err("start requires stopped instance".into());
                 }
                 cap.future()?;
-                self.unchanged(revision, args)?;
+                self.unchanged(revision.as_ref(), args)?;
                 self.aws(
                     &cap,
                     &[
@@ -554,7 +567,7 @@ impl AwsInstance {
                 return Err("use requires running instance".into());
             }
         } else if matches!(req, Request::Stop { .. }) {
-            self.unchanged(revision, args)?;
+            self.unchanged(revision.as_ref(), args)?;
             self.aws(
                 &cap,
                 &[
@@ -567,7 +580,7 @@ impl AwsInstance {
             .await?;
         }
         let state = self.state(&cap).await?;
-        self.unchanged(revision, args)?;
+        self.unchanged(revision.as_ref(), args)?;
         Ok(
             json!({"capability": cap.id, "account": cap.account, "region": cap.region, "instance": cap.instance, "deadline": cap.deadline, "state": state, "stopped": state == "stopped", "revoked": cap.revoked}),
         )
