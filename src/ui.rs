@@ -5,7 +5,9 @@ use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+    Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -150,6 +152,33 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.buttons.clear();
         app.child_rows.clear();
         render_trust(frame, bottom_area, &gate);
+        return;
+    }
+    if app.clear_pending {
+        let text = "Also kill kept processes and dismiss all monitors?\n[y] clean slate   [n] conversation only   [Esc] cancel";
+        let width = frame.area().width.saturating_sub(2).max(1) as usize;
+        let height =
+            (wrap(text, width).len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+        let [transcript_area, bottom_area, status_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(height),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+        render_status(frame, status_area, app);
+        render_transcript(frame, transcript_area, app);
+        app.input_area = None;
+        app.buttons.clear();
+        app.child_rows.clear();
+        frame.render_widget(Clear, bottom_area);
+        frame.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: false }).block(
+                Block::bordered()
+                    .title(" clear conversation ")
+                    .border_style(Style::new().fg(Color::Yellow)),
+            ),
+            bottom_area,
+        );
         return;
     }
     // sudo's question takes the bottom area next, over an approval or the prompt.
@@ -2422,6 +2451,20 @@ mod tests {
     /// A press and release on one cell, which is what counts as a click.
     fn click(app: &mut App, column: u16, row: u16) -> bool {
         app.on_mouse(down(column, row)) | app.on_mouse(up(column, row))
+    }
+
+    #[test]
+    fn clear_confirmation_shows_both_choices_and_cancel() {
+        let mut app = App::detached();
+        app.clear_pending = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("kill kept processes"), "{shown}");
+        assert!(shown.contains("[y] clean slate"), "{shown}");
+        assert!(shown.contains("[n] conversation only"), "{shown}");
+        assert!(shown.contains("[Esc] cancel"), "{shown}");
+        assert!(app.input_area.is_none());
     }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {

@@ -350,6 +350,7 @@ pub struct App {
     /// `ctrl+g` asked for the draft in the user's editor; the loop that owns the
     /// terminal opens it.
     pub editing: bool,
+    pub clear_pending: bool,
     /// ctrl+space dictation, when `[dictation]` is in the global config.
     #[cfg(feature = "dictation")]
     pub dictation: Option<crate::dictation::Dictation>,
@@ -455,6 +456,7 @@ impl App {
             esc_armed: None,
             cleared: None,
             editing: false,
+            clear_pending: false,
             #[cfg(feature = "dictation")]
             dictation: crate::dictation::configured(),
             session,
@@ -475,6 +477,17 @@ impl App {
                 KeyCode::Char('y') => self.answer_trust(true),
                 KeyCode::Char('n') | KeyCode::Esc => self.answer_trust(false),
                 KeyCode::Char('c') | KeyCode::Char('d') if ctrl => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
+
+        if self.clear_pending {
+            match key.code {
+                KeyCode::Char('y') => self.clear(true),
+                KeyCode::Char('n') => self.clear(false),
+                KeyCode::Esc => self.clear_pending = false,
+                KeyCode::Char('c') if ctrl => self.clear_pending = false,
                 _ => {}
             }
             return;
@@ -1821,7 +1834,11 @@ impl App {
             return;
         }
         if message == "/clear" {
-            self.clear();
+            if self.busy() {
+                self.note(Entry::Error("cannot clear while a turn runs".into()));
+            } else {
+                self.clear_pending = true;
+            }
             return;
         }
         if let Some(question) = crate::session::btw(&message) {
@@ -2421,10 +2438,18 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
 
     /// `/clear`: the conversation goes, and with it everything the transcript's indexes
     /// stood for, so the view starts again at the bottom of an empty screen.
-    fn clear(&mut self) {
+    fn clear(&mut self, cleanup: bool) {
+        self.clear_pending = false;
         if let Err(e) = self.session.clear() {
             self.note(Entry::Error(e.to_string()));
             return;
+        }
+        if cleanup {
+            crate::tools::bash::kill_all();
+            self.session.monitors().clear();
+            self.session.clear_queue();
+            self.queued.clear();
+            self.bg = None;
         }
         self.expanded.clear();
         self.pinned.clear();
@@ -3345,6 +3370,10 @@ mod tests {
 
         app.input.set("/clear".to_string());
         app.submit();
+        assert!(app.clear_pending);
+        assert!(control.try_recv().is_err());
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(!app.clear_pending);
         assert!(matches!(
             control.try_recv(),
             Ok(crate::agent::Control::Clear)
@@ -3360,6 +3389,93 @@ mod tests {
             "{:?}",
             entries.list
         );
+    }
+
+    #[test]
+    fn clear_can_be_cancelled_without_dropping_the_conversation() {
+        let (mut app, _user, mut control) = connected();
+        app.input.set("/clear".into());
+        app.submit();
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.clear_pending);
+        assert!(control.try_recv().is_err());
+        assert!(!app.entries().list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_clean_slate_removes_monitors_and_queued_prompts() {
+        const CHILD: &str = "BHAI_TEST_CLEAR_CLEAN_SLATE";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::tests::clear_clean_slate_removes_monitors_and_queued_prompts",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use crate::tools::Tool;
+        let args = serde_json::json!({"command": "sleep 60", "yield_time_ms": 250});
+        let (output, ok) = crate::tools::bash::Bash.execute(&args).await;
+        assert!(ok, "{output}");
+        let group = crate::tools::bash::kept()[0].group.unwrap();
+        let (mut app, _user, mut control) = connected();
+        let monitors = app.session.monitors();
+        monitors
+            .add(crate::monitor::Spec {
+                name: "test".into(),
+                command: "printf '{}'".into(),
+                workdir: std::env::temp_dir(),
+                interval_secs: 2,
+                timeout_secs: 1,
+                hooks: vec![],
+            })
+            .unwrap();
+        app.input.set("/clear".into());
+        app.submit();
+        assert_eq!(monitors.views().len(), 1);
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(monitors.views().len(), 1);
+        assert!(!crate::tools::bash::kept().is_empty());
+        assert!(matches!(
+            control.try_recv(),
+            Ok(crate::agent::Control::Clear)
+        ));
+        app.input.set("/clear".into());
+        app.submit();
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(crate::tools::bash::kept().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let output = tokio::process::Command::new("/bin/ps")
+                    .args(["-o", "stat=", "-p", &group.to_string()])
+                    .output()
+                    .await
+                    .unwrap();
+                let state = String::from_utf8_lossy(&output.stdout);
+                if state.trim().is_empty() || state.trim().starts_with('Z') {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!app.clear_pending);
+        assert!(monitors.views().is_empty());
+        assert!(app.session.queued().is_empty());
+        assert!(matches!(
+            control.try_recv(),
+            Ok(crate::agent::Control::Clear)
+        ));
     }
 
     /// `auto` mode never prompts, so a call it denies has no approval to answer. The

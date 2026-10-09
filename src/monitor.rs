@@ -320,6 +320,19 @@ impl Monitors {
         }
     }
 
+    pub(crate) fn clear(&self) {
+        {
+            let mut rows = self.rows.lock().unwrap();
+            for row in rows.values() {
+                row.data.lock().unwrap().stopped = true;
+                row.change.send_modify(|n| *n += 1);
+            }
+            rows.clear();
+        }
+        *self.last_wake.lock().unwrap() = None;
+        self.notify();
+    }
+
     pub fn control(&self, id: &str, action: &str) -> Result<(), String> {
         let mut rows = self.rows.lock().unwrap();
         let row = rows.get(id).ok_or_else(|| format!("no monitor {id}"))?;
@@ -880,6 +893,23 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_stops_observers_and_resets_the_wake_limit() {
+        let (session, _input) = session();
+        let store = session.monitors();
+        let id = store.add(spec("sleep 60")).unwrap();
+        let row = Arc::clone(store.rows.lock().unwrap().get(&id).unwrap());
+        *store.last_wake.lock().unwrap() = Some(Instant::now());
+        store.clear();
+        assert!(row.data.lock().unwrap().stopped);
+        assert!(store.views().is_empty());
+        assert!(store.background().is_empty());
+        assert!(store.context().is_none());
+        assert!(store.last_wake.lock().unwrap().is_none());
+        assert!(store.add(spec("printf '{}'")).is_ok());
+        store.clear();
     }
 
     #[tokio::test]
