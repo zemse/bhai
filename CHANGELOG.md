@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-09
 
+- The auto judge vetoes concrete safety and scope violations rather than requiring exact permission wording for routine task work, external implementation and temporary server cleanup; sensitive actions still require scoped permission and hard safeguards remain unchanged.
 - User-entered `/goal` objectives join the judge's authorization memory, including restrictions set during a running turn; automatic goal turns and model-written updates remain context only.
 - Repo-local agent instructions require verified commits, main-branch integration and safe cleanup before reporting completed work.
 - The ceilings benchmark declares the hooks module used by the agent loop, so it compiles with lifecycle automation enabled.
