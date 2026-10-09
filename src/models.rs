@@ -37,7 +37,7 @@ const CLIENT_VERSION: &str = "0.154.0";
 const FALLBACK_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 
 /// One model on offer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Model {
     /// What `--model` would be given: `gpt-5.5`, or `ollama:<name>`.
     pub id: String,
@@ -68,14 +68,14 @@ impl Model {
 }
 
 /// One reasoning effort a model takes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Effort {
     pub name: String,
     pub detail: String,
 }
 
 /// The models on offer, and a note for each backend that could not be asked.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Catalogue {
     pub models: Vec<Model>,
     pub notes: Vec<String>,
@@ -84,14 +84,38 @@ pub struct Catalogue {
 /// Ask both backends what they will serve. `current` is the session's model, which is
 /// listed even when its backend cannot be reached, since it is demonstrably servable.
 pub async fn load(ollama_url: &str, current: &str) -> Catalogue {
+    let (mut found, _) = catalogue(ollama_url).await;
+    if !found.models.iter().any(|m| m.id == current) {
+        found.models.insert(0, running(current));
+    }
+    if let Ok(mut slot) = CACHED.lock() {
+        *slot = Some((Instant::now(), Arc::new(found.clone())));
+    }
+    found
+}
+
+/// Discover models without a running session, reporting when the Codex cache was used.
+pub async fn discover(ollama_url: &str) -> Catalogue {
+    let (mut found, cached_note) = catalogue(ollama_url).await;
+    if let Some(note) = cached_note {
+        found.notes.push(note);
+    }
+    found
+}
+
+async fn catalogue(ollama_url: &str) -> (Catalogue, Option<String>) {
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_default();
     let mut found = Catalogue::default();
+    let mut cached_note = None;
 
     match tokio::time::timeout(TIMEOUT, codex(&http)).await {
-        Ok(Ok(models)) => found.models.extend(models),
+        Ok(Ok((models, note))) => {
+            found.models.extend(models);
+            cached_note = note;
+        }
         Ok(Err(e)) => found.notes.push(format!("codex: {e:#}")),
         Err(_) => found
             .notes
@@ -104,13 +128,7 @@ pub async fn load(ollama_url: &str, current: &str) -> Catalogue {
             .notes
             .push("ollama: the model list timed out".to_string()),
     }
-    if !found.models.iter().any(|m| m.id == current) {
-        found.models.insert(0, running(current));
-    }
-    if let Ok(mut slot) = CACHED.lock() {
-        *slot = Some((Instant::now(), Arc::new(found.clone())));
-    }
-    found
+    (found, cached_note)
 }
 
 /// The last catalogue loaded, for the checks that only ask whether an id is real.
@@ -189,16 +207,28 @@ fn effort(name: &str, detail: &str) -> Effort {
 }
 
 /// The Codex backend's list, or the one the Codex CLI cached when it cannot be reached.
-async fn codex(http: &reqwest::Client) -> Result<Vec<Model>> {
+async fn codex(http: &reqwest::Client) -> Result<(Vec<Model>, Option<String>)> {
     let cached = cache();
     let fetched = fetch(http, &cached).await;
+    codex_reply(fetched, cached)
+}
+
+fn codex_reply(
+    fetched: Result<Value>,
+    cached: Option<Value>,
+) -> Result<(Vec<Model>, Option<String>)> {
     match (fetched, cached) {
-        (Ok(body), _) => Ok(codex_models(&body)),
+        (Ok(body), _) => Ok((codex_models(&body), None)),
         (Err(e), Some(body)) => {
             let models = codex_models(&body);
             match models.is_empty() {
                 true => Err(e),
-                false => Ok(models),
+                false => Ok((
+                    models,
+                    Some(format!(
+                        "codex: using cached models because live discovery failed: {e:#}"
+                    )),
+                )),
             }
         }
         (Err(e), None) => Err(e),
@@ -324,6 +354,8 @@ async fn tags(http: &reqwest::Client, url: &str) -> Result<Vec<Model>> {
         Err(e) => return Err(anyhow::Error::new(e).context(format!("{endpoint} failed"))),
     };
     let body: Value = response
+        .error_for_status()
+        .with_context(|| format!("{endpoint} failed"))?
         .json()
         .await
         .with_context(|| format!("{endpoint} did not answer JSON"))?;
@@ -698,6 +730,22 @@ mod tests {
         assert_eq!(window_of(&body, "gpt-6-astra"), None);
         assert_eq!(window_of(&body, "missing"), None);
         assert_eq!(window_of(&json!({}), "gpt-5.5"), None);
+    }
+
+    #[test]
+    fn cached_codex_discovery_is_explicit_and_empty_caches_do_not_hide_errors() {
+        let (models, note) = codex_reply(Ok(codex_body()), Some(json!({}))).unwrap();
+        assert!(!models.is_empty());
+        assert!(note.is_none());
+        let (models, note) =
+            codex_reply(Err(anyhow::anyhow!("unreachable")), Some(codex_body())).unwrap();
+        assert!(!models.is_empty());
+        assert!(
+            note.unwrap()
+                .contains("using cached models because live discovery failed: unreachable")
+        );
+        assert!(codex_reply(Err(anyhow::anyhow!("unreachable")), Some(json!({}))).is_err());
+        assert!(codex_reply(Err(anyhow::anyhow!("unreachable")), None).is_err());
     }
 
     #[test]

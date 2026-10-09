@@ -52,6 +52,25 @@ session options work before or after `exec`. approvals left at ask are rejected 
 
 `sessions [prune [n]]`, `identities`, `usage` and `mcp approve|login|logout <server>` also have command-specific help. existing `--workflow`, `--serve --headless` and diagnostic flags remain available.
 
+### driving bhai from another harness
+
+`bhai models` lists exact model IDs, supported reasoning efforts and known context windows. `bhai models --json` returns one JSON object with `models` and `notes`, unlike the JSONL event stream from `exec --json`. listing reads backend metadata without starting an agent session or requesting inference.
+
+```sh
+bhai models
+bhai models --json
+bhai models --help
+
+model=$(bhai models --json | jq -er '.models[0].id') &&
+  bhai exec "review this code" --model "$model" --json --mode auto
+```
+
+pass a row's `id` unchanged to `--model`, including the `ollama:` prefix for local models. `efforts` contains objects with `name` and `detail`; pass a supported `name` to `--effort`. Ollama rows have no efforts because bhai does not send reasoning effort to Ollama. `default_effort` and `window` are null when unknown.
+
+`notes` reports backend discovery failures and explicitly labels fallback to the Codex CLI's cached model list. a cached ID is not proof that the backend is currently reachable. partial discovery exits successfully when at least one model is listed; no discovered models exits with status 1 but still prints the JSON object. the configured default model is not invented as a discovered result.
+
+`-C` selects the project root, and listing reads the same global and project configuration as a run. the configured `ollama_url` takes precedence over `BHAI_OLLAMA_URL`, then localhost is used. model listing does not require Codex login when Ollama is available; the missing login is reported in `notes`.
+
 ## auto approvals
 
 auto mode uses deterministic permission rules first, then a judge for calls the rules leave open. the judge approves ordinary task-related implementation, setup and cleanup unless it identifies a concrete safety or scope violation. working outside the project or missing exact command wording is not itself a reason to deny. publishing, termination, storage deletion and broad destructive changes still need scoped user permission.

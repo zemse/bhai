@@ -81,6 +81,17 @@ pub async fn entry() -> Result<()> {
         args.exec = Some(exec_prompt(prompt, std::io::stdin())?);
     }
     match args.command.take() {
+        Some(arguments::Command::Models) => {
+            let roots = instructions::Roots::from_env(std::env::current_dir()?);
+            let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(args.flags);
+            let client = client::Client::new(&config.choice)?;
+            let found = models::discover(client.ollama_url()).await;
+            println!("{}", models_output(&found, args.json)?);
+            if found.models.is_empty() {
+                bail!("no models discovered; see discovery notes");
+            }
+            return Ok(());
+        }
         Some(arguments::Command::Identities) => return identities(),
         Some(arguments::Command::Sessions { command }) => {
             let dir = std::env::current_dir()?.join(sessions::DIR);
@@ -1138,6 +1149,13 @@ impl ExecRun {
         }
         out.flush()?;
         Ok(matches!(event, Event::TurnEnd))
+    }
+}
+
+fn models_output(found: &models::Catalogue, json: bool) -> Result<String> {
+    match json {
+        true => Ok(serde_json::to_string_pretty(found)?),
+        false => Ok(tools::models::listing(found, "").trim_end().to_string()),
     }
 }
 

@@ -11,7 +11,7 @@ use crate::{config::Flags, permissions};
     version,
     propagate_version = true,
     about = "An agent harness.",
-    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected.\nText output goes to stdout, progress to stderr. --json emits session events as JSONL."
+    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read."
 )]
 pub(super) struct Cli {
     #[command(subcommand)]
@@ -22,7 +22,7 @@ pub(super) struct Cli {
     /// Use this directory as the project root.
     #[arg(short = 'C', long, global = true, value_name = "DIR")]
     cd: Option<std::path::PathBuf>,
-    /// Print unattended session events as JSON lines.
+    /// Print exec events as JSON lines, or the models catalogue as JSON.
     #[arg(long, global = true)]
     json: bool,
     /// Select the model (including ollama:<name>).
@@ -46,13 +46,13 @@ pub(super) struct Cli {
     /// Honour the project-supplied permission rules as they are now.
     #[arg(long, global = true)]
     trust: bool,
-    /// Skip global instructions and configuration.
+    /// Skip global instruction files.
     #[arg(long, global = true)]
     no_global: bool,
-    /// Skip project instructions and configuration.
+    /// Skip project instruction files.
     #[arg(long, global = true)]
     no_project: bool,
-    /// Skip global and project instructions and configuration.
+    /// Disable instruction files and optional integrations.
     #[arg(long, global = true)]
     bare: bool,
     /// Log model usage, headers and trace spans under .bhai/debug.
@@ -94,6 +94,11 @@ pub(super) enum Command {
         /// Instructions for the agent, or - to read stdin.
         prompt: String,
     },
+    /// List available model IDs, reasoning efforts and context windows.
+    #[command(
+        after_help = "Use --json for a single object with models and discovery notes.\nPass models[].id to --model and an efforts[].name to --effort.\nCached Codex results are labelled in notes; no agent session or inference call is started."
+    )]
+    Models,
     /// List configured agent identities.
     Identities,
     /// Show the subscription's usage windows and credits.
@@ -217,8 +222,19 @@ impl Cli {
                 "exec and --print run on their own, without --serve, --headless, --workflow or --pick",
             ));
         }
-        if parsed.json && parsed.exec.is_none() {
-            return Err(Self::invalid("--json requires exec or --print"));
+        let models = matches!(parsed.command, Some(Command::Models));
+        if models
+            && (parsed.serve.is_some()
+                || parsed.workflow.is_some()
+                || parsed.resume.is_some()
+                || parsed.pick)
+        {
+            return Err(Self::invalid(
+                "models lists the catalogue without --serve, --workflow, --resume or --pick",
+            ));
+        }
+        if parsed.json && parsed.exec.is_none() && !models {
+            return Err(Self::invalid("--json requires exec, --print or models"));
         }
         if parsed.pick && parsed.headless {
             return Err(Self::invalid("--pick needs the terminal"));
@@ -354,6 +370,27 @@ mod tests {
             vec!["--workflow-yes"],
         ] {
             assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn models_supports_json_without_an_unattended_prompt() {
+        let args = parse(&["models", "--json"]).unwrap();
+        assert_eq!(args.command, Some(Command::Models));
+        assert!(args.json && args.exec.is_none());
+        assert_eq!(parse(&["--json", "models"]).unwrap(), args);
+        assert_eq!(
+            parse(&["models", "--help"]).unwrap_err().kind(),
+            ErrorKind::DisplayHelp
+        );
+        for refused in [
+            vec!["models", "extra"],
+            vec!["--serve", "models"],
+            vec!["models", "--resume"],
+            vec!["models", "--pick"],
+            vec!["--json", "sessions"],
+        ] {
+            assert!(parse(&refused).is_err(), "{refused:?}");
         }
     }
 
