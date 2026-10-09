@@ -2,6 +2,7 @@ use super::*;
 use crate::permissions::{Decision, Mode, Policy, Rule, Rules};
 use std::os::unix::fs::PermissionsExt;
 
+mod compatibility;
 mod hardening;
 
 struct Fixture {

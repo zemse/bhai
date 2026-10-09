@@ -132,7 +132,27 @@ fn endpoints(command: &mut Command, keys: impl IntoIterator<Item = std::ffi::OsS
 }
 
 fn request(args: &Value) -> Result<Request, String> {
-    serde_json::from_value(args.clone()).map_err(|e| format!("invalid aws_instance request: {e}"))
+    let mut args = args.clone();
+    let irrelevant: &[&str] = match args.get("action").and_then(Value::as_str) {
+        Some("arm") => &["capability"],
+        Some("start" | "use" | "stop" | "status" | "revoke") => &[
+            "account", "profile", "region", "instance", "role_arn", "deadline",
+        ],
+        _ => &[],
+    };
+    if let Some(object) = args.as_object_mut() {
+        for field in irrelevant {
+            if let Some(value) = object.get(*field) {
+                if !value.is_null() && value.as_str() != Some("") {
+                    return Err(format!(
+                        "invalid aws_instance request: irrelevant field `{field}` must be empty or null"
+                    ));
+                }
+                object.remove(*field);
+            }
+        }
+    }
+    serde_json::from_value(args).map_err(|e| format!("invalid aws_instance request: {e}"))
 }
 
 fn ledger(root: &Path) -> PathBuf {
@@ -592,8 +612,8 @@ impl Tool for AwsInstance {
         NAME
     }
     fn schema(&self) -> Value {
-        json!({"type":"function", "name":NAME,
-            "description":"Scoped AWS lifecycle. Arm an existing stopped EC2 instance using an existing Scheduler execution role and independent UTC stop deadline (5 minutes to 24 hours). Arm requires user approval. Use validates running state and deadline, not arbitrary remote commands. Stop remains available after expiry/revocation. No launch, termination, IAM creation or storage deletion. Readback verifies schedule configuration, not execution-role trust or stop permission. Scheduler delivery is not a guaranteed stop or hard real-time deadline; the existing role must trust scheduler.amazonaws.com and permit ec2:StopInstances. Auto cannot start before native arming is approved by the user. Never cancel the deadline.",
+        json!({"type":"function", "name":NAME, "strict":false,
+            "description":"For arm, supply account, profile, region, instance, role_arn and deadline; omit capability or leave it empty. For other actions, supply capability; omit scope fields or leave them empty. Scoped AWS lifecycle. Arm an existing stopped EC2 instance using an existing Scheduler execution role and independent UTC stop deadline (5 minutes to 24 hours). Arm requires user approval. Use validates running state and deadline, not arbitrary remote commands. Stop remains available after expiry/revocation. No launch, termination, IAM creation or storage deletion. Readback verifies schedule configuration, not execution-role trust or stop permission. Scheduler delivery is not a guaranteed stop or hard real-time deadline; the existing role must trust scheduler.amazonaws.com and permit ec2:StopInstances. Auto cannot start before native arming is approved by the user. Never cancel the deadline.",
             "parameters":{"type":"object", "properties":{
                 "action":{"type":"string","enum":["arm","start","use","stop","status","revoke"]},
                 "capability":{"type":"string"}, "account":{"type":"string"}, "profile":{"type":"string"}, "region":{"type":"string"}, "instance":{"type":"string"}, "role_arn":{"type":"string"}, "deadline":{"type":"string"}},
