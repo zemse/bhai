@@ -1451,16 +1451,7 @@ pub(crate) async fn run_configured(
                 } else if cancel.load(Ordering::Relaxed) {
                     g.pause("interrupted");
                 } else if on_goal.is_some() {
-                    let acted = history[before.len()..].iter().any(|item| {
-                        matches!(
-                            item["type"].as_str(),
-                            Some("function_call" | "custom_tool_call" | "tool_search_call")
-                        ) && !matches!(
-                            item["name"].as_str(),
-                            Some("goal" | "update_plan" | "update_title")
-                        )
-                    });
-                    g.progress(acted);
+                    g.progress(result.acted);
                 }
             }
         }
@@ -1737,15 +1728,18 @@ struct Turn {
     /// The budget message went in, so the answer is what the agent had at that point
     /// rather than what it would have finished with.
     truncated: bool,
+    /// Tool activity survives history compaction within the turn.
+    acted: bool,
     result: anyhow::Result<()>,
 }
 
 impl Turn {
     /// A turn that ran to an answer, however much of its budget that took.
-    fn ended(steps: usize, truncated: bool) -> Self {
+    fn ended(steps: usize, truncated: bool, acted: bool) -> Self {
         Self {
             steps,
             truncated,
+            acted,
             result: Ok(()),
         }
     }
@@ -1780,6 +1774,7 @@ async fn turn(
     model.begin_turn();
     let mut error_rounds = 0usize;
     let mut truncated = false;
+    let mut acted = false;
     let mut continued = 0usize;
 
     let mut step = 0usize;
@@ -1793,6 +1788,7 @@ async fn turn(
                 return Turn {
                     steps: step - 1,
                     truncated,
+                    acted,
                     result: Err(anyhow!("kept calling tools past its {limit}-step budget")),
                 };
             }
@@ -1819,6 +1815,7 @@ async fn turn(
             return Turn {
                 steps: step - 1,
                 truncated,
+                acted,
                 result: Err(error),
             };
         }
@@ -1840,7 +1837,7 @@ async fn turn(
                     .await
                     .is_some()
                 {
-                    return Turn::ended(step - 1, truncated);
+                    return Turn::ended(step - 1, truncated, acted);
                 }
             } else {
                 let _ = tx.send(AgentEvent::CacheStalled(cache::MAX_MISSES));
@@ -1971,7 +1968,7 @@ async fn turn(
         let items = match answer {
             Ok(items) => items,
             // An interrupt is the user's decision, not an error worth reporting.
-            Err(_) if cancel.load(Ordering::Relaxed) => return Turn::ended(step, truncated),
+            Err(_) if cancel.load(Ordering::Relaxed) => return Turn::ended(step, truncated, acted),
             // Left in the history, a refused image would fail every call after this one.
             Err(e)
                 if images::refused(&e)
@@ -1983,6 +1980,7 @@ async fn turn(
                 return Turn {
                     steps: step,
                     truncated,
+                    acted,
                     result: Err(e),
                 };
             }
@@ -2040,19 +2038,25 @@ async fn turn(
             // A preamble on `end_turn: false` is the model narrating before it carries on;
             // ending there leaves the work undone.
             if !continues {
-                return Turn::ended(step, truncated);
+                return Turn::ended(step, truncated, acted);
             }
             continued += 1;
             if continued > MAX_CONTINUES {
                 let _ = tx.send(AgentEvent::Info(format!(
                     "stopped: the model asked to carry on {MAX_CONTINUES} times without acting"
                 )));
-                return Turn::ended(step, truncated);
+                return Turn::ended(step, truncated, acted);
             }
             continue;
         }
         continued = 0;
 
+        acted |= calls.iter().any(|call| {
+            !matches!(
+                call["name"].as_str(),
+                Some("goal" | "update_plan" | "update_title")
+            )
+        });
         let conversation = tools::Conversation {
             id: model.conversation(),
             model: model.name(),
@@ -2136,7 +2140,7 @@ async fn turn(
                 .take()
         });
         if cancel.load(Ordering::Relaxed) {
-            return Turn::ended(step, truncated);
+            return Turn::ended(step, truncated, acted);
         }
         if let Some(asked) = requested {
             let pass = Compaction {
@@ -2166,7 +2170,7 @@ async fn turn(
             let _ = tx.send(AgentEvent::Error(
                 "stopped: the last few tool calls all failed".to_string(),
             ));
-            return Turn::ended(step, truncated);
+            return Turn::ended(step, truncated, acted);
         }
     }
 }
@@ -3107,6 +3111,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
         steps,
         truncated,
         result,
+        ..
     } = result;
     let result = match result {
         Ok(()) if child.cancel.load(Ordering::Relaxed) => Err(anyhow!("interrupted by the user")),
@@ -5814,6 +5819,65 @@ mod tests {
         assert!(!calls[2].contains("tokens spent"), "{}", calls[2]);
         assert!(!calls[2].contains("token limit"), "{}", calls[2]);
         assert!(fake.offered.lock().unwrap()[0].contains(&"goal".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_goal_turn_can_shorten_history_without_losing_progress_or_the_next_message() {
+        use fake::{Fake, call, say};
+
+        let fake = Fake::new(vec![
+            (0..30).map(|_| say("earlier context")).collect(),
+            vec![call("compact", json!({}))],
+            vec![say("the summary")],
+            vec![say("still working")],
+            vec![call(
+                "goal",
+                json!({"status": "complete", "reason": "verified"}),
+            )],
+            vec![say("done")],
+            vec![say("next message answered")],
+        ]);
+        let (mut rx, user, control, _cancel) = goal_session(&fake, Vec::new());
+        user.send("start with earlier context".into())
+            .await
+            .unwrap();
+        settle(&mut rx).await;
+        control
+            .send(set_goal("compact and continue"))
+            .await
+            .unwrap();
+        let first = settle(&mut rx).await;
+        assert!(
+            first
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compacted { .. }))
+        );
+        assert!(
+            !first.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "{first:?}"
+        );
+        let second = settle(&mut rx).await;
+        assert!(
+            info(&second)
+                .iter()
+                .any(|s| s.starts_with("goal complete: compact and continue")),
+            "{second:?}"
+        );
+        {
+            let bodies = fake.bodies.lock().unwrap();
+            assert!(
+                bodies[3].1["input"].as_array().unwrap().len()
+                    < bodies[1].1["input"].as_array().unwrap().len()
+            );
+        }
+        user.send("one more message".into()).await.unwrap();
+        let events = settle(&mut rx).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "{events:?}"
+        );
+        assert_eq!(parent_calls(&fake).len(), 7);
+        assert!(parent_calls(&fake)[6].contains("one more message"));
     }
 
     #[tokio::test]

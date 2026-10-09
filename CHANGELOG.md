@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-10
 
+- Goal turns track tool activity independently of history indexes, so mid-turn compaction can shorten the conversation without panicking or losing progress.
 - Escape interrupts an unanswered prompt and returns its text and attachments to the editor, removing it from live and saved conversation history. Once transcript output follows it, Escape keeps the existing interrupt confirmation without editing.
 - Goal adoption shows `goal: <objective>` with a short active confirmation instead of agent instructions; resuming uses the same short confirmation.
 - The plan panel shows only its checklist and progress, without explanation text on the bottom border.
