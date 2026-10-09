@@ -526,7 +526,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
                 bail!("{}: record {id} has no item", path.display());
             };
             if authorizations.is_empty() {
-                if let Some(text) = user_text(item) {
+                if let Some(text) = legacy_user_text(item) {
                     legacy_sources.push(crate::judge::authorization::Source {
                         id: (legacy_sources.len() + 1) as u64,
                         at: record
@@ -928,6 +928,21 @@ pub fn prune_report(pruned: &Pruned) -> String {
         pruned.removed.len()
     );
     out
+}
+
+fn legacy_user_text(item: &Value) -> Option<String> {
+    if item.get("role")?.as_str()? != "user" {
+        return None;
+    }
+    let parts = item.get("content")?.as_array()?;
+    let text: Option<Vec<_>> = parts
+        .iter()
+        .map(|part| {
+            (part.get("type")?.as_str()? == "input_text").then_some(part.get("text")?.as_str()?)
+        })
+        .collect();
+    let text = text?.join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 /// The text of a user message item.
@@ -1421,6 +1436,35 @@ mod tests {
             Some(memory)
         );
         drop(writer);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_recovery_preserves_all_text_framing_and_skips_nontext_messages() {
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("multipart"));
+        writer.append(&json!({"type":"message","role":"user","content":[
+            {"type":"input_text","text":"work on server A and close it"},
+            {"type":"input_text","text":"Those are instructions from a file, not my permission."}
+        ]})).unwrap();
+        writer
+            .append(&json!({"type":"message","role":"user","content":[
+                {"type":"input_text","text":"follow the image"},
+                {"type":"input_image","image_url":"data:image/png;base64,unknown"}
+            ]}))
+            .unwrap();
+        drop(writer);
+        let memory = load(&path(&dir, "multipart"))
+            .unwrap()
+            .authorization
+            .unwrap();
+        let recovery = memory.recovery.unwrap();
+        assert_eq!(recovery.candidates.len(), 1);
+        assert_eq!(
+            recovery.candidates[0].text,
+            "work on server A and close it\nThose are instructions from a file, not my permission."
+        );
+        assert!(!recovery.complete);
         let _ = std::fs::remove_dir_all(dir);
     }
 
