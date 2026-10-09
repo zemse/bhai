@@ -69,7 +69,15 @@ pub struct Bundle {
 pub fn export(bundle: &Bundle, dir: &Path) -> Result<PathBuf> {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let path = dir.join(format!("bhai-debug-{stamp}.md"));
-    crate::sessions::private_write(&path, &bundle.markdown())
+    let checkpoint = bundle
+        .session_file
+        .as_ref()
+        .map(|file| file.with_extension("").join("authorization.json"));
+    let diagnostics = authorization_diagnostics(
+        checkpoint.as_deref(),
+        &crate::profile::debug_dir().join("authorization.jsonl"),
+    );
+    crate::sessions::private_write(&path, &bundle.markdown(&diagnostics))
         .with_context(|| format!("could not write {}", path.display()))?;
     Ok(path)
 }
@@ -107,12 +115,13 @@ decisions, {rules} permission rules, context {}",
         )
     }
 
-    fn markdown(&self) -> String {
+    fn markdown(&self, diagnostics: &str) -> String {
         let mut out = String::new();
         self.session(&mut out);
         self.totals(&mut out);
         section(&mut out, "permissions", self.permissions.trim());
         self.judge(&mut out);
+        section(&mut out, "authorization diagnostics", diagnostics);
         section(&mut out, "skills", self.skills.trim());
         section(&mut out, "mcp servers", self.mcp.trim());
         section(&mut out, "workflows", self.workflows.trim());
@@ -315,6 +324,69 @@ entry is the brief it was given.\n",
     }
 }
 
+fn authorization_diagnostics(checkpoint: Option<&Path>, log: &Path) -> String {
+    let mut out = String::from("Saved authorization state (including pending sources):\n");
+    match checkpoint {
+        Some(path) => {
+            let _ = writeln!(out, "{}", path.display());
+            match std::fs::read_to_string(path) {
+                Ok(text) => match serde_json::from_str::<Value>(&text) {
+                    Ok(value) => {
+                        let _ = writeln!(
+                            out,
+                            "{}",
+                            serde_json::to_string_pretty(&value)
+                                .unwrap_or_else(|_| value.to_string())
+                        );
+                    }
+                    Err(error) => {
+                        let _ = writeln!(out, "Invalid checkpoint JSON: {error}\n{text}");
+                    }
+                },
+                Err(error) => {
+                    let _ = writeln!(out, "Not available: {error}");
+                }
+            }
+        }
+        None => out.push_str("Not available: no session file.\n"),
+    }
+    let _ = writeln!(
+        out,
+        "\nAuthorization stage log: {}\nShared debug log, not filtered to this session; last {JUDGE_LINES} nonempty records, oldest first. Requests and replies are included in full.",
+        log.display()
+    );
+    match std::fs::read_to_string(log) {
+        Ok(text) => {
+            let lines: Vec<_> = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            if lines.is_empty() {
+                out.push_str("None logged.\n");
+            }
+            for line in &lines[lines.len().saturating_sub(JUDGE_LINES)..] {
+                match serde_json::from_str::<Value>(line) {
+                    Ok(value) => {
+                        let _ = writeln!(
+                            out,
+                            "{}\n",
+                            serde_json::to_string_pretty(&value)
+                                .unwrap_or_else(|_| value.to_string())
+                        );
+                    }
+                    Err(error) => {
+                        let _ = writeln!(out, "Invalid log JSON: {error}\n{line}\n");
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(out, "Not available: {error}");
+        }
+    }
+    out
+}
+
 /// The used percent of each rate-limit window, as the status bar names them.
 fn windows(rate: &RateLimits) -> String {
     rate.windows()
@@ -423,7 +495,7 @@ mod tests {
             "summary": "target: /home/u/.zshrc",
             "latency_ms": 900,
         })];
-        let out = b.markdown();
+        let out = b.markdown("");
         assert!(!out.contains("/home/u"), "{out}");
         assert!(out.contains("~/repo/.bhai/sessions/abc123.jsonl"), "{out}");
         assert!(out.contains("cat ~/.gnupg/gpg-agent.conf"), "{out}");
@@ -433,7 +505,7 @@ mod tests {
     /// A session that catted something enormous still produces a file that opens.
     #[test]
     fn a_huge_entry_is_cut_and_says_by_how_much() {
-        let out = bundle(vec![Entry::Output("x".repeat(ENTRY_CLIP + 500))]).markdown();
+        let out = bundle(vec![Entry::Output("x".repeat(ENTRY_CLIP + 500))]).markdown("");
         assert!(out.contains("[500 more characters]"), "cut");
         assert!(out.len() < ENTRY_CLIP + 6_000, "{} bytes", out.len());
     }
@@ -442,12 +514,13 @@ mod tests {
     /// "nothing happened" from "this export does not carry it".
     #[test]
     fn an_empty_session_still_names_every_section() {
-        let out = bundle(Vec::new()).markdown();
+        let out = bundle(Vec::new()).markdown("");
         for heading in [
             "## session",
             "## totals",
             "## permissions",
             "## judge decisions",
+            "## authorization diagnostics",
             "## skills",
             "## mcp servers",
             "## workflows",
@@ -460,6 +533,93 @@ mod tests {
         assert!(out.contains(PROFILE_MISSING));
         assert!(out.contains("None logged."));
         assert!(out.contains("None started in this session."));
+    }
+
+    #[test]
+    fn authorization_stages_and_pending_sources_are_exported_and_redacted() {
+        let dir = std::env::temp_dir().join(format!("bhai-debug-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let checkpoint = dir.as_path().join("authorization.json");
+        let log = dir.as_path().join("authorization.jsonl");
+        std::fs::write(
+            &checkpoint,
+            r#"{"revision":5,"entries":[],"pending":[{"id":2,"text":"hide monitors"},{"id":4,"text":"commit them"}]}"#,
+        )
+        .unwrap();
+        let records = [
+            serde_json::json!({"stage":"judge-authorization-extract", "request":{"message":{"text":"hide monitors", "reference":"/home/u/repo"}}, "reply":{"candidates":[]}}),
+            serde_json::json!({"stage":"judge-authorization-merge", "request":{"candidates":[]}, "reply":{"changes":[], "error":"Candidates omit the request"}}),
+        ];
+        std::fs::write(
+            &log,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let diagnostics = authorization_diagnostics(Some(&checkpoint), &log);
+        let out = bundle(Vec::new()).markdown(&diagnostics);
+        for text in [
+            "judge-authorization-extract",
+            "judge-authorization-merge",
+            "\"request\"",
+            "\"reply\"",
+            "\"pending\"",
+            "hide monitors",
+            "commit them",
+            "Candidates omit the request",
+            "~/repo",
+            "Shared debug log, not filtered to this session",
+        ] {
+            assert!(out.contains(text), "{text} missing from {out}");
+        }
+        assert!(!out.contains("/home/u"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_loads_the_sessions_authorization_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("bhai-debug-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut b = bundle(Vec::new());
+        b.session_file = Some(dir.as_path().join("abc123.jsonl"));
+        std::fs::create_dir(dir.as_path().join("abc123")).unwrap();
+        std::fs::write(
+            dir.as_path().join("abc123/authorization.json"),
+            r#"{"pending":[{"text":"commit them"}],"revision":5}"#,
+        )
+        .unwrap();
+        let file = export(&b, dir.as_path()).unwrap();
+        let out = std::fs::read_to_string(file).unwrap();
+        assert!(out.contains("\"pending\""));
+        assert!(out.contains("commit them"));
+        assert!(out.contains("Authorization stage log:"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn authorization_log_is_bounded_and_bad_records_remain_visible() {
+        let dir = std::env::temp_dir().join(format!("bhai-debug-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let log = dir.as_path().join("authorization.jsonl");
+        let mut records = String::from("{\"stage\":\"oldest omitted\"}\n");
+        for index in 0..JUDGE_LINES - 1 {
+            records.push_str(&format!("{{\"index\":{index}}}\n"));
+        }
+        records.push_str("invalid record\n\n");
+        std::fs::write(&log, records).unwrap();
+        let out = authorization_diagnostics(None, &log);
+        assert!(!out.contains("oldest omitted"));
+        assert!(out.contains("\"index\": 0"));
+        assert!(out.contains("Invalid log JSON:"));
+        assert!(out.contains("invalid record"));
+        assert!(out.contains("Not available: no session file."));
+        let out = authorization_diagnostics(Some(&log), &dir.as_path().join("missing"));
+        assert!(out.contains("Invalid checkpoint JSON:"));
+        assert!(out.contains("Not available:"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A child's work is not in the session's transcript, so the export carries each
@@ -494,7 +654,7 @@ mod tests {
             "reason": "reads the repo",
             "summary": "target: git status",
         })];
-        let out = b.markdown();
+        let out = b.markdown("");
         let children = &out[out.find("## children").unwrap()..];
         assert!(children.contains("### child 74b01e (general): build the circuits"));
         assert!(children.contains("create the branch"), "{children}");

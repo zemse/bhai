@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-10
 
+- Debug exports include saved authorization state and pending sources, plus recent extraction and merge requests and replies from the shared authorization log.
 - Bash and poll waits allow up to 30 minutes, return early on exit and guide the model to increase waits for slow builds. User message timestamps persist separately from their text and reach both backends as local date/time to the second with timezone offset; command and poll results carry the same clock. Stopping a session releases a long poll promptly.
 - Finished bash sessions and done, stopped or failed monitors disappear from the background list and live monitor cards; results and snapshots remain available to tools.
 - Clicking the plan or monitors panel folds it into a single header row; clicking again restores its live details without changing progress or stopping monitors.
