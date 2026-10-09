@@ -986,6 +986,7 @@ mod tests {
             children: Arc::clone(&harness.agent.children),
             cancel: Arc::clone(&harness.agent.cancel),
             monitors: None,
+            context: Arc::default(),
         };
         let (text, ok) = status.execute(&json!({})).await;
         assert!(ok);

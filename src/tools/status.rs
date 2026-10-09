@@ -1,4 +1,4 @@
-//! A pull-only glance at commands, active children and session observers.
+//! A pull-only glance at context usage, commands, active children and session observers.
 
 use std::sync::Arc;
 
@@ -9,11 +9,22 @@ use crate::agent::{Cancel, Children};
 use crate::monitor::{Monitors, View};
 
 pub const NAME: &str = "status";
+pub type Context = Arc<std::sync::Mutex<Option<Value>>>;
+
+pub fn context(input: u64, window: u64, estimated: bool) -> Value {
+    json!({
+        "input_tokens": input,
+        "window_tokens": window,
+        "percent": 100.0 * input as f64 / window.max(1) as f64,
+        "estimated": estimated,
+    })
+}
 
 pub struct Status {
     pub children: Children,
     pub cancel: Arc<Cancel>,
     pub monitors: Option<Arc<Monitors>>,
+    pub context: Context,
 }
 
 impl Tool for Status {
@@ -25,7 +36,7 @@ impl Tool for Status {
         json!({
             "type": "function",
             "name": NAME,
-            "description": "Read a succinct JSON snapshot of background work when you want to see what's up. \
+            "description": "Read context usage (input_tokens, window_tokens, percent, estimated) and a succinct JSON snapshot of background work. Context reflects the latest model call; estimated is true when backend usage is unavailable. \
         Commands include running sessions and exited ones with next: collect (use write_stdin with that id). \
         Children include only active tasks, including those waiting for a slot. Monitors include state and a short summary. \
         Empty sections are omitted. Reads do not wait, collect results or change anything; push updates arrive separately.",
@@ -47,7 +58,7 @@ impl Tool for Status {
     }
 
     fn describe(&self, _args: &Value) -> Result<String, String> {
-        Ok("read background status".to_string())
+        Ok("read context and background status".to_string())
     }
 
     fn execute<'a>(&'a self, _args: &'a Value) -> BoxFuture<'a, (String, bool)> {
@@ -63,7 +74,16 @@ impl Tool for Status {
                 })
                 .collect();
             let monitors = self.monitors.as_ref().map_or_else(Vec::new, |m| m.views());
-            (snapshot(bash::kept(), children, monitors).to_string(), true)
+            let mut out = snapshot(bash::kept(), children, monitors);
+            if let Some(context) = self
+                .context
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                out["context"] = context;
+            }
+            (out.to_string(), true)
         })
     }
 }
@@ -117,6 +137,27 @@ mod tests {
     use crate::agent::ChildUsage;
     use crate::monitor::Snapshot;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn context_is_visible_even_without_background_work() {
+        let status = Status {
+            children: Arc::default(),
+            cancel: Arc::default(),
+            monitors: None,
+            context: Arc::default(),
+        };
+        for (input, window, estimated, percent) in [(25, 100, false, 25.0), (120, 100, true, 120.0)]
+        {
+            *status.context.lock().unwrap() = Some(context(input, window, estimated));
+            let (text, ok) = status.execute(&json!({})).await;
+            assert!(ok);
+            let value: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["context"]["percent"], json!(percent));
+            assert_eq!(value["context"]["estimated"], json!(estimated));
+            assert_eq!(value["context"]["input_tokens"], json!(input));
+            assert_eq!(value["context"]["window_tokens"], json!(window));
+        }
+    }
 
     #[test]
     fn empty_sections_are_omitted() {
@@ -180,6 +221,7 @@ mod tests {
             children: Arc::default(),
             cancel: Arc::default(),
             monitors: None,
+            context: Arc::default(),
         };
         let active = status.cancel.child("active");
         status.children.lock().unwrap().extend([
@@ -229,6 +271,7 @@ mod tests {
             children: Arc::default(),
             cancel: Arc::default(),
             monitors: None,
+            context: Arc::default(),
         };
         let begun = std::time::Instant::now();
         loop {
@@ -273,6 +316,7 @@ mod tests {
             children: Arc::default(),
             cancel: Arc::default(),
             monitors: None,
+            context: Arc::default(),
         }));
         let tool = registry.get(NAME).unwrap();
         assert!(!tool.needs_approval());

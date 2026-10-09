@@ -781,6 +781,8 @@ pub(crate) async fn run_configured(
     let goal_requested = Arc::new(AtomicBool::new(false));
     let plan = crate::plan::Shared::new(Arc::clone(&goal));
     let title_updated = Arc::new(std::sync::Mutex::new(false));
+    let compact_requested: tools::compact::Requested = Arc::default();
+    let context_usage: tools::status::Context = Arc::default();
     // The file this session is saved as, which a resume names after the session it continues.
     let own = saved
         .as_ref()
@@ -838,6 +840,12 @@ pub(crate) async fn run_configured(
                 children: Arc::clone(&children),
                 cancel: Arc::clone(&stop),
                 monitors: delegation.as_ref().and_then(|d| d.monitors.clone()),
+                context: Arc::clone(&context_usage),
+            }));
+        }
+        if prompt.identity.allows_tool(tools::compact::NAME) {
+            registry = registry.with_tool(Box::new(tools::compact::Compact {
+                requested: Arc::clone(&compact_requested),
             }));
         }
         registry
@@ -1322,6 +1330,8 @@ pub(crate) async fn run_configured(
         let goal_context = GoalContext {
             goal: &goal,
             plan: &plan,
+            compact_requested: &compact_requested,
+            context_usage: &context_usage,
         };
         // A root per turn; `session.id` is what ties a session's turns together.
         let span = info_span!(
@@ -1631,6 +1641,8 @@ fn persist(
 struct GoalContext<'a> {
     goal: &'a goal::Shared,
     plan: &'a crate::plan::Shared,
+    compact_requested: &'a tools::compact::Requested,
+    context_usage: &'a tools::status::Context,
 }
 
 /// The update a model that takes them needs before the next turn: the effort it runs at,
@@ -1878,6 +1890,16 @@ async fn turn(
         // What the backend has to read before it can answer. Counted here rather than
         // taken from the call's usage, which only arrives once the answer is over.
         let prompt = prompt_tokens(model.name(), instructions, tools, history);
+        if let Some(context) = goal_context {
+            *context
+                .context_usage
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(tools::status::context(
+                prompt,
+                limits.unwrap_or_default().window(model.name()),
+                true,
+            ));
+        }
         let _ = tx.send(AgentEvent::Sending(prompt));
         let _ = tx.send(AgentEvent::Streaming(true));
         let span = info_span!(
@@ -1931,6 +1953,16 @@ async fn turn(
             let _ = tx.send(AgentEvent::Error(format!("usage log: {e:#}")));
         }
         if let Some(usage) = finished {
+            if let Some(context) = goal_context {
+                *context
+                    .context_usage
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(tools::status::context(
+                    usage.input,
+                    limits.unwrap_or_default().window(model.name()),
+                    false,
+                ));
+            }
             let call = Call {
                 usage,
                 sent,
@@ -2052,8 +2084,32 @@ async fn turn(
         history.extend(results);
         record(sink, &history[sent..], tx);
 
+        let requested = goal_context.and_then(|context| {
+            context
+                .compact_requested
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        });
         if cancel.load(Ordering::Relaxed) {
             return Turn::ended(step, truncated);
+        }
+        if let Some(asked) = requested {
+            let pass = Compaction {
+                model,
+                tools,
+                instructions,
+                limits: limits.unwrap_or_default(),
+                tx,
+                cancel,
+                asked,
+                plan: goal_context.and_then(|context| context.plan.get()),
+            };
+            if let Err(e) = pass.run(history, Trigger::Asked, sink).await {
+                let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
+            }
+            ledger.clear();
+            *monitor = CacheMonitor::default();
         }
 
         error_rounds = if all_failed { error_rounds + 1 } else { 0 };
@@ -4232,6 +4288,127 @@ mod tests {
             events.push(event);
         }
         (history, done, events)
+    }
+
+    #[tokio::test]
+    async fn model_compaction_records_the_whole_step_then_continues() {
+        use fake::{Fake, call, say};
+
+        for args in [json!({}), json!({"prompt": "preserve decisions"})] {
+            let requested: tools::compact::Requested = Arc::default();
+            let context_usage: tools::status::Context = Arc::default();
+            let goal: goal::Shared = Arc::default();
+            let plan = crate::plan::Shared::new(Arc::clone(&goal));
+            let context = GoalContext {
+                goal: &goal,
+                plan: &plan,
+                compact_requested: &requested,
+                context_usage: &context_usage,
+            };
+            let registry = Registry::new(Vec::new())
+                .with_tool(Box::new(tools::compact::Compact {
+                    requested: Arc::clone(&requested),
+                }))
+                .with_tool(Box::new(tools::status::Status {
+                    children: Arc::default(),
+                    cancel: Arc::default(),
+                    monitors: None,
+                    context: Arc::clone(&context_usage),
+                }));
+            let compact_call = call("compact", args.clone());
+            let status_call = call("status", json!({}));
+            let fake = Fake::new(vec![
+                vec![compact_call.clone(), status_call.clone()],
+                vec![say("decisions preserved")],
+                vec![call("status", json!({}))],
+                vec![say("finished after compaction")],
+            ]);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let policy = Policy::new(
+                Mode::Ask,
+                crate::permissions::Rules::default(),
+                None,
+                std::env::temp_dir(),
+            );
+            let mut history = vec![
+                compact::user_message("earlier work"),
+                say("earlier answer"),
+                compact::user_message("continue"),
+            ];
+            let done = turn(
+                &fake,
+                &registry,
+                &policy,
+                None,
+                &registry.schemas(),
+                "",
+                &mut history,
+                &tx,
+                &Arc::new(AtomicBool::new(false)),
+                &mut Vec::new(),
+                &mut CacheMonitor::default(),
+                None,
+                &mut Sink::Discard,
+                None,
+                None,
+                None,
+                Some(&context),
+                Some(Limits {
+                    window: Some(1000),
+                    ..Limits::default()
+                }),
+            )
+            .await;
+            assert!(done.result.is_ok(), "{:?}", done.result);
+            assert!(requested.lock().unwrap().is_none());
+            let bodies = fake.bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 4);
+            let summary_input = bodies[1].1["input"].as_array().unwrap();
+            assert_eq!(
+                summary_input.last(),
+                Some(&compact::request(args["prompt"].as_str()))
+            );
+            for call in [&compact_call, &status_call] {
+                assert!(summary_input.contains(call));
+                assert!(
+                    summary_input
+                        .iter()
+                        .any(|item| item["type"] == "function_call_output"
+                            && item["call_id"] == call["call_id"])
+                );
+            }
+            assert!(
+                bodies[2].1["input"]
+                    .to_string()
+                    .contains("decisions preserved")
+            );
+            assert!(!bodies[2].1["input"].to_string().contains("earlier answer"));
+            assert!(
+                history
+                    .last()
+                    .unwrap()
+                    .to_string()
+                    .contains("finished after compaction")
+            );
+            let status = summary_input
+                .iter()
+                .find(|item| {
+                    item["type"] == "function_call_output"
+                        && item["call_id"] == status_call["call_id"]
+                })
+                .unwrap();
+            let output: Value =
+                serde_json::from_str(&tools::output_text(&status["output"])).unwrap();
+            assert_eq!(
+                output["context"],
+                tools::status::context(fake::USAGE.input, 1000, false)
+            );
+            let mut compacted = false;
+            while let Ok(event) = rx.try_recv() {
+                compacted |= matches!(event, AgentEvent::Compacted { .. });
+            }
+            assert!(compacted);
+        }
     }
 
     /// Waits on `b` when called as `a`, so two `a`/`b` calls only finish if they overlap.

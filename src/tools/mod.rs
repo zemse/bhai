@@ -13,6 +13,7 @@ pub mod aws_instance;
 pub mod bash;
 pub mod browser;
 mod cdp;
+pub mod compact;
 pub mod edit;
 pub mod fetch;
 pub mod goal;
@@ -37,7 +38,8 @@ pub mod web;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 16] = [
+pub const NAMES: [&str; 17] = [
+    compact::NAME,
     aws_instance::NAME,
     bash::NAME,
     read::NAME,

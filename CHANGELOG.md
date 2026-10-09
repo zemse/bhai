@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-10
+
+- The model can call `compact` with an optional summary prompt; compaction waits for every tool result in the step and work continues on the compacted history. `status` reports context tokens, window size and percentage, marking estimates when backend usage is unavailable.
+
 ## 2026-10-09
 
 - Clicking inline code or a code block copies the code without Markdown delimiters; drag selection keeps its existing Markdown copy behavior.
