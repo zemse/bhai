@@ -860,6 +860,16 @@ impl Session {
         self.lock().plan.clone()
     }
 
+    /// Native recovery control, refused while model work is in flight.
+    pub fn recover_authorization(&self, command: &str) -> Result<(), String> {
+        if self.lock().working {
+            return Err("finish or interrupt the turn before recovering authorization".into());
+        }
+        self.tx_control
+            .try_send(Control::AuthorizationRecovery(command.to_string()))
+            .map_err(|_| SubmitError::Closed.to_string())
+    }
+
     /// `/goal` with what followed it. The agent takes it even mid-turn, and opens a turn on
     /// an active goal once it is idle; it says what came of it in the transcript.
     pub fn set_goal(&self, text: &str) -> Result<(), String> {
@@ -1137,6 +1147,14 @@ impl Session {
     /// What `/permissions` prints.
     pub fn permissions(&self) -> String {
         let mut out = self.policy.describe();
+        if let Some(judge) = &self.judge
+            && judge
+                .authorization()
+                .recovery
+                .is_some_and(|recovery| !recovery.complete)
+        {
+            out.push_str("\nLegacy authorization origins are unproven. Run /permissions recover to preview exact candidates, then explicitly confirm genuine user messages.");
+        }
         if self.policy.mode() == Mode::Auto {
             out.push_str(&match &self.judge {
                 Some(judge) => judge.describe(),

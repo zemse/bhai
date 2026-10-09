@@ -1873,6 +1873,15 @@ impl App {
             self.export_debug();
             return;
         }
+        if let Some(rest) = message.strip_prefix("/permissions recover")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            self.follow = true;
+            if let Err(error) = self.session.recover_authorization(rest.trim()) {
+                self.note(Entry::Error(error));
+            }
+            return;
+        }
         if message.starts_with("/permissions") {
             self.follow = true;
             self.note(Entry::Info(self.session.permissions()));

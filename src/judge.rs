@@ -461,6 +461,33 @@ impl Judge {
         Ok(())
     }
 
+    pub fn authorization_recovery(&self, selection: Option<&str>) -> Result<String> {
+        let mut current = self.authorization.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = current.clone();
+        let reply = match selection {
+            None => {
+                let preview = next.recovery_preview();
+                if let Some(recovery) = &mut next.recovery {
+                    recovery.previewed = true;
+                }
+                preview
+            }
+            Some(selection) => {
+                next = next.recover(selection)?;
+                "Legacy recovery confirmed. Original sources are queued chronologically; authorization remains pending until extraction and merge succeed.".to_string()
+            }
+        };
+        next.validate()?;
+        self.persist_authorization(&next)?;
+        *current = next;
+        drop(current);
+        if selection.is_some() {
+            *self.failed_update.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.lock().cache.clear();
+        }
+        Ok(reply)
+    }
+
     pub fn authorization_store(&self, path: PathBuf) -> Result<()> {
         let mut memory = self.authorization.lock().unwrap_or_else(|e| e.into_inner());
         *memory = memory
@@ -1454,6 +1481,50 @@ mod tests {
         assert!(!SYSTEM.contains("When you are unsure, deny"));
         assert!(!SYSTEM.contains("Deny, whatever the task says"));
         assert!(!SYSTEM.contains("changes nothing outside the project root"));
+    }
+
+    #[tokio::test]
+    async fn recovery_preview_preserves_failed_updates_and_checkpoint_confirmation() {
+        let dir = crate::tools::temp_dir();
+        let (judge, backend) = judge(Answers::Verdict(approve("fine")), &dir);
+        let mut memory = judge.authorization();
+        memory.recovery = Some(authorization::Recovery {
+            candidates: vec![authorization::Source {
+                id: 1,
+                at: "2026-10-08T09:00:00Z".parse().unwrap(),
+                text: "work on server A and close it".into(),
+                reference: None,
+            }],
+            ..Default::default()
+        });
+        judge.restore_authorization(memory).unwrap();
+        let checkpoint = dir.join("authorization.json");
+        judge.authorization_store(checkpoint.clone()).unwrap();
+        *backend.authorization_failure.lock().unwrap() = Some((Stage::Extract, false));
+        assert!(judge.update_authorization().await.is_err());
+        let failed = *judge.failed_update.lock().unwrap();
+        let revision = judge.authorization().revision;
+        judge.authorization_recovery(None).unwrap();
+        assert_eq!(*judge.failed_update.lock().unwrap(), failed);
+        assert_eq!(judge.authorization().revision, revision);
+        assert!(judge.update_authorization().await.is_err());
+        let stored: Memory =
+            serde_json::from_str(&std::fs::read_to_string(&checkpoint).unwrap()).unwrap();
+        assert!(stored.recovery.unwrap().previewed);
+        judge.authorization_recovery(Some("1")).unwrap();
+        let confirmed = judge.authorization();
+        assert!(confirmed.recovery.as_ref().unwrap().complete);
+        assert_eq!(confirmed.pending[0].text, "work on server A and close it");
+        assert_eq!(
+            confirmed.pending[0].at,
+            "2026-10-08T09:00:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        );
+        assert!(judge.failed_update.lock().unwrap().is_none());
+        let restored = Memory::default().checkpoint(&checkpoint).unwrap();
+        assert_eq!(restored, confirmed);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

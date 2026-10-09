@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -297,7 +297,7 @@ impl Writer {
         } else if let Some(plan) = plan {
             fork.plan(&Some(plan.clone()))?;
         }
-        if memory.revision > 0 {
+        if memory.revision > 0 || memory.recovery.is_some() {
             fork.authorization(&memory)?;
         }
         fork.sync()?;
@@ -433,6 +433,8 @@ pub fn load(path: &Path) -> Result<Loaded> {
     let mut plan = None;
     let mut legacy_goal = false;
     let mut authorizations = Vec::new();
+    let mut legacy_sources = Vec::new();
+    let mut preceding_assistant = None;
     while let Some(line) = lines.next() {
         let record = serde_json::from_str::<Value>(line)
             .ok()
@@ -523,6 +525,33 @@ pub fn load(path: &Path) -> Result<Loaded> {
             let Some(item) = record.get("item") else {
                 bail!("{}: record {id} has no item", path.display());
             };
+            if authorizations.is_empty() {
+                if let Some(text) = user_text(item) {
+                    legacy_sources.push(crate::judge::authorization::Source {
+                        id: (legacy_sources.len() + 1) as u64,
+                        at: record
+                            .get("at")
+                            .or_else(|| record.get("timestamp"))
+                            .cloned()
+                            .and_then(|at| serde_json::from_value(at).ok())
+                            .unwrap_or_else(|| header.created.with_timezone(&chrono::Utc)),
+                        text,
+                        reference: preceding_assistant.clone(),
+                    });
+                } else if item.get("role").and_then(Value::as_str) == Some("assistant") {
+                    preceding_assistant = item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .filter(|text| !text.is_empty() && text.len() <= 4000);
+                }
+            }
             items.push((item.clone(), index));
         }
         len += line.len() as u64;
@@ -540,7 +569,58 @@ pub fn load(path: &Path) -> Result<Loaded> {
         len = records.last().map_or(first.len() as u64, |(_, end)| *end);
     }
     // Dropping an unanswered tool call must not resurrect an older user grant.
-    let authorization = authorizations.into_iter().last().map(|(memory, _)| memory);
+    let first_memory = authorizations.first().map(|(memory, _)| memory);
+    if let Some(memory) = first_memory {
+        let existing: Vec<_> = memory
+            .entries
+            .iter()
+            .map(|entry| &entry.source.text)
+            .chain(memory.sources.iter().map(|source| &source.text))
+            .chain(memory.pending.iter().map(|source| &source.text))
+            .collect();
+        legacy_sources.retain(|source| !existing.contains(&&source.text));
+    }
+    let mut authorization = authorizations.last().map(|(memory, _)| memory.clone());
+    if !legacy_sources.is_empty() {
+        let missing_snapshot = authorization.is_none();
+        let memory = authorization.get_or_insert_with(Default::default);
+        if missing_snapshot || memory.recovery.is_none() {
+            memory.recovery = Some(crate::judge::authorization::Recovery {
+                candidates: legacy_sources,
+                complete: false,
+                ..Default::default()
+            });
+        }
+    }
+    if let Some(memory) = &mut authorization
+        && memory
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| !recovery.complete)
+    {
+        let mut originals = std::collections::BTreeMap::new();
+        for (snapshot, _) in &authorizations {
+            for source in snapshot
+                .entries
+                .iter()
+                .map(|entry| &entry.source)
+                .chain(&snapshot.sources)
+                .chain(&snapshot.pending)
+            {
+                if let Some(previous) = originals.insert(source.id, source) {
+                    ensure!(
+                        previous == source,
+                        "conflicting original user evidence in authorization journal"
+                    );
+                }
+            }
+        }
+        memory.sources.clear();
+        for source in originals.values() {
+            memory.remember_for_recovery(source);
+        }
+        memory.validate()?;
+    }
     Ok(Loaded {
         header,
         model,
@@ -1341,6 +1421,81 @@ mod tests {
             Some(memory)
         );
         drop(writer);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_cleanup_recovery_survives_compaction_and_replays_later_zero_note_restrictions() {
+        use crate::judge::authorization::Memory;
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("legacy"));
+        let original = "resolve Nvidia - you can work in the server to finish this and close it";
+        for text in [
+            original,
+            "Continue working toward the goal the user set.",
+            "A child agent you started has finished.",
+        ] {
+            writer
+                .append(&crate::tools::user_message(text, &[]))
+                .unwrap();
+        }
+        let mut memory: Memory =
+            serde_json::from_value(json!({"revision":0,"entries":[],"pending":[]})).unwrap();
+        for text in ["continue with the plan goal", "do not use server A again"] {
+            writer
+                .append(&crate::tools::user_message(text, &[]))
+                .unwrap();
+            memory.enqueue(text, None);
+            writer.authorization(&memory).unwrap();
+            let source = memory.pending[0].clone();
+            memory = memory.merged(&source, &[], json!({"changes":[]})).unwrap();
+            writer.authorization(&memory).unwrap();
+        }
+        writer.compact("test", 100, 5, &items()[4..]).unwrap();
+        drop(writer);
+        let loaded = load(&path(&dir, "legacy")).unwrap();
+        assert_eq!(loaded.items, items()[4..]);
+        let mut recovered = loaded.authorization.clone().unwrap();
+        assert!(recovered.entries.is_empty());
+        let recovery = recovered.recovery.as_ref().unwrap();
+        assert!(!recovery.complete);
+        assert_eq!(recovery.candidates.len(), 3);
+        assert_eq!(recovery.candidates[0].text, original);
+        assert!(recovery.candidates[1].text.starts_with("Continue working"));
+        assert_eq!(recovered.sources.len(), 2);
+        let mut resumed = Writer::resume(&dir, &loaded).unwrap();
+        let checkpoint = resumed.authorization_path();
+        private_dir(checkpoint.parent().unwrap()).unwrap();
+        private_write(
+            &checkpoint,
+            &json!({"revision":recovered.revision,"entries":[],"pending":[]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(recovered.checkpoint(&checkpoint).unwrap(), recovered);
+        let fork = resumed.fork(&loaded.items, None).unwrap();
+        assert_eq!(
+            load(&path(&dir, &fork)).unwrap().authorization,
+            Some(recovered.clone())
+        );
+        recovered.recovery.as_mut().unwrap().previewed = true;
+        let recovered = recovered.recover("1").unwrap();
+        assert_eq!(
+            recovered
+                .pending
+                .iter()
+                .map(|source| source.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                original,
+                "continue with the plan goal",
+                "do not use server A again"
+            ]
+        );
+        resumed.authorization(&recovered).unwrap();
+        resumed.sync().unwrap();
+        drop(resumed);
+        let again = load(&path(&dir, "legacy")).unwrap();
+        assert_eq!(again.authorization, Some(recovered));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -66,7 +66,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "permissions",
         args: "",
-        help: "the rules that decide approvals",
+        help: "approval rules; /permissions recover previews legacy authorization",
     },
     Command {
         name: "allow",

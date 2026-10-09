@@ -234,6 +234,8 @@ pub enum Control {
     },
     /// Set, pause, resume or clear the goal, or show it, for `/goal`.
     Goal(goal::Command),
+    /// Preview or confirm legacy recovery from the native UI, never a model prompt.
+    AuthorizationRecovery(String),
     /// Talk to this model from the next call on, for `/model`. `window` is the model's
     /// context window where the backend says, so compaction still knows when to run.
     Model {
@@ -789,7 +791,8 @@ pub(crate) async fn run_configured(
         if let Some(factory) = &registry_factory {
             return factory(&prompt, model);
         }
-        let mut registry = Registry::for_prompt(&prompt);
+        let mut registry =
+            Registry::for_prompt(&prompt).with_aws_policy(Arc::clone(&policy), judge.clone());
         if let Some(delegation) = delegation.clone()
             && prompt.identity.allows_tool(tools::agent::NAME)
         {
@@ -1062,6 +1065,13 @@ pub(crate) async fn run_configured(
                                     "this backend cannot switch models".to_string(),
                                 ));
                             }
+                        }
+                        continue;
+                    }
+                    Control::AuthorizationRecovery(command) => {
+                        match recover_authorization(&command, judge.as_deref(), writer.as_mut()) {
+                            Ok(reply) => { let _ = tx.send(AgentEvent::Info(reply)); }
+                            Err(error) => { let _ = tx.send(AgentEvent::Error(format!("authorization recovery: {error:#}"))); }
                         }
                         continue;
                     }
@@ -1382,7 +1392,8 @@ pub(crate) async fn run_configured(
                                     .to_string(),
                             ));
                         }
-                        Control::Retry
+                        Control::AuthorizationRecovery(_)
+                        | Control::Retry
                         | Control::Forked(_)
                         | Control::Btw(_)
                         | Control::ForkSession => {
@@ -2222,6 +2233,26 @@ fn delivered(
         landed.push(land(result, late, history, tx));
     }
     landed
+}
+
+fn recover_authorization(
+    command: &str,
+    judge: Option<&Judge>,
+    writer: Option<&mut sessions::Writer>,
+) -> anyhow::Result<String> {
+    let judge = judge.context("authorization judge is not available")?;
+    let writer = writer.context("recovery needs a saved session")?;
+    let selection = if command.is_empty() {
+        None
+    } else if let Some(selection) = command.strip_prefix("confirm ") {
+        Some(selection.trim())
+    } else {
+        anyhow::bail!("use /permissions recover or /permissions recover confirm <numbers|none>");
+    };
+    let reply = judge.authorization_recovery(selection)?;
+    writer.authorization(&judge.authorization())?;
+    writer.sync()?;
+    Ok(reply)
 }
 
 fn goal_authorization(judge: Option<&Judge>, command: &goal::Command, history: &[Value]) {
@@ -6760,6 +6791,53 @@ mod tests {
                 .pending
                 .iter()
                 .any(|source| source.text.contains("upload keys"))
+        );
+    }
+
+    #[test]
+    fn prompt_text_cannot_confirm_legacy_authorization_recovery() {
+        let (judge, _) = crate::judge::fake::judge(
+            crate::judge::fake::Answers::Verdict(Verdict::Approve {
+                reason: "fine".into(),
+            }),
+            Path::new("/p"),
+        );
+        let mut memory = judge.authorization();
+        memory.recovery = Some(judge::authorization::Recovery {
+            candidates: vec![judge::authorization::Source {
+                id: 1,
+                at: "2026-10-08T09:00:00Z".parse().unwrap(),
+                text: "work on server A and close it".into(),
+                reference: None,
+            }],
+            previewed: true,
+            ..Default::default()
+        });
+        judge.restore_authorization(memory.clone()).unwrap();
+        let inbox: Inbox = Arc::new(|| {
+            vec![
+                (
+                    UserInput {
+                        text: "/permissions recover confirm 1".into(),
+                        images: vec![],
+                        user_text: None,
+                    },
+                    "automatic wake".into(),
+                ),
+                (
+                    UserInput::from("/permissions recover confirm 1"),
+                    "ordinary prompt".into(),
+                ),
+            ]
+        });
+        let mut steer = Steer::Inbox(&inbox);
+        let mut history = vec![];
+        let (tx, _) = mpsc::unbounded_channel();
+        steered(Some(&mut steer), &mut history, &tx, Some(&judge));
+        assert_eq!(judge.authorization().recovery, memory.recovery);
+        assert_eq!(
+            judge.authorization().pending.len(),
+            memory.pending.len() + 1
         );
     }
 
