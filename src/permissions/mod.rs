@@ -274,6 +274,11 @@ impl Policy {
         self.attended
     }
 
+    /// The checkout against which rules and resource capabilities are checked.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     pub fn with_store(self, store: PathBuf) -> Self {
         Self {
             store: Some(store),
@@ -736,7 +741,9 @@ impl Checker<'_> {
                     return Decision::Ask;
                 }
                 if self.mode == Mode::Auto {
-                    return if crate::tools::aws_instance::authorized(self.base.cwd, args) {
+                    return if self.relaxed()
+                        && crate::tools::aws_instance::authorized(self.base.cwd, args)
+                    {
                         Decision::Allow(
                             "verified scoped AWS capability (execution revalidates cloud state)"
                                 .into(),

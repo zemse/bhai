@@ -412,6 +412,18 @@ impl Registry {
         registry
     }
 
+    /// Use the permission checkout for AWS capabilities, not the process directory.
+    pub fn with_aws_root(mut self, root: &Path) -> Self {
+        if let Some(tool) = self
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name() == aws_instance::NAME)
+        {
+            *tool = Box::new(aws_instance::AwsInstance::at(root.to_path_buf()));
+        }
+        self
+    }
+
     /// Move every call into a child's worktree before it is run.
     pub fn with_workdir(mut self, rooted: crate::worktrees::Rooted) -> Self {
         self.rooted = Some(rooted);
@@ -601,6 +613,19 @@ pub fn temp_dir() -> std::path::PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn setting_aws_scope_preserves_registration_order_and_identity_narrowing() {
+        let registry = Registry::new(vec![]);
+        let scoped = Registry::new(vec![]).with_aws_root(Path::new("/policy-checkout"));
+        assert_eq!(registry.names(), scoped.names());
+        assert!(
+            Registry::empty()
+                .with_aws_root(Path::new("/policy-checkout"))
+                .names()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn schemas_serialize_with_the_expected_names() {

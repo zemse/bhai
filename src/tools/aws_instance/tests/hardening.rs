@@ -179,6 +179,39 @@ fn raw_prefix_rules_cannot_override_launch_guard_but_explicit_deny_and_ask_win()
 }
 
 #[tokio::test]
+async fn explicit_checkout_root_reuses_the_permission_ledger() {
+    let f = Fixture::new();
+    let id = f.arm().await;
+    let mut tool = AwsInstance::at(f.tool.root.clone());
+    tool.cli = f.tool.cli.clone();
+    tool.timeout = f.tool.timeout;
+    let output = tool.run(&f.call("status", &id)).await.unwrap();
+    assert_eq!(
+        output["instance"],
+        load(&f.tool.root, &id).unwrap().instance
+    );
+    assert!(authorized(&f.tool.root, &f.call("stop", &id)));
+}
+
+#[tokio::test]
+async fn scoped_capabilities_do_not_bypass_project_trust() {
+    let f = Fixture::new();
+    let id = f.arm().await;
+    let policy = Policy::new(Mode::Auto, Rules::default(), None, f.tool.root.clone()).with_trust(
+        crate::permissions::Trust::new(&f.tool.root.join("config"), &f.tool.root),
+    );
+    assert!(!policy.trusted());
+    assert_eq!(
+        policy.check(NAME, &f.call("stop", &id), true),
+        Decision::Ask
+    );
+    assert_eq!(
+        policy.check(NAME, &f.call("start", &id), true),
+        Decision::Ask
+    );
+}
+
+#[tokio::test]
 async fn native_arm_is_reserved_for_user_and_persists_exact_resource_association() {
     let f = Fixture::new();
     let policy = f.policy(Mode::Auto, Rules::default());

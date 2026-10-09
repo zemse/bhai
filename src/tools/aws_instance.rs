@@ -236,6 +236,13 @@ impl Default for AwsInstance {
 }
 
 impl AwsInstance {
+    pub fn at(root: PathBuf) -> Self {
+        Self {
+            root,
+            ..Self::default()
+        }
+    }
+
     async fn aws(&self, cap: &Capability, args: &[String]) -> Result<Value, String> {
         let mut command = Command::new(&self.cli);
         command
