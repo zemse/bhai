@@ -73,7 +73,16 @@ impl Tool for Goal {
     }
 
     fn describe(&self, args: &Value) -> Result<String, String> {
-        status(args).map(|status| format!("goal {status}"))
+        let status = status(args)?;
+        if status == "adopt" {
+            let spec = args
+                .get("spec")
+                .ok_or_else(|| "adopt/update requires a compact `spec`.".to_string())?;
+            let spec = goal::Specification::parse(spec)?;
+            Ok(format!("goal: {}", spec.objective))
+        } else {
+            Ok(format!("goal {status}"))
+        }
     }
 
     fn execute<'a>(&'a self, args: &'a Value) -> BoxFuture<'a, (String, bool)> {
@@ -144,7 +153,7 @@ impl Tool for Goal {
                     _ => return ("Keep the existing objective. Only blocked goals can resume here; user pauses require /goal.".to_string(), false),
                 }
                 self.requested.store(false, Ordering::Relaxed);
-                return ("Goal active. Work until verified complete or genuinely blocked; no further 'do it' is needed.".to_string(), true);
+                return ("Goal active.".to_string(), true);
             }
             match shared.as_mut() {
                 Some(goal) if goal.active() => {
@@ -205,8 +214,11 @@ mod tests {
     #[tokio::test]
     async fn chat_adopts_once_and_a_reply_resumes_only_a_blocked_goal() {
         let tool = tool(None, true);
-        let (_, ok) = tool.execute(&adopt("build a generator")).await;
+        let args = adopt("build a generator");
+        assert_eq!(tool.describe(&args).unwrap(), "goal: build a generator");
+        let (text, ok) = tool.execute(&args).await;
         assert!(ok);
+        assert_eq!(text, "Goal active.");
         let (_, ok) = tool.execute(&adopt("replace it")).await;
         assert!(!ok);
         assert!(
@@ -221,11 +233,11 @@ mod tests {
                 .1
         );
         tool.requested.store(true, Ordering::Relaxed);
-        assert!(
-            tool.execute(&json!({"status": "resume", "reason": "user supplied key"}))
-                .await
-                .1
-        );
+        let args = json!({"status": "resume", "reason": "user supplied key"});
+        assert_eq!(tool.describe(&args).unwrap(), "goal resume");
+        let (text, ok) = tool.execute(&args).await;
+        assert!(ok);
+        assert_eq!(text, "Goal active.");
         let goal = tool.goal.lock().unwrap().clone().unwrap();
         assert_eq!(goal.objective, "build a generator");
         assert!(goal.active());

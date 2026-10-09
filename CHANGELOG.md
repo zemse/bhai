@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-10
 
+- Goal adoption shows `goal: <objective>` with a short active confirmation instead of agent instructions; resuming uses the same short confirmation.
 - The plan panel shows only its checklist and progress, without explanation text on the bottom border.
 - Debug exports include saved authorization state and pending sources, plus recent extraction and merge requests and replies from the shared authorization log.
 - Bash and poll waits allow up to 30 minutes, return early on exit and guide the model to increase waits for slow builds. User message timestamps persist separately from their text and reach both backends as local date/time to the second with timezone offset; command and poll results carry the same clock. Stopping a session releases a long poll promptly.
