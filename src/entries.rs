@@ -18,6 +18,7 @@ const LIVE_BYTES: usize = 16_000;
 #[derive(Debug, Clone, Hash)]
 pub enum Entry {
     User(String),
+    Automatic(String),
     Assistant(String),
     /// What the model said before carrying on, as opposed to its answer.
     Commentary(String),
@@ -104,6 +105,7 @@ impl Entries {
                     self.attribution.mark = self.attribution.mark.min(index);
                 }
             }
+            Event::Automatic { text, .. } => self.push(Entry::Automatic(text.clone())),
             // Nothing was typed: the reports themselves follow, as the tool results
             // they are, so this only says why the agent started working again.
             Event::Resumed(what) => self.push(Entry::Info(format!("resumed {what}"))),
@@ -231,6 +233,9 @@ impl Entries {
                     .join("\n")
             };
             let entry = match item["type"].as_str() {
+                Some("message") if item["role"] == "user" && item["bhai_automatic"] == true => {
+                    Entry::Automatic(text("content"))
+                }
                 Some("message") if item["role"] == "user" => match summarised(&text("content")) {
                     Some(summary) => Entry::Summary(summary),
                     // A child's report is carried in a user message, since the call that
@@ -295,7 +300,10 @@ impl Entries {
                 ),
                 _ => continue,
             };
-            if matches!(entry, Entry::User(_) | Entry::Summary(_) | Entry::Output(_)) {
+            if matches!(
+                entry,
+                Entry::User(_) | Entry::Automatic(_) | Entry::Summary(_) | Entry::Output(_)
+            ) {
                 self.attribution.items.insert(index, self.list.len());
             }
             self.list.push(entry);
@@ -404,7 +412,7 @@ impl Entries {
                 }
             }
             None => {
-                if let Some(entry) = last(|e| matches!(e, Entry::User(_))) {
+                if let Some(entry) = last(|e| matches!(e, Entry::User(_) | Entry::Automatic(_))) {
                     self.attribution.items.insert(index, entry);
                 }
             }
@@ -486,6 +494,7 @@ impl Entry {
     pub fn text(&self) -> &str {
         match self {
             Entry::User(t)
+            | Entry::Automatic(t)
             | Entry::Assistant(t)
             | Entry::Commentary(t)
             | Entry::Reasoning(t)
@@ -505,6 +514,7 @@ impl Entry {
     pub fn kind(&self) -> &'static str {
         match self {
             Entry::User(_) => "user",
+            Entry::Automatic(_) => "automatic",
             Entry::Assistant(_) => "assistant",
             Entry::Commentary(_) => "commentary",
             Entry::Reasoning(_) => "thinking",
@@ -668,6 +678,34 @@ mod tests {
         });
         assert!(matches!(&entries.list[..],
             [Entry::Done(t)] if t == "9m 54s chabāyā \u{b7} 12:58 PM khatam"));
+    }
+
+    #[test]
+    fn automatic_entries_stay_distinct_live_and_after_restore() {
+        let mut entries = Entries::default();
+        entries.apply(&Event::User("typed".into()));
+        entries.apply(&Event::Item(0));
+        entries.apply(&Event::Automatic {
+            text: "monitor wake".into(),
+            steered: true,
+        });
+        entries.apply(&Event::Item(1));
+        assert!(matches!(&entries.list[1], Entry::Automatic(t) if t == "monitor wake"));
+        assert_eq!(entries.list[1].kind(), "automatic");
+        assert_eq!(entries.attribution.items.get(&1), Some(&1));
+
+        let history = vec![
+            crate::tools::user_message("typed", &[]),
+            serde_json::json!({
+                "type": "message", "role": "user", "bhai_automatic": true,
+                "content": [{"type": "input_text", "text": "monitor wake"}]
+            }),
+        ];
+        let mut restored = Entries::default();
+        restored.restore(&history);
+        assert!(matches!(&restored.list[0], Entry::User(t) if t == "typed"));
+        assert!(matches!(&restored.list[1], Entry::Automatic(t) if t == "monitor wake"));
+        assert_eq!(restored.attribution.items.get(&1), Some(&1));
     }
 
     #[test]

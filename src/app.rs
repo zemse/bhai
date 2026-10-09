@@ -1560,7 +1560,7 @@ impl App {
     pub fn on_event(&mut self, event: Event) {
         match event {
             // Messages from any consumer (this TUI or the debug server) land here.
-            Event::User(_) => {
+            Event::User(_) | Event::Automatic { steered: false, .. } => {
                 self.follow = true;
                 self.working = true;
                 // Nothing waits unless a turn runs, so a user message with a queue
@@ -1587,7 +1587,7 @@ impl App {
                 }
             }
             // The same, between the steps of the turn already running.
-            Event::Steered(_) => {
+            Event::Steered(_) | Event::Automatic { steered: true, .. } => {
                 self.follow = true;
                 if !self.queued.is_empty() {
                     self.queued.remove(0);
@@ -4046,6 +4046,24 @@ mod tests {
             "identity: general. Usage: /as <name>"
         );
         assert!(switch_notice("general", "router").ends_with("run: bhai --as router"));
+    }
+
+    #[test]
+    fn automatic_events_start_turns_and_drain_the_visible_queue() {
+        let mut app = App::detached();
+        app.queued = vec!["monitor wake".into()];
+        app.on_event(Event::Automatic {
+            text: "monitor wake".into(),
+            steered: false,
+        });
+        assert!(app.working);
+        assert!(app.queued.is_empty());
+        app.queued = vec!["another wake".into()];
+        app.on_event(Event::Automatic {
+            text: "another wake".into(),
+            steered: true,
+        });
+        assert!(app.queued.is_empty());
     }
 
     #[test]

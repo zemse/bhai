@@ -57,6 +57,11 @@ pub enum Event {
         #[serde(skip)]
         images: Vec<Image>,
     },
+    /// An automatic prompt joined the history, starting a turn or steering one.
+    Automatic {
+        text: String,
+        steered: bool,
+    },
     /// A turn started on its own, on the reports of children that finished while the
     /// session was idle; the string says what they were doing. Nothing was typed, so
     /// the transcript shows the reports, not a message.
@@ -357,6 +362,16 @@ impl Prompt {
     /// The prompt with `images` attached.
     pub fn with_images(self, images: Vec<Image>) -> Self {
         Self { images, ..self }
+    }
+
+    fn event(self) -> Event {
+        match self.user_text {
+            Some(_) => Event::User(self.shown),
+            None => Event::Automatic {
+                text: self.shown,
+                steered: false,
+            },
+        }
     }
 
     /// What the agent is sent.
@@ -701,7 +716,7 @@ impl Session {
             .try_send(prompt.input())
             .map_err(|_| SubmitError::Closed)?;
         inner.start();
-        self.publish(Event::User(prompt.shown));
+        self.publish(prompt.event());
         Ok(Submitted::Started)
     }
 
@@ -722,7 +737,7 @@ impl Session {
             .try_send(Control::Forked(prompt.input()))
             .map_err(|_| SubmitError::Closed)?;
         inner.start();
-        self.publish(Event::User(prompt.shown));
+        self.publish(prompt.event());
         Ok(())
     }
 
@@ -970,7 +985,7 @@ impl Session {
             return;
         }
         inner.start();
-        self.publish(Event::User(prompt.shown));
+        self.publish(prompt.event());
     }
 
     /// Whether the approval on screen appeared less than `APPROVAL_SETTLE` ago.
@@ -1487,6 +1502,10 @@ impl Session {
             }
             AgentEvent::Item(index) => Event::Item(index),
             AgentEvent::Steered(shown) => Event::Steered(shown),
+            AgentEvent::Automatic(text) => Event::Automatic {
+                text,
+                steered: true,
+            },
             AgentEvent::CacheHit(hit) => Event::CacheHit(hit),
             AgentEvent::CacheStalled(misses) => Event::CacheStalled(misses),
             AgentEvent::RateLimits(limits) => {
@@ -2279,6 +2298,29 @@ mod tests {
     }
 
     #[test]
+    fn editing_never_returns_an_automatic_prompt_to_the_editor() {
+        let (session, _rx) = session();
+        session
+            .submit(Prompt::automatic(
+                "observer context".into(),
+                "monitor wake".into(),
+            ))
+            .unwrap();
+        assert!(!session.edit_prompt());
+        assert!(!session.cancel.stopped());
+        let (reply, mut ready) = oneshot::channel();
+        session.on_agent(AgentEvent::EditPrompt {
+            text: "monitor wake".into(),
+            images: Vec::new(),
+            reply,
+        });
+        assert!(!ready.try_recv().unwrap());
+        assert!(
+            matches!(&session.entries().list[..], [Entry::Automatic(t)] if t == "monitor wake")
+        );
+    }
+
+    #[test]
     fn an_idle_session_with_a_child_still_running_can_be_interrupted() {
         let (session, _rx) = session();
         assert!(!session.interrupt(), "nothing running, nothing to stop");
@@ -2404,6 +2446,55 @@ mod tests {
         assert_eq!(session.queued(), ["c"]);
         session.on_agent(AgentEvent::TurnEnd);
         assert_eq!(rx_user.try_recv().unwrap().text, "c");
+    }
+
+    #[test]
+    fn automatic_prompts_start_and_queue_without_user_events() {
+        let (session, mut rx_user) = session();
+        let mut events = session.subscribe();
+        let wake = || Prompt::automatic("observer context".into(), "monitor wake".into());
+        session.submit(wake()).unwrap();
+        assert!(rx_user.try_recv().unwrap().user_text.is_none());
+        assert_eq!(
+            events.try_recv().unwrap(),
+            Event::Automatic {
+                text: "monitor wake".into(),
+                steered: false
+            }
+        );
+        assert!(
+            matches!(&session.entries.lock().unwrap().list[0], Entry::Automatic(t) if t == "monitor wake")
+        );
+        session.submit(wake()).unwrap();
+        assert!(matches!(events.try_recv().unwrap(), Event::Queued { .. }));
+        session.on_agent(AgentEvent::TurnEnd);
+        assert!(rx_user.try_recv().unwrap().user_text.is_none());
+        assert!(matches!(events.try_recv().unwrap(), Event::Done { .. }));
+        assert_eq!(events.try_recv().unwrap(), Event::TurnEnd);
+        assert_eq!(
+            events.try_recv().unwrap(),
+            Event::Automatic {
+                text: "monitor wake".into(),
+                steered: false
+            }
+        );
+    }
+
+    #[test]
+    fn automatic_steering_keeps_its_transcript_source() {
+        let (session, _) = session();
+        let mut events = session.subscribe();
+        session.on_agent(AgentEvent::Automatic("monitor wake".into()));
+        assert_eq!(
+            events.try_recv().unwrap(),
+            Event::Automatic {
+                text: "monitor wake".into(),
+                steered: true
+            }
+        );
+        assert!(
+            matches!(&session.entries.lock().unwrap().list[0], Entry::Automatic(t) if t == "monitor wake")
+        );
     }
 
     #[test]

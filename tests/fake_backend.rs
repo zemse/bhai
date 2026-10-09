@@ -1811,8 +1811,9 @@ async fn a_schedule_missed_while_bhai_was_down_fires_at_startup_framed_as_late()
         fired["data"],
         json!({"id": "late01", "origin": "user", "spec": "in 1h", "text": "check the deploy", "missed": true, "queued": false})
     );
-    let user = events.until("user").await;
-    let shown = user["data"].as_str().unwrap();
+    let automatic = events.until("automatic").await;
+    assert_eq!(automatic["data"]["steered"], false);
+    let shown = automatic["data"]["text"].as_str().unwrap();
     assert!(shown.starts_with("(missed `in 1h`, due "), "{shown}");
     assert!(shown.ends_with(") check the deploy"), "{shown}");
     events.until("turn_end").await;
@@ -2025,8 +2026,9 @@ async fn a_schedule_the_model_set_fires_as_its_own_note_and_not_the_users_words(
 
     let fired = events.until("scheduled").await;
     assert_eq!(fired["data"]["origin"], "model", "{fired}");
-    let user = events.until("user").await;
-    let shown = user["data"].as_str().unwrap();
+    let automatic = events.until("automatic").await;
+    assert_eq!(automatic["data"]["steered"], false);
+    let shown = automatic["data"]["text"].as_str().unwrap();
     assert!(shown.starts_with("(missed `in 1h`, due "), "{shown}");
     assert!(shown.ends_with(", set by the model) check CI"), "{shown}");
     events.until("turn_end").await;

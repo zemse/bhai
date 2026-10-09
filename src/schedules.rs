@@ -850,7 +850,7 @@ mod tests {
         let shown = session.entries().list.clone();
         let at = shown
             .iter()
-            .position(|e| matches!(e, crate::entries::Entry::User(t) if t == "(scheduled `in 20m`) check CI"))
+            .position(|e| matches!(e, crate::entries::Entry::Automatic(t) if t == "(scheduled `in 20m`) check CI"))
             .unwrap_or_else(|| panic!("{shown:?}"));
         // Marked right above the prompt it started a turn with.
         assert!(
@@ -906,7 +906,7 @@ mod tests {
         let shown = session.entries().list.clone();
         let at = shown
             .iter()
-            .position(|e| matches!(e, crate::entries::Entry::User(t) if t == "(scheduled `in 20m`, set by the model) check CI"))
+            .position(|e| matches!(e, crate::entries::Entry::Automatic(t) if t == "(scheduled `in 20m`, set by the model) check CI"))
             .unwrap_or_else(|| panic!("{shown:?}"));
         assert!(
             matches!(&shown[at - 1], crate::entries::Entry::Info(t) if *t == format!("schedule {} (set by the model) fired", row.id)),
@@ -1080,7 +1080,7 @@ mod tests {
         );
         assert!(text.ends_with("late one"), "{text}");
         assert!(session.entries().list.iter().any(
-            |e| matches!(e, crate::entries::Entry::User(t) if t.starts_with("(missed `in 1h`, due "))
+            |e| matches!(e, crate::entries::Entry::Automatic(t) if t.starts_with("(missed `in 1h`, due "))
         ));
         let notes = infos(&session);
         assert!(

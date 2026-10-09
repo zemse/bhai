@@ -1325,6 +1325,7 @@ fn entry_lines(
     let rejected: String;
     let (prefix, text, style): (&str, &str, Style) = match entry {
         Entry::User(t) => ("› ", t, Style::new().bg(USER_BG)),
+        Entry::Automatic(t) => ("notification: ", t, Style::new().fg(Color::DarkGray)),
         Entry::Assistant(t) | Entry::Commentary(t) => ("", t, Style::new()),
         Entry::Reasoning(t) => ("✻ ", t, Style::new().fg(Color::DarkGray).italic()),
         Entry::Command { tool, summary } => {
@@ -2088,6 +2089,23 @@ mod tests {
             ..Tokens::default()
         };
         assert_eq!(badge(&thinking).unwrap(), "40 thinking");
+    }
+
+    #[test]
+    fn automatic_prompts_draw_as_notifications_not_user_blocks() {
+        let rows = entry_lines(
+            &Entry::Automatic("monitor wake".into()),
+            60,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(rows.plains[0], "notification: monitor wake");
+        assert_eq!(rows.lines[0].spans[0].style.fg, Some(Color::DarkGray));
+        assert_ne!(rows.lines[0].spans[0].style.bg, Some(USER_BG));
+        let user = entry_lines(&Entry::User("typed".into()), 60, false, false, None);
+        assert!(user.plains[0].starts_with("› typed"));
+        assert_eq!(user.lines[0].spans[0].style.bg, Some(USER_BG));
     }
 
     #[test]

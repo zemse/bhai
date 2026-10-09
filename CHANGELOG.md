@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-20
 
+- Automatic monitor and other wake prompts render as notifications instead of user messages, including mid-turn delivery and restored transcripts; their source stays separate from user authorization.
 - Interactive CLI prompts use terminal sessions and approved `write_stdin` responses instead of a blanket interactive-command ban; sensitive input stays in the user's own terminal.
 
 ## 2026-10-16

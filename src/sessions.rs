@@ -946,7 +946,7 @@ pub fn prune_report(pruned: &Pruned) -> String {
 }
 
 fn legacy_user_text(item: &Value) -> Option<String> {
-    if item.get("role")?.as_str()? != "user" {
+    if item.get("role")?.as_str()? != "user" || item["bhai_automatic"] == true {
         return None;
     }
     let parts = item.get("content")?.as_array()?;
@@ -984,6 +984,14 @@ fn truncate(text: String) -> String {
 mod tests {
     use super::*;
     use crate::tools::temp_dir;
+
+    #[test]
+    fn automatic_prompts_are_not_legacy_user_evidence() {
+        let mut item = crate::tools::user_message("observer context", &[]);
+        assert_eq!(legacy_user_text(&item).as_deref(), Some("observer context"));
+        item["bhai_automatic"] = Value::Bool(true);
+        assert!(legacy_user_text(&item).is_none());
+    }
 
     fn header(id: &str) -> Header {
         Header::new(id, "general", "gpt-5", "high", Path::new("/work"))

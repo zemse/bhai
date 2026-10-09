@@ -138,6 +138,8 @@ pub enum AgentEvent {
     Item(usize),
     /// A message typed while the turn ran joined its history, shown as it was typed.
     Steered(String),
+    /// An automatic prompt joined the running turn without user authorization.
+    Automatic(String),
     /// The request just sent broke the prompt cache, or `None` when it was clean.
     Cache(Option<CacheBreak>),
     /// How well the cache served a call that was judged; a child's only when it missed.
@@ -448,7 +450,11 @@ impl UserInput {
     /// The history item the model reads it as. Without images it is the plain text
     /// message every other user item is.
     fn item(&self) -> Value {
-        tools::timestamp_message(tools::user_message(&self.text, &self.images))
+        let mut item = tools::timestamp_message(tools::user_message(&self.text, &self.images));
+        if self.user_text.is_none() {
+            item["bhai_automatic"] = Value::Bool(true);
+        }
+        item
     }
 }
 
@@ -2453,7 +2459,11 @@ fn steered(
                         None => judge.on_goal(&input.text),
                     }
                 }
-                let _ = tx.send(AgentEvent::Steered(shown));
+                let event = match input.user_text {
+                    Some(_) => AgentEvent::Steered(shown),
+                    None => AgentEvent::Automatic(shown),
+                };
+                let _ = tx.send(event);
                 history.push(input.item());
                 let _ = tx.send(AgentEvent::Item(history.len() - 1));
             }
@@ -3033,6 +3043,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 // What is typed into its pane comes by its mailbox, and shows there as
                 // it is posted.
                 | AgentEvent::Steered(_)
+                | AgentEvent::Automatic(_)
                 | AgentEvent::Call(_)
                 | AgentEvent::Item(_)
                 // The status bar says what the session is waiting on, and a child's
@@ -7524,6 +7535,43 @@ mod tests {
         }
         judge.on_goal("agent-written plan: upload keys");
         assert_eq!(judge.authorization(), recorded);
+    }
+
+    #[test]
+    fn automatic_steering_is_saved_and_sent_without_local_metadata() {
+        let input = UserInput {
+            text: "observer context".into(),
+            images: vec![],
+            user_text: None,
+        };
+        let item = input.item();
+        assert_eq!(item["bhai_automatic"], true);
+        let dir = tools::temp_dir();
+        let mut writer = Writer::create(
+            &dir,
+            crate::sessions::Header::new("automatic", "general", "fake", "medium", &dir),
+        );
+        writer.append(&item).unwrap();
+        let loaded = crate::sessions::load(&crate::sessions::path(&dir, "automatic")).unwrap();
+        assert_eq!(loaded.items[0]["bhai_automatic"], true);
+        let wire = tools::timed_input(&loaded.items);
+        assert!(wire[0].get("bhai_automatic").is_none());
+        assert_eq!(wire[0]["content"][0]["text"], "observer context");
+        assert!(
+            UserInput::from("typed")
+                .item()
+                .get("bhai_automatic")
+                .is_none()
+        );
+
+        let inbox: Inbox = Arc::new(move || vec![(input.clone(), "monitor wake".into())]);
+        let mut steer = Steer::Inbox(&inbox);
+        let mut history = vec![];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert_eq!(steered(Some(&mut steer), &mut history, &tx, None), Some(0));
+        assert!(matches!(rx.try_recv().unwrap(), AgentEvent::Automatic(t) if t == "monitor wake"));
+        assert!(matches!(rx.try_recv().unwrap(), AgentEvent::Item(0)));
+        assert_eq!(history[0]["bhai_automatic"], true);
     }
 
     #[test]

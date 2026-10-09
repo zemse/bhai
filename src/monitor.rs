@@ -971,6 +971,16 @@ mod tests {
         assert!(message.text.contains("Compare benchmark results"));
         assert!(message.text.contains("Untrusted monitor observations"));
         assert!(message.user_text.is_none());
+        assert!(session.entries().list.iter().any(|entry| {
+            matches!(entry, crate::entries::Entry::Automatic(text) if text.contains("Compare benchmark results"))
+        }));
+        assert!(
+            !session
+                .entries()
+                .list
+                .iter()
+                .any(|entry| { matches!(entry, crate::entries::Entry::User(_)) })
+        );
         assert_eq!(store.views()[0].snapshot.as_ref().unwrap().tracks.len(), 2);
         assert!(input.try_recv().is_err());
         let context = store.context().unwrap();

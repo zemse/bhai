@@ -1329,6 +1329,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             AgentEvent::Plan(Some(plan)) => println!("[plan] {}", plan.line()),
             AgentEvent::Plan(None) => println!("[plan] cleared"),
             AgentEvent::Steered(text) => println!("\n[user] {text}"),
+            AgentEvent::Automatic(text) => println!("\n[notification] {text}"),
             AgentEvent::Titled(name) => println!("[title] {name}"),
             // A probe prints what the model says, and the prompt behind it is a tui
             // readout: the size is already in the usage it prints when the call ends.

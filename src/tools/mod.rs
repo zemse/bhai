@@ -158,6 +158,9 @@ pub(crate) fn timed_input(input: &[Value]) -> Vec<Value> {
         .iter()
         .cloned()
         .map(|mut item| {
+            if let Some(item) = item.as_object_mut() {
+                item.remove("bhai_automatic");
+            }
             let stamp = item
                 .as_object_mut()
                 .and_then(|item| item.remove("bhai_local_time"));
