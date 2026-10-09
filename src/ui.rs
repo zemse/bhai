@@ -3565,6 +3565,51 @@ mod tests {
     }
 
     #[test]
+    fn a_click_on_inline_code_copies_without_backticks() {
+        let (mut app, _) = drawn("run `cargo test` now", 40);
+        let (line, column) = find(&app, "cargo test");
+        let area = app.transcript_area.unwrap();
+        let y = area.y + (line - app.scroll) as u16;
+        assert!(click(&mut app, area.x + column as u16, y));
+        assert_eq!(
+            crate::clipboard::last_copied().as_deref(),
+            Some("cargo test")
+        );
+        drag(&mut app, (line, column), (line, column + 4));
+        assert_eq!(app.selected_text().as_deref(), Some("`cargo test`"));
+    }
+
+    #[test]
+    fn code_clicks_use_char_positions_and_take_priority_over_links() {
+        let (mut app, _) = drawn("界 [`cargo test`](https://example.com)", 40);
+        let (line, column) = find(&app, "cargo test");
+        let area = app.transcript_area.unwrap();
+        let x = area.x
+            + crate::wrap::width(&app.lines[line].chars().take(column).collect::<String>()) as u16;
+        let y = area.y + (line - app.scroll) as u16;
+        assert!(click(&mut app, x, y));
+        assert_eq!(
+            crate::clipboard::last_copied().as_deref(),
+            Some("cargo test")
+        );
+    }
+
+    #[test]
+    fn a_click_inside_a_code_block_copies_the_whole_block() {
+        let (mut app, _) = drawn("```sh\ncargo test\n  ls -la\n```", 40);
+        for needle in ["cargo test", "ls -la"] {
+            let (line, column) = find(&app, needle);
+            let area = app.transcript_area.unwrap();
+            let y = area.y + (line - app.scroll) as u16;
+            assert!(click(&mut app, area.x + column as u16, y));
+            assert_eq!(
+                crate::clipboard::last_copied().as_deref(),
+                Some("cargo test\n  ls -la")
+            );
+        }
+    }
+
+    #[test]
     fn a_table_with_wide_chars_keeps_its_columns() {
         let (app, _) = drawn("| 名前 | x |\n|---|---|\n| ab | y |", 40);
         let (head, _) = find(&app, "名前");

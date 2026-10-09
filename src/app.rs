@@ -213,7 +213,7 @@ pub struct App {
     pub margins: Vec<usize>,
     /// Where each of those lines came from, for the ones an assistant message drew.
     pub sources: Vec<Option<Source>>,
-    /// The `[copy]` label over each code block: its line, its chars and the code.
+    /// Clickable code: its line, its chars and the code.
     pub copies: Vec<(usize, Range<usize>, String)>,
     /// The transcript's text area, filled in by the renderer.
     pub transcript_area: Option<Rect>,
@@ -931,8 +931,8 @@ impl App {
                     return self.copy_selection(at) | self.rehover();
                 }
                 return clicked
-                    && (self.click_link(mouse.column, mouse.row)
-                        || self.click_copy(mouse.column, mouse.row)
+                    && (self.click_copy(mouse.column, mouse.row)
+                        || self.click_link(mouse.column, mouse.row)
                         || self.click_entry(mouse.row));
             }
             _ => return false,
@@ -1104,8 +1104,8 @@ impl App {
         true
     }
 
-    /// A click on a code block's `[copy]` label: the code goes on the clipboard, said
-    /// beside the label the way a drag's copy is. Returns whether it was one.
+    /// A click on code: it goes on the clipboard, said beside the click the way a
+    /// drag's copy is. Returns whether it was one.
     fn click_copy(&mut self, x: u16, y: u16) -> bool {
         let Some((line, column)) = self.cell_at(x, y) else {
             return false;

@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-09
 
+- Clicking inline code or a code block copies the code without Markdown delimiters; drag selection keeps its existing Markdown copy behavior.
 - The auto judge vetoes concrete safety and scope violations rather than requiring exact permission wording for routine task work, external implementation and temporary server cleanup; sensitive actions still require scoped permission and hard safeguards remain unchanged.
 - User-entered `/goal` objectives join the judge's authorization memory, including restrictions set during a running turn; automatic goal turns and model-written updates remain context only.
 - Repo-local agent instructions require verified commits, main-branch integration and safe cleanup before reporting completed work.

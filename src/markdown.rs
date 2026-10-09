@@ -14,7 +14,7 @@ use crate::wrap::Join;
 
 /// One styled character and where it came from; lines are built from these so wrapping
 /// keeps both.
-type Cell = (char, Style, Option<Origin>);
+type Cell = (char, Style, Option<Origin>, Option<usize>);
 
 /// The bytes of the source a drawn char came from. Every char of an inline element
 /// (`**bold**`, a link, `code`) has the whole element, so a copy keeps its delimiters.
@@ -43,7 +43,7 @@ pub struct Rendered {
     pub margins: Vec<usize>,
     /// Where each char of each row came from, `None` for what the renderer adds.
     pub origins: Vec<Vec<Option<Origin>>>,
-    /// The `[copy]` label over each code block: its row, its chars and the code it copies.
+    /// Clickable code: its row, its chars and the code it copies.
     pub copies: Vec<(usize, Range<usize>, String)>,
 }
 
@@ -100,6 +100,8 @@ struct Renderer {
     out: Rendered,
     /// Inline content of the block being built.
     inline: Vec<Cell>,
+    /// Payloads for inline code, indexed by its cells.
+    click_codes: Vec<String>,
     styles: Vec<Style>,
     /// The open inline elements; the outermost is what their chars copy as.
     elements: Vec<Origin>,
@@ -129,7 +131,15 @@ impl Renderer {
                 }
                 None => self.push(&text, self.style(), range),
             },
-            Event::Code(text) => self.push(&text, self.style().patch(CODE), range),
+            Event::Code(text) => {
+                let start = self.inline.len();
+                self.push(&text, self.style().patch(CODE), range);
+                let code = self.click_codes.len();
+                self.click_codes.push(text.to_string());
+                for cell in &mut self.inline[start..] {
+                    cell.3 = Some(code);
+                }
+            }
             Event::InlineMath(text) | Event::DisplayMath(text) => {
                 self.push(&text, self.style(), range)
             }
@@ -143,7 +153,7 @@ impl Renderer {
                 let rule = "─".repeat(self.width.saturating_sub(self.prefix_width()).min(40));
                 let origin = Some(range.into());
                 self.emit(
-                    rule.chars().map(|c| (c, DIM, origin)).collect(),
+                    rule.chars().map(|c| (c, DIM, origin, None)).collect(),
                     Join::Newline,
                 );
                 self.gap = true;
@@ -302,13 +312,13 @@ impl Renderer {
     fn push(&mut self, text: &str, style: Style, range: Range<usize>) {
         match self.elements.first() {
             Some(&element) => {
-                let cells = text.chars().map(|c| (c, style, Some(element)));
+                let cells = text.chars().map(|c| (c, style, Some(element), None));
                 self.inline.extend(cells);
             }
             None => {
                 let cells = text.chars().zip(origins(text, range));
                 self.inline
-                    .extend(cells.map(|(c, origin)| (c, style, origin)));
+                    .extend(cells.map(|(c, origin)| (c, style, origin, None)));
             }
         }
     }
@@ -359,7 +369,9 @@ impl Renderer {
         self.code_header(&lang, code);
         // Only the word before any attributes, which fences carry in several dialects.
         let name = lang.split([' ', ',', '{', ':']).next().unwrap_or("").trim();
+        let start = self.out.lines.len();
         if mermaid::is_mermaid(name) && self.diagram(code, block) {
+            self.code_targets(start, code);
             self.gap = true;
             return;
         }
@@ -372,7 +384,7 @@ impl Renderer {
         let painted: Vec<Cell> = syntax::highlight(code, &lang)
             .into_iter()
             .zip(origins)
-            .map(|((c, style), origin)| (c, style, origin))
+            .map(|((c, style), origin)| (c, style, origin, None))
             .collect();
         for line in split_lines(&painted) {
             let cells: Vec<Cell> = line.to_vec();
@@ -383,7 +395,10 @@ impl Renderer {
                 cells.chunks(width).collect()
             };
             for (index, chunk) in chunks.into_iter().enumerate() {
-                let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, PLAIN, None)).collect();
+                let mut row: Vec<Cell> = CODE_INDENT
+                    .chars()
+                    .map(|c| (c, PLAIN, None, None))
+                    .collect();
                 row.extend_from_slice(chunk);
                 // The line was split to fit, not reflowed, so nothing stands between.
                 let join = match index {
@@ -393,7 +408,17 @@ impl Renderer {
                 self.emit_code(row, join);
             }
         }
+        self.code_targets(start, code);
         self.gap = true;
+    }
+
+    fn code_targets(&mut self, start: usize, code: &str) {
+        for row in start..self.out.lines.len() {
+            let chars = self.out.lines[row].to_string().chars().count();
+            self.out
+                .copies
+                .push((row, self.prefix_width()..chars, code.to_string()));
+        }
     }
 
     /// The row over a code block: its language, if the fence names one, and the label a
@@ -403,14 +428,17 @@ impl Renderer {
         let mut rows = match lang.is_empty() {
             true => Vec::new(),
             false => wrap(
-                &lang.chars().map(|c| (c, DIM, None)).collect::<Vec<_>>(),
+                &lang
+                    .chars()
+                    .map(|c| (c, DIM, None, None))
+                    .collect::<Vec<_>>(),
                 width,
             ),
         };
         let label = COPY_LABEL.chars().count();
         let last = rows.last().map_or(0, |(row, _)| cells_width(row));
         match rows.last_mut() {
-            Some((row, _)) if last + 1 + label <= width => row.push((' ', DIM, None)),
+            Some((row, _)) if last + 1 + label <= width => row.push((' ', DIM, None, None)),
             _ if label <= width => rows.push((Vec::new(), Join::Newline)),
             _ => {}
         }
@@ -418,7 +446,7 @@ impl Renderer {
         if let (Some(at), Some((row, _))) = (at, rows.last_mut())
             && label <= width
         {
-            row.extend(COPY_LABEL.chars().map(|c| (c, DIM, None)));
+            row.extend(COPY_LABEL.chars().map(|c| (c, DIM, None, None)));
             let start = self.prefix_width() + at;
             let line = self.out.lines.len() + rows.len() - 1;
             self.out
@@ -445,8 +473,11 @@ impl Renderer {
             return false;
         }
         for line in lines {
-            let mut row: Vec<Cell> = CODE_INDENT.chars().map(|c| (c, PLAIN, None)).collect();
-            row.extend(line.chars().map(|c| (c, PLAIN, Some(block))));
+            let mut row: Vec<Cell> = CODE_INDENT
+                .chars()
+                .map(|c| (c, PLAIN, None, None))
+                .collect();
+            row.extend(line.chars().map(|c| (c, PLAIN, Some(block), None)));
             self.emit_code(row, Join::Newline);
         }
         true
@@ -487,15 +518,15 @@ impl Renderer {
                 let mut text: Vec<Cell> = Vec::new();
                 for (i, w) in widths.iter().enumerate() {
                     if i > 0 {
-                        text.extend([(' ', Style::new(), None); 2]);
+                        text.extend([(' ', Style::new(), None, None); 2]);
                     }
                     let part = cells[i].get(line).map_or(&[][..], Vec::as_slice);
-                    text.extend(part.iter().map(|&(c, style, origin)| match head {
-                        true => (c, style.bold(), origin),
-                        false => (c, style, origin),
+                    text.extend(part.iter().map(|&(c, style, origin, click)| match head {
+                        true => (c, style.bold(), origin, click),
+                        false => (c, style, origin, click),
                     }));
                     let pad = w.saturating_sub(cells_width(part));
-                    text.extend(std::iter::repeat_n((' ', Style::new(), None), pad));
+                    text.extend(std::iter::repeat_n((' ', Style::new(), None, None), pad));
                 }
                 while text.last().is_some_and(|(c, ..)| *c == ' ') {
                     text.pop();
@@ -517,7 +548,7 @@ impl Renderer {
             if head {
                 let rule = "─".repeat((widths.iter().sum::<usize>() + gaps).min(width));
                 self.emit(
-                    rule.chars().map(|c| (c, DIM, None)).collect(),
+                    rule.chars().map(|c| (c, DIM, None, None)).collect(),
                     Join::Newline,
                 );
             }
@@ -548,13 +579,32 @@ impl Renderer {
         }
         let mut run = String::new();
         let mut style = None;
-        for (c, s, origin) in cells {
+        let mut click_run: Option<(usize, usize)> = None;
+        for (c, s, origin, click) in cells {
+            let column = origins.len();
+            if click_run.map(|(_, code)| code) != click {
+                if let Some((start, code)) = click_run.take() {
+                    self.out.copies.push((
+                        self.out.lines.len(),
+                        start..column,
+                        self.click_codes[code].clone(),
+                    ));
+                }
+                click_run = click.map(|code| (column, code));
+            }
             origins.push(origin);
             if style.is_some_and(|current| current != s) {
                 spans.push(Span::styled(std::mem::take(&mut run), style.unwrap()));
             }
             style = Some(s);
             run.push(c);
+        }
+        if let Some((start, code)) = click_run {
+            self.out.copies.push((
+                self.out.lines.len(),
+                start..origins.len(),
+                self.click_codes[code].clone(),
+            ));
         }
         if let Some(style) = style {
             spans.push(Span::styled(run, style));
@@ -789,6 +839,50 @@ fn markup(line: &str) -> usize {
 mod tests {
     use super::*;
     use ratatui::style::Modifier;
+
+    #[test]
+    fn inline_code_targets_survive_wrapping_and_nested_markup() {
+        let rendered = render("**before `one two three` and ``a ` b`` after**", 12);
+        let mut seen = Vec::new();
+        for (row, chars, code) in &rendered.copies {
+            let line = rendered.lines[*row].to_string();
+            let drawn: String = line.chars().skip(chars.start).take(chars.len()).collect();
+            assert!(!drawn.is_empty());
+            assert!(code.contains(&drawn), "{drawn:?} is not in {code:?}");
+            seen.push(code.as_str());
+        }
+        assert!(seen.iter().filter(|code| **code == "one two three").count() > 1);
+        assert!(seen.contains(&"a ` b"));
+    }
+
+    #[test]
+    fn inline_code_in_tables_keeps_separate_targets() {
+        let rendered = render("| a | b |\n|---|---|\n| `left` | `right` |", 30);
+        let codes: Vec<_> = rendered
+            .copies
+            .iter()
+            .map(|(_, _, code)| code.as_str())
+            .collect();
+        assert_eq!(codes, ["left", "right"]);
+    }
+
+    #[test]
+    fn code_rows_are_clickable_without_a_copy_label() {
+        let rendered = render("```\nabcdef\n\n  x\n```", 4);
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .all(|line| !line.to_string().contains(COPY_LABEL))
+        );
+        assert_eq!(rendered.copies.len(), rendered.lines.len());
+        assert!(
+            rendered
+                .copies
+                .iter()
+                .all(|(_, _, code)| code == "abcdef\n\n  x")
+        );
+    }
 
     /// The lines alone, for the tests that have nothing to say about the wrapping.
     fn lines(source: &str, width: usize) -> Vec<Line<'static>> {
