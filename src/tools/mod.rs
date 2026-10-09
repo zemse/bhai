@@ -133,6 +133,45 @@ pub fn function_output(call_id: &str, text: &str, images: &[Image]) -> Value {
     })
 }
 
+/// Local wall time to the second, with an unambiguous timezone offset.
+pub(crate) fn local_time() -> String {
+    chrono::Local::now()
+        .format("%d/%m/%Y %H:%M:%S %:z")
+        .to_string()
+}
+
+/// Saved user wording stays intact; assistant outputs must replay byte-for-byte.
+pub(crate) fn timestamp_message(mut item: Value) -> Value {
+    if item.get("type").and_then(Value::as_str) == Some("message")
+        && item.get("role").and_then(Value::as_str) == Some("user")
+    {
+        item["bhai_local_time"] = Value::String(local_time());
+    }
+    item
+}
+
+/// Backend items carry the saved time as text, not as an unsupported API field.
+pub(crate) fn timed_input(input: &[Value]) -> Vec<Value> {
+    input
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            let stamp = item
+                .as_object_mut()
+                .and_then(|item| item.remove("bhai_local_time"));
+            if item.get("role").and_then(Value::as_str) == Some("user")
+                && let Some(stamp) = stamp.and_then(|stamp| stamp.as_str().map(str::to_string))
+                && let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut)
+            {
+                parts.push(serde_json::json!({
+                    "type": "input_text", "text": format!("\n[local time: {stamp}]"),
+                }));
+            }
+            item
+        })
+        .collect()
+}
+
 /// A user message of `text` and the images attached to it, after the text.
 pub fn user_message(text: &str, images: &[Image]) -> Value {
     serde_json::json!({
@@ -646,6 +685,48 @@ mod tests {
                 .names()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn timestamps_use_local_date_time_seconds_and_offset() {
+        let before = chrono::Local::now();
+        let stamp = local_time();
+        let parsed = chrono::DateTime::parse_from_str(&stamp, "%d/%m/%Y %H:%M:%S %:z").unwrap();
+        let after = chrono::Local::now();
+        assert_eq!(stamp.len(), 26);
+        assert!(parsed.timestamp() >= before.timestamp());
+        assert!(parsed.timestamp() <= after.timestamp());
+        assert_eq!(parsed.offset(), before.offset());
+    }
+
+    #[test]
+    fn message_timestamps_preserve_wording_and_non_message_items() {
+        let user = timestamp_message(user_message("original wording", &[]));
+        assert_eq!(user["content"][0]["text"], "original wording");
+        assert_eq!(crate::tokens::item_text(&user).unwrap(), "original wording");
+        let input = timed_input(std::slice::from_ref(&user));
+        assert!(input[0].get("bhai_local_time").is_none());
+        assert_eq!(input[0]["content"][1]["type"], "input_text");
+        assert_eq!(
+            input[0]["content"][1]["text"],
+            format!(
+                "\n[local time: {}]",
+                user["bhai_local_time"].as_str().unwrap()
+            )
+        );
+        assert_eq!(timed_input(std::slice::from_ref(&user)), input);
+        let assistant = timestamp_message(json!({
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}],
+        }));
+        assert_eq!(assistant["content"][0]["text"], "answer");
+        assert_eq!(crate::tokens::item_text(&assistant).unwrap(), "answer");
+        assert!(assistant.get("bhai_local_time").is_none());
+        assert_eq!(timed_input(std::slice::from_ref(&assistant)), [assistant]);
+        let call = json!({"type": "function_call", "call_id": "c", "name": "bash"});
+        assert_eq!(timestamp_message(call.clone()), call);
+        let reasoning = json!({"type": "reasoning", "summary": []});
+        assert_eq!(timestamp_message(reasoning.clone()), reasoning);
     }
 
     #[test]

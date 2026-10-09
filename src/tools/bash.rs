@@ -24,7 +24,7 @@ const TIMEOUT: Duration = Duration::from_secs(120);
 const YIELD: Duration = Duration::from_secs(10);
 /// The bounds on the `yield_time_ms` a call may ask for.
 const YIELD_MIN: Duration = Duration::from_millis(250);
-const YIELD_MAX: Duration = Duration::from_secs(30);
+const YIELD_MAX: Duration = Duration::from_secs(1800);
 /// Sessions kept running at once; past this the one used least recently is killed.
 const MAX_SESSIONS: usize = 16;
 /// The terminal a `tty` session gets.
@@ -201,7 +201,9 @@ fn tool_schema() -> Value {
                 "yield_time_ms": {
                     "type": "integer",
                     "description": "How long to wait for the command to finish before \
-    returning a session ID, 250 to 30000. Defaults to 10000."
+    returning a session ID, 250 to 1800000. Defaults to 10000. Returns early on exit and \
+    streams output while waiting. For slow builds or installs, choose an expected duration \
+    such as 120000 to 300000 rather than repeatedly polling short waits."
                 },
                 "tty": {
                     "type": "boolean",
@@ -475,6 +477,8 @@ struct Shared {
     recent: std::collections::VecDeque<u8>,
     /// Bytes have fallen off the front of `recent`.
     recent_cut: bool,
+    /// Release a polling wait so the user's stop can acquire the proc.
+    stopping: bool,
 }
 
 /// A running command and the tasks reading its output. Reading goes on between calls,
@@ -590,6 +594,7 @@ impl Proc {
             open: pipes.len(),
             recent: std::collections::VecDeque::new(),
             recent_cut: false,
+            stopping: false,
         }));
         let closed = Arc::new(Notify::new());
         let readers = pipes
@@ -626,6 +631,13 @@ impl Proc {
     ) -> io::Result<Option<ExitStatus>> {
         let mut tick = tokio::time::interval(TICK);
         loop {
+            if self.lock().stopping {
+                self.flush(live.progress);
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "session stopped by the user",
+                ));
+            }
             let now = tokio::time::Instant::now();
             if let Some(status) = self.status
                 && (self.lock().open == 0 || self.drained_by.is_some_and(|at| now >= at))
@@ -1066,8 +1078,12 @@ pub fn stop(id: u32) -> bool {
     let Some(session) = sessions().live.remove(&id) else {
         return false;
     };
+    session
+        .shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stopping = true;
     tokio::spawn(async move {
-        // A poll holding the proc has it until its own wait ends.
         let mut proc = session.proc.lock().await;
         if proc.status.is_some() {
             return;
@@ -1204,7 +1220,11 @@ fn running(id: u32, stdout: &Kept, stderr: &Kept, took: Duration) -> String {
 fn trailer(stdout: &Kept, stderr: &Kept, took: Duration) -> String {
     let lines = stdout.lines() + stderr.lines();
     let s = if lines == 1 { "" } else { "s" };
-    format!("\n{TRAILER}{lines} line{s}, {:.1}s]", took.as_secs_f64())
+    format!(
+        "\n{TRAILER}{lines} line{s}, {:.1}s] [local time: {}]",
+        took.as_secs_f64(),
+        super::local_time(),
+    )
 }
 
 #[cfg(test)]
@@ -1569,7 +1589,9 @@ mod tests {
         assert!(out.starts_with("exit code: 0\n1\n2\n3\n4\n5\n"), "{out}");
         let last = out.lines().last().unwrap();
         assert!(
-            last.starts_with("[output: 5 lines, ") && last.ends_with("s]"),
+            last.starts_with("[output: 5 lines, ")
+                && last.contains("s] [local time: ")
+                && last.ends_with(']'),
             "{last}"
         );
         assert_eq!(outcome(&out), Some(Outcome::Succeeded));
@@ -1757,6 +1779,7 @@ mod tests {
             open: 0,
             recent: "é-tail-secret-0b7d ok".bytes().skip(1).collect(),
             recent_cut: true,
+            stopping: false,
         };
         assert_eq!(recent(&shared, false), "[REDACTED] ok");
         shared.recent_cut = false;
@@ -1949,7 +1972,7 @@ mod tests {
             conversation: None,
         };
         let start_at = Instant::now();
-        let out = write(id, "", Duration::from_secs(30), live).await;
+        let out = write(id, "", YIELD_MAX, live).await;
         assert!(start_at.elapsed() < Duration::from_secs(2), "{out}");
         assert_eq!(outcome(&out), Some(Outcome::Killed), "{out}");
         assert_eq!(session(id), None);
@@ -2020,6 +2043,58 @@ mod tests {
             Some(Outcome::Running(12))
         );
         assert!(Outcome::Running(12).ok());
+    }
+
+    #[tokio::test]
+    async fn stopping_a_session_releases_a_long_poll() {
+        let out = start("sleep 60", None, YIELD_MIN, false, quiet()).await;
+        let id = session_id(&out);
+        let proc = Arc::clone(&sessions().live[&id].proc);
+        let poll = tokio::spawn(async move { write(id, "", YIELD_MAX, quiet()).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while proc.try_lock().is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(stop(id));
+        let out = tokio::time::timeout(Duration::from_secs(2), poll)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.contains("session stopped by the user"), "{out}");
+        assert!(session(id).is_none());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while proc.lock().await.status.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_waits_return_on_exit_and_timestamp_each_result() {
+        assert_eq!(
+            parse_yield(&json!({"yield_time_ms": 600_000})),
+            Ok(Duration::from_secs(600))
+        );
+        let started = Instant::now();
+        let out = start("printf done", None, YIELD_MAX, false, quiet()).await;
+        assert_eq!(outcome(&out), Some(Outcome::Succeeded));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(out.contains("[local time: "), "{out}");
+
+        let out = start("sleep 1; printf done", None, YIELD_MIN, false, quiet()).await;
+        let id = session_id(&out);
+        assert!(out.contains("[local time: "), "{out}");
+        let started = Instant::now();
+        let out = write(id, "", YIELD_MAX, quiet()).await;
+        assert_eq!(outcome(&out), Some(Outcome::Succeeded));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(out.contains("[local time: "), "{out}");
+        assert!(session(id).is_none());
     }
 
     #[tokio::test]

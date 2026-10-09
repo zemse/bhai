@@ -62,7 +62,8 @@ pub fn messages(instructions: &str, input: &[Value]) -> Vec<Value> {
     // A `function_call_output` carries only the call id, and Ollama pairs a result with
     // its tool by name, so the names are remembered as the calls go past.
     let mut names: HashMap<&str, Cow<str>> = HashMap::new();
-    for item in input {
+    let input = crate::tools::timed_input(input);
+    for item in &input {
         let field = |key: &str| item.get(key).and_then(Value::as_str);
         let text = crate::tokens::item_text(item).unwrap_or_default();
         match field("type") {

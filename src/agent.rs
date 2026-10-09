@@ -442,7 +442,7 @@ impl UserInput {
     /// The history item the model reads it as. Without images it is the plain text
     /// message every other user item is.
     fn item(&self) -> Value {
-        tools::user_message(&self.text, &self.images)
+        tools::timestamp_message(tools::user_message(&self.text, &self.images))
     }
 }
 
@@ -1683,7 +1683,7 @@ fn prompt_tokens(model: &str, instructions: &str, tools: &[Value], items: &[Valu
             .iter()
             .map(|t| counter.count(&t.to_string()))
             .sum::<usize>()) as u64
-        + compact::estimate(items, counter)
+        + compact::estimate(&tools::timed_input(items), counter)
 }
 
 /// How one turn ended: the model calls it made, whether its step budget was spent, and
@@ -2380,13 +2380,7 @@ fn steered(
     judge: Option<&Judge>,
 ) -> Option<usize> {
     let from = history.len();
-    let message = |text: String| {
-        json!({
-            "type": "message",
-            "role": "user",
-            "content": [{ "type": "input_text", "text": text }],
-        })
-    };
+    let message = |text: String| tools::timestamp_message(tools::user_message(&text, &[]));
     match steer? {
         Steer::Mailbox(rx) => {
             while let Ok(text) = rx.try_recv() {
@@ -4025,6 +4019,45 @@ mod tests {
     use super::*;
     use crate::permissions::Mode;
 
+    fn untimed(items: &[Value]) -> Vec<Value> {
+        items
+            .iter()
+            .cloned()
+            .map(|mut item| {
+                if let Some(stamp) = item
+                    .as_object_mut()
+                    .and_then(|item| item.remove("bhai_local_time"))
+                {
+                    chrono::DateTime::parse_from_str(
+                        stamp.as_str().unwrap(),
+                        "%d/%m/%Y %H:%M:%S %:z",
+                    )
+                    .unwrap();
+                }
+                if let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut)
+                    && let Some(stamp) = parts
+                        .last()
+                        .and_then(|part| part["text"].as_str())
+                        .and_then(|text| text.strip_prefix("\n[local time: "))
+                        .and_then(|text| text.strip_suffix(']'))
+                {
+                    chrono::DateTime::parse_from_str(stamp, "%d/%m/%Y %H:%M:%S %:z").unwrap();
+                    parts.pop();
+                }
+                item
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prompt_estimates_include_model_visible_message_times() {
+        let plain = tools::user_message("build", &[]);
+        let timed = UserInput::from("build").item();
+        assert!(
+            prompt_tokens("fake", "", &[], &[timed]) > prompt_tokens("fake", "", &[], &[plain])
+        );
+    }
+
     #[tokio::test]
     async fn context_is_answered_while_idle() {
         let (_tx_user, rx_user) = mpsc::channel(1);
@@ -5583,15 +5616,26 @@ mod tests {
         tx_user.send(input.clone()).await.unwrap();
         settle(&mut rx).await;
 
-        let said = input.item();
+        let said = tools::user_message(&input.text, &input.images);
         assert_eq!(
             said["content"][1],
             json!({"type": "input_image", "image_url": "data:image/png;base64,iVBORw0K"})
         );
         let sent = fake.bodies.lock().unwrap().last().unwrap().1["input"].clone();
-        assert!(sent.as_array().unwrap().contains(&said), "{sent}");
+        assert!(untimed(sent.as_array().unwrap()).contains(&said), "{sent}");
         let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
-        assert!(loaded.items.contains(&said), "{:?}", loaded.items);
+        assert!(untimed(&loaded.items).contains(&said), "{:?}", loaded.items);
+        let saved = loaded
+            .items
+            .iter()
+            .find(|item| item["role"] == "user")
+            .unwrap();
+        assert!(saved["bhai_local_time"].is_string());
+        assert!(
+            sent.as_array()
+                .unwrap()
+                .contains(&tools::timed_input(std::slice::from_ref(saved))[0])
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7453,7 +7497,10 @@ mod tests {
             compact::user_message("Summary of earlier conversation:\nthe summary")
         );
         let last = parent[19]["input"].as_array().unwrap();
-        assert_eq!(&last[..loaded.items.len()], loaded.items.as_slice());
+        assert_eq!(
+            &last[..loaded.items.len()],
+            tools::timed_input(&loaded.items).as_slice()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7513,7 +7560,7 @@ mod tests {
         assert_eq!(*fake.breaks.lock().unwrap(), []);
         let bodies = fake.bodies.lock().unwrap();
         let input = bodies[0].1["input"].as_array().unwrap();
-        assert_eq!(&input[..3], loaded.items.as_slice());
+        assert_eq!(&input[..3], tools::timed_input(&loaded.items).as_slice());
 
         // The context read back from the file is still current, so it is not sent again.
         let reloaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
@@ -7665,10 +7712,10 @@ mod tests {
         let summary = compact::user_message("Summary of earlier conversation:\nthe summary");
         let text = |t: &str| compact::user_message(t);
         assert_eq!(
-            bodies[4].as_array().unwrap(),
-            &[
+            untimed(bodies[4].as_array().unwrap()),
+            [
                 input[0].clone(),
-                input[1].clone(),
+                untimed(&input[1..2])[0].clone(),
                 summary,
                 text("second"),
                 say("two"),
@@ -7684,10 +7731,10 @@ mod tests {
         let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
         let summary = compact::user_message("Summary of earlier conversation:\nsummary two");
         assert_eq!(
-            loaded.items,
+            untimed(&loaded.items),
             [
                 input[0].clone(),
-                input[1].clone(),
+                untimed(&input[1..2])[0].clone(),
                 summary,
                 text("third"),
                 say("three")
@@ -7722,7 +7769,10 @@ mod tests {
         drive(&tx_user, &mut rx, &cancel, "fourth", &[]).await;
         assert_eq!(*fake.breaks.lock().unwrap(), []);
         let input = fake.bodies.lock().unwrap()[0].1["input"].clone();
-        assert_eq!(&input.as_array().unwrap()[..5], loaded.items.as_slice());
+        assert_eq!(
+            &input.as_array().unwrap()[..5],
+            tools::timed_input(&loaded.items).as_slice()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7918,7 +7968,7 @@ mod tests {
         assert_eq!(sent.len(), 4);
         let summary = compact::user_message("Summary of earlier conversation:\nthe summary");
         assert_eq!(
-            sent[3],
+            untimed(&sent[3]),
             [
                 sent[0][0].clone(),
                 compact::user_message("one"),
@@ -7990,7 +8040,7 @@ mod tests {
         assert_eq!(evicted(&sent[3]), 2);
         let dropped = format!("{}\n{}", compact::SUMMARY_PREFIX, compact::UNSUMMARISED);
         assert_eq!(
-            sent[4],
+            untimed(&sent[4]),
             [
                 sent[0][0].clone(),
                 compact::user_message("one"),
@@ -9083,7 +9133,7 @@ mod tests {
         assert_eq!(input[4]["content"][0]["text"], TURN_ABORTED);
         assert_eq!(input[5]["content"][0]["text"], "again");
         let loaded = sessions::load(&sessions::path(&dir, "sess")).unwrap();
-        assert_eq!(&loaded.items[..6], &input[..6]);
+        assert_eq!(tools::timed_input(&loaded.items[..6]), input[..6]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

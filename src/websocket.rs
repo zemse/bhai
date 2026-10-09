@@ -174,6 +174,23 @@ mod tests {
     }
 
     #[test]
+    fn user_timestamps_preserve_the_server_side_assistant_prefix() {
+        let user = crate::tools::timestamp_message(say("hi"));
+        let first = body(std::slice::from_ref(&user));
+        let answer = json!({"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "hello"}
+        ]});
+        let last = Last::after("resp_1".to_string(), &first, std::slice::from_ref(&answer));
+        let more = crate::tools::timestamp_message(say("more"));
+        let next = body(&[user, crate::tools::timestamp_message(answer), more.clone()]);
+        let (frame, delta) = frame(last.as_ref(), &next);
+        let frame = sent(&frame);
+        assert!(delta);
+        assert_eq!(frame["previous_response_id"], "resp_1");
+        assert_eq!(frame["input"], json!(crate::tools::timed_input(&[more])));
+    }
+
+    #[test]
     fn anything_but_an_append_is_replayed_whole() {
         let first = body(&[say("hi")]);
         let answer = json!({ "type": "message", "role": "assistant", "content": [] });

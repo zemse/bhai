@@ -1441,7 +1441,7 @@ pub fn request_body(
     json!({
         "model": model,
         "instructions": instructions,
-        "input": input,
+        "input": crate::tools::timed_input(input),
         "tools": tools,
         "tool_choice": "auto",
         "parallel_tool_calls": true,
@@ -1992,6 +1992,31 @@ mod tests {
 
         assert!(!client.set_fast(false));
         assert!(child.body("i", &[], &[]).get("service_tier").is_none());
+    }
+
+    #[test]
+    fn saved_message_times_reach_both_backends_without_metadata_fields() {
+        let input = vec![json!({
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "build"}],
+            "bhai_local_time": "10/10/2026 01:02:03 +05:30",
+        })];
+        let body = request_body("model", "medium", "key", "", &[], &input);
+        assert!(body["input"][0].get("bhai_local_time").is_none());
+        assert_eq!(
+            body["input"][0]["content"][1]["text"],
+            "\n[local time: 10/10/2026 01:02:03 +05:30]"
+        );
+        let messages = crate::ollama::messages("", &input);
+        assert_eq!(
+            messages[0]["content"],
+            "build\n[local time: 10/10/2026 01:02:03 +05:30]"
+        );
+        assert_eq!(input[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            request_body("model", "medium", "key", "", &[], &input),
+            body
+        );
     }
 
     #[test]

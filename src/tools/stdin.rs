@@ -17,9 +17,9 @@ const WRITE_MIN: Duration = Duration::from_millis(250);
 const WRITE_MAX: Duration = Duration::from_secs(30);
 /// How long a call that types nothing waits, and the bounds on it: a poll every quarter
 /// second would spend a model call on each.
-const POLL: Duration = Duration::from_secs(30);
+const POLL: Duration = Duration::from_secs(60);
 const POLL_MIN: Duration = Duration::from_secs(5);
-const POLL_MAX: Duration = Duration::from_secs(300);
+const POLL_MAX: Duration = Duration::from_secs(1800);
 
 pub struct WriteStdin;
 
@@ -34,8 +34,9 @@ impl Tool for WriteStdin {
             "name": NAME,
             "description": "Poll a command `bash` left running as a session, or type into it. \
         Returns the output printed since the session was last read, then either its exit code \
-        or `Process running with session ID N` again. With `chars` empty it only waits for \
-        output. Typing needs a session started with `tty: true`; one without a terminal only \
+        or `Process running with session ID N` again. With `chars` empty it reads output, \
+        waiting until exit or the deadline, not returning for each output chunk. Typing \
+        needs a session started with `tty: true`; one without a terminal only \
         takes \"\\u0003\" (ctrl-c). The user approves what is typed.",
             "strict": false,
             "parameters": {
@@ -52,9 +53,12 @@ impl Tool for WriteStdin {
                     },
                     "yield_time_ms": {
                         "type": "integer",
-                        "description": "How long to wait for output before returning, unless \
-        the command exits first: 250 to 30000 after typing (default 500), 5000 to 300000 for \
-        a poll (default 30000)."
+                        "description": "How long to wait before returning, unless \
+        the command exits first: 250 to 30000 after typing (default 500), 5000 to 1800000 for \
+        a poll (default 60000). A poll returns early when the command exits and streams \
+        output while waiting; it does not keep polling after exit. For builds and installs, \
+        wait for the expected remaining duration (often 300000 to 600000). Increase the wait \
+        when successive polls show little progress; use result timestamps to track elapsed time."
                     }
                 },
                 "required": ["session_id"],
@@ -145,6 +149,10 @@ mod tests {
         assert_eq!(parse(&poll).unwrap(), (3, "", POLL));
         let (_, _, wait) = parse(&json!({"session_id": 3, "yield_time_ms": 10})).unwrap();
         assert_eq!(wait, POLL_MIN);
+        let args = json!({"session_id": 3, "yield_time_ms": 600_000});
+        assert_eq!(parse(&args).unwrap().2, Duration::from_secs(600));
+        let args = json!({"session_id": 3, "yield_time_ms": 9_999_999});
+        assert_eq!(parse(&args).unwrap().2, POLL_MAX);
         let typed = json!({"session_id": 3, "chars": "x\n"});
         assert_eq!(parse(&typed).unwrap(), (3, "x\n", AFTER_WRITE));
         let args = json!({"session_id": 3, "chars": "x", "yield_time_ms": 999_999});
