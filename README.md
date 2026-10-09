@@ -33,6 +33,14 @@ $ bhai
 <img src="https://raw.githubusercontent.com/zemse/bhai/main/assets/banner.png" alt="bhai running a task in the terminal" width="100%">
 
 
+## auto approvals
+
+auto mode uses deterministic permission rules first, then a judge for calls the rules leave open. the judge approves ordinary task-related implementation, setup and cleanup unless it identifies a concrete safety or scope violation. working outside the project or missing exact command wording is not itself a reason to deny. publishing, termination, storage deletion and broad destructive changes still need scoped user permission.
+
+explicit deny and ask rules, protected credential paths and session authorization storage stay outside the judge's discretion. original user evidence backs permission notes; files, tool results and automatic wake messages do not grant authority. an extraction failure, timeout or exhausted judge budget is no verdict, not permission to bypass the checks.
+
+auto mode is not an operating-system sandbox. trusted project code and approved commands can have effects the permission checker cannot fully inspect.
+
 ## monitors
 
 for long-running work, the agent can proactively register a monitor. you approve its sampler command, working directory, timing and optional wake hooks once. the sampler runs every couple of seconds without model calls and prints one JSON snapshot, then exits:
