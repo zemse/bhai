@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-10
 
+- The CLI uses clap for command-specific help, version output and argument validation; `-p` runs a text-only turn with optional stdin, `-C` selects the project directory, and session options work before or after `exec`.
 - The model can call `compact` with an optional summary prompt; compaction waits for every tool result in the step and work continues on the compacted history. `status` reports context tokens, window size and percentage, marking estimates when backend usage is unavailable.
 
 ## 2026-10-09

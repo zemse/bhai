@@ -32,6 +32,25 @@ $ bhai
 
 <img src="https://raw.githubusercontent.com/zemse/bhai/main/assets/banner.png" alt="bhai running a task in the terminal" width="100%">
 
+## command line
+
+`bhai` starts the terminal UI. `bhai --help`, `bhai exec --help` and `bhai --version` work without starting a session or calling a model.
+
+```sh
+bhai exec "review this code"
+bhai -p "review this code"
+cat prompt.txt | bhai exec -
+cat prompt.txt | bhai -p
+bhai exec "review this code" --json
+bhai -C /path/to/project exec "continue the review" --resume <id>
+bhai exec "review this code" -m ollama:<name> --mode auto
+```
+
+`exec` and `--print` run one unattended turn. text output goes to stdout; commentary and progress go to stderr. `--json` writes session events as JSONL, not a single JSON answer. failed or interrupted turns exit with status 1; invalid arguments exit with status 2. empty prompts are rejected before model setup. prompts starting with a dash can follow the option terminator: `bhai exec -- "-literal prompt"`.
+
+session options work before or after `exec`. approvals left at ask are rejected because no user is there to answer them. configure allow rules or explicitly select `--mode auto` for unattended tools; this does not bypass explicit ask or deny rules.
+
+`sessions [prune [n]]`, `identities`, `usage` and `mcp approve|login|logout <server>` also have command-specific help. existing `--workflow`, `--serve --headless` and diagnostic flags remain available.
 
 ## auto approvals
 

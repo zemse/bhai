@@ -8,6 +8,11 @@ use crate::{
     tokens, tools, trace, ui, workflow, worktrees,
 };
 
+#[path = "cli_args.rs"]
+mod arguments;
+
+use clap::Parser;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -64,81 +69,77 @@ pub async fn entry() -> Result<()> {
         std::process::exit(askpass::helper(&args[1..]));
     }
     tools::bash::kill_all_on_signal()?;
-    if args.first().is_some_and(|a| a == "identities") {
-        return identities();
+    let cli = arguments::Cli::try_parse_from(std::iter::once("bhai".to_string()).chain(args))
+        .unwrap_or_else(|error| error.exit());
+    // Validate run options before any command has effects.
+    let mut args = cli.into_args().unwrap_or_else(|error| error.exit());
+    if let Some(dir) = &args.cd {
+        std::env::set_current_dir(dir)
+            .with_context(|| format!("could not use project directory {}", dir.display()))?;
     }
-    if args.first().is_some_and(|a| a == "sessions") {
-        let dir = std::env::current_dir()?.join(sessions::DIR);
-        // `prune [n]` is the only way sessions are ever deleted: they are the debug record,
-        // so nothing removes one on its own.
-        if args.get(1).is_some_and(|a| a == "prune") {
-            let keep = match args.get(2) {
-                Some(n) => n
-                    .parse()
-                    .with_context(|| format!("`{n}` is not a number of sessions to keep"))?,
-                None => sessions::PRUNE_KEEP,
-            };
-            print!("{}", sessions::prune_report(&sessions::prune(&dir, keep)));
+    if let Some(prompt) = args.exec.take() {
+        args.exec = Some(exec_prompt(prompt, std::io::stdin())?);
+    }
+    match args.command.take() {
+        Some(arguments::Command::Identities) => return identities(),
+        Some(arguments::Command::Sessions { command }) => {
+            let dir = std::env::current_dir()?.join(sessions::DIR);
+            match command {
+                Some(arguments::SessionsCommand::Prune { keep }) => print!(
+                    "{}",
+                    sessions::prune_report(&sessions::prune(
+                        &dir,
+                        keep.unwrap_or(sessions::PRUNE_KEEP)
+                    ))
+                ),
+                None => print!("{}", sessions::report(&sessions::list(&dir))),
+            }
             return Ok(());
         }
-        print!("{}", sessions::report(&sessions::list(&dir)));
-        return Ok(());
-    }
-
-    // `bhai usage` prints the plan's windows and credits, as `/usage` does.
-    if args.first().is_some_and(|a| a == "usage") {
-        let body = limits::fetch_now().await?;
-        println!("{}", limits::report(&body, chrono::Local::now()));
-        return Ok(());
-    }
-
-    // `bhai mcp approve <name>` records a `.mcp.json` server as it is defined now, which
-    // is how a server that changed since its approval is accepted again. `bhai mcp login
-    // <name>` signs in to a hosted server over OAuth, and `logout` forgets the login.
-    if args.first().is_some_and(|a| a == "mcp") {
-        let (verb, name) = match (args.get(1).map(String::as_str), args.get(2)) {
-            (Some(verb @ ("approve" | "login" | "logout")), Some(name)) => (verb, name),
-            _ => bail!("usage: bhai mcp approve|login|logout <server>"),
-        };
-        let cwd = std::env::current_dir()?;
-        let roots = instructions::Roots::from_env(cwd);
-        let config = Config::load(roots.home.as_deref(), &roots.cwd)?;
-        if verb != "approve" {
-            return mcp_login(&roots, &config, verb == "login", name).await;
+        Some(arguments::Command::Usage) => {
+            let body = limits::fetch_now().await?;
+            println!("{}", limits::report(&body, chrono::Local::now()));
+            return Ok(());
         }
-        let server = mcp::servers::approve(&roots, &config.mcp_servers, name)?;
-        let what = match &server.url {
-            Some(url) => url.clone(),
-            None => format!("{} {}", server.command, server.args.join(" "))
-                .trim()
-                .to_string(),
-        };
-        println!("approved {name} as `{what}` from {}", server.source);
-        println!("it starts with the next bhai in this project");
-        return Ok(());
+        Some(arguments::Command::Mcp { command }) => {
+            let cwd = std::env::current_dir()?;
+            let roots = instructions::Roots::from_env(cwd);
+            let config = Config::load(roots.home.as_deref(), &roots.cwd)?;
+            let name = match command {
+                arguments::McpCommand::Login { server } => {
+                    return mcp_login(&roots, &config, true, &server).await;
+                }
+                arguments::McpCommand::Logout { server } => {
+                    return mcp_login(&roots, &config, false, &server).await;
+                }
+                arguments::McpCommand::Approve { server } => server,
+            };
+            let server = mcp::servers::approve(&roots, &config.mcp_servers, &name)?;
+            let what = match &server.url {
+                Some(url) => url.clone(),
+                None => format!("{} {}", server.command, server.args.join(" "))
+                    .trim()
+                    .to_string(),
+            };
+            println!("approved {name} as `{what}` from {}", server.source);
+            println!("it starts with the next bhai in this project");
+            return Ok(());
+        }
+        Some(arguments::Command::Exec { .. }) | None => {}
     }
 
     // `bhai --probe [prompt]` does one non-interactive model call, for checking that
     // auth and the wire format still work without entering the TUI.
-    if args.first().is_some_and(|a| a == "--probe") {
+    if let Some(prompt) = args.probe.take() {
         let setup = load(Flags::default(), identity::DEFAULT).await?;
         let hub = setup.prompt.mcp.clone();
-        let result = probe(setup, args.get(1).cloned()).await;
+        let result = probe(setup, prompt).await;
         shutdown(hub).await;
         return result;
     }
     // `bhai --cache-check [minutes]` sends a few calls on one prefix and checks the cache
     // served it; with minutes, one more call after that long checks it lasted.
-    if args.first().is_some_and(|a| a == "--cache-check") {
-        let wait = match args.get(1) {
-            Some(m) => Some(
-                m.trim_end_matches('m')
-                    .parse::<u64>()
-                    .map(|m| Duration::from_secs(m * 60))
-                    .with_context(|| format!("--cache-check takes minutes, not {m}"))?,
-            ),
-            None => None,
-        };
+    if let Some(wait) = args.cache_check.take() {
         let setup = load(Flags::default(), identity::DEFAULT).await?;
         let hub = setup.prompt.mcp.clone();
         let result = cache_check(setup, wait).await;
@@ -149,25 +150,22 @@ pub async fn entry() -> Result<()> {
         return Ok(());
     }
     // `bhai --judge-eval [file]` scores the judge against a file of cases.
-    if args.first().is_some_and(|a| a == "--judge-eval") {
+    if let Some(file) = args.judge_eval.take() {
         let setup = load(Flags::default(), identity::DEFAULT).await?;
         let hub = setup.prompt.mcp.clone();
-        let result = judge_eval(setup, args.get(1).cloned()).await;
+        let result = judge_eval(setup, file).await;
         shutdown(hub).await;
         if !result? {
             std::process::exit(1);
         }
         return Ok(());
     }
-    let args = match parse_args(&args).and_then(with_env_mode) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            eprintln!(
-                "bhai: {e:#}\nusage: bhai [identities] [usage] [sessions [prune [n]]] [mcp approve|login|logout <server>] [--probe [prompt]] [--cache-check [minutes]] [--judge-eval [file]] [--as <identity>] [--resume [id] | --pick] [--workflow <name> [input] [--workflow-yes]] [exec <prompt|-> [--json]] [--model <name>] [--effort <level>] [--serve [port] [--headless]] [--profile] [--strict-cache] [--mode ask|auto|bypass] [--trust] [--no-global] [--no-project] [--bare]"
-            );
-            std::process::exit(2);
-        }
-    };
+    let args = with_env_mode(args).unwrap_or_else(|error| {
+        use clap::CommandFactory;
+        arguments::Cli::command()
+            .error(clap::error::ErrorKind::InvalidValue, error.to_string())
+            .exit()
+    });
     let _trace = trace::init(
         args.profile
             .then(|| profile::debug_dir().join("trace.jsonl"))
@@ -676,6 +674,11 @@ async fn shutdown(hub: Option<Arc<mcp::Hub>>) {
 /// Command-line flags, apart from `--probe` and `--cache-check`.
 #[derive(Debug, Default, PartialEq)]
 struct Args {
+    command: Option<arguments::Command>,
+    cd: Option<PathBuf>,
+    probe: Option<Option<String>>,
+    cache_check: Option<Option<Duration>>,
+    judge_eval: Option<Option<String>>,
     /// Port for the debug server, when `--serve` is given.
     serve: Option<u16>,
     headless: bool,
@@ -891,97 +894,12 @@ fn identities() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_args(args: &[String]) -> Result<Args> {
-    let mut parsed = Args::default();
-    let mut args = args.iter().peekable();
-    if args.next_if(|a| *a == "exec").is_some() {
-        let prompt = args
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("exec needs a prompt, or - to read it from stdin"))?;
-        parsed.exec = Some(prompt.clone());
-    }
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--json" => parsed.json = true,
-            "--serve" => {
-                let port = args.next_if(|a| !a.starts_with("--"));
-                parsed.serve = Some(match port {
-                    Some(port) => port
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("bad port `{port}`"))?,
-                    None => server::DEFAULT_PORT,
-                });
-            }
-            "--headless" => parsed.headless = true,
-            "--profile" => parsed.profile = true,
-            "--strict-cache" => parsed.strict_cache = true,
-            "--trust" => parsed.trust = true,
-            "--mode" => {
-                let mode = args
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--mode needs a value"))?;
-                parsed.flags.mode = Some(mode.parse().map_err(anyhow::Error::msg)?);
-            }
-            "--model" => {
-                let name = args
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--model needs a model name"))?;
-                parsed.model = Some(name.clone());
-            }
-            "--effort" => {
-                let level = args
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--effort needs a level"))?;
-                parsed.effort = Some(level.clone());
-            }
-            "--as" => {
-                let name = args
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--as needs an identity name"))?;
-                parsed.identity = Some(name.clone());
-            }
-            "--resume" => {
-                parsed.resume = Some(args.next_if(|a| !a.starts_with("--")).cloned());
-            }
-            "--pick" => parsed.pick = true,
-            "--workflow" => {
-                let name = args
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--workflow needs a workflow name"))?;
-                let input = args.next_if(|a| !a.starts_with("--")).cloned();
-                parsed.workflow = Some((name.clone(), input.unwrap_or_default()));
-            }
-            "--workflow-yes" => parsed.workflow_yes = true,
-            "--no-global" => parsed.flags.no_global = true,
-            "--no-project" => parsed.flags.no_project = true,
-            "--bare" => parsed.flags.bare = true,
-            other => bail!("unknown argument `{other}`"),
-        }
-    }
-    if parsed.headless && parsed.serve.is_none() {
-        bail!("--headless needs --serve");
-    }
-    if parsed.workflow.is_some() && (parsed.serve.is_some() || parsed.headless) {
-        bail!("--workflow runs on its own, so it takes no --serve or --headless");
-    }
-    if parsed.exec.is_some()
-        && (parsed.serve.is_some() || parsed.headless || parsed.workflow.is_some())
-    {
-        bail!("exec runs on its own, so it takes no --serve, --headless or --workflow");
-    }
-    if parsed.json && parsed.exec.is_none() {
-        bail!("--json is for exec");
-    }
-    if parsed.pick && parsed.resume.is_some() {
-        bail!("--pick chooses the session --resume would name, so not both");
-    }
-    if parsed.pick && (parsed.headless || parsed.workflow.is_some() || parsed.exec.is_some()) {
-        bail!("--pick needs the terminal, so it takes no --headless, --workflow or exec");
-    }
-    if (parsed.resume.is_some() || parsed.pick) && parsed.identity.is_some() {
-        bail!("--resume keeps the session's identity, so it takes no --as");
-    }
-    Ok(parsed)
+    Ok(arguments::Cli::try_parse_from(
+        std::iter::once("bhai").chain(args.iter().map(String::as_str)),
+    )?
+    .into_args()?)
 }
 
 /// `BHAI_MODE` where `--mode` was not given. It is read like the flag, but `bypass` is
@@ -1223,14 +1141,22 @@ impl ExecRun {
     }
 }
 
+/// Read and validate unattended input before loading configuration or calling a model.
+fn exec_prompt(prompt: String, input: impl std::io::Read) -> Result<String> {
+    let prompt = match prompt.as_str() {
+        "-" => std::io::read_to_string(input).context("could not read stdin")?,
+        _ => prompt,
+    };
+    if prompt.trim().is_empty() {
+        bail!("the prompt must not be empty");
+    }
+    Ok(prompt)
+}
+
 /// Run one prompt to the end of its turn without the TUI. Returns `false` when the turn
 /// failed or was interrupted, which is the exit status. The policy is unattended, so an
 /// approval is not expected; one that arrives anyway is rejected.
 async fn headless_exec(session: &Arc<Session>, prompt: String, json: bool) -> Result<bool> {
-    let prompt = match prompt.as_str() {
-        "-" => std::io::read_to_string(std::io::stdin()).context("could not read stdin")?,
-        _ => prompt,
-    };
     let mut events = session.subscribe();
     session.submit(prompt).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut run = ExecRun::default();
@@ -2028,6 +1954,28 @@ mod tests {
 
     fn parsed(args: &[&str]) -> Result<Args> {
         parse_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn unattended_input_is_validated_before_starting_the_session() {
+        assert_eq!(
+            exec_prompt("-".to_string(), "review\n".as_bytes()).unwrap(),
+            "review\n"
+        );
+        assert_eq!(
+            exec_prompt("review".to_string(), "ignored".as_bytes()).unwrap(),
+            "review"
+        );
+        assert!(exec_prompt("-".to_string(), " \n".as_bytes()).is_err());
+        assert!(exec_prompt("".to_string(), "unused".as_bytes()).is_err());
+        let unreadable = std::io::Error::other("cannot read");
+        struct Unreadable(std::io::Error);
+        impl std::io::Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(self.0.kind(), self.0.to_string()))
+            }
+        }
+        assert!(exec_prompt("-".to_string(), Unreadable(unreadable)).is_err());
     }
 
     #[test]
