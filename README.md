@@ -41,6 +41,18 @@ explicit deny and ask rules, protected credential paths and session authorizatio
 
 auto mode is not an operating-system sandbox. trusted project code and approved commands can have effects the permission checker cannot fully inspect.
 
+older sessions may have human and generated messages stored under the same role. `/permissions recover` previews their exact text without granting authority. while idle, use `/permissions recover confirm 1 3` to select only genuine human originals, or `/permissions recover confirm none` to decline. prompt text, files and model messages cannot confirm recovery. non-text legacy messages need fresh authorization instead of partial recovery. selected originals keep their old time anchors and replay before later human messages, including restrictions that previously produced no notes. recovery status survives resume, compaction and forks. an incomplete or overfull journal cannot restore old grants; decline and explicitly reauthorize the required scope instead.
+
+## temporary AWS instances
+
+`aws_instance` supports existing stopped EC2 instances in the standard AWS partition. `arm` requires one-time user approval of the account, profile, region, instance, existing Scheduler execution role and UTC stop deadline (5 minutes to 24 hours). switch to ask mode to approve arming, then return to auto for scoped work and cleanup. it creates an independent EventBridge Scheduler `ec2:stopInstances` target and verifies its cloud configuration before issuing a project-local capability. no instance starts during arming.
+
+`start` rechecks the caller account, exact resource, enabled schedule and remaining deadline, and checks task relevance. `use` validates running state and deadline; it does not execute remote commands. `stop` remains available after expiry or work-access revocation. it reports stopped only when the instance description says stopped. ordinary scoped cleanup needs no fresh judge verdict when there are no unresolved user messages or active restrictions. later restrictions and explicit permission rules still apply; failed authorization updates do not become permission.
+
+the execution role must trust `scheduler.amazonaws.com` and permit `ec2:StopInstances` on the instance. schedule readback does not prove those permissions, and delivery is not a hard real-time guarantee. the tool never cancels the cloud deadline, including on failure or revoke. capabilities are project-local leases, not authenticated goal lineage, and no automatic goal-end cleanup hook is installed. request early stopping when work completes; the deadline is the independent fallback.
+
+there is no launch, termination, IAM creation or storage deletion action. detectable raw `aws ec2 start-instances` and `run-instances` require the user in auto mode; arbitrary scripts and aliases are not sandboxed. ask and bypass modes retain their explicit approval semantics.
+
 ## monitors
 
 for long-running work, the agent can proactively register a monitor. you approve its sampler command, working directory, timing and optional wake hooks once. the sampler runs every couple of seconds without model calls and prints one JSON snapshot, then exits:
