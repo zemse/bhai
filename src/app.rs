@@ -2562,12 +2562,14 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     fn export_context(&mut self) {
         self.follow = true;
         let transcript = self.transcript();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let diagnostics = crate::sessions::debug_dir(&cwd, &self.session_id);
         let session = Arc::clone(&self.session);
         tokio::spawn(async move {
             let event = match session.context().await {
                 Some(mut profile) => {
                     profile.transcript = Some(transcript);
-                    match profile::export(&profile, &profile::debug_dir()) {
+                    match profile::export(&profile, &diagnostics) {
                         Ok(path) => Event::Info(profile.summary(&path)),
                         Err(e) => Event::Error(format!("context export failed: {e:#}")),
                     }
@@ -2579,7 +2581,7 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     }
 
     /// Everything about this session in one file, for `/export-debug`. It goes in the
-    /// working directory rather than under `.bhai/debug`, since the point of it is to be
+    /// working directory rather than under the session directory, since it is to be
     /// handed to someone: a path the user can see beats one they have to be told about.
     /// The profile is the one part that has to be asked for, so the rest is gathered
     /// here and the write waits on it.
@@ -2636,7 +2638,9 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             skills: skills_report(&self.skills),
             mcp: crate::mcp::report(self.mcp.as_deref()),
             workflows: workflow::report(&self.workflows),
-            judged: debug::judge_log(&profile::debug_dir().join("judge.jsonl")),
+            judged: debug::judge_log(
+                &crate::sessions::debug_dir(&cwd, &self.session_id).join("judge.jsonl"),
+            ),
             children: self.session.child_logs(),
             sidechains: (!self.session_id.is_empty())
                 .then(|| cwd.join(crate::sessions::DIR).join(&self.session_id)),

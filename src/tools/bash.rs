@@ -172,7 +172,8 @@ fn tool_schema() -> Value {
     with session ID N` and holds the output so far, and `write_stdin` polls it for more or, \
     for a `tty` session, types into it. Use that for dev servers, watchers, long builds and \
     REPLs. A job sent to the background with `&` must redirect its output to a file, since \
-    it inherits this command's own.{}{}{}",
+    it inherits this command's own. Temporary files belong in $BHAI_SCRATCH_DIR, also set \
+    as TMPDIR; $BHAI_SESSION_DIR holds this session's state.{}{}{}",
         crate::sandbox::active().map_or("", Sandbox::describe),
         crate::egress::active().map_or("", crate::egress::Proxy::describe),
         match crate::askpass::active() {
@@ -296,7 +297,13 @@ async fn run_in(
     live: Live<'_>,
 ) -> String {
     let started = Instant::now();
-    let mut proc = match Proc::spawn(command, workdir, sandbox, false) {
+    let mut proc = match Proc::spawn(
+        command,
+        workdir,
+        sandbox,
+        false,
+        live.conversation.map(|c| c.id),
+    ) {
         Err(e) => return e,
         Ok(proc) => proc,
     };
@@ -332,7 +339,13 @@ async fn start(
     live: Live<'_>,
 ) -> String {
     let started = Instant::now();
-    let mut proc = match Proc::spawn(command, workdir, crate::sandbox::active(), tty) {
+    let mut proc = match Proc::spawn(
+        command,
+        workdir,
+        crate::sandbox::active(),
+        tty,
+        live.conversation.map(|c| c.id),
+    ) {
         Err(e) => return e,
         Ok(proc) => proc,
     };
@@ -522,6 +535,7 @@ impl Proc {
         workdir: Option<&str>,
         sandbox: Option<&Sandbox>,
         tty: bool,
+        session: Option<&str>,
     ) -> Result<Self, String> {
         // On Linux it holds the Landlock ruleset the child applies, until the spawn.
         let shell = sandbox
@@ -529,7 +543,7 @@ impl Proc {
             .transpose()
             .map_err(|e| format!("{UNSTARTED} in the sandbox: {e}"))?;
         let asking = crate::askpass::register(command);
-        Self::spawn_in(command, workdir, shell, asking, tty)
+        Self::spawn_in(command, workdir, shell, asking, tty, session)
             .map_err(|e| format!("{UNSTARTED}: {e}"))
     }
 
@@ -539,6 +553,7 @@ impl Proc {
         mut shell: Option<crate::sandbox::Shell>,
         asking: Option<crate::askpass::Call>,
         tty: bool,
+        session: Option<&str>,
     ) -> io::Result<Self> {
         let mut plain = Command::new("bash");
         let bash = match &mut shell {
@@ -547,6 +562,17 @@ impl Proc {
         };
         crate::childenv::scrub(bash);
         crate::childenv::non_interactive(bash);
+        if let Some(session) = session {
+            let cwd = std::env::current_dir()?;
+            let scratch = crate::sessions::scratch_dir(&cwd, session);
+            crate::sessions::private_dir(&scratch)?;
+            bash.env(
+                "BHAI_SESSION_DIR",
+                crate::sessions::state_dir(&cwd, session),
+            )
+            .env("BHAI_SCRATCH_DIR", &scratch)
+            .env("TMPDIR", &scratch);
+        }
         if let Some(proxy) = crate::egress::active() {
             proxy.apply(bash);
         }
@@ -1262,6 +1288,50 @@ mod tests {
             progress: &|_| {},
             cancel: &NOT_CANCELLED,
             conversation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_scratch_space_is_owned_by_its_session() {
+        let cwd = std::env::current_dir().unwrap();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        for id in [&first, &second] {
+            let conversation = super::super::Conversation {
+                id,
+                model: "test",
+                history: &[],
+            };
+            let live = Live {
+                conversation: Some(conversation),
+                ..quiet()
+            };
+            let command = "printf '%s\\n' \"$BHAI_SESSION_DIR\" \"$BHAI_SCRATCH_DIR\" \"$TMPDIR\"; printf '%s' \"$BHAI_SESSION_DIR\" > \"$TMPDIR/work\"";
+            let result = run_in(command, None, None, live).await;
+            assert_eq!(outcome(&result), Some(Outcome::Succeeded), "{result}");
+            let state = crate::sessions::state_dir(&cwd, id);
+            let scratch = crate::sessions::scratch_dir(&cwd, id);
+            assert!(
+                result.contains(&format!(
+                    "{}\n{}\n{}",
+                    state.display(),
+                    scratch.display(),
+                    scratch.display()
+                )),
+                "{result}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(scratch.join("work")).unwrap(),
+                state.display().to_string()
+            );
+        }
+        for id in [&first, &second] {
+            let state = crate::sessions::state_dir(&cwd, id);
+            assert_eq!(
+                std::fs::read_to_string(state.join("scratch/work")).unwrap(),
+                state.display().to_string()
+            );
+            std::fs::remove_dir_all(state).unwrap();
         }
     }
 
@@ -2000,7 +2070,7 @@ mod tests {
     #[tokio::test]
     async fn output_nobody_polls_for_is_not_queued_past_the_cap() {
         let command = "yes line | head -n 200000; echo finished";
-        let proc = Proc::spawn(command, None, None, false).unwrap();
+        let proc = Proc::spawn(command, None, None, false, None).unwrap();
         while proc.lock().open > 0 {
             tokio::time::sleep(TICK).await;
         }

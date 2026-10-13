@@ -55,7 +55,7 @@ pub(super) struct Cli {
     /// Disable instruction files and optional integrations.
     #[arg(long, global = true)]
     bare: bool,
-    /// Log model usage, headers and trace spans under .bhai/debug.
+    /// Log model usage, headers and trace spans under .bhai/sessions/<id>/debug.
     #[arg(long, global = true)]
     profile: bool,
     /// Refuse requests that break the prompt cache.

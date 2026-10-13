@@ -116,6 +116,7 @@ pub enum Status {
 
 pub struct Dictation {
     settings: Settings,
+    scratch: PathBuf,
     state: State,
 }
 
@@ -123,8 +124,14 @@ impl Dictation {
     pub fn new(settings: Settings) -> Self {
         Self {
             settings,
+            scratch: std::env::temp_dir(),
             state: State::Idle,
         }
+    }
+
+    pub fn with_scratch(mut self, scratch: PathBuf) -> Self {
+        self.scratch = scratch;
+        self
     }
 
     pub fn status(&self) -> Status {
@@ -149,7 +156,11 @@ impl Dictation {
     }
 
     fn start(&mut self) -> Result<(), String> {
-        let dir = std::env::temp_dir().join(format!("bhai-dictation-{}", uuid::Uuid::new_v4()));
+        let dir = self
+            .scratch
+            .join(format!("bhai-dictation-{}", uuid::Uuid::new_v4()));
+        crate::sessions::private_dir(&self.scratch)
+            .map_err(|e| format!("{}: {e}", self.scratch.display()))?;
         let wav = dir.join(WAV);
         let model = self.settings.model.as_deref();
         // The transcriber's placeholders are checked now, not after the user has spoken.
@@ -461,6 +472,29 @@ mod tests {
         );
         assert_eq!(dictation.status(), Status::Idle);
         assert!(!wav.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn recordings_use_the_sessions_scratch_directory() {
+        let root = crate::tools::temp_dir();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        for id in [&first, &second] {
+            let scratch = crate::sessions::scratch_dir(&root, id);
+            let mut dictation = Dictation::new(Settings {
+                record: sh(RECORD),
+                transcribe: sh("true"),
+                model: None,
+            })
+            .with_scratch(scratch.clone());
+            dictation.toggle().unwrap();
+            let wav = dictation.wait_for_audio(100);
+            assert!(wav.starts_with(&scratch));
+            assert!(dictation.cancel());
+            assert!(!wav.parent().unwrap().exists());
+            assert!(scratch.exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

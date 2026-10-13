@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-13
+
+- Each session owns its diagnostics and scratch space under `.bhai/sessions/<uuid>/`; resumes keep the same paths, debug exports exclude other sessions, and Bash uses session-local temporary files.
+
 ## 2026-10-10
 
 - Goal turns track tool activity independently of history indexes, so mid-turn compaction can shorten the conversation without panicking or losing progress.

@@ -117,6 +117,19 @@ and nothing to poll.\n",
         self
     }
 
+    /// The session's own working files, separate from project configuration.
+    pub fn with_session(mut self, cwd: &std::path::Path, session: &str) -> Self {
+        let _ = write!(
+            self.text,
+            "\n\n# Session\n\nSession: {session}\nState directory: {}\nScratch directory: {}\n\
+Use this scratch directory for temporary working files, not another session's directory. \
+Bash sets BHAI_SESSION_DIR, BHAI_SCRATCH_DIR and TMPDIR to these paths.",
+            crate::sessions::state_dir(cwd, session).display(),
+            crate::sessions::scratch_dir(cwd, session).display(),
+        );
+        self
+    }
+
     /// Append the memory notes; they go after the MCP server lines. Read once, when the
     /// session starts, so a note saved during it changes nothing here.
     pub fn with_memory(mut self, memory: Option<Memory>) -> Self {

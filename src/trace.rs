@@ -1,6 +1,6 @@
 //! Spans at the loop's boundaries (a turn, a model call, a tool call, a child), so a
 //! session can say where its time went. `--profile` writes each closed span as a line of
-//! `.bhai/debug/trace.jsonl`; a build with the `otel` feature also exports them over
+//! `.bhai/sessions/<id>/debug/trace.jsonl`; a build with the `otel` feature exports over
 //! OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 //!
 //! A span carries names, ids, counts and timings, never a prompt, a tool's arguments or

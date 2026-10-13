@@ -65,17 +65,17 @@ pub struct Bundle {
     pub profile: Option<Profile>,
 }
 
-/// Write the bundle as `bhai-debug-<timestamp>.md` in `dir`, and return its path.
+/// Write the bundle as `bhai-debug-<timestamp>-<session>.md` in `dir`.
 pub fn export(bundle: &Bundle, dir: &Path) -> Result<PathBuf> {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let path = dir.join(format!("bhai-debug-{stamp}.md"));
+    let path = dir.join(format!("bhai-debug-{stamp}-{}.md", bundle.session_id));
     let checkpoint = bundle
         .session_file
         .as_ref()
         .map(|file| file.with_extension("").join("authorization.json"));
     let diagnostics = authorization_diagnostics(
         checkpoint.as_deref(),
-        &crate::profile::debug_dir().join("authorization.jsonl"),
+        &crate::sessions::debug_dir(&bundle.cwd, &bundle.session_id).join("authorization.jsonl"),
     );
     crate::sessions::private_write(&path, &bundle.markdown(&diagnostics))
         .with_context(|| format!("could not write {}", path.display()))?;
@@ -352,7 +352,7 @@ fn authorization_diagnostics(checkpoint: Option<&Path>, log: &Path) -> String {
     }
     let _ = writeln!(
         out,
-        "\nAuthorization stage log: {}\nShared debug log, not filtered to this session; last {JUDGE_LINES} nonempty records, oldest first. Requests and replies are included in full.",
+        "\nAuthorization stage log: {}\nSession debug log; last {JUDGE_LINES} nonempty records, oldest first. Requests and replies are included in full.",
         log.display()
     );
     match std::fs::read_to_string(log) {
@@ -480,6 +480,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exports_only_read_their_sessions_diagnostics() {
+        let root = crate::tools::temp_dir();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        let shared = root.join(".bhai/debug");
+        crate::sessions::private_dir(&shared).unwrap();
+        std::fs::write(shared.join("authorization.jsonl"), "legacy-shared-record").unwrap();
+        let mut paths = Vec::new();
+        for id in [&first, &second] {
+            let diagnostics = crate::sessions::debug_dir(&root, id);
+            crate::sessions::private_dir(&diagnostics).unwrap();
+            std::fs::write(
+                diagnostics.join("judge.jsonl"),
+                serde_json::json!({"verdict":"deny", "reason":id, "summary":id}).to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                diagnostics.join("authorization.jsonl"),
+                serde_json::json!({"stage":"judge-authorization-extract", "request":id})
+                    .to_string(),
+            )
+            .unwrap();
+            let mut b = bundle(Vec::new());
+            b.cwd = root.clone();
+            b.session_id = id.clone();
+            b.session_file = Some(root.join(crate::sessions::DIR).join(format!("{id}.jsonl")));
+            b.judged = judge_log(&diagnostics.join("judge.jsonl"));
+            let path = export(&b, &root).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let other = if id == &first { &second } else { &first };
+            assert!(text.contains(id));
+            assert!(text.contains("judge-authorization-extract"));
+            assert!(!text.contains(other));
+            assert!(!text.contains("legacy-shared-record"));
+            paths.push(path);
+        }
+        assert_ne!(paths[0], paths[1]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// The one identifying thing the export would add by itself is the path it writes
     /// down, so the home directory goes everywhere it appears, transcript included.
     #[test]
@@ -571,7 +612,7 @@ mod tests {
             "commit them",
             "Candidates omit the request",
             "~/repo",
-            "Shared debug log, not filtered to this session",
+            "Session debug log",
         ] {
             assert!(out.contains(text), "{text} missing from {out}");
         }

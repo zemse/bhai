@@ -669,14 +669,6 @@ minus cached is new input and output includes thinking.\n\n",
     out
 }
 
-/// Where debug output goes: `.bhai/debug` under the working directory.
-pub fn debug_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_default()
-        .join(".bhai")
-        .join("debug")
-}
-
 /// Write `context-<timestamp>.json` and `.md` into `dir`; returns the JSON path.
 pub fn export(profile: &Profile, dir: &Path) -> Result<PathBuf> {
     crate::sessions::private_dir(dir)

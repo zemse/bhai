@@ -847,7 +847,10 @@ async fn profile_traces_the_turn_to_a_file_without_the_prompt() {
     assert_eq!(status, StatusCode::OK, "{answer}");
     events.until("turn_end").await;
 
-    let path = bhai.project().join(".bhai/debug/trace.jsonl");
+    let saved = bhai::sessions::list(&bhai.project().join(bhai::sessions::DIR));
+    assert_eq!(saved.len(), 1);
+    let path = bhai::sessions::debug_dir(&bhai.project(), &saved[0].id).join("trace.jsonl");
+    assert!(!bhai.project().join(".bhai/debug").exists());
     let file = std::fs::read_to_string(&path).unwrap();
     let spans: Vec<Value> = file
         .lines()
@@ -868,6 +871,94 @@ async fn profile_traces_the_turn_to_a_file_without_the_prompt() {
     );
     for said in ["say ok", "ok from the fake", ACCESS_TOKEN] {
         assert!(!file.contains(said), "{said} in {file}");
+    }
+}
+
+#[tokio::test]
+async fn sessions_in_one_project_own_their_diagnostics_and_resume_their_scratch() {
+    let fake = Arc::new(Fake::default());
+    fake.replies
+        .lock()
+        .unwrap()
+        .extend([says("first"), says("second"), says("resumed")]);
+    let backend = serve_fake(fake.clone()).await;
+    let mut first = Bhai::start_in(&backend, &["--profile"], &[], None).await;
+    let project = first.project();
+    let second = Bhai::start_in(
+        &backend,
+        &["--profile", "-C", project.to_str().unwrap()],
+        &[],
+        None,
+    )
+    .await;
+    for bhai in [&first, &second] {
+        let mut events = bhai.events().await;
+        let (status, answer) = bhai.post("/prompt", json!({"text":"say ok"})).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        events.until("turn_end").await;
+    }
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 2);
+    let ids: Vec<_> = sent
+        .iter()
+        .map(|request| request.body["prompt_cache_key"].as_str().unwrap())
+        .collect();
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(
+        bhai::sessions::list(&project.join(bhai::sessions::DIR)).len(),
+        2
+    );
+    for (index, id) in ids.iter().enumerate() {
+        uuid::Uuid::parse_str(id).unwrap();
+        let diagnostics = bhai::sessions::debug_dir(&project, id);
+        let trace = std::fs::read_to_string(diagnostics.join("trace.jsonl")).unwrap();
+        assert!(trace.contains(id), "{trace}");
+        assert!(!trace.contains(ids[1 - index]), "{trace}");
+        assert!(diagnostics.join("usage.jsonl").exists());
+        let scratch = bhai::sessions::scratch_dir(&project, id);
+        assert!(scratch.is_dir());
+        std::fs::write(scratch.join("work"), id).unwrap();
+        assert!(
+            sent[index].body["instructions"]
+                .as_str()
+                .unwrap()
+                .contains(scratch.to_str().unwrap())
+        );
+    }
+    assert!(!project.join(".bhai/debug").exists());
+    first.child.kill().await.unwrap();
+    let resumed = Bhai::start_in(
+        &backend,
+        &[
+            "--profile",
+            "-C",
+            project.to_str().unwrap(),
+            "--resume",
+            ids[0],
+        ],
+        &[],
+        None,
+    )
+    .await;
+    let mut events = resumed.events().await;
+    let (status, answer) = resumed
+        .post("/prompt", json!({"text":"say ok again"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    events.until("turn_end").await;
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[2].body["prompt_cache_key"], ids[0]);
+    assert_eq!(
+        bhai::sessions::list(&project.join(bhai::sessions::DIR)).len(),
+        2
+    );
+    for id in &ids {
+        assert_eq!(
+            std::fs::read_to_string(bhai::sessions::scratch_dir(&project, id).join("work"))
+                .unwrap(),
+            *id
+        );
     }
 }
 

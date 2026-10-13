@@ -14,6 +14,21 @@ use sha2::{Digest, Sha256};
 /// Where sessions live, under the project root.
 pub const DIR: &str = ".bhai/sessions";
 
+/// State and scratch files owned by one saved session.
+pub fn state_dir(cwd: &Path, session: &str) -> PathBuf {
+    cwd.join(DIR).join(session)
+}
+
+/// Diagnostics owned by one session, including its children.
+pub fn debug_dir(cwd: &Path, session: &str) -> PathBuf {
+    state_dir(cwd, session).join("debug")
+}
+
+/// Temporary working files owned by one session.
+pub fn scratch_dir(cwd: &Path, session: &str) -> PathBuf {
+    state_dir(cwd, session).join("scratch")
+}
+
 /// Create `dir` and everything above it, reachable only by the user on unix. What bhai
 /// writes is what a session read, wrote and was told; the default umask would leave it
 /// readable by everyone with an account on the machine.
@@ -990,6 +1005,41 @@ mod tests {
             writer.append(item).unwrap();
         }
         path(dir, id)
+    }
+
+    #[test]
+    fn session_storage_is_disjoint_and_resume_keeps_its_paths() {
+        let root = temp_dir();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        assert_ne!(first, second);
+        for id in [&first, &second] {
+            private_dir(&scratch_dir(&root, id)).unwrap();
+            private_dir(&debug_dir(&root, id)).unwrap();
+            private_write(&scratch_dir(&root, id).join("work"), id).unwrap();
+            private_write(&debug_dir(&root, id).join("judge.jsonl"), id).unwrap();
+            write(&root.join(DIR), id, &items());
+        }
+        let loaded = load(&path(&root.join(DIR), &first)).unwrap();
+        let writer = Writer::resume(&root.join(DIR), &loaded).unwrap();
+        assert_eq!(writer.header.session, first);
+        assert_eq!(
+            writer.authorization_path(),
+            state_dir(&root, &first).join("authorization.json")
+        );
+        for id in [&first, &second] {
+            assert_eq!(
+                std::fs::read_to_string(scratch_dir(&root, id).join("work")).unwrap(),
+                *id
+            );
+            assert_eq!(
+                std::fs::read_to_string(debug_dir(&root, id).join("judge.jsonl")).unwrap(),
+                *id
+            );
+        }
+        assert_ne!(state_dir(&root, &first), state_dir(&root, &second));
+        assert!(!root.join(".bhai/debug").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

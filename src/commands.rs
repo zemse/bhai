@@ -56,7 +56,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "context",
         args: "",
-        help: "write the context to .bhai/debug",
+        help: "write the context to this session's debug directory",
     },
     Command {
         name: "export-debug",

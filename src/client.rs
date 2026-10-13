@@ -420,7 +420,7 @@ impl Client {
         Ok(Self {
             http,
             cache_key: session_id.clone(),
-            guard: guard(&session_id, false),
+            guard: guard(&session_id, &session_id, false),
             session_id,
             model,
             effort,
@@ -465,7 +465,7 @@ impl Client {
 
     /// `--strict-cache`: refuse to send a request that breaks the prompt cache.
     pub fn strict_cache(mut self, strict: bool) -> Self {
-        self.guard = guard(&self.session_id, strict);
+        self.guard = guard(&self.session_id, &self.session_id, strict);
         self
     }
 
@@ -566,7 +566,7 @@ impl Client {
     pub fn with_session(mut self, id: &str) -> Self {
         self.session_id = id.to_string();
         self.cache_key = self.session_id.clone();
-        self.guard = guard(&self.session_id, false);
+        self.guard = guard(&self.session_id, &self.session_id, false);
         self
     }
 
@@ -629,7 +629,11 @@ impl Client {
             .unwrap_or_else(|e| e.into_inner())
             .strict();
         let id = uuid::Uuid::new_v4().simple().to_string();
-        child.guard = guard(&format!("{}/{}", child.cache_key, &id[..6]), strict);
+        child.guard = guard(
+            &format!("{}/{}", child.cache_key, &id[..6]),
+            &self.session_id,
+            strict,
+        );
         child.turn_state = Arc::default();
         if let Some(ws) = &mut child.ws {
             ws.socket = Arc::default();
@@ -1423,9 +1427,10 @@ pub(crate) fn take_line(buf: &mut Vec<u8>) -> Option<String> {
     Some(line)
 }
 
-/// A fresh guard for `conversation`, logging to `.bhai/debug/cache.jsonl`.
-fn guard(conversation: &str, strict: bool) -> Arc<Mutex<CacheGuard>> {
-    let log = crate::profile::debug_dir().join("cache.jsonl");
+/// A fresh guard for `conversation`, logging under its owning session.
+fn guard(conversation: &str, session: &str, strict: bool) -> Arc<Mutex<CacheGuard>> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let log = crate::sessions::debug_dir(&cwd, session).join("cache.jsonl");
     Arc::new(Mutex::new(CacheGuard::new(conversation, Some(log), strict)))
 }
 
@@ -1785,6 +1790,35 @@ mod tests {
             (forked.session_id(), forked.cache_key.as_str()),
             ("fork", "parent")
         );
+    }
+
+    #[test]
+    fn cache_diagnostics_follow_session_identity_not_the_cache_key() {
+        let cwd = std::env::current_dir().unwrap();
+        let first = Client::new(&Choice::default()).unwrap();
+        let second = Client::new(&Choice::default())
+            .unwrap()
+            .with_cache_key(Some(first.session_id()));
+        uuid::Uuid::parse_str(first.session_id()).unwrap();
+        uuid::Uuid::parse_str(second.session_id()).unwrap();
+        assert_ne!(first.session_id(), second.session_id());
+        let child = second.for_child(&crate::identity::Identity::default());
+        for client in [&first, &second, &child] {
+            let mut guard = client.guard.lock().unwrap();
+            guard
+                .check(&request_body("m", "e", "k", "original", &[], &[]))
+                .unwrap();
+            guard
+                .check(&request_body("m", "e", "k", "changed", &[], &[]))
+                .unwrap();
+        }
+        for (client, other) in [(&first, &second), (&second, &first)] {
+            let root = crate::sessions::state_dir(&cwd, client.session_id());
+            let log = std::fs::read_to_string(root.join("debug/cache.jsonl")).unwrap();
+            assert!(log.contains(client.session_id()), "{log}");
+            assert!(!log.contains(other.session_id()), "{log}");
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

@@ -142,7 +142,7 @@ pub async fn entry() -> Result<()> {
     // `bhai --probe [prompt]` does one non-interactive model call, for checking that
     // auth and the wire format still work without entering the TUI.
     if let Some(prompt) = args.probe.take() {
-        let setup = load(Flags::default(), identity::DEFAULT).await?;
+        let setup = load(Flags::default(), identity::DEFAULT, None).await?;
         let hub = setup.prompt.mcp.clone();
         let result = probe(setup, prompt).await;
         shutdown(hub).await;
@@ -151,7 +151,7 @@ pub async fn entry() -> Result<()> {
     // `bhai --cache-check [minutes]` sends a few calls on one prefix and checks the cache
     // served it; with minutes, one more call after that long checks it lasted.
     if let Some(wait) = args.cache_check.take() {
-        let setup = load(Flags::default(), identity::DEFAULT).await?;
+        let setup = load(Flags::default(), identity::DEFAULT, None).await?;
         let hub = setup.prompt.mcp.clone();
         let result = cache_check(setup, wait).await;
         shutdown(hub).await;
@@ -162,7 +162,7 @@ pub async fn entry() -> Result<()> {
     }
     // `bhai --judge-eval [file]` scores the judge against a file of cases.
     if let Some(file) = args.judge_eval.take() {
-        let setup = load(Flags::default(), identity::DEFAULT).await?;
+        let setup = load(Flags::default(), identity::DEFAULT, None).await?;
         let hub = setup.prompt.mcp.clone();
         let result = judge_eval(setup, file).await;
         shutdown(hub).await;
@@ -177,11 +177,6 @@ pub async fn entry() -> Result<()> {
             .error(clap::error::ErrorKind::InvalidValue, error.to_string())
             .exit()
     });
-    let _trace = trace::init(
-        args.profile
-            .then(|| profile::debug_dir().join("trace.jsonl"))
-            .as_deref(),
-    )?;
     let cwd = std::env::current_dir()?;
     let dir = cwd.join(sessions::DIR);
     let resume = match args.pick {
@@ -195,6 +190,17 @@ pub async fn entry() -> Result<()> {
         Some(id) => Some(sessions::find(&dir, id.as_deref())?),
         None => None,
     };
+    let session_id = resumed.as_ref().map_or_else(
+        || uuid::Uuid::new_v4().to_string(),
+        |loaded| loaded.header.session.clone(),
+    );
+    let diagnostics = sessions::debug_dir(&cwd, &session_id);
+    sessions::private_dir(&sessions::scratch_dir(&cwd, &session_id))?;
+    let _trace = trace::init(
+        args.profile
+            .then(|| diagnostics.join("trace.jsonl"))
+            .as_deref(),
+    )?;
     startup::mark("resume");
     let mut warnings = Vec::new();
     let name = match &resumed {
@@ -205,6 +211,7 @@ pub async fn entry() -> Result<()> {
             .unwrap_or_else(|| identity::DEFAULT.to_string()),
     };
     let Setup {
+        session: _,
         prompt,
         policy,
         delegation,
@@ -214,7 +221,7 @@ pub async fn entry() -> Result<()> {
         choice,
         statusline,
         sudo,
-    } = load(args.flags, &name).await?;
+    } = load(args.flags, &name, Some(&session_id)).await?;
     // `--workflow` and `exec` answer every approval but the workflow's own with no, so a
     // call the rules leave at `Ask` is refused for good. The agent is told that rather
     // than told to ask someone who is not there.
@@ -224,7 +231,7 @@ pub async fn entry() -> Result<()> {
     };
     let hub = prompt.mcp.clone();
     let identity = prompt.identity.clone();
-    let client = client::Client::new(&choice)?;
+    let client = client::Client::new(&choice)?.with_session(&session_id);
     let defaults = (client.model().to_string(), client.effort().to_string());
     let mut client = client.with_overrides(identity.model.clone(), identity.effort.clone());
     // A resumed session goes back on the model it was last on: that is what its cached
@@ -253,10 +260,7 @@ pub async fn entry() -> Result<()> {
     let client = client
         .strict_cache(args.strict_cache)
         .with_window(limits.window)
-        .log_headers(
-            args.profile
-                .then(|| profile::debug_dir().join("headers.jsonl")),
-        );
+        .log_headers(args.profile.then(|| diagnostics.join("headers.jsonl")));
     startup::mark("client");
     // Fail before taking over the terminal if the backend cannot serve the model.
     if let Err(e) = client.preflight().await {
@@ -393,9 +397,7 @@ allow it.",
         },
         None => None,
     };
-    let usage_log = args
-        .profile
-        .then(|| profile::debug_dir().join("usage.jsonl"));
+    let usage_log = args.profile.then(|| diagnostics.join("usage.jsonl"));
     let history = saved.history.clone();
     let session_id = saved.writer.header.session.clone();
     let ollama_url = client.ollama_url().to_string();
@@ -693,8 +695,7 @@ struct Args {
     /// Port for the debug server, when `--serve` is given.
     serve: Option<u16>,
     headless: bool,
-    /// Log every model call's usage to `.bhai/debug/usage.jsonl`, and its spans to
-    /// `trace.jsonl` beside it.
+    /// Log model usage and trace spans in this session's debug directory.
     profile: bool,
     /// Refuse to send a request that breaks the prompt cache.
     strict_cache: bool,
@@ -724,6 +725,7 @@ struct Args {
 /// Everything a session is built from once the config, the identity and the project's
 /// instructions have been read.
 struct Setup {
+    session: String,
     prompt: SystemPrompt,
     policy: Policy,
     delegation: Delegation,
@@ -742,9 +744,12 @@ struct Setup {
 /// Config and instruction files for the working directory, as the system prompt for
 /// the identity called `name`, the permission policy, and what child agents need.
 /// Starts the MCP servers.
-async fn load(flags: Flags, name: &str) -> Result<Setup> {
+async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> {
+    let fresh = uuid::Uuid::new_v4().to_string();
+    let session = session.unwrap_or(&fresh);
     let cwd = std::env::current_dir()?;
     let roots = instructions::Roots::from_env(cwd);
+    sessions::private_dir(&sessions::scratch_dir(&roots.cwd, session))?;
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
     childenv::set_pass(&config.pass_env);
     #[cfg(feature = "dictation")]
@@ -762,7 +767,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     let identities = identity::discover(&roots);
     let identity = identity::find(&identities, name)?;
     startup::mark("config");
-    let hub = mcp::start(&config, &roots, &identity).await;
+    let hub = mcp::start(&config, &roots, &identity, session).await;
     startup::mark("mcp");
     let bhai = roots.cwd.join(".bhai");
     let notes = memory::path(&bhai);
@@ -773,7 +778,8 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     // Children are built without it: they neither see the notes nor save one.
     let mut prompt = identity::build(&config, &roots, &identity, &identities)
         .with_mcp(hub.clone())
-        .with_memory(memory);
+        .with_memory(memory)
+        .with_session(&roots.cwd, session);
     prompt.skipped.extend(refused);
     let delegation = Delegation {
         identities,
@@ -787,9 +793,12 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
         // Children reuse the session's MCP connections, narrowed to their identity.
         prompt: {
             let (config, roots) = (config.clone(), roots.clone());
+            let session = session.to_string();
             Arc::new(move |child: &identity::Identity| {
                 let narrowed = hub.as_ref().map(|hub| Arc::new(hub.narrowed(child)));
-                identity::build(&config, &roots, child, &[]).with_mcp(narrowed)
+                identity::build(&config, &roots, child, &[])
+                    .with_mcp(narrowed)
+                    .with_session(&roots.cwd, &session)
             })
         },
     };
@@ -803,6 +812,7 @@ async fn load(flags: Flags, name: &str) -> Result<Setup> {
     prompt.skipped.extend(notices);
     startup::mark("prompt");
     Ok(Setup {
+        session: session.to_string(),
         prompt,
         policy,
         delegation,
@@ -849,8 +859,7 @@ fn permissions(config: Config, home: Option<PathBuf>, cwd: PathBuf) -> (Policy, 
     };
     let mut policy = Policy::new(config.permission_mode, rules, home, cwd)
         .with_store(store)
-        .with_relax(relax)
-        .with_log(profile::debug_dir().join("permissions.jsonl"));
+        .with_relax(relax);
     if let Some(trust) = trust {
         policy = policy.with_trust(trust);
     }
@@ -953,16 +962,15 @@ fn start(
     let (tx_control, rx_control) = mpsc::channel::<Control>(16);
     let (tx_agent, rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(agent::Cancel::default());
-    let policy = Arc::new(policy);
+    let diagnostics = saved.writer.authorization_path().with_file_name("debug");
+    let policy = Arc::new(policy.with_log(diagnostics.join("permissions.jsonl")));
     // Keep recording user sources even with judging off; re-enabling it must see
     // restrictions stated while it was disabled.
     let settings_model = settings.model.clone();
     let judge = Some({
         let backend = Arc::new(ModelJudge::new(client.clone(), &settings));
         let root = std::env::current_dir().unwrap_or_default();
-        Arc::new(
-            Judge::new(backend, root, settings).with_log(profile::debug_dir().join("judge.jsonl")),
-        )
+        Arc::new(Judge::new(backend, root, settings).with_log(diagnostics.join("judge.jsonl")))
     });
     // One small call names the session for the terminal's title. It is not the judge's
     // model: the cheapest one on the backend can write four words.
@@ -1216,6 +1224,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
     let (tx_agent, mut rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(agent::Cancel::default());
     let client = client::Client::new(&setup.choice)?
+        .with_session(&setup.session)
         .with_overrides(
             system.identity.model.clone(),
             system.identity.effort.clone(),
@@ -1371,6 +1380,7 @@ struct CacheRow {
 async fn cache_check(setup: Setup, wait: Option<Duration>) -> Result<bool> {
     let (system, policy, delegation) = (setup.prompt, setup.policy, setup.delegation);
     let client = client::Client::new(&setup.choice)?
+        .with_session(&setup.session)
         .with_overrides(
             system.identity.model.clone(),
             system.identity.effort.clone(),
@@ -1528,6 +1538,7 @@ async fn judge_eval(setup: Setup, path: Option<String>) -> Result<bool> {
         bail!("no cases in {}", path.display());
     }
     let client = client::Client::new(&setup.choice)?
+        .with_session(&setup.session)
         .with_overrides(
             system.identity.model.clone(),
             system.identity.effort.clone(),
@@ -1640,6 +1651,13 @@ async fn run(
     app.trust_gate = trust_gate;
     app.ollama_url = ollama_url;
     app.session_id = session_id;
+    #[cfg(feature = "dictation")]
+    if let Some(dictation) = app.dictation.take() {
+        app.dictation = Some(dictation.with_scratch(sessions::scratch_dir(
+            &std::env::current_dir()?,
+            &app.session_id,
+        )));
+    }
     app.limits = limits;
     // One that does not parse was already reported with the notices.
     app.statusline = statusline.and_then(|t| statusline::Template::parse(&t).ok());

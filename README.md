@@ -52,6 +52,12 @@ session options work before or after `exec`. approvals left at ask are rejected 
 
 `sessions [prune [n]]`, `identities`, `usage` and `mcp approve|login|logout <server>` also have command-specific help. existing `--workflow`, `--serve --headless` and diagnostic flags remain available.
 
+### session storage
+
+new sessions get a UUID before startup services run. session state lives under `.bhai/sessions/<uuid>/`, beside its `<uuid>.jsonl` transcript. `debug/` holds that session's judge, authorization, permission, cache, MCP and profiling logs; debug exports do not read the old project-wide log directory. `scratch/` holds temporary working files and dictation recordings. Bash sets `BHAI_SESSION_DIR`, `BHAI_SCRATCH_DIR` and `TMPDIR` to these paths.
+
+`--resume` keeps the same UUID and directories. project configuration, remembered permission rules, project memory and explicitly enabled workflow caches remain shared; session search and worktree coordination still work across sessions.
+
 ### driving bhai from another harness
 
 `bhai models` lists exact model IDs, supported reasoning efforts and known context windows. `bhai models --json` returns one JSON object with `models` and `notes`, unlike the JSONL event stream from `exec --json`. listing reads backend metadata without starting an agent session or requesting inference.

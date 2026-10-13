@@ -201,12 +201,17 @@ impl fmt::Debug for Hub {
 }
 
 /// The session's hub, or `None` when MCP is off.
-pub async fn start(config: &Config, roots: &Roots, identity: &Identity) -> Option<Arc<Hub>> {
+pub async fn start(
+    config: &Config,
+    roots: &Roots,
+    identity: &Identity,
+    session: &str,
+) -> Option<Arc<Hub>> {
     if !config.mcp {
         return None;
     }
     let servers = servers::load(roots, &config.mcp_servers);
-    let log_dir = roots.cwd.join(".bhai").join("debug");
+    let log_dir = crate::sessions::debug_dir(&roots.cwd, session);
     let mut hub = Hub::connect(servers, identity, &log_dir, START_TIMEOUT).await;
     if let Some(shared) = Arc::get_mut(&mut hub.shared) {
         shared.source = Some((roots.clone(), config.mcp_servers.clone()));
@@ -1192,9 +1197,10 @@ where
 /// A stdio server as a child process leading its own group. Its stderr goes to
 /// `<log_dir>/mcp-<name>.log`.
 async fn stdio(server: &Server, log_dir: &Path) -> Result<(Service, Option<Group>)> {
-    std::fs::create_dir_all(log_dir).with_context(|| format!("creating {}", log_dir.display()))?;
+    crate::sessions::private_dir(log_dir)
+        .with_context(|| format!("creating {}", log_dir.display()))?;
     let log_path = log_dir.join(format!("mcp-{}.log", file_safe(&server.name)));
-    let log = std::fs::File::create(&log_path)
+    let log = crate::sessions::private_append(&log_path)
         .with_context(|| format!("creating {}", log_path.display()))?;
     let mut command = tokio::process::Command::new(&server.command);
     crate::childenv::scrub(&mut command);
