@@ -19,6 +19,7 @@ pub mod fetch;
 pub mod goal;
 pub mod history;
 pub mod image_gen;
+pub mod judge_appeal;
 pub mod mcp;
 pub mod memory;
 pub mod models;
@@ -38,7 +39,7 @@ pub mod web;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 17] = [
+pub const NAMES: [&str; 18] = [
     compact::NAME,
     aws_instance::NAME,
     bash::NAME,
@@ -56,6 +57,7 @@ pub const NAMES: [&str; 17] = [
     schedule::NAME,
     monitor::NAME,
     status::NAME,
+    judge_appeal::NAME,
 ];
 
 /// Tool output past this is trimmed in the middle; the tail usually carries the error.
@@ -470,6 +472,11 @@ impl Registry {
         policy: Arc<crate::permissions::Policy>,
         judge: Option<Arc<crate::judge::Judge>>,
     ) -> Self {
+        if let Some(judge) = &judge {
+            self.tools.push(Box::new(judge_appeal::JudgeAppeal {
+                judge: Arc::clone(judge),
+            }));
+        }
         if let Some(tool) = self
             .tools
             .iter_mut()

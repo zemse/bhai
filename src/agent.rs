@@ -3395,8 +3395,8 @@ not retry it. Try a different approach, or ask the user."
                     });
                     return (
                         format!(
-                            "denied by auto policy: {reason}. It did not run. Do not retry it \
-as-is. Try a different approach, or ask the user."
+                            "denied by auto policy: {reason}. It did not run. Do not retry unchanged without new context.{}",
+                            judge.map_or_else(String::new, |judge| judge.appeal_hint(name, &args))
                         ),
                         false,
                     );
@@ -3565,7 +3565,7 @@ async fn judged(
         .judgeable(name, checked)
         .map_err(Undecided::Unjudgeable)?;
     judge
-        .decide_writing(name, target, detail, &policy.written(name, args))
+        .decide_call(name, args, target, detail, &policy.written(name, args))
         .await
 }
 
@@ -6469,6 +6469,148 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn judge_appeals_retry_the_original_call_and_recheck_hard_policy() {
+        use crate::judge::fake::Answers;
+        use crate::permissions::{Relax, Rule, Rules, Trust};
+        use fake::call;
+
+        for blocked in [false, true] {
+            let dir = tools::temp_dir();
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let policy = Arc::new(
+                Policy::new(Mode::Auto, Rules::default(), None, repo.clone())
+                    .with_relax(Relax {
+                        writes: false,
+                        commands: false,
+                    })
+                    .with_trust(Trust::new(&dir.join("config"), &repo)),
+            );
+            policy.trust().unwrap();
+            let (judge, backend) = crate::judge::fake::judge(
+                Answers::Replies(vec![
+                    r#"{"verdict":"deny","reason":"unclear relevance"}"#.into(),
+                    r#"{"verdict":"approve","reason":"benign task note"}"#.into(),
+                ]),
+                &repo,
+            );
+            let judge = Arc::new(judge);
+            let registry = Registry::new(Vec::new())
+                .with_aws_policy(Arc::clone(&policy), Some(Arc::clone(&judge)));
+            assert!(
+                registry
+                    .schemas()
+                    .iter()
+                    .any(|schema| schema["name"] == "judge_appeal")
+            );
+            let target = repo.join("notes.txt");
+            let args = json!({"path": target, "content": "parser notes"});
+            let write = call("write", args.clone());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut images = Vec::new();
+            let (output, ok) = execute(
+                &registry,
+                &policy,
+                Some(&judge),
+                &write,
+                None,
+                &tx,
+                &cancel,
+                &mut images,
+            )
+            .await;
+            assert!(!ok);
+            assert!(!target.exists());
+            assert!(output.contains("3 of 3 reconsiderations remain"));
+            let id = output
+                .split("with activity \"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            let appeal = call(
+                "judge_appeal",
+                json!({"activity": id, "justification": "The user asked for parser documentation; this writes a bounded note, not secrets."}),
+            );
+            let (output, ok) = execute(
+                &registry,
+                &policy,
+                Some(&judge),
+                &appeal,
+                None,
+                &tx,
+                &cancel,
+                &mut images,
+            )
+            .await;
+            assert!(ok, "{output}");
+            assert!(
+                !target.exists(),
+                "queueing a justification does not execute the call"
+            );
+            let retry_policy = Policy::new(
+                Mode::Auto,
+                Rules {
+                    deny: if blocked {
+                        vec![Rule::parse("Write(**)").unwrap()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Rules::default()
+                },
+                None,
+                repo.clone(),
+            )
+            .with_relax(Relax {
+                writes: false,
+                commands: false,
+            })
+            .with_trust(Trust::new(&dir.join("config"), &repo));
+            let (output, ok) = execute(
+                &registry,
+                &retry_policy,
+                Some(&judge),
+                &write,
+                None,
+                &tx,
+                &cancel,
+                &mut images,
+            )
+            .await;
+            assert_eq!(ok, !blocked, "{output}");
+            assert_eq!(target.exists(), !blocked);
+            assert_eq!(
+                backend.calls.lock().unwrap().len(),
+                if blocked { 1 } else { 2 }
+            );
+            if !blocked {
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "parser notes");
+            }
+            let secret = call("read", json!({"path": repo.join(".env")}));
+            let (output, ok) = execute(
+                &registry,
+                &retry_policy,
+                Some(&judge),
+                &secret,
+                None,
+                &tx,
+                &cancel,
+                &mut images,
+            )
+            .await;
+            assert!(!ok, "{output}");
+            assert!(!output.contains("reconsiderations remain"));
+            assert_eq!(
+                backend.calls.lock().unwrap().len(),
+                if blocked { 1 } else { 2 }
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// `auto` mode never prompts, so a judge that answers with an error, nothing at all

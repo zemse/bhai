@@ -320,10 +320,13 @@ impl AwsInstance {
                 "scoped account {} profile {} region {} instance {} deadline {}",
                 cap.account, cap.profile, cap.region, cap.instance, cap.deadline
             );
-            match judge.decide_writing(NAME, &target, &detail, &[]).await {
+            match judge.decide_call(NAME, &args, &target, &detail, &[]).await {
                 Ok(Verdict::Approve { .. }) => {}
                 Ok(Verdict::Deny { reason }) => {
-                    return Err(format!("AWS authorization veto: {reason}"));
+                    return Err(format!(
+                        "AWS authorization veto: {reason}.{}",
+                        judge.appeal_hint(NAME, &args)
+                    ));
                 }
                 Err(reason) => {
                     return Err(format!(

@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-14
+
+- Judge denials offer up to three reconsiderations per exact tool activity through `judge_appeal`; agent justifications supply context without granting permission, and retries still check hard policy and secret protections.
+
 ## 2026-10-13
 
 - Each session owns its diagnostics and scratch space under `.bhai/sessions/<uuid>/`; resumes keep the same paths, debug exports exclude other sessions, and Bash uses session-local temporary files.
