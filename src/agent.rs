@@ -3295,6 +3295,9 @@ async fn execute(
         let _ = tx.send(AgentEvent::Info(notice.clone()));
     }
     if let Some(reason) = before.blocked {
+        if let Some(judge) = judge {
+            judge.reject_pending_appeal(name, &args, &reason);
+        }
         return (format!("Blocked by a PreToolUse hook: {reason}"), false);
     }
     if let Some(updated) = before.updated_input {
@@ -3314,7 +3317,13 @@ async fn execute(
     // Hooks may tighten the policy, never relax it.
     let decision = policy.check(name, &checked, tool.needs_approval());
     let decision = match decision {
-        Decision::Allow(_) if before.ask => Decision::Ask,
+        Decision::Allow(_)
+            if before.ask
+                || (policy.mode() == Mode::Auto
+                    && judge.is_some_and(|judge| judge.has_pending_appeal(name, &args))) =>
+        {
+            Decision::Ask
+        }
         other => other,
     };
     let judge = if before.ask { None } else { judge };
@@ -3339,6 +3348,9 @@ async fn execute(
             }
         }
         Decision::Deny(reason) => {
+            if let Some(judge) = judge {
+                judge.reject_pending_appeal(name, &args, &reason);
+            }
             audit("blocked", "rule", &reason);
             let _ = tx.send(AgentEvent::ToolRejected {
                 tool: name.to_string(),
@@ -3422,6 +3434,10 @@ not retry it. Try a different approach, or ask the user."
                         Undecided::Context => (
                             "the original user evidence is too large to judge in full".to_string(),
                             " Start a new session with the task and current restrictions, or use ask mode.",
+                        ),
+                        Undecided::Proposal => (
+                            "another command is queued for this denied activity".to_string(),
+                            " Retry only the exact proposed arguments returned by judge_appeal; the original command cannot run in its place.",
                         ),
                         // Which one it was, and the word it tripped on. Naming every
                         // cause at once left the model rewriting the call at random.
@@ -3572,9 +3588,10 @@ async fn judged(
     detail: &str,
 ) -> Result<Verdict, Undecided> {
     let judge = judge.ok_or(Undecided::Off)?;
-    policy
-        .judgeable(name, checked)
-        .map_err(Undecided::Unjudgeable)?;
+    if let Err(reserved) = policy.judgeable(name, checked) {
+        judge.reject_pending_appeal(name, args, &reserved.why());
+        return Err(Undecided::Unjudgeable(reserved));
+    }
     judge
         .decide_call(name, args, target, detail, &policy.written(name, args))
         .await
@@ -6524,6 +6541,235 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn replacement_appeals_execute_only_reviewed_commands_and_keep_hard_guards() {
+        use crate::judge::fake::Answers;
+        use crate::permissions::{Relax, Rule, Rules, Trust};
+        use fake::call;
+
+        for outcome in ["approve", "deny", "secret", "rule"] {
+            let dir = tools::temp_dir();
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let policy = Arc::new(
+                Policy::new(
+                    Mode::Auto,
+                    Rules {
+                        allow: vec![Rule::parse("Bash(printf:*)").unwrap()],
+                        ..Rules::default()
+                    },
+                    None,
+                    repo.clone(),
+                )
+                .with_relax(Relax {
+                    writes: true,
+                    commands: true,
+                })
+                .with_trust(Trust::new(&dir.join("config"), &repo)),
+            );
+            policy.trust().unwrap();
+            let (judge, backend) = crate::judge::fake::judge(
+                Answers::Replies(vec![
+                    r#"{"verdict":"deny","reason":"use a bounded replacement"}"#.into(),
+                    if outcome == "deny" {
+                        r#"{"verdict":"deny","reason":"replacement still violates scope"}"#.into()
+                    } else {
+                        r#"{"verdict":"approve","reason":"bounded replacement"}"#.into()
+                    },
+                ]),
+                &repo,
+            );
+            let judge = Arc::new(judge);
+            let registry = Registry::new(Vec::new())
+                .with_aws_policy(Arc::clone(&policy), Some(Arc::clone(&judge)));
+            let original_command = r#"python3 -c 'from pathlib import Path; Path("original.txt").write_text("original")'"#;
+            let original =
+                json!({"command": original_command, "workdir": repo, "yield_time_ms": 1000});
+            assert!(matches!(
+                policy.check("bash", &original, true),
+                Decision::Ask
+            ));
+            let original_call = call("bash", original.clone());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut images = Vec::new();
+            let (output, ok) = execute(
+                &registry,
+                &policy,
+                Some(&judge),
+                &original_call,
+                None,
+                &tx,
+                &cancel,
+                &mut images,
+            )
+            .await;
+            assert!(!ok, "{output}");
+            let id = output
+                .split("with activity \"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .to_string();
+            let marker = repo.join("replacement.txt");
+            let command = if outcome == "secret" {
+                std::fs::write(repo.join(".env"), "FAKE_TEST_SECRET").unwrap();
+                format!("cat {}", repo.join(".env").display())
+            } else {
+                format!("printf replacement > {}", marker.display())
+            };
+            let mut proposed = original.clone();
+            proposed["command"] = json!(command);
+            if outcome == "approve" {
+                assert!(
+                    matches!(policy.check("bash", &proposed, true), Decision::Allow(_)),
+                    "baseline-safe proposals still require fresh judging"
+                );
+            }
+            let appeal = call(
+                "judge_appeal",
+                json!({"activity": id, "justification": "Use this narrower command instead", "replacement_command": command}),
+            );
+            let (output, ok) = execute(
+                &registry,
+                &policy,
+                Some(&judge),
+                &appeal,
+                None,
+                &tx,
+                &cancel,
+                &mut images,
+            )
+            .await;
+            assert!(ok, "{output}");
+            assert!(!marker.exists());
+            let (output, ok) = execute(
+                &registry,
+                &policy,
+                Some(&judge),
+                &original_call,
+                None,
+                &tx,
+                &cancel,
+                &mut images,
+            )
+            .await;
+            assert!(!ok, "{output}");
+            assert!(output.contains("another command is queued"));
+            assert_eq!(backend.calls.lock().unwrap().len(), 1);
+            let retry_policy = if outcome == "rule" {
+                Arc::new(
+                    Policy::new(
+                        Mode::Auto,
+                        Rules {
+                            deny: vec![Rule::parse("Bash(printf:*)").unwrap()],
+                            ..Rules::default()
+                        },
+                        None,
+                        repo.clone(),
+                    )
+                    .with_relax(Relax {
+                        writes: true,
+                        commands: true,
+                    })
+                    .with_trust(Trust::new(&dir.join("config"), &repo)),
+                )
+            } else {
+                Arc::clone(&policy)
+            };
+            let (output, ok) = execute(
+                &registry,
+                &retry_policy,
+                Some(&judge),
+                &call("bash", proposed.clone()),
+                None,
+                &tx,
+                &cancel,
+                &mut images,
+            )
+            .await;
+            assert_eq!(ok, outcome == "approve", "{outcome}: {output}");
+            assert!(!output.contains("FAKE_TEST_SECRET"));
+            assert!(!repo.join("original.txt").exists());
+            assert_eq!(marker.exists(), outcome == "approve");
+            assert!(!judge.has_pending_appeal("bash", &proposed));
+            if matches!(outcome, "secret" | "rule") {
+                assert_eq!(
+                    backend.calls.lock().unwrap().len(),
+                    1,
+                    "hard-blocked proposals never reach the judge"
+                );
+                let corrected = format!("echo corrected > {}", marker.display());
+                let correction = call(
+                    "judge_appeal",
+                    json!({"activity": id, "justification": "Avoid the protected action", "replacement_command": corrected}),
+                );
+                let (output, ok) = execute(
+                    &registry,
+                    &retry_policy,
+                    Some(&judge),
+                    &correction,
+                    None,
+                    &tx,
+                    &cancel,
+                    &mut images,
+                )
+                .await;
+                assert!(ok, "{output}");
+                proposed["command"] = json!(corrected);
+                let (output, ok) = execute(
+                    &registry,
+                    &retry_policy,
+                    Some(&judge),
+                    &call("bash", proposed),
+                    None,
+                    &tx,
+                    &cancel,
+                    &mut images,
+                )
+                .await;
+                assert!(ok, "{output}");
+                assert_eq!(
+                    std::fs::read_to_string(&marker).unwrap().trim(),
+                    "corrected"
+                );
+            }
+            if outcome == "approve" {
+                let (output, ok) = execute(
+                    &registry,
+                    &policy,
+                    Some(&judge),
+                    &original_call,
+                    None,
+                    &tx,
+                    &cancel,
+                    &mut images,
+                )
+                .await;
+                assert!(
+                    !ok,
+                    "the replacement approval must not approve the original: {output}"
+                );
+                assert!(!repo.join("original.txt").exists());
+            }
+            assert_eq!(backend.calls.lock().unwrap().len(), 2);
+            let context: Value =
+                serde_json::from_str(&backend.calls.lock().unwrap()[1].reconsideration).unwrap();
+            assert_eq!(context["original_target"], original_command);
+            assert_eq!(
+                context["round"],
+                if matches!(outcome, "secret" | "rule") {
+                    2
+                } else {
+                    1
+                }
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test]
