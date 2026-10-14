@@ -9,7 +9,7 @@ use bhai::client::Delta;
 use bhai::identity::Identity;
 use bhai::permissions::{Answer, Mode, Rules};
 use bhai::tools::BoxFuture;
-use bhai::{AgentEvent, Cancel, Model, Policy, Registry, Runtime, SystemPrompt, Tool};
+use bhai::{AgentEvent, Cancel, Control, Model, Policy, Registry, Runtime, SystemPrompt, Tool};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -18,6 +18,8 @@ use tokio::time::timeout;
 struct Script {
     replies: Arc<Mutex<VecDeque<Vec<Value>>>>,
     requests: Arc<Mutex<Vec<Value>>>,
+    name: String,
+    next: Option<Arc<Script>>,
 }
 
 impl Script {
@@ -34,6 +36,8 @@ impl Script {
                 })],
             ]))),
             requests: Arc::default(),
+            name: "ollama:script".to_string(),
+            next: None,
         }
     }
 }
@@ -68,8 +72,15 @@ impl Model for Script {
         Arc::new(self.clone())
     }
 
+    fn switch(&self, model: &str, _effort: &str) -> Option<Arc<dyn Model>> {
+        self.next
+            .as_ref()
+            .filter(|next| next.name() == model)
+            .map(|next| Arc::clone(next) as Arc<dyn Model>)
+    }
+
     fn name(&self) -> &str {
-        "ollama:script"
+        &self.name
     }
 
     fn reports_cache(&self) -> bool {
@@ -197,6 +208,124 @@ async fn host_registry_replaces_builtins_and_runs_through_approval() {
             .unwrap()
             .iter()
             .any(|item| item["type"] == "function_call_output" && item["output"] == "from host")
+    );
+}
+
+#[tokio::test]
+async fn host_registry_survives_a_model_switch_without_restoring_builtins() {
+    let second = Script {
+        name: "ollama:second".to_string(),
+        ..Script::tool()
+    };
+    let first = Script {
+        name: "ollama:first".to_string(),
+        next: Some(Arc::new(second.clone())),
+        replies: Arc::new(Mutex::new(VecDeque::from([vec![json!({
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}]
+        })]]))),
+        ..Script::tool()
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let builds = Arc::new(Mutex::new(Vec::new()));
+    let policy = Arc::new(Policy::new(
+        Mode::Ask,
+        Rules::default(),
+        None,
+        std::env::temp_dir(),
+    ));
+    let mut runtime = Runtime::new(
+        Arc::new(first.clone()),
+        "host-switch-session",
+        SystemPrompt {
+            text: "host instructions".to_string(),
+            ..Default::default()
+        },
+        policy,
+    );
+    assert!(runtime.delegation.is_none());
+    runtime.registry = Some(Arc::new({
+        let calls = Arc::clone(&calls);
+        let builds = Arc::clone(&builds);
+        move |_, model| {
+            builds.lock().unwrap().push(model.name().to_string());
+            Registry::empty().with_tool(Box::new(Echo(Arc::clone(&calls))))
+        }
+    }));
+    let (user, rx_user) = mpsc::channel(1);
+    let (control, rx_control) = mpsc::channel(1);
+    let (events, mut rx_events) = mpsc::unbounded_channel();
+    let task = tokio::spawn(runtime.run(rx_user, rx_control, events, Arc::new(Cancel::default())));
+    let (approvals, outputs) = timeout(Duration::from_secs(10), async {
+        let mut approvals = 0;
+        let mut outputs = Vec::new();
+        for turn in 0..2 {
+            if turn == 1 {
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                control
+                    .send(Control::Model {
+                        model: second.name().to_string(),
+                        effort: "high".to_string(),
+                        window: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            user.send("use the host tool".into()).await.unwrap();
+            loop {
+                match rx_events.recv().await.expect("runtime closed during turn") {
+                    AgentEvent::Approval { tool, reply, .. } => {
+                        assert_eq!(turn, 1);
+                        assert_eq!(tool, "host_echo");
+                        assert_eq!(calls.load(Ordering::SeqCst), 0);
+                        approvals += 1;
+                        reply.send(Answer::Accept(None)).unwrap();
+                    }
+                    AgentEvent::ToolOutput(text) => outputs.push(text),
+                    AgentEvent::TurnEnd => break,
+                    AgentEvent::Error(error) | AgentEvent::TurnFailed(error) => {
+                        panic!("runtime failed: {error}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (approvals, outputs)
+    })
+    .await
+    .expect("model-switch turns did not finish");
+    drop(user);
+    drop(control);
+    timeout(Duration::from_secs(10), task)
+        .await
+        .expect("runtime did not stop")
+        .unwrap();
+
+    assert_eq!(*builds.lock().unwrap(), ["ollama:first", "ollama:second"]);
+    assert_eq!(approvals, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outputs, ["from host"]);
+    let before = first.requests.lock().unwrap();
+    let after = second.requests.lock().unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(after.len(), 2);
+    for request in before.iter().chain(after.iter()) {
+        assert_eq!(request["instructions"], "host instructions");
+        let names: Vec<_> = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["host_echo"]);
+        for builtin in ["bash", "read", "agent", "goal", "plan"] {
+            assert!(!names.contains(&builtin));
+        }
+    }
+    assert!(
+        after[1]["input"].as_array().unwrap().iter().any(|item| {
+            item["type"] == "function_call_output" && item["output"] == "from host"
+        })
     );
 }
 
