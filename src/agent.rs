@@ -791,6 +791,10 @@ pub(crate) async fn run_configured(
     // hand the session a second set of slots while the first set is still running.
     let slots = Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING));
     let goal: goal::Shared = Arc::default();
+    if let Some(judge) = &judge {
+        judge.project_context(&prompt.instructions);
+        judge.goal_context(Arc::clone(&goal));
+    }
     let goal_requested = Arc::new(AtomicBool::new(false));
     let plan = crate::plan::Shared::new(Arc::clone(&goal));
     let title_updated = Arc::new(std::sync::Mutex::new(false));
@@ -1247,9 +1251,11 @@ pub(crate) async fn run_configured(
             history.push(context);
         }
         if opens && let Some(reload) = &prompt.reload {
-            for update in
-                crate::instructions::updates(&history, &prompt.instructions, &reload.files())
-            {
+            let files = reload.files();
+            if let Some(judge) = &judge {
+                judge.project_context(&files);
+            }
+            for update in crate::instructions::updates(&history, &prompt.instructions, &files) {
                 if let Some(note) = crate::instructions::note(&update) {
                     let _ = tx.send(AgentEvent::Info(note));
                 }
@@ -2395,6 +2401,7 @@ async fn refresh_authorization(
         writer.authorization(&memory)?;
     }
     if memory.pending.is_empty()
+        || judge.authorization_failed()
         || !judge.is_on()
         || policy.mode() != Mode::Auto
         || !policy.trusted()
@@ -2412,7 +2419,7 @@ async fn refresh_authorization(
     }
     if let Err(error) = result {
         let _ = tx.send(AgentEvent::Info(format!(
-            "authorization update pending: {error:#}; judge-required calls cannot use old approvals"
+            "authorization summary pending: {error:#}; ordinary calls use original user messages, not stale approvals"
         )));
     }
     Ok(())
@@ -3409,8 +3416,12 @@ not retry it. Try a different approach, or ask the user."
                     let (why, how) = match undecided {
                         Undecided::Unanswered => ("the judge could not decide it".to_string(), ""),
                         Undecided::Authorization => (
-                            "the latest authorization update did not complete safely".to_string(),
-                            " Old approvals cannot be used; retry the update or use ask mode.",
+                            "user evidence changed while the judge was deciding".to_string(),
+                            " Retry against the latest user context; old approvals cannot be used.",
+                        ),
+                        Undecided::Context => (
+                            "the original user evidence is too large to judge in full".to_string(),
+                            " Start a new session with the task and current restrictions, or use ask mode.",
                         ),
                         // Which one it was, and the word it tripped on. Naming every
                         // cause at once left the model rewriting the call at random.
@@ -6258,6 +6269,16 @@ mod tests {
         replies: &[Answer],
         settings: crate::judge::Settings,
     ) -> Judged {
+        judged_with_summary_failure(answers, deny, replies, settings, None).await
+    }
+
+    async fn judged_with_summary_failure(
+        answers: crate::judge::fake::Answers,
+        deny: &[&str],
+        replies: &[Answer],
+        settings: crate::judge::Settings,
+        failure: Option<crate::judge::authorization::Stage>,
+    ) -> Judged {
         use crate::permissions::{Relax, Rule, Rules, Trust};
         use fake::{Fake, call, say};
 
@@ -6285,6 +6306,7 @@ mod tests {
             vec![say("done")],
         ]);
         let (judge, backend) = crate::judge::fake::judge_with(answers, &repo, settings);
+        *backend.authorization_failure.lock().unwrap() = failure.map(|stage| (stage, false));
         let judge = Arc::new(judge);
         let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
@@ -6396,6 +6418,39 @@ mod tests {
             "Wrote ",
         ] {
             assert!(!file.contains(said), "{said} in {file}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_work_runs_when_authorization_summarization_fails() {
+        use crate::judge::authorization::Stage;
+        use crate::judge::fake::Answers;
+
+        for stage in [Stage::Extract, Stage::Merge] {
+            let run = judged_with_summary_failure(
+                Answers::Verdict(Verdict::Approve {
+                    reason: "benign requested note".into(),
+                }),
+                &[],
+                &[],
+                crate::judge::Settings::default(),
+                Some(stage),
+            )
+            .await;
+            assert!(!asked(&run.events));
+            assert!(run.outputs[0].starts_with("Wrote "), "{}", run.outputs[0]);
+            let calls = run.backend.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(
+                calls[0]
+                    .pending_user
+                    .iter()
+                    .any(|source| source.contains("write down what the parser does"))
+            );
+            assert!(
+                calls[0].user_context.is_empty(),
+                "failed summaries do not invent permission"
+            );
         }
     }
 
@@ -7324,8 +7379,8 @@ mod tests {
     async fn a_failed_summary_update_is_persisted_pending_before_any_command() {
         let dir = tools::temp_dir();
         let (judge, backend) = crate::judge::fake::judge(
-            crate::judge::fake::Answers::Verdict(Verdict::Approve {
-                reason: "fine".into(),
+            crate::judge::fake::Answers::Verdict(Verdict::Deny {
+                reason: "user forbids server A".into(),
             }),
             &dir,
         );
@@ -7358,9 +7413,17 @@ mod tests {
         );
         assert_eq!(
             judge.decide("bash", "ssh server-a true", "").await,
-            Err(Undecided::Authorization)
+            Ok(Verdict::Deny {
+                reason: "user forbids server A".into()
+            })
         );
-        assert!(backend.calls.lock().unwrap().is_empty());
+        assert_eq!(backend.calls.lock().unwrap().len(), 1);
+        assert!(
+            backend.calls.lock().unwrap()[0]
+                .pending_user
+                .iter()
+                .any(|source| source.contains("do not use server A"))
+        );
         drop(writer);
         let loaded = sessions::load(&sessions::path(&dir, "auth")).unwrap();
         let memory = loaded.authorization.unwrap();

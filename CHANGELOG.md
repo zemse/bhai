@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-14
 
+- Ordinary auto-mode calls use original user evidence when authorization summarization fails, rather than blocking before the judge; verdicts include loaded project workflow and live goal specifications, and pending evidence disables approval caching.
 - Judge denials offer up to three reconsiderations per exact tool activity through `judge_appeal`; agent justifications supply context without granting permission, and retries still check hard policy and secret protections.
 
 ## 2026-10-13

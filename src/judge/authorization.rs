@@ -488,6 +488,29 @@ impl Memory {
             .collect()
     }
 
+    /// Original queued messages remain usable when their derived notes cannot be built.
+    pub fn pending_context(&self) -> Result<Vec<String>> {
+        let context: Vec<String> = self
+            .pending
+            .iter()
+            .map(|source| {
+                json!({
+                    "user_message": source.id,
+                    "user_message_at": source.at,
+                    "user_text": source.text,
+                    "assistant_reference": source.reference,
+                })
+                .to_string()
+            })
+            .collect();
+        ensure!(
+            context.len() <= MAX_REPLAY_SOURCES
+                && context.iter().map(String::len).sum::<usize>() <= MAX_REPLAY_BYTES,
+            "pending user evidence is too large to judge in full"
+        );
+        Ok(context)
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.entries.len() <= MAX_ENTRIES,
