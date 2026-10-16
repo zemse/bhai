@@ -2029,7 +2029,13 @@ mod tests {
         );
         write(id, "ls", Duration::from_millis(250), quiet()).await;
         assert!(stdin.describe(&typed("\n")).unwrap().contains("\"ls\\n\""));
-        write(id, "\u{3}exit\n", Duration::from_secs(5), quiet()).await;
+        let cancel = AtomicBool::new(true);
+        let live = Live {
+            cancel: &cancel,
+            ..quiet()
+        };
+        let out = write(id, "", Duration::from_secs(5), live).await;
+        assert_eq!(outcome(&out), Some(Outcome::Killed), "{out}");
     }
 
     #[tokio::test]
