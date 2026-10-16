@@ -1667,9 +1667,26 @@ mod tests {
         assert_eq!(outcome(&out), Some(Outcome::Succeeded));
 
         let out = run("sleep 0.3", None, quiet()).await;
+        assert!(out.contains("(no output)\n[output: 0 lines, "), "{out}");
+        let took = out
+            .lines()
+            .last()
+            .unwrap()
+            .strip_prefix("[output: 0 lines, ")
+            .unwrap()
+            .split_once("s] [local time: ")
+            .unwrap()
+            .0
+            .parse::<f64>()
+            .unwrap();
+        assert!(took >= 0.3, "{out}");
         assert!(
-            out.contains("(no output)\n[output: 0 lines, 0.3s]"),
-            "{out}"
+            trailer(
+                &Kept::default(),
+                &Kept::default(),
+                Duration::from_millis(300)
+            )
+            .starts_with("\n[output: 0 lines, 0.3s] [local time: ")
         );
 
         // A last line without its newline counts, and so does stderr.

@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-16
 
+- TLS uses rustls 0.23.46; Mermaid uses merman 0.9, and syntax highlighting loads only bundled grammars and themes, removing unmaintained YAML and unused XML dependencies. The Bash timing test allows scheduler delay while checking fixed-duration formatting separately.
 - CI uses Rust 1.99.0 on both platforms; Clippy checks pass with current lints, and locked HTTP/2, TLS and XML dependencies include their security fixes.
 
 ## 2026-10-14

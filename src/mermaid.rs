@@ -5,8 +5,9 @@
 //! anything that does not parse, is `None`, and the caller shows the fence as the code
 //! block it would otherwise have been.
 
-use merman_ascii::{AsciiRenderOptions, render_model};
-use merman_core::{Engine, ParseOptions};
+use merman_ascii::{AsciiRenderOptions, AsciiRenderer, AsciiResourcePolicy};
+use merman_core::runtime::RuntimePolicy;
+use merman_core::{Engine, OperationControl, ParseOptions};
 
 /// The fence languages that mean mermaid.
 pub fn is_mermaid(lang: &str) -> bool {
@@ -22,7 +23,16 @@ pub fn render(source: &str) -> Option<Vec<String>> {
     let parsed = Engine::new()
         .parse_diagram_for_render_model_sync(source, ParseOptions::strict())
         .ok()??;
-    let drawn = render_model(&parsed.model, &AsciiRenderOptions::unicode()).ok()?;
+    let context = RuntimePolicy::deterministic().begin_operation().ok()?;
+    let drawn = AsciiRenderer::new(AsciiRenderOptions::unicode())
+        .ok()?
+        .render_parsed(
+            &parsed,
+            &OperationControl::new(),
+            &context,
+            AsciiResourcePolicy::default(),
+        )
+        .ok()?;
     let lines: Vec<String> = drawn.lines().map(|l| l.trim_end().to_string()).collect();
     // An empty drawing is no more use than no drawing, and the source says more.
     lines.iter().any(|l| !l.is_empty()).then_some(lines)

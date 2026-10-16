@@ -29,8 +29,8 @@ ignore = "0.4.31"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 libc = "0.2.189"
 lol_html = "2.9.0"
-merman-ascii = "0.7.0"
-merman-core = "0.7.0"
+merman-ascii = { version = "0.9.0", features = ["all-diagrams"] }
+merman-core = "0.9.0"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace"], optional = true }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"], optional = true }
@@ -39,11 +39,11 @@ ratatui = "0.30.2"
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls", "http2"] }
 rmcp = { version = "2.2.0", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
-rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
-syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 tiktoken-rs = "0.12"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "io-util", "net", "signal", "fs"] }
 tokio-rustls = { version = "0.26.4", default-features = false }
