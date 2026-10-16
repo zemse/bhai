@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-16
 
+- Automatic goals are reserved for longer, sustained tasks; small tasks and quick fixes run directly, while explicit `/goal` requests still work at any size.
 - Sandbox write tests expect each platform's permission-denied diagnostic while verifying that only writable directories change.
 - The split-input terminal test cancels and reaps its shell during cleanup instead of racing Ctrl-C against `exit`, which could hang the Linux test runtime.
 - TLS uses rustls 0.23.46; Mermaid uses merman 0.9, and syntax highlighting loads only bundled grammars and themes, removing unmaintained YAML and unused XML dependencies. The Bash timing test allows scheduler delay while checking fixed-duration formatting separately.
