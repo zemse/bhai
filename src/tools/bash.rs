@@ -1462,7 +1462,12 @@ mod tests {
             return;
         };
         assert!(out.contains("done"), "{out}");
-        assert!(out.contains("Operation not permitted"), "{out}");
+        let denied = if cfg!(target_os = "macos") {
+            "Operation not permitted"
+        } else {
+            "Permission denied"
+        };
+        assert!(out.contains(denied), "{out}");
         assert!(
             inside.join("a").exists() && inside.join("d").is_dir(),
             "{out}"
