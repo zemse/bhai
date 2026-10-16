@@ -21,7 +21,14 @@ fn api_args(mut args: Value, placeholder: &Value) -> Value {
 fn schema_keeps_action_specific_fields_optional_in_the_api_request() {
     let f = Fixture::new();
     let schema = f.tool.schema();
-    let body = crate::client::request_body("test", "low", "test", "", &[schema.clone()], &[]);
+    let body = crate::client::request_body(
+        "test",
+        "low",
+        "test",
+        "",
+        std::slice::from_ref(&schema),
+        &[],
+    );
     assert_eq!(body["tools"][0], schema);
     assert_eq!(schema["strict"], false);
     assert_eq!(schema["parameters"]["required"], json!(["action"]));

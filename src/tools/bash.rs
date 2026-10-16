@@ -796,7 +796,7 @@ fn open_pty() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            &raw mut size,
         )
     };
     if opened != 0 {

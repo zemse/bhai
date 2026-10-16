@@ -286,7 +286,7 @@ impl Renderer {
                 self.gap = true;
             }
             TagEnd::TableCell => {
-                let cell = self.inline.drain(..).collect();
+                let cell = std::mem::take(&mut self.inline);
                 self.row.push(cell);
             }
             TagEnd::TableHead | TagEnd::TableRow => {

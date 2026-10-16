@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-16
+
+- CI uses Rust 1.99.0 on both platforms; Clippy checks pass with current lints, and locked HTTP/2, TLS and XML dependencies include their security fixes.
+
 ## 2026-10-14
 
 - `judge_appeal` accepts model-proposed Bash replacement commands; revisions share the original activity's three reconsiderations, preserve execution options, and require fresh policy and judge checks before only the proposed command can run.

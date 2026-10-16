@@ -343,18 +343,22 @@ async fn completed_checkpoint_resumes_compacts_and_reopens_without_replaying_too
         "alpha-follow-up",
     )
     .await;
-    assert_eq!(*resumed.seeds.lock().unwrap(), [checkpoint.items.clone()]);
+    assert_eq!(
+        resumed.seeds.lock().unwrap().as_slice(),
+        std::slice::from_ref(&checkpoint.items)
+    );
     assert_eq!(*resumed.resets.lock().unwrap(), ["compaction: summary"]);
     assert!(events.iter().any(|event| matches!(event, AgentEvent::Compacted { summary: Some(text), freed, .. } if text == summary && *freed > 0)));
-    let requests = resumed.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1].last().unwrap(), &compact::request(None));
-    assert!(
-        serde_json::to_string(&requests[1])
-            .unwrap()
-            .contains("alpha-result:fixture-only")
-    );
-    drop(requests);
+    {
+        let requests = resumed.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].last().unwrap(), &compact::request(None));
+        assert!(
+            serde_json::to_string(&requests[1])
+                .unwrap()
+                .contains("alpha-result:fixture-only")
+        );
+    }
     let compacted = load(&roots, session);
     assert!(compacted.warnings.is_empty());
     assert_eq!(compacted.header, checkpoint.header);
@@ -398,7 +402,10 @@ async fn completed_checkpoint_resumes_compacts_and_reopens_without_replaying_too
         "alpha-confirm-result",
     )
     .await;
-    assert_eq!(*again.seeds.lock().unwrap(), [compacted.items.clone()]);
+    assert_eq!(
+        again.seeds.lock().unwrap().as_slice(),
+        std::slice::from_ref(&compacted.items)
+    );
     assert!(
         serde_json::to_string(&again.requests.lock().unwrap()[0])
             .unwrap()

@@ -64,7 +64,7 @@ impl Rule {
         let tool = name.to_lowercase();
         let pattern = match content {
             None | Some("*") | Some("") => Pattern::Any,
-            Some(content) if tool == "bash" => command_pattern(content).map_err(&bad)?,
+            Some(content) if tool == "bash" => command_pattern(content).map_err(bad)?,
             Some(content) if matches!(tool.as_str(), "read" | "edit" | "write") => {
                 Pattern::Path(content.to_string())
             }
