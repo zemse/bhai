@@ -30,7 +30,7 @@ use crate::frontmatter;
 use crate::identity::{self, Identity};
 use crate::instructions::{self, Roots};
 use crate::judge::Judge;
-use crate::permissions::{Offers, Policy};
+use crate::permissions::{Decision, Mode, Offers, Policy};
 use crate::tools;
 use crate::tools::submit::Contract;
 
@@ -818,7 +818,7 @@ pub async fn run(run: Run<'_>) -> Report {
     }
     let plan = plan(workflow, &identities);
     let _ = run.tx.send(AgentEvent::Info(plan.clone()));
-    if !confirm(run.tx, plan).await {
+    if !confirm(run.policy, run.tx, plan).await {
         report.refused = Some("not started".to_string());
         let _ = run.tx.send(AgentEvent::Info(report.text()));
         return report;
@@ -1186,8 +1186,26 @@ fn running_as(identity: &str, resolved: &Identity) -> String {
     }
 }
 
-/// Ask the user through the session's approval path.
-async fn confirm(tx: &mpsc::UnboundedSender<AgentEvent>, plan: String) -> bool {
+/// Check launch policy, asking through the session's approval path when needed.
+async fn confirm(policy: &Policy, tx: &mpsc::UnboundedSender<AgentEvent>, plan: String) -> bool {
+    // The user starts the workflow. Its plan is not a concrete tool call for the judge;
+    // each step's actual tools still go through their normal policy and judge checks.
+    let mode = policy.mode();
+    let args = serde_json::json!({"plan": plan});
+    match policy.check(TOOL, &args, mode != Mode::Auto) {
+        Decision::Allow(_) => return true,
+        Decision::Deny(reason) => {
+            let _ = tx.send(AgentEvent::Error(format!("workflow: {reason}")));
+            return false;
+        }
+        Decision::Ask if mode == Mode::Auto => {
+            let _ = tx.send(AgentEvent::Error(
+                "workflow: launch requires user approval".to_string(),
+            ));
+            return false;
+        }
+        Decision::Ask => {}
+    }
     let (reply, wait) = oneshot::channel();
     let sent = tx.send(AgentEvent::Approval {
         tool: TOOL.to_string(),
@@ -1558,6 +1576,16 @@ mod tests {
         input: &str,
         fake: &Fake,
     ) -> (Report, Vec<String>) {
+        go_with_policy(root, workflow, input, fake, &Policy::default()).await
+    }
+
+    async fn go_with_policy(
+        root: &Path,
+        workflow: &Workflow,
+        input: &str,
+        fake: &Fake,
+        policy: &Policy,
+    ) -> (Report, Vec<String>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let seen = tokio::spawn(accept(rx));
         let report = run(Run {
@@ -1565,7 +1593,7 @@ mod tests {
             input,
             delegation: &delegation(),
             model: fake,
-            policy: &Policy::default(),
+            policy,
             tx: &tx,
             cancel: &Arc::new(AtomicBool::new(false)),
             children: &Children::default(),
@@ -1584,6 +1612,62 @@ mod tests {
             .iter()
             .map(|s| (s.id.as_str(), &s.status))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn launch_obeys_mode_and_explicit_rules() {
+        use crate::permissions::{Rule, Rules};
+
+        let workflow = workflow("steps:\n  - id: a\n    prompt: one\n");
+        for mode in [Mode::Ask, Mode::Auto, Mode::Bypass] {
+            for rule in ["none", "allow", "ask", "deny"] {
+                let root = tools::temp_dir();
+                let mut rules = Rules::default();
+                let workflow_rule = Rule::parse("Workflow").unwrap().by_user();
+                match rule {
+                    "allow" => rules.allow.push(workflow_rule),
+                    "ask" => rules.ask.push(workflow_rule),
+                    "deny" => rules.deny.push(workflow_rule),
+                    _ => {}
+                }
+                let policy = Policy::new(mode, rules, None, root.clone());
+                let fake = Fake::new(vec![vec![say("done")]]);
+                let (report, seen) = go_with_policy(&root, &workflow, "", &fake, &policy).await;
+                let refused = rule == "deny" || (mode == Mode::Auto && rule == "ask");
+                let prompted =
+                    !refused && (rule == "ask" || (mode == Mode::Ask && rule != "allow"));
+                let context = format!("{mode:?} {rule}: {seen:?}");
+                assert_eq!(report.refused.is_some(), refused, "{context}");
+                assert_eq!(
+                    fake.bodies.lock().unwrap().len(),
+                    usize::from(!refused),
+                    "{context}"
+                );
+                assert_eq!(
+                    seen.iter().filter(|s| s.starts_with("approval: ")).count(),
+                    usize::from(prompted),
+                    "{context}"
+                );
+                if !refused {
+                    assert_eq!(statuses(&report), [("a", &Status::Ok)], "{context}");
+                }
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_confirmation_can_be_rejected() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let answer = tokio::spawn(async move {
+            let AgentEvent::Approval { tool, reply, .. } = rx.recv().await.unwrap() else {
+                panic!("expected launch approval");
+            };
+            assert_eq!(tool, TOOL);
+            reply.send(Answer::Reject).unwrap();
+        });
+        assert!(!confirm(&Policy::default(), &tx, "plan".to_string()).await);
+        answer.await.unwrap();
     }
 
     #[tokio::test]
