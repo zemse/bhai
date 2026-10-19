@@ -1900,6 +1900,30 @@ mod tests {
         assert!(!out.contains('\r'), "{out:?}");
     }
 
+    #[tokio::test]
+    async fn a_tty_session_handles_successive_prompts_without_newlines() {
+        let command = "printf 'Name: '; read name; printf 'Confirm: '; read answer; \
+                       printf 'accepted %s %s\\n' \"$name\" \"$answer\"";
+        let out = start(command, None, Duration::from_millis(500), true, quiet()).await;
+        let id = session_id(&out);
+        assert!(out.contains("Name: "), "{out}");
+
+        let out = write(
+            id,
+            "test contributor\n",
+            Duration::from_millis(500),
+            quiet(),
+        )
+        .await;
+        assert_eq!(outcome(&out), Some(Outcome::Running(id)), "{out}");
+        assert!(out.contains("Confirm: "), "{out}");
+
+        let out = write(id, "yes\n", Duration::from_secs(5), quiet()).await;
+        assert_eq!(outcome(&out), Some(Outcome::Succeeded), "{out}");
+        assert!(out.contains("accepted test contributor yes"), "{out}");
+        assert!(check_input(id, "more\n").is_err());
+    }
+
     /// The policy reads the session's command and the line it has so far, so a line
     /// finished across two writes is ruled on whole.
     #[tokio::test]

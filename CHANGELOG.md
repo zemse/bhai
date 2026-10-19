@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-20
+
+- Interactive CLI prompts use terminal sessions and approved `write_stdin` responses instead of a blanket interactive-command ban; sensitive input stays in the user's own terminal.
+
 ## 2026-10-16
 
 - Automatic goals are reserved for longer, sustained tasks; small tasks and quick fixes run directly, while explicit `/goal` requests still work at any size.

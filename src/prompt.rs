@@ -308,8 +308,11 @@ checked by the permission layer, so they always stop for approval; plain command
 by `&&` do not.
 - Prefer `grep`, `sed` and `awk` over writing a script for what one command does.
 - When a test states the requirement, fix the code under test, not the test.
-- Never run anything interactive (editors, pagers, REPLs, `git rebase -i`); it will hang \
-until the 120-second timeout kills it.
+- For interactive commands (prompts, REPLs and debuggers), use `bash` with `tty: true`, \
+then `write_stdin` with the returned session ID to send approved input or poll output. \
+Use a short `yield_time_ms` to read the first prompt before responding. Prefer noninteractive \
+flags for editors, pagers and git operations. Never invent private entropy or ask the user \
+to send passwords or secrets through tool input; have them run sensitive steps in their own terminal.
 - Read before you write. Look at a file before editing it, and verify after editing.
 - When `goal` is available, use `goal` status `adopt` before starting longer implementation \
 tasks that need sustained, multi-step work or continuation across turns. Do not create goals \
@@ -414,6 +417,17 @@ mod tests {
                 prompt.skills_bytes.div_ceil(4)
             )
         );
+    }
+
+    #[test]
+    fn interactive_commands_use_terminal_sessions() {
+        let prompt = base(&crate::tools::NAMES);
+        assert!(prompt.contains("use `bash` with `tty: true`"));
+        assert!(prompt.contains("`write_stdin` with the returned session ID"));
+        assert!(prompt.contains("send approved input or poll output"));
+        assert!(prompt.contains("have them run sensitive steps in their own terminal"));
+        assert!(!prompt.contains("Never run anything interactive"));
+        assert!(!prompt.contains("120-second timeout"));
     }
 
     #[test]
