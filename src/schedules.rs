@@ -443,20 +443,10 @@ impl Schedules {
 
     /// Remove schedule `id`.
     pub fn cancel(&self, id: &str) -> Result<Row, String> {
-        self.remove(id, Origin::User)
-    }
-
-    /// Remove schedule `id` for `by`: the user may remove any, the model only its own.
-    pub fn remove(&self, id: &str, by: Origin) -> Result<Row, String> {
         let now = self.now();
         self.edit(|rows| {
             let at = find(rows, id)?;
             let row = checked(&rows[at], now)?;
-            if by == Origin::Model && row.origin != Origin::Model {
-                return Err(format!(
-                    "{id} is the user's schedule; only they can cancel it"
-                ));
-            }
             rows.remove(at);
             Ok(row)
         })
@@ -862,7 +852,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_schedule_the_model_set_fires_as_its_note_and_it_cancels_only_its_own() {
+    async fn a_schedule_the_model_set_fires_as_its_note_and_keeps_creation_limits() {
         let dir = crate::tools::temp_dir();
         let store = schedules(&dir);
         let model = |spec: &str, text: &str| New {
@@ -876,12 +866,6 @@ mod tests {
         assert!(store.add(model("every 5m", "poll")).is_ok());
         // The user is not held to it.
         let user = store.add(new("every 1m", "mine")).unwrap();
-        assert!(
-            store
-                .remove(&user.id, Origin::Model)
-                .unwrap_err()
-                .contains("the user's schedule")
-        );
         let long = model("in 20m", &"x".repeat(MODEL_TEXT_MAX + 1));
         assert!(store.vet(long.clone()).is_err() && store.add(long).is_err());
         assert!(

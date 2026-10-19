@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-20
 
+- Auto mode sends monitors, schedules, AWS arming, protected paths, code runners and terminal input to the judge instead of human-only gates; workflows launch without manual confirmation, full automation arguments reach review, and schedule cancellation follows permission policy regardless of its creator.
 - Automatic monitor and other wake prompts render as notifications instead of user messages, including mid-turn delivery and restored transcripts; their source stays separate from user authorization.
 - Interactive CLI prompts use terminal sessions and approved `write_stdin` responses instead of a blanket interactive-command ban; sensitive input stays in the user's own terminal.
 

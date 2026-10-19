@@ -1,7 +1,6 @@
 //! `schedule`, for the main agent: leave itself a prompt that comes back into this
-//! session later ("check CI in 20m"), list the schedules, or cancel one it set. A schedule
-//! starts a turn with nobody watching, so every one it sets is the user's to approve and
-//! never the judge's, and the user's own schedules are not its to cancel.
+//! session later ("check CI in 20m"), list the schedules, or cancel one.
+//! Changes go through the permission policy, including the judge in auto mode.
 
 use std::sync::Arc;
 
@@ -43,17 +42,16 @@ impl Action {
             Some("list") => Ok(Action::List),
             Some("cancel") => match string_arg(args, "id").map(str::trim) {
                 Some(id) if !id.is_empty() => Ok(Action::Cancel(id.to_string())),
-                _ => Err("`cancel` needs the `id` of a schedule you set.".to_string()),
+                _ => Err("`cancel` needs the `id` of a schedule.".to_string()),
             },
             _ => Err("`action` must be `create`, `list` or `cancel`.".to_string()),
         }
     }
 }
 
-/// Whether a call with `args` changes nothing the user has to approve: everything but
-/// `create`. The permission rules read it.
+/// Listing does not change schedules; creation and cancellation require review.
 pub fn reads_only(args: &Value) -> bool {
-    string_arg(args, "action") != Some("create")
+    string_arg(args, "action") == Some("list")
 }
 
 fn new(spec: Spec, text: String) -> New {
@@ -79,9 +77,9 @@ impl Tool for Schedule {
         to arrive as a new message at `when`, as a note from you rather than from the user: \
         `in 20m`, `at 17:30`, `at 2026-10-04 09:00`, `every 2h` or `cron <5 fields>` in local \
         time. Use it to check on something slow, such as CI or a deploy, instead of waiting. \
-        The user approves every one. A recurring one fires at least {} minutes apart and \
-        ends after {} days; you may have {} set at once, and a prompt is at most {} bytes. \
-        `list` shows every schedule with its id; `cancel` removes one you set.",
+        The permission policy reviews creation and cancellation. A recurring one fires at least \
+        {} minutes apart and ends after {} days; you may have {} set at once, and a prompt is at most {} bytes. \
+        `list` shows every schedule with its id; `cancel` removes one by id.",
                 schedules::MODEL_GAP_MIN.num_minutes(),
                 schedules::EXPIRY.num_days(),
                 schedules::MODEL_ROWS_MAX,
@@ -148,7 +146,7 @@ cancel it with that id.",
                     Ok((rows, bad)) => (listed(&rows, bad.len(), store.now()), true),
                     Err(e) => (e, false),
                 },
-                Action::Cancel(id) => match store.remove(&id, Origin::Model) {
+                Action::Cancel(id) => match store.cancel(&id) {
                     Ok(row) => (
                         format!("Cancelled {}.", schedules::describe(&row, store.now())),
                         true,
@@ -196,7 +194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_model_sets_lists_and_cancels_its_own_schedules() {
+    async fn the_model_sets_lists_and_cancels_schedules_after_policy_review() {
         let dir = super::super::temp_dir();
         let tool = tool(&dir);
         assert!(tool.needs_approval());
@@ -223,17 +221,17 @@ mod tests {
             "{out}"
         );
 
-        // The user's own is not the model's to cancel.
+        // The permission policy reviews cancellation regardless of who created it.
         let cancel = |id: &str| json!({"action": "cancel", "id": id});
         assert_eq!(
             tool.describe(&cancel(&user.id)).unwrap(),
             format!("schedule cancel {}", user.id)
         );
         let (out, ok) = tool.execute(&cancel(&user.id)).await;
-        assert!(!ok && out.contains("the user's schedule"), "{out}");
+        assert!(ok && out.starts_with("Cancelled "), "{out}");
         let (out, ok) = tool.execute(&cancel(&rows[0].id)).await;
         assert!(ok && out.starts_with("Cancelled "), "{out}");
-        assert_eq!(tool.schedules.list().unwrap().0, [user]);
+        assert!(tool.schedules.list().unwrap().0.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -299,9 +297,9 @@ mod tests {
     }
 
     #[test]
-    fn only_create_asks() {
+    fn only_list_skips_review() {
         assert!(!reads_only(&json!({"action": "create"})));
         assert!(reads_only(&json!({"action": "list"})));
-        assert!(reads_only(&json!({"action": "cancel", "id": "x"})));
+        assert!(!reads_only(&json!({"action": "cancel", "id": "x"})));
     }
 }

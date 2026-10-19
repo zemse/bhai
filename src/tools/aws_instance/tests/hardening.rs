@@ -340,14 +340,12 @@ async fn scoped_capabilities_do_not_bypass_project_trust() {
 }
 
 #[tokio::test]
-async fn native_arm_is_reserved_for_user_and_persists_exact_resource_association() {
+async fn native_arm_reaches_the_judge_and_persists_exact_resource_association() {
     let f = Fixture::new();
     let policy = f.policy(Mode::Auto, Rules::default());
     let args = f.arm_args();
     assert_eq!(policy.check(NAME, &args, true), Decision::Ask);
-    assert!(
-        matches!(policy.judgeable(NAME, &args), Err(crate::permissions::Reserved::Protected(message)) if message.contains("arm"))
-    );
+    assert!(policy.judgeable(NAME, &args).is_ok());
     assert_eq!(
         f.policy(Mode::Ask, Rules::default())
             .check(NAME, &args, true),

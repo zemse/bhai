@@ -37,7 +37,7 @@ impl Tool for WriteStdin {
         or `Process running with session ID N` again. With `chars` empty it reads output, \
         waiting until exit or the deadline, not returning for each output chunk. Typing \
         needs a session started with `tty: true`; one without a terminal only \
-        takes \"\\u0003\" (ctrl-c). The user approves what is typed.",
+        takes \"\\u0003\" (ctrl-c). Typed input goes through the permission policy.",
             "strict": false,
             "parameters": {
                 "type": "object",

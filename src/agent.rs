@@ -3452,7 +3452,7 @@ not retry it. Try a different approach, or ask the user."
                         ),
                         // Which one it was, and the word it tripped on. Naming every
                         // cause at once left the model rewriting the call at random.
-                        Undecided::Unjudgeable(reserved) => (reserved.why(), reserved.how()),
+                        Undecided::Unjudgeable(reserved) => (reserved.why(), ""),
                         Undecided::TooLong => (
                             "it is too long to put to the judge in full".to_string(),
                             " Broken into shorter commands, each one may go through.",
@@ -6483,6 +6483,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_creation_uses_the_judge_without_a_human_prompt() {
+        use crate::judge::fake::Answers;
+        use crate::permissions::{Rules, Trust};
+        for approve in [true, false] {
+            let dir = tools::temp_dir();
+            let policy = Policy::new(Mode::Auto, Rules::default(), None, dir.clone())
+                .with_trust(Trust::new(&dir.join("config"), &dir));
+            policy.trust().unwrap();
+            let verdict = if approve {
+                Verdict::Approve {
+                    reason: "observe requested work".into(),
+                }
+            } else {
+                Verdict::Deny {
+                    reason: "unrelated observer".into(),
+                }
+            };
+            let (judge, backend) = crate::judge::fake::judge(Answers::Verdict(verdict), &dir);
+            let monitors = crate::monitor::Monitors::new(std::sync::Weak::new());
+            let registry = Registry::new(Vec::new()).with_tool(Box::new(tools::monitor::Monitor {
+                monitors: Arc::clone(&monitors),
+            }));
+            let args = json!({
+                "action":"create", "name":"progress", "command":"cat progress.json", "workdir":dir,
+                "hooks":[{"condition":"done", "prompt":"check the completed work"}]
+            });
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (output, ok) = execute(
+                &registry,
+                &policy,
+                Some(&judge),
+                &fake::call("monitor", args.clone()),
+                None,
+                &tx,
+                &Arc::new(AtomicBool::new(false)),
+                &mut Vec::new(),
+            )
+            .await;
+            assert_eq!(ok, approve, "{output}");
+            assert_eq!(monitors.views().len(), usize::from(approve));
+            monitors.shutdown();
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(event, AgentEvent::Approval { .. }));
+            }
+            let calls = backend.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                serde_json::from_str::<Value>(&calls[0].target).unwrap(),
+                args
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn an_approved_call_runs_without_prompting() {
         use crate::judge::Verdict;
         use crate::judge::fake::Answers;
@@ -6584,11 +6639,12 @@ mod tests {
             let (judge, backend) = crate::judge::fake::judge(
                 Answers::Replies(vec![
                     r#"{"verdict":"deny","reason":"use a bounded replacement"}"#.into(),
-                    if outcome == "deny" {
+                    if matches!(outcome, "deny" | "secret") {
                         r#"{"verdict":"deny","reason":"replacement still violates scope"}"#.into()
                     } else {
                         r#"{"verdict":"approve","reason":"bounded replacement"}"#.into()
                     },
+                    r#"{"verdict":"approve","reason":"bounded correction"}"#.into(),
                 ]),
                 &repo,
             );
@@ -6711,8 +6767,8 @@ mod tests {
             if matches!(outcome, "secret" | "rule") {
                 assert_eq!(
                     backend.calls.lock().unwrap().len(),
-                    1,
-                    "hard-blocked proposals never reach the judge"
+                    if outcome == "secret" { 2 } else { 1 },
+                    "secret access is judged; explicit deny rules never reach the judge"
                 );
                 let corrected = format!("echo corrected > {}", marker.display());
                 let correction = call(
@@ -6805,7 +6861,12 @@ mod tests {
             let (judge, backend) = crate::judge::fake::judge(
                 Answers::Replies(vec![
                     r#"{"verdict":"deny","reason":"unclear relevance"}"#.into(),
-                    r#"{"verdict":"approve","reason":"benign task note"}"#.into(),
+                    if blocked {
+                        r#"{"verdict":"deny","reason":"secret read"}"#.into()
+                    } else {
+                        r#"{"verdict":"approve","reason":"benign task note"}"#.into()
+                    },
+                    r#"{"verdict":"deny","reason":"secret read"}"#.into(),
                 ]),
                 &repo,
             );
@@ -6916,10 +6977,10 @@ mod tests {
             )
             .await;
             assert!(!ok, "{output}");
-            assert!(!output.contains("reconsiderations remain"));
+            assert!(output.contains("denied by auto policy: secret read"));
             assert_eq!(
                 backend.calls.lock().unwrap().len(),
-                if blocked { 1 } else { 2 }
+                if blocked { 2 } else { 3 }
             );
             std::fs::remove_dir_all(dir).unwrap();
         }

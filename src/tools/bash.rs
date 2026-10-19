@@ -1,4 +1,4 @@
-//! Run a shell command, after the user approves it. One still running when the call
+//! Run a shell command, after permission-policy approval. One still running when the call
 //! yields stays alive as a session, which `write_stdin` polls or types into.
 
 use std::collections::BTreeMap;
@@ -166,7 +166,7 @@ impl Tool for Bash {
 fn tool_schema() -> Value {
     let description = format!(
         "Run a shell command with `bash -lc` in the current working directory, or in \
-    `workdir` when given, and return its combined stdout and stderr plus the exit code. The user approves every command \
+    `workdir` when given, and return its combined stdout and stderr plus the exit code. The permission policy reviews each command \
     before it runs; a rejected command does not execute. Use absolute paths. A command still \
     running after `yield_time_ms` keeps running as a session: the result starts `Process running \
     with session ID N` and holds the output so far, and `write_stdin` polls it for more or, \
@@ -1928,7 +1928,7 @@ mod tests {
     /// finished across two writes is ruled on whole.
     #[tokio::test]
     async fn typing_into_a_shell_session_is_ruled_on_as_the_line_it_finishes() {
-        use crate::permissions::{Mode, Policy, Reserved, Rules, Trust};
+        use crate::permissions::{Mode, Policy, Rules, Trust};
         let dir = std::env::temp_dir().join(format!("bhai-stdin-{}", uuid::Uuid::new_v4()));
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -1942,10 +1942,7 @@ mod tests {
         let typed = |chars: &str| json!({ "session_id": id, "chars": chars });
         assert!(policy.judgeable("write_stdin", &typed("cat .e")).is_ok());
         write(id, "cat .e", Duration::from_millis(250), quiet()).await;
-        assert_eq!(
-            policy.judgeable("write_stdin", &typed("nv\n")),
-            Err(Reserved::Protected(".env".to_string()))
-        );
+        assert_eq!(policy.judgeable("write_stdin", &typed("nv\n")), Ok(()));
         write(id, "\u{3}", Duration::from_millis(250), quiet()).await;
         assert!(policy.judgeable("write_stdin", &typed("nv\n")).is_ok());
         write(id, "exit\n", Duration::from_secs(5), quiet()).await;
@@ -1954,7 +1951,7 @@ mod tests {
         let id = session_id(&out);
         assert_eq!(
             policy.judgeable("write_stdin", &json!({ "session_id": id, "chars": "x\n" })),
-            Err(Reserved::Typed("cat".to_string()))
+            Ok(())
         );
         write(id, "\u{4}", Duration::from_secs(5), quiet()).await;
         std::fs::remove_dir_all(dir).unwrap();

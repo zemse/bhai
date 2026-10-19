@@ -1,5 +1,5 @@
 //! `remember`, for the main agent: append a note to `.bhai/MEMORY.md` for later sessions,
-//! after the user approves it. A child is never given it.
+//! after permission-policy approval. A child is never given it.
 
 use std::path::PathBuf;
 
@@ -34,8 +34,8 @@ impl Tool for Remember {
             "name": NAME,
             "description": "Save one short note to this project's memory file for later \
         sessions: a fact about the project or how the user wants work done that the next \
-        session would otherwise have to rediscover, not a record of this task. The user \
-        approves every note. Notes load when a session starts, so this one reaches the next \
+        session would otherwise have to rediscover, not a record of this task. The permission policy \
+        reviews each note. Notes load when a session starts, so this one reaches the next \
         session, not this one.",
             "strict": false,
             "parameters": {

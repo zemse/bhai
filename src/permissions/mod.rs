@@ -16,7 +16,7 @@ pub mod rules;
 pub mod settings;
 pub mod trust;
 
-use crate::tools::{fetch, image_gen, monitor, patch, schedule, ssrf, view_image};
+use crate::tools::{fetch, image_gen, monitor, patch, schedule, view_image};
 use rules::Base;
 pub use rules::Rule;
 pub use trust::Trust;
@@ -28,7 +28,7 @@ pub enum Mode {
     /// Every call that needs approval prompts.
     #[default]
     Ask,
-    /// Allow rules and read-only commands run; everything else prompts.
+    /// Rules and read-only commands run; the judge reviews other calls without prompting.
     Auto,
     /// Everything runs, except ask rules and protected paths, which prompt.
     Bypass,
@@ -79,27 +79,14 @@ impl Rules {
     }
 }
 
-/// Why a call is the user's to approve and never the judge's. `auto` mode denies every
-/// one of them without prompting, so which it was is what the agent is told: a denial
-/// that names all of the causes at once is one the model can only answer by guessing.
+/// Why a call cannot reach the judge. User rules and project trust still apply in auto.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reserved {
-    /// A path, or a word of a command, only the user may approve.
-    Protected(String),
+    /// A malformed target that cannot be matched against user rules.
+    Invalid(String),
     /// An ask rule the user set, by its text.
     Asked(String),
-    /// A command the tokenizer could not read, by the word that runs code in it.
-    RunsCode(String),
-    /// Input typed into a session that is not a plain shell, or that holds keys which
-    /// edit the line, by the session's command: nothing here can tell what it runs.
-    Typed(String),
-    /// A schedule the model sets, which starts a turn later with nobody watching.
-    Scheduled,
-    /// An observer repeatedly executes a command and can wake the loop.
-    Monitor,
-    /// The judge does not run here at all: this is not `auto`, or the project is not
-    /// trusted. Neither reaches the agent, since `auto` implies a trusted project and
-    /// every other mode prompts.
+    /// The judge only runs in auto mode in a trusted project.
     Untrusted,
 }
 
@@ -107,32 +94,9 @@ impl Reserved {
     /// What the denial says it was.
     pub fn why(&self) -> String {
         match self {
-            Reserved::Protected(what) => {
-                format!("only the user may approve a call naming {what}")
-            }
+            Reserved::Invalid(what) => format!("invalid approval target: {what}"),
             Reserved::Asked(rule) => format!("the user's rule {rule} keeps this one for them"),
-            Reserved::RunsCode(word) => {
-                format!("the permission checker cannot read a command holding `{word}`")
-            }
-            Reserved::Typed(command) => {
-                format!("only the user may approve what is typed into `{command}`")
-            }
-            Reserved::Monitor => "only the user may approve a monitor command and its wake hooks".to_string(),
-            Reserved::Scheduled => {
-                "only the user may approve a schedule, which starts a turn later with nobody watching".to_string()
-            }
             Reserved::Untrusted => "this project is not trusted".to_string(),
-        }
-    }
-
-    /// What the agent can do about it, if anything.
-    pub fn how(&self) -> &'static str {
-        match self {
-            Reserved::RunsCode(_) => {
-                " It reads that as running whatever follows it, so it cannot tell what the \
-command would do. Without it, or split into separate commands, the same work may go through."
-            }
-            _ => "",
         }
     }
 }
@@ -396,17 +360,8 @@ impl Policy {
             .check(tool, args, needs_approval)
     }
 
-    /// Whether a call the rules left at `Ask` may go to the auto-approval judge, and
-    /// what keeps it from the judge when it may not. Only in `auto` mode in a trusted
-    /// project, and never for what the user must decide themselves: a protected path, an
-    /// ask rule they set, or a command the tokenizer refuses, which is how `sudo` and
-    /// everything it cannot read are kept out. `auto` never prompts, so in that mode
-    /// those are denied rather than asked.
-    ///
-    /// Where the call would land is not one of those. The judge rules on that, against
-    /// what the user asked for: a shell redirect anywhere on the machine already reached
-    /// it, so keeping the `write` that does the same thing from it decided nothing and
-    /// left a task about the machine with no way through at all.
+    /// Calls left at `Ask` reach the judge in trusted auto mode unless a user ask rule
+    /// reserves them. Built-in guards require review, not necessarily a human review.
     pub fn judgeable(&self, tool: &str, args: &Value) -> Result<(), Reserved> {
         let rules = self.rules();
         self.checker(&rules, self.mode()).judgeable(tool, args)
@@ -1072,19 +1027,18 @@ impl Checker<'_> {
         if !self.relaxed() {
             return Err(Reserved::Untrusted);
         }
-        if tool == crate::tools::aws_instance::NAME
-            || (tool == "bash" && bash::aws_launch(args["command"].as_str().unwrap_or_default()))
-        {
-            return Err(Reserved::Protected(
-                "AWS lifecycle: use aws_instance to arm an existing stopped instance with a cloud stop deadline; raw launch/start and unverified capabilities require the user".into(),
-            ));
-        }
-        // As in `check`, the `Read` or `Write` rules and the protected paths decide these.
+        // As in `check`, image calls answer to `Read` or `Write` rules.
         let tool = match tool {
             view_image::NAME => "read",
             image_gen::NAME => "write",
             _ => tool,
         };
+        let mcp = if tool == "mcp_call" {
+            Some(mcp_name(args).ok_or_else(|| Reserved::Invalid("no MCP tool name".into()))?)
+        } else {
+            None
+        };
+        let tool = mcp.as_deref().unwrap_or(tool);
         let text = |key| args.get(key).and_then(Value::as_str);
         // An ask rule is the user saying they want to see this one. The judge waving it
         // through would leave the rule tightening nothing in the mode that needs it.
@@ -1103,54 +1057,28 @@ impl Checker<'_> {
                 }
                 match bash::parse(command) {
                     Some(commands) => commands.iter().try_for_each(|c| {
-                        if let Some(word) = bash::protected_mention(c) {
-                            return Err(Reserved::Protected(word));
-                        }
                         match self.find_loose(&self.rules.ask, c) {
                             Some(rule) => Err(Reserved::Asked(rule.text)),
                             None => Ok(()),
                         }
                     }),
-                    // A command the tokenizer could not take apart is still the judge's
-                    // to rule on: it reads the text as written, and a variable or a
-                    // substitution is most of what the tokenizer refuses. What it must
-                    // not be handed is a command that runs its arguments as shell code
-                    // or as someone else, or one naming a protected path, since the
-                    // shape those hide behind is the reason they are the user's alone.
-                    None => {
-                        if let Some(rule) = self.find_raw(&self.rules.ask, command) {
-                            return Err(Reserved::Asked(rule.text));
-                        }
-                        match bash::reserved(command) {
-                            Some(bash::Reserved::Program(word)) => Err(Reserved::RunsCode(word)),
-                            Some(bash::Reserved::Path(word)) => Err(Reserved::Protected(word)),
-                            None => Ok(()),
-                        }
-                    }
+                    None => match self.find_raw(&self.rules.ask, command) {
+                        Some(rule) => Err(Reserved::Asked(rule.text)),
+                        None => Ok(()),
+                    },
                 }
             }
-            // A protected path is the user's alone. Everywhere else, including the rest
-            // of the machine, is the judge's to rule on against what the user asked for.
             "read" | "write" | "edit" => match text("path") {
-                Some(path) => {
-                    let path = Path::new(path);
-                    match rules::is_protected(path, self.base.home) {
-                        true => Err(Reserved::Protected(path.display().to_string())),
-                        false => asked(path).map_or(Ok(()), Err),
-                    }
-                }
-                None => Err(Reserved::Protected("no path".to_string())),
+                Some(path) => asked(Path::new(path)).map_or(Ok(()), Err),
+                None => Err(Reserved::Invalid("no path".to_string())),
             },
             patch::NAME => {
                 let paths = patch::paths(args, self.base.cwd)
-                    .ok_or_else(|| Reserved::Protected("no path".to_string()))?;
+                    .ok_or_else(|| Reserved::Invalid("no path".to_string()))?;
                 if let Some(rule) = self.rules.ask.iter().find(|r| r.applies_to(patch::NAME)) {
                     return Err(Reserved::Asked(rule.text.clone()));
                 }
                 paths.iter().try_for_each(|path| {
-                    if rules::is_protected(path, self.base.home) {
-                        return Err(Reserved::Protected(path.display().to_string()));
-                    }
                     match self
                         .rules
                         .ask
@@ -1163,19 +1091,18 @@ impl Checker<'_> {
                 })
             }
             crate::tools::stdin::NAME => self.judgeable_typing(tool, &Typing::of(args)),
-            monitor::NAME => Err(Reserved::Monitor),
-            schedule::NAME => Err(Reserved::Scheduled),
-            // The guard refuses a private address when the fetch runs; one written into
-            // the URL is kept from the judge too, so it is never what the judge approved.
+            monitor::NAME => {
+                if let Some(rule) = self.rules.ask.iter().find(|r| r.applies_to(tool)) {
+                    return Err(Reserved::Asked(rule.text.clone()));
+                }
+                if text("action") == Some("create") {
+                    self.judgeable("bash", args)?;
+                }
+                Ok(())
+            }
             fetch::NAME => {
                 let host =
-                    fetch::host(args).ok_or_else(|| Reserved::Protected("no URL".to_string()))?;
-                let inside = host == "localhost"
-                    || host.ends_with(".localhost")
-                    || ssrf::literal(&host).is_some_and(|ip| ssrf::refusal(ip).is_some());
-                if inside {
-                    return Err(Reserved::Protected(host));
-                }
+                    fetch::host(args).ok_or_else(|| Reserved::Invalid("no URL".to_string()))?;
                 match self
                     .rules
                     .ask
@@ -1195,9 +1122,7 @@ impl Checker<'_> {
         }
     }
 
-    /// What a shell is given reaches the judge only as `bash` running it would, and only
-    /// once it is whole commands; anything else typed is the user's, since nothing says
-    /// what the program does with it.
+    /// Shell input also answers to Bash ask rules; other input is reviewed in context.
     fn judgeable_typing(&self, tool: &str, typing: &Typing) -> Result<(), Reserved> {
         if let Some(rule) = self.rules.ask.iter().find(|r| r.applies_to(tool)) {
             return Err(Reserved::Asked(rule.text.clone()));
@@ -1208,12 +1133,12 @@ impl Checker<'_> {
                 if !entered.trim().is_empty() {
                     self.judgeable("bash", &json!({ "command": entered }))?;
                 }
-                match open {
-                    Some(command) => Err(Reserved::Typed(command.clone())),
-                    None => Ok(()),
+                if let Some(command) = open {
+                    self.judgeable("bash", &json!({ "command": command }))?;
                 }
+                Ok(())
             }
-            Typing::Into(command) => Err(Reserved::Typed(command.clone())),
+            Typing::Into(_) => Ok(()),
         }
     }
 
@@ -1911,12 +1836,9 @@ mod tests {
         }
     }
 
-    /// The backend is not trusted with the transcript it is served. A model that asks
-    /// for a credential file must not get one without the user seeing the call, whatever
-    /// the mode, and whichever tool it reaches for: the read tool and `cat` answer the
-    /// same, or the cheaper one is the whole defence.
+    /// Credential paths never run on deterministic permission alone.
     #[test]
-    fn a_hostile_backend_cannot_read_credentials() {
+    fn credential_paths_require_review_even_in_auto() {
         let trusted = |mode| {
             let policy = policy(mode, &[], &[], &[]);
             let trust = Trust::new(Path::new("/home/u/.config/bhai"), Path::new("/home/u/repo"));
@@ -1962,10 +1884,10 @@ mod tests {
                     Decision::Ask,
                     "{path} in {mode}"
                 );
-                // `auto` never prompts, so the judge must not be offered it either.
                 for tool in ["read", "view_image"] {
-                    assert!(
-                        policy.judgeable(tool, &json!({ "path": path })).is_err(),
+                    assert_eq!(
+                        policy.judgeable(tool, &json!({ "path": path })).is_ok(),
+                        mode == Mode::Auto,
                         "{tool} {path} in {mode}"
                     );
                 }
@@ -2064,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fetch_is_decided_by_its_domain_and_a_private_one_never_judged() {
+    fn a_fetch_is_decided_by_its_domain_and_reaches_the_judge() {
         let call = |url: &str| json!({ "url": url });
         let docs = call("https://Docs.rs/serde");
         let auto = policy(
@@ -2111,17 +2033,14 @@ mod tests {
             "http://0x7f.1/",
         ] {
             assert!(
-                matches!(
-                    auto.judgeable("fetch", &call(url)),
-                    Err(Reserved::Protected(_))
-                ),
+                matches!(auto.judgeable("fetch", &call(url)), Ok(())),
                 "{url}"
             );
         }
     }
 
     #[test]
-    fn a_schedule_the_model_sets_asks_and_is_never_judged() {
+    fn a_schedule_the_model_sets_reaches_the_judge() {
         let create = json!({ "action": "create", "when": "in 20m", "prompt": "x" });
         let list = json!({ "action": "list" });
         let cancel = json!({ "action": "cancel", "id": "abc123" });
@@ -2130,16 +2049,13 @@ mod tests {
         assert_eq!(ask.offers("schedule", &create), Offers::default());
         let auto = policy(Mode::Auto, &[], &[], &[]);
         assert_eq!(auto.check("schedule", &create, true), Decision::Ask);
+        assert_eq!(auto.judgeable("schedule", &create), Ok(()));
         assert_eq!(
-            auto.judgeable("schedule", &create),
-            Err(Reserved::Scheduled)
+            auto.check("schedule", &list, true),
+            Decision::Allow(String::new())
         );
-        for args in [&list, &cancel] {
-            assert_eq!(
-                auto.check("schedule", args, true),
-                Decision::Allow(String::new())
-            );
-        }
+        assert_eq!(auto.check("schedule", &cancel, true), Decision::Ask);
+        assert_eq!(auto.judgeable("schedule", &cancel), Ok(()));
         let denied = policy(Mode::Auto, &[], &["Schedule"], &[]);
         assert!(matches!(
             denied.check("schedule", &list, true),
@@ -2163,7 +2079,7 @@ mod tests {
         let create = json!({"action":"create", "name":"bench", "command":"cat /tmp/progress.json", "workdir":"/tmp"});
         let auto = policy(Mode::Auto, &[], &[], &[]);
         assert_eq!(auto.check("monitor", &create, true), Decision::Ask);
-        assert_eq!(auto.judgeable("monitor", &create), Err(Reserved::Monitor));
+        assert_eq!(auto.judgeable("monitor", &create), Ok(()));
         assert_eq!(auto.offers("monitor", &create), Offers::default());
         for action in ["list", "pause", "resume", "stop", "dismiss"] {
             assert_eq!(
@@ -2181,6 +2097,34 @@ mod tests {
             denied.check("monitor", &json!({"action":"list"}), true),
             Decision::Deny(_)
         ));
+    }
+
+    #[test]
+    fn automatic_actions_still_respect_explicit_ask_rules() {
+        let monitor =
+            json!({"action":"create", "command":"cat /tmp/progress.json", "workdir":"/tmp"});
+        for (rule, tool, args) in [
+            ("Monitor", "monitor", monitor.clone()),
+            ("Bash(cat:*)", "monitor", monitor),
+            (
+                "Schedule",
+                "schedule",
+                json!({"action":"create", "when":"in 20m", "prompt":"check CI"}),
+            ),
+            (
+                "mcp__docs__read",
+                "mcp_call",
+                json!({"name":"mcp__docs__read", "arguments":{}}),
+            ),
+        ] {
+            let auto = policy(Mode::Auto, &[], &[], &[rule]);
+            assert_eq!(auto.check(tool, &args, true), Decision::Ask, "{rule}");
+            assert_eq!(
+                auto.judgeable(tool, &args),
+                Err(Reserved::Asked(rule.into())),
+                "{rule}"
+            );
+        }
     }
 
     #[test]
@@ -2327,7 +2271,7 @@ mod tests {
     }
 
     #[test]
-    fn a_line_left_inside_a_quote_is_only_the_users_to_approve() {
+    fn unfinished_shell_input_reaches_the_judge() {
         let dir = std::env::temp_dir().join(format!("bhai-open-{}", uuid::Uuid::new_v4()));
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -2339,7 +2283,7 @@ mod tests {
             p.checker(&rules, p.mode())
                 .judgeable_typing("write_stdin", &Typing::read("bash", unrun, chars))
         };
-        let typed = Err(Reserved::Typed("bash".to_string()));
+        let typed = Ok(());
         assert_eq!(judgeable("echo \"\n", "echo \"\n"), typed);
         assert_eq!(judgeable("cat <<'EOF'\n", "cat <<'EOF'\n"), typed);
         assert_eq!(judgeable("echo a \\\n", "echo a \\\n"), typed);
@@ -2392,22 +2336,13 @@ mod tests {
         };
         assert!(judgeable("bash", "cargo test\n").is_ok());
         assert!(judgeable("bash", "\u{3}").is_ok());
-        assert_eq!(
-            judgeable("bash", "cat .env\n"),
-            Err(Reserved::Protected(".env".to_string()))
-        );
+        assert_eq!(judgeable("bash", "cat .env\n"), Ok(()));
         assert_eq!(
             judgeable("bash", "ls\ngit push\n"),
             Err(Reserved::Asked("Bash(git push:*)".to_string()))
         );
-        assert_eq!(
-            judgeable("bash", "eval \"$X\"\n"),
-            Err(Reserved::RunsCode("eval".to_string()))
-        );
-        assert_eq!(
-            judgeable("python3", "print(1)\n"),
-            Err(Reserved::Typed("python3".to_string()))
-        );
+        assert_eq!(judgeable("bash", "eval \"$X\"\n"), Ok(()));
+        assert_eq!(judgeable("python3", "print(1)\n"), Ok(()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2605,7 +2540,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_identity_use_reaches_the_judge_but_disclosure_does_not() {
+    fn ssh_identity_use_and_protected_commands_require_review() {
         let auto = policy(Mode::Auto, &[], &[], &[]);
         let call = "ssh -i /home/u/.ssh/id_ed25519 -o BatchMode=yes ubuntu@host true";
         assert_eq!(bash(&auto, call), Decision::Ask);
@@ -2616,10 +2551,7 @@ mod tests {
             "ssh -i /home/u/.ssh/id_ed25519 host 'cat key.pem'",
             "printf forged > /p/.bhai/sessions/session.jsonl",
         ] {
-            assert!(
-                auto.judgeable("bash", &json!({"command": command}))
-                    .is_err()
-            );
+            assert!(auto.judgeable("bash", &json!({"command": command})).is_ok());
         }
         let asked = policy(Mode::Auto, &[], &[], &["Bash(ssh:*)"]);
         assert!(asked.judgeable("bash", &json!({"command": call})).is_err());
@@ -2644,19 +2576,10 @@ mod tests {
         assert!(command("cargo clippy").is_ok());
         assert!(path("write", &repo.join("src/a.rs")).is_ok());
 
-        // The categories that always reach the user instead, each naming what it was.
-        assert_eq!(
-            command("sudo cargo clippy"),
-            Err(Reserved::RunsCode("sudo".to_string()))
-        );
-        assert_eq!(
-            command("cat .env"),
-            Err(Reserved::Protected(".env".to_string()))
-        );
-        assert_eq!(
-            path("edit", &repo.join(".env")),
-            Err(Reserved::Protected(repo.join(".env").display().to_string()))
-        );
+        // Built-in guards require a verdict, not a human-only approval.
+        assert_eq!(command("sudo cargo clippy"), Ok(()));
+        assert_eq!(command("cat .env"), Ok(()));
+        assert_eq!(path("edit", &repo.join(".env")), Ok(()));
         assert!(p.judgeable("write", &json!({})).is_err(), "no path");
 
         // Where the call lands is the judge's to rule on, not a category of its own:
@@ -2670,8 +2593,7 @@ mod tests {
             "the same by redirect"
         );
 
-        // A command the tokenizer cannot take apart is the judge's, unless its text
-        // names one of those categories, which is all that can be read off it.
+        // The judge reviews the original command even when tokenization fails.
         assert!(
             command("cat $HOME/.cargo/config.toml").is_ok(),
             "an expansion"
@@ -2683,23 +2605,20 @@ mod tests {
         );
         assert_eq!(
             command("ls $(sudo rm x)"),
-            Err(Reserved::RunsCode("sudo".to_string())),
+            Ok(()),
             "sudo behind a substitution"
         );
         assert_eq!(
             command("sh -c \"$SCRIPT\""),
-            Err(Reserved::RunsCode("sh".to_string())),
+            Ok(()),
             "a shell reading its argument"
         );
         assert!(
-            matches!(
-                command("cat $HOME/.ssh/id_ed25519"),
-                Err(Reserved::Protected(_))
-            ),
+            matches!(command("cat $HOME/.ssh/id_ed25519"), Ok(())),
             "a protected path"
         );
         assert!(
-            matches!(command("cat $HOME/.e*"), Err(Reserved::Protected(_))),
+            matches!(command("cat $HOME/.e*"), Ok(())),
             "a glob that may reach one"
         );
         // A probe of what is installed, which `command` in the refused list used to take
@@ -2789,10 +2708,7 @@ mod tests {
             "read outside"
         );
         assert!(
-            matches!(
-                path("read", &repo.join(".env")),
-                Err(Reserved::Protected(_))
-            ),
+            matches!(path("read", &repo.join(".env")), Ok(())),
             "read protected"
         );
 

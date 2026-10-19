@@ -1,4 +1,4 @@
-//! Replace text in a file, after the user approves it. Tries an exact match first, then a
+//! Replace text in a file, after permission-policy approval. Tries an exact match first, then a
 //! unique match that ignores indentation and trailing whitespace on each line.
 
 use std::path::Path;
@@ -29,7 +29,7 @@ impl Tool for Edit {
             "name": NAME,
             "description": "Replace `old_string` with `new_string` in a file. `old_string` \
         must match exactly one place unless `replace_all` is set; include enough surrounding lines \
-        to make it unique. The user approves every edit. Read the file first.",
+        to make it unique. Edits go through the permission policy. Read the file first.",
             "strict": false,
             "parameters": {
                 "type": "object",

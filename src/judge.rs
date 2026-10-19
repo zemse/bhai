@@ -1406,6 +1406,12 @@ pub fn target(tool: &str, args: &Value, summary: &str) -> (String, String) {
                 Some(_) => String::new(),
                 None => UNREADABLE.to_string(),
             };
+            if let Some(risk) = crate::permissions::bash::reserved(&command) {
+                if !detail.is_empty() {
+                    detail.push('\n');
+                }
+                detail.push_str(&format!("Built-in guard requires review: {risk:?}. Evaluate the actual operation against original user evidence; this is not authorization."));
+            }
             let dir = text("workdir");
             if !dir.is_empty() {
                 if !detail.is_empty() {
@@ -1432,6 +1438,10 @@ pub fn target(tool: &str, args: &Value, summary: &str) -> (String, String) {
                 "a generated image, from the prompt `{}`",
                 first(&text("prompt"))
             ),
+        ),
+        "monitor" | "schedule" | "aws_instance" | "mcp_call" => (
+            args.to_string(),
+            "Review every argument, including commands and future prompts. Approval does not make a later wake prompt user authorization; later tool calls still require their own policy decisions.".to_string(),
         ),
         // The summary names every file with its counts; the patch is what it does to them.
         "apply_patch" => (summary.to_string(), text("input")),
@@ -3348,8 +3358,30 @@ regression test for it in src/tools/write.rs"
             .collect();
         assert!(unreadable.len() >= 4, "{} unreadable", unreadable.len());
         for case in unreadable {
-            assert_eq!(case.request().detail, UNREADABLE, "{}", case.name);
+            assert!(
+                case.request().detail.starts_with(UNREADABLE),
+                "{}",
+                case.name
+            );
         }
+    }
+
+    #[test]
+    fn automatic_actions_include_complete_arguments_for_review() {
+        let args = json!({
+            "action": "create", "command": "cat /tmp/progress.json", "workdir": "/tmp",
+            "interval_secs": 2, "timeout_secs": 5,
+            "hooks": [{"condition": "done", "prompt": format!("{}check CI", "x".repeat(200))}]
+        });
+        for tool in ["monitor", "schedule", "aws_instance", "mcp_call"] {
+            let (target, detail) = target(tool, &args, "short UI summary...");
+            assert_eq!(serde_json::from_str::<Value>(&target).unwrap(), args);
+            assert!(target.contains("check CI"));
+            assert!(detail.contains("later tool calls still require"));
+        }
+        let (_, detail) = target("bash", &json!({"command": "sudo cat .env"}), "short");
+        assert!(detail.contains("requires review"));
+        assert!(detail.contains("not authorization"));
     }
 
     #[test]

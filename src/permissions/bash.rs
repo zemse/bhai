@@ -996,9 +996,7 @@ fn ssh_identities(words: &[String]) -> Vec<usize> {
     Vec::new()
 }
 
-/// What in a command this parser could not read keeps it for the user, and which word
-/// it was. The word is what the agent is told: a denial it cannot locate is one it can
-/// only answer by rewriting the command at random.
+/// A command's sensitive paths or code runners, supplied as context for judge review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reserved {
     /// A program that runs its arguments as shell code, or as someone else.
@@ -1007,12 +1005,8 @@ pub enum Reserved {
     Path(String),
 }
 
-/// Whether the raw text of a command this parser could not read names anything only the
-/// user may approve: a program that runs its arguments as shell code or as someone else,
-/// a protected path, or a glob that could reach one. It is all that can be said about a
-/// command whose shape is unknown, and it is what decides whether such a command may be
-/// put to the auto-approval judge rather than denied outright. The split is deliberately
-/// blunt: it looks inside substitutions and quotes, because it cannot tell them apart.
+/// Find a code runner, protected path or glob in raw command text. This is review
+/// context, not a denial. The split looks inside substitutions and quotes.
 pub fn reserved(input: &str) -> Option<Reserved> {
     // A second pass with the quoting taken out, since `$('s'udo rm /)` and `$(su\do id)`
     // are the same word to the shell. Both passes count: removing the quotes can also
@@ -1127,8 +1121,7 @@ mod tests {
         }
     }
 
-    /// What can be read off a command this parser refuses: the programs that run their
-    /// arguments as something else, and the paths only the user may approve.
+    /// Raw commands still expose code runners and sensitive paths for review.
     #[test]
     fn a_command_that_cannot_be_read_still_shows_what_it_names() {
         for tame in [

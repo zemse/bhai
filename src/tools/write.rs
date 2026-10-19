@@ -1,4 +1,4 @@
-//! Write a whole file, creating parent directories, after the user approves it.
+//! Write a whole file, creating parent directories, after permission-policy approval.
 
 use std::path::Path;
 
@@ -20,7 +20,7 @@ impl Tool for Write {
             "type": "function",
             "name": NAME,
             "description": "Create or overwrite a file with the given content, creating \
-        missing parent directories. The user approves every write. Prefer `edit` for changes to an \
+        missing parent directories. Writes go through the permission policy. Prefer `edit` for changes to an \
         existing file.",
             "strict": false,
             "parameters": {

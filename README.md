@@ -81,7 +81,9 @@ pass a row's `id` unchanged to `--model`, including the `ollama:` prefix for loc
 
 auto mode uses deterministic permission rules first, then a judge for calls the rules leave open. the judge approves ordinary task-related implementation, setup and cleanup unless it identifies a concrete safety or scope violation. working outside the project or missing exact command wording is not itself a reason to deny. publishing, termination, storage deletion and broad destructive changes still need scoped user permission.
 
-explicit deny and ask rules, protected credential paths and session authorization storage stay outside the judge's discretion. original user evidence backs permission notes; files, tool results and automatic wake messages do not grant authority. an extraction failure, timeout or exhausted judge budget is no verdict, not permission to bypass the checks.
+explicit deny and ask rules still apply. built-in guards for monitors, schedules, AWS arming, protected paths, code runners and terminal input request judge review rather than human-only approval. the judge still denies secret reads and unauthorized effects. monitor, schedule, AWS and MCP reviews include complete arguments rather than shortened UI descriptions. original user evidence backs permission notes; files, tool results and automatic wake messages do not grant authority. an extraction failure, timeout or exhausted judge budget is no verdict, not permission to bypass the checks.
+
+workflow launches do not prompt in auto mode; explicit rules still apply and each step's tools are checked normally. project trust, MCP server/catalog approval, legacy authorization recovery and external authentication remain separate setup controls, not automatic grants.
 
 auto mode is not an operating-system sandbox. trusted project code and approved commands can have effects the permission checker cannot fully inspect.
 
@@ -89,17 +91,17 @@ older sessions may have human and generated messages stored under the same role.
 
 ## temporary AWS instances
 
-`aws_instance` supports existing stopped EC2 instances in the standard AWS partition. `arm` requires one-time user approval of the account, profile, region, instance, existing Scheduler execution role and UTC stop deadline (5 minutes to 24 hours). switch to ask mode to approve arming, then return to auto for scoped work and cleanup. it creates an independent EventBridge Scheduler `ec2:stopInstances` target and verifies its cloud configuration before issuing a project-local capability. no instance starts during arming.
+`aws_instance` supports existing stopped EC2 instances in the standard AWS partition. `arm` requests permission-policy review of the account, profile, region, instance, existing Scheduler execution role and UTC stop deadline (5 minutes to 24 hours), including judge approval in auto mode. it creates an independent EventBridge Scheduler `ec2:stopInstances` target and verifies its cloud configuration before issuing a project-local capability. no instance starts during arming.
 
 `start` rechecks the caller account, exact resource, enabled schedule and remaining deadline, and checks task relevance. `use` validates running state and deadline; it does not execute remote commands. `stop` remains available after expiry or work-access revocation. it reports stopped only when the instance description says stopped. ordinary scoped cleanup needs no fresh judge verdict when there are no unresolved user messages or active restrictions. later restrictions and explicit permission rules still apply; failed authorization updates do not become permission.
 
 the execution role must trust `scheduler.amazonaws.com` and permit `ec2:StopInstances` on the instance. schedule readback does not prove those permissions, and delivery is not a hard real-time guarantee. the tool never cancels the cloud deadline, including on failure or revoke. capabilities are project-local leases, not authenticated goal lineage, and no automatic goal-end cleanup hook is installed. request early stopping when work completes; the deadline is the independent fallback.
 
-there is no launch, termination, IAM creation or storage deletion action. detectable raw `aws ec2 start-instances` and `run-instances` require the user in auto mode; arbitrary scripts and aliases are not sandboxed. ask and bypass modes retain their explicit approval semantics.
+there is no launch, termination, IAM creation or storage deletion action. detectable raw `aws ec2 start-instances` and `run-instances` require judge review in auto mode; arbitrary scripts and aliases are not sandboxed. ask and bypass modes retain their explicit approval semantics.
 
 ## monitors
 
-for long-running work, the agent can proactively register a monitor. you approve its sampler command, working directory, timing and optional wake hooks once. the sampler runs every couple of seconds without model calls and prints one JSON snapshot, then exits:
+for long-running work, the agent can proactively register a monitor. the permission policy reviews its sampler command, working directory, timing and optional wake hooks once, using the judge in auto mode. the sampler runs every couple of seconds without model calls and prints one JSON snapshot, then exits:
 
 ```json
 {

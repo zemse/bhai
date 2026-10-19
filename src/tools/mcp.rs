@@ -205,8 +205,8 @@ impl Tool for Call {
         json!({
             "type": "function",
             "name": CALL,
-            "description": "Run an MCP tool found with `mcp_search`. The user approves each \
-        call.",
+            "description": "Run an MCP tool found with `mcp_search`. Each call goes through the \
+        permission policy.",
             "strict": false,
             "parameters": {
                 "type": "object",

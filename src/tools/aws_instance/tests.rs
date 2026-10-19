@@ -355,9 +355,7 @@ fn raw_launch_guard_handles_wrappers_and_explicit_modes() {
         let args = json!({"command":command});
         let policy = f.policy(Mode::Auto, rules);
         assert_eq!(policy.check("bash", &args, true), Decision::Ask);
-        assert!(
-            matches!(policy.judgeable("bash", &args), Err(crate::permissions::Reserved::Protected(message)) if message.contains("AWS lifecycle"))
-        );
+        assert!(policy.judgeable("bash", &args).is_ok());
         assert!(matches!(
             f.policy(Mode::Bypass, Rules::default())
                 .check("bash", &args, true),

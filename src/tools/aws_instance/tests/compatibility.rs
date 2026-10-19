@@ -154,12 +154,13 @@ async fn api_shaped_calls_keep_approval_scope_and_expired_cleanup_boundaries() {
         };
         assert_eq!(policy.check(NAME, &compact, true), expected);
         assert_eq!(policy.check(NAME, &arm, true), expected);
-        assert!(policy.judgeable(NAME, &arm).is_err());
+        assert_eq!(policy.judgeable(NAME, &arm).is_ok(), mode == Mode::Auto);
     }
-    assert!(matches!(
-        f.policy(Mode::Auto, Rules::default()).judgeable(NAME, &arm),
-        Err(crate::permissions::Reserved::Protected(message)) if message.contains("arm")
-    ));
+    assert!(
+        f.policy(Mode::Auto, Rules::default())
+            .judgeable(NAME, &arm)
+            .is_ok()
+    );
     let id = f.tool.run(&arm).await.unwrap()["capability"]
         .as_str()
         .unwrap()

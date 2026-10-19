@@ -31,8 +31,8 @@ const TICK: Duration = Duration::from_millis(50);
 
 const DESCRIPTION: &str = "Generate a PNG image from a text prompt and save it to a file, \
 such as an icon, an illustration or a placeholder asset. Describe the subject, style, colours \
-and composition in the prompt. The image comes back with the result. The user approves every \
-image, as they do a `write` of its path.";
+and composition in the prompt. The image comes back with the result. The permission policy \
+reviews each image as a `write` of its path.";
 
 pub struct ImageGen {
     endpoint: String,
