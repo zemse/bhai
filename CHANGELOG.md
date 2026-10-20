@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-21
+
+- Goals require a structured blocker review before stopping; continuation and compaction instructions preserve authorizations, distinguish secure local randomness from user secrets, and keep resource limits local to affected work with authorized artifact rotation.
+
 ## 2026-10-20
 
 - Auto mode sends monitors, schedules, AWS arming, protected paths, code runners and terminal input to the judge instead of human-only gates; workflows launch without manual confirmation, full automation arguments reach review, and schedule cancellation follows permission policy regardless of its creator.

@@ -44,7 +44,13 @@ conversation no longer fit in the context window to be summarised.";
 /// What the model is asked for when history is summarised.
 const REQUEST: &str = "Write a concise summary of the conversation so far, for yourself to \
 continue from once the older messages are gone: the user's goals, decisions made, files \
-touched, what is done and what is left. Do not call any tools; reply with the summary only.";
+touched, what is done and what is left. Preserve user authorizations and their scope, verified \
+working procedures, attempted alternatives and their outcomes, and evidence for unresolved \
+blockers. Distinguish explicit user requirements and tool-enforced restrictions from your own \
+inferences; label uncertainty and do not turn an inferred restriction into a user requirement. \
+Carry forward later corrections and resolved blockers rather than stale constraints. Include \
+resource limits only for affected work, with measured capacity and authorized cleanup or artifact \
+rotation options. Do not include secret values. Do not call any tools; reply with the summary only.";
 
 /// When to compact, from the config.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -275,6 +281,29 @@ mod tests {
             history.push(output(id, &"x".repeat(400)));
         }
         history.push(json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}));
+    }
+
+    #[test]
+    fn summaries_preserve_authorization_without_hardening_inferred_blockers() {
+        for asked in [None, Some("keep the benchmark progress")] {
+            let message = request(asked);
+            let text = message["content"][0]["text"].as_str().unwrap();
+            for instruction in [
+                "Preserve user authorizations and their scope",
+                "verified working procedures",
+                "attempted alternatives and their outcomes",
+                "label uncertainty",
+                "do not turn an inferred restriction into a user requirement",
+                "later corrections and resolved blockers rather than stale constraints",
+                "authorized cleanup or artifact rotation options",
+                "Do not include secret values",
+            ] {
+                assert!(text.contains(instruction), "{instruction}");
+            }
+            if let Some(asked) = asked {
+                assert!(text.ends_with(asked));
+            }
+        }
     }
 
     #[test]

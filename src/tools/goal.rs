@@ -4,12 +4,53 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{BoxFuture, Tool};
 use crate::goal::{self, Shared, State};
 
 pub const NAME: &str = "goal";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Blocker {
+    missing_input: String,
+    evidence: String,
+    alternatives: Vec<String>,
+    work_remaining: bool,
+}
+
+impl Blocker {
+    fn parse(value: &Value) -> Result<Self, String> {
+        let review: Self = serde_json::from_value(value.clone())
+            .map_err(|e| format!("`blocked` needs a structured `blocker` review: {e}"))?;
+        if review.missing_input.trim().is_empty()
+            || review.evidence.trim().is_empty()
+            || review.alternatives.is_empty()
+            || review.alternatives.iter().any(|s| s.trim().is_empty())
+        {
+            return Err("Identify the essential missing input, observed evidence, and alternatives with their outcomes before blocking.".to_string());
+        }
+        if review.work_remaining {
+            return Err("Continue the remaining authorized work before blocking the goal. Resource limits on one item do not block smaller or independent work; consider authorized cleanup or artifact rotation.".to_string());
+        }
+        Ok(review)
+    }
+
+    fn note(&self, reason: &str) -> String {
+        format!(
+            "{reason}\nMissing input: {}\nEvidence: {}\nAlternatives: {}\nNo useful authorized work remains.",
+            self.missing_input.trim(),
+            self.evidence.trim(),
+            self.alternatives
+                .iter()
+                .map(|s| s.trim())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    }
+}
 
 pub struct Goal {
     pub goal: Shared,
@@ -38,15 +79,35 @@ impl Tool for Goal {
         requirements. An active goal keeps opening turns. `resume` continues a blocked goal \
         when the user's reply resolves it; user pauses require /goal resume. \
         `complete` requires checking every requirement with the listed verification and \
-        citing results in `reason`; `blocked` requires a specific essential input and no useful \
-        authorized work remaining. Finish independent work and try alternatives first. \
-        Use null spec for resume/complete/blocked. Never ask for a routine 'do it'.",
+        citing results in `reason`; `blocked` requires a structured `blocker` review identifying \
+        an essential unavailable input, observed evidence, alternatives and their outcomes, and \
+        work_remaining=false. Finish independent work and try alternatives first. Missing artifacts \
+        you can generate are work, not blockers. Resource limits affect individual items: measure \
+        capacity, try smaller work and authorized cleanup or sequential artifact rotation. Reassess \
+        when user replies change resources or authorization. Use null blocker unless blocking and \
+        null spec for resume/complete/blocked. Never ask for a routine 'do it'.",
             "strict": true,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "status": { "type": "string", "enum": ["adopt", "update", "resume", "complete", "blocked"] },
                     "reason": { "type": "string", "description": "Why the specification changed, verification results, or the specific blocker or resolution." },
+                    "blocker": {
+                        "type": ["object", "null"],
+                        "description": "Required only for blocked. A factual review, not new authority or permission to bypass restrictions.",
+                        "properties": {
+                            "missing_input": { "type": "string", "description": "Essential unavailable user input, access or resource; not an artifact you can generate." },
+                            "evidence": { "type": "string", "description": "Observed evidence that the input is unavailable; include measured capacity for resource limits." },
+                            "alternatives": {
+                                "type": "array", "minItems": 1,
+                                "items": { "type": "string" },
+                                "description": "Alternatives checked and their outcomes, including smaller or independent work and authorized cleanup or rotation for resource limits."
+                            },
+                            "work_remaining": { "type": "boolean", "description": "Whether any useful authorized work remains. Must be false to block." }
+                        },
+                        "required": ["missing_input", "evidence", "alternatives", "work_remaining"],
+                        "additionalProperties": false
+                    },
                     "spec": {
                         "type": ["object", "null"],
                         "description": "Required for adopt/update. At most 1024 characters of text in total. No progress log or implementation plan.",
@@ -65,7 +126,7 @@ impl Tool for Goal {
                         "additionalProperties": false
                     }
                 },
-                "required": ["status", "reason", "spec"],
+                "required": ["status", "reason", "spec", "blocker"],
                 "additionalProperties": false
             }
         })
@@ -119,6 +180,17 @@ impl Tool for Goal {
                 }
                 (_, None) => None,
             };
+            let blocker = match (status, args.get("blocker").filter(|v| !v.is_null())) {
+                ("blocked", Some(value)) => match Blocker::parse(value) {
+                    Ok(review) => Some(review),
+                    Err(e) => return (e, false),
+                },
+                ("blocked", None) => {
+                    return ("`blocked` requires a structured `blocker` review. Keep working unless an essential input is unavailable and no useful authorized work remains.".to_string(), false);
+                }
+                (_, Some(_)) => return ("Use null `blocker` unless blocking.".to_string(), false),
+                (_, None) => None,
+            };
             let mut shared = self.goal.lock().unwrap_or_else(|e| e.into_inner());
             if status == "update" {
                 return match shared.as_mut() {
@@ -168,7 +240,8 @@ impl Tool for Goal {
                     } else {
                         State::Blocked
                     };
-                    goal.note = reason.to_string();
+                    goal.note =
+                        blocker.map_or_else(|| reason.to_string(), |review| review.note(reason));
                     (format!("Goal {}.", goal.state.label()), true)
                 }
                 Some(goal) => (
@@ -214,6 +287,70 @@ mod tests {
         }})
     }
 
+    fn blocked(reason: &str) -> Value {
+        json!({"status": "blocked", "reason": reason, "spec": null, "blocker": {
+            "missing_input": "user-held signing key",
+            "evidence": "signer reports no key available",
+            "alternatives": ["offline tests passed; signing requires the user's hardware key"],
+            "work_remaining": false
+        }})
+    }
+
+    #[tokio::test]
+    async fn blocking_requires_a_review_and_no_remaining_work() {
+        let tool = tool(Some(goal::Goal::new("benchmark all pairs")), false);
+        let valid = blocked("needs a signer");
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("blocker");
+        let mut null = valid.clone();
+        null["blocker"] = Value::Null;
+        let mut empty_input = valid.clone();
+        empty_input["blocker"]["missing_input"] = json!(" ");
+        let mut empty_evidence = valid.clone();
+        empty_evidence["blocker"]["evidence"] = json!("");
+        let mut no_alternatives = valid.clone();
+        no_alternatives["blocker"]["alternatives"] = json!([]);
+        let mut empty_alternative = valid.clone();
+        empty_alternative["blocker"]["alternatives"] = json!([" "]);
+        let mut resource_limited = valid.clone();
+        resource_limited["blocker"] = json!({
+            "missing_input": "disk for the largest circuit",
+            "evidence": "21 GiB free; large circuit needs 30 GiB",
+            "alternatives": ["smaller circuits fit; user authorized sequential key rotation"],
+            "work_remaining": true
+        });
+        for args in [
+            missing,
+            null,
+            empty_input,
+            empty_evidence,
+            no_alternatives,
+            empty_alternative,
+            resource_limited,
+        ] {
+            let (_, ok) = tool.execute(&args).await;
+            assert!(!ok, "{args}");
+            let saved = tool.goal.lock().unwrap();
+            assert!(saved.as_ref().unwrap().active());
+            assert!(saved.as_ref().unwrap().note.is_empty());
+        }
+        assert!(tool.execute(&valid).await.1);
+        let saved = tool.goal.lock().unwrap();
+        let saved = saved.as_ref().unwrap();
+        assert_eq!(saved.state, State::Blocked);
+        assert!(saved.note.contains("signer reports no key available"));
+        assert!(saved.note.contains("offline tests passed"));
+    }
+
+    #[tokio::test]
+    async fn reviews_are_rejected_for_other_transitions() {
+        let tool = tool(Some(goal::Goal::new("work")), false);
+        let mut args = blocked("finished");
+        args["status"] = json!("complete");
+        assert!(!tool.execute(&args).await.1);
+        assert!(tool.goal.lock().unwrap().as_ref().unwrap().active());
+    }
+
     #[tokio::test]
     async fn chat_adopts_once_and_a_reply_resumes_only_a_blocked_goal() {
         let tool = tool(None, true);
@@ -224,11 +361,7 @@ mod tests {
         assert_eq!(text, "Goal active.");
         let (_, ok) = tool.execute(&adopt("replace it")).await;
         assert!(!ok);
-        assert!(
-            tool.execute(&json!({"status": "blocked", "reason": "needs a key"}))
-                .await
-                .1
-        );
+        assert!(tool.execute(&blocked("needs a key")).await.1);
         assert!(
             !tool
                 .execute(&json!({"status": "resume", "reason": "try again"}))
@@ -343,15 +476,22 @@ mod tests {
     async fn terminal_status_returns_only_the_goal_status() {
         for (status, state) in [("complete", State::Complete), ("blocked", State::Blocked)] {
             let tool = tool(Some(goal::Goal::new("ship")), false);
-            let (out, ok) = tool
-                .execute(&json!({"status": status, "reason": "verified outcome"}))
-                .await;
+            let args = if status == "blocked" {
+                blocked("verified outcome")
+            } else {
+                json!({"status": status, "reason": "verified outcome"})
+            };
+            let (out, ok) = tool.execute(&args).await;
             assert!(ok);
             assert_eq!(out, format!("Goal {status}."));
             let goal = tool.goal.lock().unwrap();
             let goal = goal.as_ref().unwrap();
             assert_eq!(goal.state, state);
-            assert_eq!(goal.note, "verified outcome");
+            if status == "blocked" {
+                assert!(goal.note.starts_with("verified outcome\nMissing input:"));
+            } else {
+                assert_eq!(goal.note, "verified outcome");
+            }
         }
     }
 

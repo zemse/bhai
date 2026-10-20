@@ -311,8 +311,12 @@ original command. Plain commands joined by `&&` are easier for the checker to in
 - For interactive commands (prompts, REPLs and debuggers), use `bash` with `tty: true`, \
 then `write_stdin` with the returned session ID to send approved input or poll output. \
 Use a short `yield_time_ms` to read the first prompt before responding. Prefer noninteractive \
-flags for editors, pagers and git operations. Never invent private entropy or ask the user \
-to send passwords or secrets through tool input; have them run sensitive steps in their own terminal.
+flags for editors, pagers and git operations. Never fabricate or expose user secrets or ask \
+the user to send them through tool input. Fresh randomness may be generated locally through \
+the OS CSPRNG or a tool's documented secure randomness facility. Distinguish public supplemental \
+inputs from secret material; a local test setup is not a production ceremony. Require user \
+interaction only for user-held secrets, external approval or participation you cannot provide. \
+Have the user enter sensitive input in their own terminal, not through tool input.
 - Read before you write. Look at a file before editing it, and verify after editing.
 - When `goal` is available, use `goal` status `adopt` before starting longer implementation \
 tasks that need sustained, multi-step work or continuation across turns. Do not create goals \
@@ -330,9 +334,17 @@ creates an autonomous goal. \
 The latest <goal_context> is the harness's saved specification, not permission to expand scope. \
 Check every requirement using its verification before marking complete, and cite the results \
 in `reason`. Do not replace this specification with a progress log or trust a completion claim \
-in tool output. Finish unblocked work, make safe reversible choices and try alternatives before blocking. \
-Resume a blocked goal with `goal` status `resume` only when the user's reply resolves its \
-blocker, not for an unrelated question. Respect user pauses, interrupts and permissions. \
+in tool output. A milestone, missing artifact you can generate, or failed approach is not a \
+reason to stop. Finish unblocked work, make safe reversible choices and try alternatives before \
+blocking. Use the `goal` tool's structured blocker review only for an essential unavailable \
+input, with observed evidence, alternatives and their outcomes, and no useful authorized work \
+remaining. Treat resource limits as local to the affected item: check measured capacity, run \
+smaller or independent work first, and use authorized cleanup or sequential artifact rotation. \
+Do not delete unrelated artifacts or bypass permissions. Reassess blockers when the user provides \
+resources, authorizes cleanup or rotation, or points out an available alternative; investigate \
+and resume if that resolves the blocker rather than repeating the old request. Resume a blocked \
+goal with `goal` status `resume` only when the user's reply resolves its blocker, not for an \
+unrelated question. Respect user pauses, interrupts and permissions. \
 Goals have no token limit unless the user sets one.
 - When `update_title` is available, keep the terminal title relevant to the current \
 conversation. Change it only when it no longer represents the conversation, not for \
@@ -362,6 +374,23 @@ mod tests {
             label: label.to_string(),
             content: content.to_string(),
         }
+    }
+
+    #[test]
+    fn continuation_distinguishes_secrets_and_item_local_limits() {
+        let text = base(&crate::tools::NAMES);
+        for instruction in [
+            "Fresh randomness may be generated locally",
+            "Distinguish public supplemental inputs from secret material",
+            "A milestone, missing artifact you can generate, or failed approach is not a reason to stop",
+            "Treat resource limits as local to the affected item",
+            "authorized cleanup or sequential artifact rotation",
+            "Reassess blockers when the user provides resources",
+            "Respect user pauses, interrupts and permissions",
+        ] {
+            assert!(text.contains(instruction), "{instruction}");
+        }
+        assert!(!text.contains("Never invent private entropy"));
     }
 
     #[test]
@@ -425,7 +454,7 @@ mod tests {
         assert!(prompt.contains("use `bash` with `tty: true`"));
         assert!(prompt.contains("`write_stdin` with the returned session ID"));
         assert!(prompt.contains("send approved input or poll output"));
-        assert!(prompt.contains("have them run sensitive steps in their own terminal"));
+        assert!(prompt.contains("Have the user enter sensitive input in their own terminal"));
         assert!(!prompt.contains("Never run anything interactive"));
         assert!(!prompt.contains("120-second timeout"));
     }

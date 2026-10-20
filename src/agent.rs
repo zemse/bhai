@@ -5962,6 +5962,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_blockers_leave_autonomous_work_active() {
+        use fake::{Fake, call, say};
+
+        let fake = Fake::new(vec![
+            vec![call(
+                "goal",
+                json!({"status": "blocked", "reason": "needs artifacts"}),
+            )],
+            vec![call(
+                "goal",
+                json!({"status": "blocked", "reason": "disk full for large pair", "blocker": {
+                    "missing_input": "space for large pair",
+                    "evidence": "21 GiB free; large pair needs 30 GiB",
+                    "alternatives": ["smaller pairs fit and key rotation is authorized"],
+                    "work_remaining": true
+                }}),
+            )],
+            vec![call("read", json!({"path": "/etc/hosts"}))],
+            vec![say("smaller work checked; continuing")],
+            vec![call(
+                "goal",
+                json!({"status": "complete", "reason": "verified"}),
+            )],
+            vec![say("done")],
+        ]);
+        let (mut rx, _user, _control, _cancel) =
+            goal_session(&fake, vec![set_goal("benchmark pairs")]);
+        let first = settle(&mut rx).await;
+        let second = settle(&mut rx).await;
+        assert!(
+            !info(&first)
+                .iter()
+                .chain(info(&second).iter())
+                .any(|s| s.starts_with("goal blocked:"))
+        );
+        assert!(
+            info(&second)
+                .iter()
+                .any(|s| s.starts_with("goal complete: benchmark pairs")),
+            "{second:?}"
+        );
+        assert_eq!(parent_calls(&fake).len(), 6);
+        assert!(parent_calls(&fake)[4].contains(goal::CONTINUE));
+    }
+
+    #[tokio::test]
     async fn a_chat_task_continues_without_another_do_it_and_resumes_on_a_reply() {
         use fake::{Fake, call, say};
 
@@ -5977,7 +6023,12 @@ mod tests {
             vec![say("still working")],
             vec![call(
                 "goal",
-                json!({"status": "blocked", "reason": "needs a key"}),
+                json!({"status": "blocked", "reason": "needs a key", "blocker": {
+                    "missing_input": "user-held signing key",
+                    "evidence": "signer reports no key available",
+                    "alternatives": ["offline checks passed; signing needs the user's key"],
+                    "work_remaining": false
+                }}),
             )],
             vec![say("please supply the key")],
             vec![call(
