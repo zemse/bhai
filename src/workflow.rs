@@ -192,7 +192,8 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
         }
     };
     let budget_tokens = number("budget_tokens", DEFAULT_BUDGET)?;
-    let max_parallel = number("max_parallel", 1)?.clamp(1, tools::agent::MAX_RUNNING as u64);
+    let max_parallel = usize::try_from(number("max_parallel", 1)?.max(1))
+        .context("`max_parallel` is too large")?;
     let max_fanout = number("max_fanout", DEFAULT_FANOUT)?.clamp(1, MAX_FANOUT);
     let cache = match value("cache").as_deref() {
         None | Some("false") => false,
@@ -273,7 +274,7 @@ pub fn parse(text: &str, source: &str) -> Result<Workflow> {
         description: value("description").unwrap_or_default(),
         source: source.to_string(),
         budget_tokens,
-        max_parallel: max_parallel as usize,
+        max_parallel,
         max_fanout: max_fanout as usize,
         cache,
         steps,
@@ -2070,8 +2071,8 @@ needs: [a]\n    prompt: two\n---\n",
         )
         .unwrap();
         assert_eq!(workflow.budget_tokens, DEFAULT_BUDGET);
-        assert_eq!(workflow.max_parallel, tools::agent::MAX_RUNNING);
-        // Both caps are clamped, so a definition cannot talk its way past either.
+        assert_eq!(workflow.max_parallel, 9);
+        // Fan-out still bounds how many steps a workflow can expand.
         assert_eq!(workflow.max_fanout, DEFAULT_FANOUT as usize);
         let greedy = parse(
             "---\nname: w\nmax_fanout: 5000\nsteps:\n  - id: a\n    prompt: one\n---\n",

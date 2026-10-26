@@ -316,6 +316,8 @@ pub struct App {
     pub inside: Option<Inside>,
     /// Each subagent row's area and id, filled in by the renderer so a click opens it.
     pub child_rows: Vec<(Rect, String)>,
+    pub children_area: Option<Rect>,
+    pub children_scroll: usize,
     /// How many things run in the background, from [`Event::Background`].
     pub background: usize,
     /// The status bar's `bg` chip, filled in by the renderer while it is drawn.
@@ -444,6 +446,8 @@ impl App {
             diff: None,
             inside: None,
             child_rows: Vec::new(),
+            children_area: None,
+            children_scroll: 0,
             background: 0,
             chip: None,
             plan_area: None,
@@ -929,6 +933,21 @@ impl App {
         // With an approval up, clicks still reach its buttons.
         if let Some(diff) = self.diff.as_mut().filter(|_| self.pending.is_none()) {
             return diff_mouse(diff, mouse);
+        }
+        if self.children_area.is_some_and(|area| area.contains(at)) {
+            let max = self.children().len().saturating_sub(self.child_rows.len());
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.children_scroll =
+                        self.children_scroll.saturating_add(WHEEL_LINES).min(max);
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.children_scroll = self.children_scroll.saturating_sub(WHEEL_LINES);
+                    return true;
+                }
+                _ => {}
+            }
         }
         match mouse.kind {
             MouseEventKind::ScrollUp => self.wheel(-(WHEEL_LINES as isize)),
@@ -2724,6 +2743,16 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         let Some(entries) = self.session.child_entries(id) else {
             return;
         };
+        let visible = self.child_rows.len().max(1);
+        let max = rows.len().saturating_sub(visible);
+        let top = max.saturating_sub(self.children_scroll);
+        if let Some(at) = rows.iter().position(|row| row.id == id) {
+            if at < top {
+                self.children_scroll = max.saturating_sub(at);
+            } else if at >= top + visible {
+                self.children_scroll = rows.len().saturating_sub(at + 1);
+            }
+        }
         self.inside = Some(Inside {
             id: row.id.clone(),
             model: row.model.clone(),

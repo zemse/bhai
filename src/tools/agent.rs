@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tracing::Instrument as _;
 
 use super::{BoxFuture, Tool, string_arg, truncate};
@@ -20,10 +20,6 @@ use crate::worktrees;
 
 pub const NAME: &str = "agent";
 pub const CLOSE: &str = "close_agent";
-
-/// Children of one parent running at once. A call past that is still accepted; the
-/// child waits for a slot rather than the parent waiting for the call.
-pub const MAX_RUNNING: usize = 3;
 
 /// Lowercased fragments that make a line look like a turn marker or control tag.
 const MARKERS: [&str; 16] = [
@@ -60,7 +56,6 @@ pub struct Agent {
     pub judge: Option<Arc<Judge>>,
     /// Where a finished child posts its report, for the parent to read between steps.
     pub results: Results,
-    pub slots: Arc<Semaphore>,
     /// This session's transcript directory.
     pub transcripts: PathBuf,
     /// This session's id, which its children's worktrees are registered under.
@@ -182,7 +177,6 @@ impl Tool for Agent {
                     entry.branch
                 )
             });
-            let waiting = MAX_RUNNING.saturating_sub(self.slots.available_permits());
             let again = match history.is_empty() {
                 true => "",
                 false => " again, from where it left off",
@@ -190,15 +184,9 @@ impl Tool for Agent {
             self.spawn(&id, &identity, description, task, history, lease);
             let name = &identity.name;
             let place = place.unwrap_or_default();
-            let queued = match waiting >= MAX_RUNNING {
-                true => format!(
-                    ", behind the {MAX_RUNNING} already running: it starts when one of them ends"
-                ),
-                false => String::new(),
-            };
             (
                 format!(
-                    "child {id} ({name}) started{place}{again}{queued}. Its report will reach you as a \
+                    "child {id} ({name}) started{place}{again}. Its report will reach you as a \
 message when it finishes; nothing else is needed to collect it."
                 ),
                 true,
@@ -264,8 +252,8 @@ impl Tool for Close {
 }
 
 impl Agent {
-    /// Run the child detached, so the turn that asked for it carries on. It holds a
-    /// slot for as long as it runs and posts its report when it ends; the parent reads
+    /// Run the child detached, so the turn that asked for it carries on. It posts
+    /// its report when it ends; the parent reads
     /// that between steps, or in a turn of its own once the session is idle.
     fn spawn(
         &self,
@@ -297,11 +285,10 @@ impl Agent {
             Arc::clone(&self.delegation.mailboxes),
             Arc::clone(&self.policy),
         );
-        // Taken here, not inside the task: a child queued behind the running ones must
-        // still be stopped by an interrupt that lands before it gets a slot.
+        // Taken here so an interrupt before the task is scheduled still stops it.
         let (tx, cancel) = (self.tx.clone(), self.cancel.child(&id));
-        let (children, slots) = (Arc::clone(&self.children), Arc::clone(&self.slots));
-        // Status includes a child waiting for a slot, before its loop starts.
+        let children = Arc::clone(&self.children);
+        // Status includes the child before its loop starts.
         {
             let mut rows = children.lock().unwrap_or_else(|e| e.into_inner());
             match rows.iter_mut().find(|row| row.id == id) {
@@ -319,14 +306,7 @@ impl Agent {
         let judge = self.judge.as_ref().map(|judge| judge.child(&id, &task));
         let span = crate::trace::child(&id, &identity.name);
         let run = async move {
-            // Past `MAX_RUNNING` the child waits here rather than the parent waiting
-            // for the call, so the model is never blocked on a slot. The lease is held
-            // by this task, so however it ends the worktree is settled.
-            let Ok(_slot) = slots.acquire().await else {
-                return;
-            };
-            // Interrupted while it waited for a slot. It never ran, so there is no
-            // transcript to report; say so rather than leaving the parent to wonder.
+            // A child stopped before it was scheduled has no transcript to report.
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let mut text = format!(
                     "child {id} ({}) was stopped before it started.",
@@ -650,7 +630,6 @@ mod tests {
             children: Children::default(),
             judge: None,
             results: tx_results,
-            slots: Arc::new(Semaphore::new(MAX_RUNNING)),
             transcripts: super::super::temp_dir(),
             session: "session-1".to_string(),
         };
@@ -776,10 +755,10 @@ mod tests {
         harness.cleanup();
     }
 
-    /// Already stopped when the call came, so it never gets a slot. It costs no model
+    /// Already stopped when the call came, so it never runs. It costs no model
     /// call, and the parent is told rather than left waiting for a report.
     #[tokio::test]
-    async fn a_child_stopped_before_its_slot_never_runs() {
+    async fn a_child_stopped_before_it_starts_never_runs() {
         let fake = Fake::new(vec![vec![call("read", json!({"path": "/etc/hosts"}))]]);
         let mut harness = tool(&fake, true);
         let args = json!({"description": "read hosts", "prompt": "go"});
@@ -970,15 +949,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_includes_a_child_waiting_for_a_slot() {
+    async fn status_includes_a_child_before_its_loop_starts() {
         let fake = Fake::new(Vec::new());
         let mut harness = tool(&fake, false);
-        let slots = Arc::clone(&harness.agent.slots);
-        let lease = slots.acquire_many(MAX_RUNNING as u32).await.unwrap();
         let (out, ok) = harness
             .agent
             .execute(&json!({
-                "description": "queued review", "prompt": "go"
+                "description": "new review", "prompt": "go"
             }))
             .await;
         assert!(ok, "{out}");
@@ -993,10 +970,9 @@ mod tests {
         let value: Value = serde_json::from_str(&text).unwrap();
         let rows = value["children"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["task"], "queued review");
+        assert_eq!(rows[0]["task"], "new review");
         assert_eq!(rows[0]["state"], "running");
         harness.agent.cancel.stop();
-        drop(lease);
         assert!(
             harness
                 .results
@@ -1011,55 +987,36 @@ mod tests {
 
     #[tokio::test]
     async fn every_child_asked_for_runs_at_once_and_none_of_them_holds_the_call() {
-        // Each child hangs until the turn is cancelled, so all three are alive together
-        // or the permits never run out.
-        let fake = Fake::new(Vec::new()).with_children(vec![fake::step(fake::HANG); 4]);
+        const COUNT: usize = 8;
+        let fake = Fake::new(Vec::new()).with_children(vec![fake::step(fake::HANG); COUNT]);
         let mut harness = tool(&fake, false);
-        let args = |n: usize| json!({"description": format!("look {n}"), "prompt": "go"});
-        for n in 0..MAX_RUNNING {
-            let (out, ok) = harness.agent.execute(&args(n)).await;
+        for n in 0..COUNT {
+            let (out, ok) = harness
+                .agent
+                .execute(&json!({
+                    "description": format!("look {n}"), "prompt": "go"
+                }))
+                .await;
             assert!(ok, "{out}");
             assert!(out.contains("started."), "{out}");
         }
-        let slots = Arc::clone(&harness.agent.slots);
-        // The call returns before the child is even scheduled, so the permits are taken
-        // a moment later.
         for _ in 0..1000 {
-            if slots.available_permits() == 0 {
+            if fake.bodies.lock().unwrap().len() == COUNT {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(
-            slots.available_permits(),
-            0,
-            "all {MAX_RUNNING} are running"
+            fake.bodies.lock().unwrap().len(),
+            COUNT,
+            "all children called the model"
         );
         assert!(harness.results.try_recv().is_err(), "none has finished");
-
-        // One more than there are slots is still accepted; it waits, the caller does not.
-        let (out, ok) = harness.agent.execute(&args(MAX_RUNNING)).await;
-        assert!(ok, "{out}");
-        assert!(out.contains("behind the 3 already running"), "{out}");
-
-        // The running ones are interrupted where they stand; the one still waiting for a
-        // slot never starts. Which report arrives first is up to the runtime.
         harness.agent.cancel.stop();
-        let mut reports = Vec::new();
-        for _ in 0..=MAX_RUNNING {
-            reports.push(harness.results.recv().await.expect("a report").text);
+        for _ in 0..COUNT {
+            let report = harness.results.recv().await.expect("a report").text;
+            assert!(report.contains("interrupted by the user"), "{report}");
         }
-        let (queued, running): (Vec<_>, Vec<_>) = reports
-            .iter()
-            .partition(|r| r.contains("was stopped before it started"));
-        assert_eq!(queued.len(), 1, "{reports:?}");
-        assert_eq!(running.len(), MAX_RUNNING, "{reports:?}");
-        assert!(
-            running
-                .iter()
-                .all(|r| r.contains("interrupted by the user")),
-            "{running:?}"
-        );
         harness.cleanup();
     }
 
@@ -1125,7 +1082,7 @@ mod tests {
                 "{out}"
             );
         }
-        // Still running, or still waiting for a slot.
+        // Still running.
         let _flag = harness.agent.cancel.child("a1b2c3");
         let (out, ok) = harness.agent.execute(&call("a1b2c3")).await;
         assert!(!ok);
@@ -1260,9 +1217,8 @@ mod tests {
         let args = json!({"description": "wait", "prompt": "p", "worktree": true});
         let (started, ok) = harness.agent.execute(&args).await;
         assert!(ok, "{started}");
-        let slots = Arc::clone(&harness.agent.slots);
         for _ in 0..1000 {
-            if slots.available_permits() < MAX_RUNNING {
+            if !fake.bodies.lock().unwrap().is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;

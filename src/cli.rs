@@ -1411,7 +1411,6 @@ async fn cache_check(setup: Setup, wait: Option<Duration>) -> Result<bool> {
             children: agent::Children::default(),
             judge: None,
             results: mpsc::unbounded_channel().0,
-            slots: Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING)),
             session: client.session_id().to_string(),
         });
         registry = registry.with_models(tools::models::Models {

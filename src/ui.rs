@@ -34,7 +34,7 @@ const MAX_INPUT_LINES: usize = 8;
 /// Characters of the judged call the working row shows.
 const JUDGING_CLIP: usize = 48;
 
-/// Subagents the panel lists before it shows only the most recent ones.
+/// Subagent rows visible at once in the scrollable panel.
 const MAX_CHILD_ROWS: usize = 4;
 /// Rows the queue panel shows before it says how many more are behind them.
 const MAX_QUEUED_ROWS: usize = 3;
@@ -153,6 +153,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.input_area = None;
         app.buttons.clear();
         app.child_rows.clear();
+        app.children_area = None;
         render_trust(frame, bottom_area, &gate);
         return;
     }
@@ -172,6 +173,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.input_area = None;
         app.buttons.clear();
         app.child_rows.clear();
+        app.children_area = None;
         frame.render_widget(Clear, bottom_area);
         frame.render_widget(
             Paragraph::new(text).wrap(Wrap { trim: false }).block(
@@ -204,6 +206,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.input_area = None;
         app.buttons.clear();
         app.child_rows.clear();
+        app.children_area = None;
         let block = Block::bordered()
             .title(" sudo wants your password ")
             .border_style(Style::new().fg(Color::Yellow));
@@ -234,6 +237,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.input_area = None;
         app.buttons.clear();
         app.child_rows.clear();
+        app.children_area = None;
         if let Some(picker) = &mut app.picker {
             picker.render(frame, bottom_area);
         } else if let Some(search) = &app.search {
@@ -1559,9 +1563,25 @@ fn mode_chip(mode: Mode) -> Line<'static> {
 /// `app.child_rows` so a click on it opens that child's pane.
 fn render_children(frame: &mut Frame, area: Rect, app: &mut App, children: &[ChildRow]) {
     app.child_rows.clear();
+    app.children_area = None;
     if area.height == 0 {
         return;
     }
+    app.children_area = Some(area);
+    let rows = area.height.saturating_sub(2) as usize;
+    let max = children.len().saturating_sub(rows);
+    app.children_scroll = app.children_scroll.min(max);
+    let top = max.saturating_sub(app.children_scroll);
+    let title = if children.len() > rows {
+        format!(
+            " subagents {}-{}/{} · scroll ",
+            top + 1,
+            (top + rows).min(children.len()),
+            children.len()
+        )
+    } else {
+        " subagents ".to_string()
+    };
     let dim = Style::new().fg(Color::DarkGray);
     let open = app.inside.as_ref().map(|inside| inside.id.as_str());
     let hint = match open {
@@ -1570,20 +1590,18 @@ fn render_children(frame: &mut Frame, area: Rect, app: &mut App, children: &[Chi
     };
     let block = Block::bordered()
         .border_style(dim)
-        .title(Line::styled(" subagents ", dim))
+        .title(Line::styled(title, dim))
         .title_bottom(Line::styled(hint, dim).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let rows = inner.height as usize;
-    // The running ones are the newest, so it is the tail that is worth the room.
-    let top = children.len().saturating_sub(rows);
     let width = inner.width as usize;
     let lines: Vec<Line> = children
         .iter()
         .enumerate()
         .skip(top)
+        .take(rows)
         .map(|(at, child)| {
             let row = Rect {
                 y: inner.y + (at - top) as u16,
@@ -2665,6 +2683,62 @@ mod tests {
         let shown = screen(&terminal);
         assert!(!shown.contains("to worker"), "{shown}");
         assert!(!shown.contains("✕ close"), "{shown}");
+    }
+
+    #[test]
+    fn the_subagent_panel_is_bounded_and_scrolls_without_moving_the_transcript() {
+        let mut app = App::detached();
+        app.working = true;
+        for n in 0..12 {
+            app.session().publish(Event::ChildStarted {
+                id: format!("a{n:02}"),
+                identity: "worker".to_string(),
+                model: "fake".to_string(),
+                description: format!("task {n}"),
+                task: "go".to_string(),
+            });
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.children_area.unwrap().height, 6);
+        assert_eq!(app.child_rows.len(), 4);
+        assert_eq!(app.child_rows[0].1, "a08");
+        assert!(screen(&terminal).contains("9-12/12"));
+        let area = app.children_area.unwrap();
+        let scroll = app.scroll;
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: area.x + 1,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..10 {
+            assert!(app.on_mouse(wheel(MouseEventKind::ScrollUp)));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        }
+        assert_eq!(app.child_rows[0].1, "a00");
+        assert_eq!(app.child_rows.len(), 4);
+        assert!(screen(&terminal).contains("1-4/12"));
+        assert_eq!(app.scroll, scroll);
+        let row = app.child_rows[0].0;
+        assert!(click(&mut app, row.x, row.y));
+        assert_eq!(app.inside.as_ref().unwrap().id, "a00");
+        for _ in 0..10 {
+            assert!(app.on_mouse(wheel(MouseEventKind::ScrollDown)));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        }
+        assert_eq!(app.child_rows[0].1, "a08");
+        app.leave_child();
+        app.open_child("a00");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.child_rows[0].1, "a00");
+        app.open_child("a11");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.child_rows.last().unwrap().1, "a11");
+        app.picker = Some(Picker::new("m", "medium"));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.children_area.is_none());
+        assert!(app.child_rows.is_empty());
     }
 
     #[test]

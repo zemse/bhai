@@ -38,7 +38,7 @@ impl Tool for Status {
             "name": NAME,
             "description": "Read context usage (input_tokens, window_tokens, percent, estimated) and a succinct JSON snapshot of background work. Context reflects the latest model call; estimated is true when backend usage is unavailable. \
         Commands include running sessions and exited ones with next: collect (use write_stdin with that id). \
-        Children include only active tasks, including those waiting for a slot. Monitors include state and a short summary. \
+        Children include only active tasks. Monitors include state and a short summary. \
         Empty sections are omitted. Reads do not wait, collect results or change anything; push updates arrive separately.",
             "strict": true,
             "parameters": {

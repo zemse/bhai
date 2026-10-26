@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-26
+
+- Subagents start without a hardcoded concurrency cap; workflows respect their configured parallelism. The four-row subagent panel scrolls with the mouse wheel and shows the visible range.
+
 ## 2026-10-21
 
 - Goals require a structured blocker review before stopping; continuation and compaction instructions preserve authorizations, distinguish secure local randomness from user secrets, and keep resource limits local to affected work with authorized artifact rotation.

@@ -646,7 +646,7 @@ impl Cancel {
         }
     }
 
-    /// Whether child `id` is running or waiting for a slot.
+    /// Whether child `id` is running.
     pub fn running(&self, id: &str) -> bool {
         self.lock()
             .iter()
@@ -792,10 +792,6 @@ pub(crate) async fn run_configured(
         .as_ref()
         .map(|d| d.cache_root.clone())
         .unwrap_or_default();
-    // Outside `build`, like the ledger and the report channel: children outlive the
-    // turn that started them, so a `/model` switch that rebuilt the fan-out cap would
-    // hand the session a second set of slots while the first set is still running.
-    let slots = Arc::new(tokio::sync::Semaphore::new(tools::agent::MAX_RUNNING));
     let goal: goal::Shared = Arc::default();
     if let Some(judge) = &judge {
         judge.project_context(&prompt.instructions);
@@ -831,7 +827,6 @@ pub(crate) async fn run_configured(
                 children: Arc::clone(&children),
                 judge: judge.clone(),
                 results: tx_results.clone(),
-                slots: Arc::clone(&slots),
                 session: session_id.clone(),
             });
             registry = registry.with_models(tools::models::Models {
@@ -4050,7 +4045,7 @@ mod tests {
         stop.stop();
         assert!(
             stop.child("a").load(Ordering::Relaxed),
-            "a child queued behind a slot must not start after an interrupt"
+            "a child must not start after an interrupt"
         );
     }
 
@@ -8996,11 +8991,9 @@ mod tests {
         );
     }
 
-    /// Children outlive the turn that started them, so the cap on how many run at once
-    /// belongs to the session. Rebuilt with the rest of the registry on a `/model`
-    /// switch, it handed out a second set of slots to children still holding the first.
+    /// Children keep running across a model switch, and new children start too.
     #[tokio::test]
-    async fn a_model_switch_does_not_hand_out_a_second_set_of_child_slots() {
+    async fn a_model_switch_keeps_children_running_and_starts_new_ones() {
         use fake::{Fake, call, say};
 
         let dir = crate::tools::temp_dir();
@@ -9011,12 +9004,12 @@ mod tests {
             )
         };
         let fake = Fake::new(vec![
-            (0..tools::agent::MAX_RUNNING).map(spawn).collect(),
+            (0..3).map(spawn).collect(),
             vec![say("all three are running")],
             vec![spawn(9)],
             vec![say("and one more")],
         ])
-        .with_children(vec![fake::step(fake::HANG); tools::agent::MAX_RUNNING + 1]);
+        .with_children(vec![fake::step(fake::HANG); 4]);
         let cancel = Arc::new(Cancel::default());
         let (tx_user, rx_user) = mpsc::channel(1);
         let (tx_control, rx_control) = mpsc::channel(1);
@@ -9060,13 +9053,33 @@ mod tests {
             .await
             .unwrap();
         let events = drive(&tx_user, &mut rx, &cancel, "one more", &[]).await;
-        let queued = events.iter().any(|e| {
-            matches!(e, AgentEvent::ToolOutput(o)
-                if o.contains(&format!("behind the {} already running", tools::agent::MAX_RUNNING)))
-        });
         assert!(
-            queued,
-            "the fourth child took a slot of its own: {events:?}"
+            events.iter().any(|e| matches!(e, AgentEvent::ToolOutput(o)
+            if o.contains("started.") && !o.contains("behind"))),
+            "{events:?}"
+        );
+        for _ in 0..1000 {
+            if fake
+                .bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| id != "parent")
+                .count()
+                == 4
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            fake.bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| id != "parent")
+                .count(),
+            4
         );
 
         cancel.stop();
