@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-28
+
+- CI runs only on manual dispatch, not automatically on pushes or pull requests; platform checks and dependency advisory checks remain available.
+
 ## 2026-10-27
 
 - Mermaid blocks switch between diagram and source with clickable header controls; source fallbacks explain rendering failures or width limits, and explicitly opened wide diagrams clip without wrapping. Copy controls stay separate.
