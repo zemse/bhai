@@ -862,6 +862,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut margins: Vec<usize> = Vec::new();
     let mut sources: Vec<Option<Source>> = Vec::new();
     let mut copies = Vec::new();
+    let mut diagrams = Vec::new();
     let mut folds = HashMap::new();
     // Each drawn entry and how many of its cached rows it shows.
     let mut parts: Vec<(usize, usize)> = Vec::new();
@@ -905,6 +906,10 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
                 .iter()
                 .map(|(row, chars, code)| (start + row, chars.clone(), code.clone())),
         );
+        diagrams.extend(rows.diagrams.iter().cloned().map(|mut toggle| {
+            toggle.row += start;
+            (index, toggle)
+        }));
         if rows.folded || owner != index {
             folds.insert(index, owner);
         }
@@ -932,6 +937,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     app.margins = margins;
     app.sources = sources;
     app.copies = copies;
+    app.diagrams = diagrams;
     app.rehover();
 
     // Only the rows in view are cloned out of the cache. Scrolling by leaving out the
@@ -1188,6 +1194,7 @@ fn shell_status(result: &Entry) -> Option<(String, Color)> {
 #[derive(Default)]
 pub struct Drawn {
     slots: Vec<Option<(Key, Rows)>>,
+    diagram_views: HashMap<usize, Vec<(usize, bool)>>,
     /// Entries laid out afresh rather than taken from the cache.
     #[cfg(test)]
     built: usize,
@@ -1204,8 +1211,25 @@ struct Key {
 }
 
 impl Drawn {
+    pub fn toggle_diagram(&mut self, entry: usize, block: usize, source: bool) {
+        let views = self.diagram_views.entry(entry).or_default();
+        match views.iter_mut().find(|(at, _)| *at == block) {
+            Some((_, shown)) => *shown = !source,
+            None => views.push((block, !source)),
+        }
+        if let Some(slot) = self.slots.get_mut(entry) {
+            *slot = None;
+        }
+    }
+
+    pub fn clear_diagrams(&mut self) {
+        self.diagram_views.clear();
+        self.slots.clear();
+    }
+
     /// One slot per entry, dropping those past the end of a transcript that shrank.
     fn fit(&mut self, len: usize) {
+        self.diagram_views.retain(|entry, _| *entry < len);
         self.slots.truncate(len);
         self.slots.resize_with(len, || None);
     }
@@ -1235,7 +1259,17 @@ impl Drawn {
             {
                 self.built += 1;
             }
-            *slot = Some((key, entry_lines(entry, width, expanded, retryable, result)));
+            *slot = Some((
+                key,
+                entry_lines(
+                    entry,
+                    width,
+                    expanded,
+                    retryable,
+                    result,
+                    self.diagram_views.get(&index).map_or(&[], Vec::as_slice),
+                ),
+            ));
         }
         &slot.as_ref().expect("filled above").1
     }
@@ -1252,6 +1286,7 @@ struct Rows {
     margins: Vec<usize>,
     origins: Vec<Option<Vec<Option<Origin>>>>,
     copies: Vec<(usize, Range<usize>, String)>,
+    diagrams: Vec<markdown::DiagramToggle>,
     folded: bool,
 }
 
@@ -1264,6 +1299,7 @@ fn entry_lines(
     expanded: bool,
     retryable: bool,
     result: Option<&Entry>,
+    diagram_views: &[(usize, bool)],
 ) -> Rows {
     if let Entry::Diff(text) = entry {
         return diff_entry(text, width, expanded);
@@ -1276,13 +1312,21 @@ fn entry_lines(
         };
         let lead = MESSAGE_MARK.chars().count();
         let indent = " ".repeat(lead);
-        let rendered = markdown::render(text, width.saturating_sub(lead).max(4));
+        let rendered = markdown::render(text, width.saturating_sub(lead).max(4), diagram_views);
         let mut joins = rendered.joins;
         let mut margins: Vec<usize> = rendered.margins.iter().map(|m| m + lead).collect();
         let mut origins: Vec<Option<Vec<Option<Origin>>>> = rendered
             .origins
             .into_iter()
             .map(|row| Some([vec![None; lead], row].concat()))
+            .collect();
+        let diagrams = rendered
+            .diagrams
+            .into_iter()
+            .map(|mut toggle| {
+                toggle.chars = toggle.chars.start + lead..toggle.chars.end + lead;
+                toggle
+            })
             .collect();
         let copies = rendered
             .copies
@@ -1323,6 +1367,7 @@ fn entry_lines(
             margins,
             origins,
             copies,
+            diagrams,
             folded: false,
         };
     }
@@ -1461,6 +1506,7 @@ fn entry_lines(
         joins,
         margins,
         copies: Vec::new(),
+        diagrams: Vec::new(),
         folded: hidden > 0 || printed > 0,
     }
 }
@@ -1537,6 +1583,7 @@ fn diff_entry(text: &str, width: usize, expanded: bool) -> Rows {
         joins,
         margins,
         copies: Vec::new(),
+        diagrams: Vec::new(),
         folded: true,
     }
 }
@@ -2117,11 +2164,12 @@ mod tests {
             false,
             false,
             None,
+            &[],
         );
         assert_eq!(rows.plains[0], "notification: monitor wake");
         assert_eq!(rows.lines[0].spans[0].style.fg, Some(Color::DarkGray));
         assert_ne!(rows.lines[0].spans[0].style.bg, Some(USER_BG));
-        let user = entry_lines(&Entry::User("typed".into()), 60, false, false, None);
+        let user = entry_lines(&Entry::User("typed".into()), 60, false, false, None, &[]);
         assert!(user.plains[0].starts_with("› typed"));
         assert_eq!(user.lines[0].spans[0].style.bg, Some(USER_BG));
     }
@@ -3383,7 +3431,7 @@ mod tests {
     #[test]
     fn commentary_is_drawn_dimmer_than_the_answer() {
         let fg = |entry: Entry| {
-            let rows = entry_lines(&entry, 40, false, false, None);
+            let rows = entry_lines(&entry, 40, false, false, None, &[]);
             let line = &rows.lines[0];
             let span = line.spans.last().unwrap();
             line.style.patch(span.style).fg
@@ -3709,6 +3757,74 @@ mod tests {
             Some("cargo test\nls -la")
         );
         assert!(app.copied.is_some(), "the copy is not said");
+    }
+
+    #[test]
+    fn mermaid_switches_views_by_click_without_copying_or_changing_other_blocks() {
+        let fence = "```mermaid\nsequenceDiagram\n    A->>B: hello\n```";
+        let (mut app, mut terminal) = drawn(&format!("{fence}\n\n{fence}"), 80);
+        let toggle = |app: &mut App, label: &str| {
+            let (line, column) = find(app, label);
+            let area = app.transcript_area.unwrap();
+            assert!(click(
+                app,
+                area.x + column as u16,
+                area.y + (line - app.scroll) as u16
+            ));
+        };
+        assert_eq!(app.diagrams.len(), 2);
+        assert!(app.diagrams.iter().all(|(_, diagram)| !diagram.source));
+        toggle(&mut app, "[source]");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.diagrams[0].1.source);
+        assert!(!app.diagrams[1].1.source);
+        assert!(
+            app.lines
+                .iter()
+                .any(|line| line.contains("sequenceDiagram"))
+        );
+        assert!(app.copied.is_none());
+        let built = app.drawn.built;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.drawn.built, built, "the view stays cached");
+        toggle(&mut app, "[copy]");
+        assert_eq!(
+            crate::clipboard::last_copied().as_deref(),
+            Some("sequenceDiagram\n    A->>B: hello")
+        );
+        toggle(&mut app, "[diagram]");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.diagrams.iter().all(|(_, diagram)| !diagram.source));
+        assert!(
+            !app.lines
+                .iter()
+                .any(|line| line.contains("sequenceDiagram"))
+        );
+        toggle(&mut app, "[source]");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.diagrams[0].1.source);
+        app.leave_child();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.diagrams.iter().all(|(_, diagram)| !diagram.source));
+    }
+
+    #[test]
+    fn a_wide_mermaid_can_be_opened_and_the_choice_survives_resizing() {
+        let fence = "```mermaid\nsequenceDiagram\n    A->>B: hello\n```";
+        let (mut app, mut terminal) = drawn(fence, 15);
+        assert!(app.diagrams[0].1.source);
+        let (line, column) = find(&app, "[diagram]");
+        let area = app.transcript_area.unwrap();
+        let y = area.y + (line - app.scroll) as u16;
+        assert!(click(&mut app, area.x + column as u16, y));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!app.diagrams[0].1.source);
+        assert!(app.lines.iter().any(|line| line.contains("(clipped)")));
+        terminal.backend_mut().resize(80, 40);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!app.diagrams[0].1.source);
+        assert!(!app.lines.iter().any(|line| line.contains("(clipped)")));
+        assert!(app.lines.iter().any(|line| line.contains("hello")));
     }
 
     #[test]

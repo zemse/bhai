@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-27
+
+- Mermaid blocks switch between diagram and source with clickable header controls; source fallbacks explain rendering failures or width limits, and explicitly opened wide diagrams clip without wrapping. Copy controls stay separate.
+
 ## 2026-10-26
 
 - Subagents start without a hardcoded concurrency cap; workflows respect their configured parallelism. The four-row subagent panel scrolls with the mouse wheel and shows the visible range.

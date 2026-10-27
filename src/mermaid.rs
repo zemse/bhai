@@ -11,7 +11,7 @@ use merman_core::{Engine, OperationControl, ParseOptions};
 
 /// The fence languages that mean mermaid.
 pub fn is_mermaid(lang: &str) -> bool {
-    matches!(lang, "mermaid" | "mmd")
+    lang.eq_ignore_ascii_case("mermaid") || lang.eq_ignore_ascii_case("mmd")
 }
 
 /// The diagram `source` draws as, without trailing spaces, or `None` when it cannot be
@@ -68,7 +68,9 @@ mod tests {
 
     #[test]
     fn both_spellings_of_the_fence_are_mermaid() {
-        assert!(is_mermaid("mermaid") && is_mermaid("mmd"));
+        for lang in ["mermaid", "mmd", "Mermaid", "MMD"] {
+            assert!(is_mermaid(lang));
+        }
         assert!(!is_mermaid("rust") && !is_mermaid(""));
     }
 }

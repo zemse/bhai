@@ -45,6 +45,17 @@ pub struct Rendered {
     pub origins: Vec<Vec<Option<Origin>>>,
     /// Clickable code: its row, its chars and the code it copies.
     pub copies: Vec<(usize, Range<usize>, String)>,
+    /// Clickable Mermaid view controls.
+    pub diagrams: Vec<DiagramToggle>,
+}
+
+/// A header control and the block's current view.
+#[derive(Clone)]
+pub struct DiagramToggle {
+    pub row: usize,
+    pub chars: Range<usize>,
+    pub block: usize,
+    pub source: bool,
 }
 
 /// The label over a code block that a click copies the block by.
@@ -58,11 +69,13 @@ const CODE_INDENT: &str = "  ";
 /// Renders `text` into lines no wider than `width` chars, each with how it joins the one
 /// above, how many chars in front of it are layout and where its chars came from, so a
 /// copy of a selection can undo what was done here. Origins are offsets into
-/// `wrap::readable(text)`, which is what is parsed.
-pub fn render(text: &str, width: usize) -> Rendered {
+/// `wrap::readable(text)`, which is what is parsed. `views` overrides Mermaid blocks by
+/// their start offset, with `true` choosing source.
+pub fn render(text: &str, width: usize, views: &[(usize, bool)]) -> Rendered {
     let text = &crate::wrap::readable(text);
     let mut renderer = Renderer {
         width: width.max(1),
+        diagram_views: views.to_vec(),
         ..Renderer::default()
     };
     for (event, range) in Parser::new_ext(text, OPTIONS).into_offset_iter() {
@@ -102,6 +115,7 @@ struct Renderer {
     inline: Vec<Cell>,
     /// Payloads for inline code, indexed by its cells.
     click_codes: Vec<String>,
+    diagram_views: Vec<(usize, bool)>,
     styles: Vec<Style>,
     /// The open inline elements; the outermost is what their chars copy as.
     elements: Vec<Origin>,
@@ -366,15 +380,57 @@ impl Renderer {
             return;
         };
         let code = text.strip_suffix('\n').unwrap_or(&text);
-        self.code_header(&lang, code);
         // Only the word before any attributes, which fences carry in several dialects.
         let name = lang.split([' ', ',', '{', ':']).next().unwrap_or("").trim();
-        let start = self.out.lines.len();
-        if mermaid::is_mermaid(name) && self.diagram(code, block) {
-            self.code_targets(start, code);
-            self.gap = true;
-            return;
+        if mermaid::is_mermaid(name) {
+            let drawing = mermaid::render(code);
+            let width = self
+                .width
+                .saturating_sub(self.prefix_width() + CODE_INDENT.len());
+            let wide = drawing
+                .as_ref()
+                .is_some_and(|lines| lines.iter().any(|line| crate::wrap::width(line) > width));
+            let source = drawing.is_none()
+                || self
+                    .diagram_views
+                    .iter()
+                    .find(|(at, _)| *at == block.start)
+                    .map_or(wide, |(_, source)| *source);
+            let label = match drawing {
+                None => format!("{lang} (cannot render)"),
+                Some(_) if source => {
+                    format!("{lang} [diagram]{}", if wide { " (too wide)" } else { "" })
+                }
+                Some(_) => format!("{lang} [source]{}", if wide { " (clipped)" } else { "" }),
+            };
+            let header = self.out.lines.len();
+            self.code_header(&label, code);
+            if drawing.is_some() {
+                let label = if source { "[diagram]" } else { "[source]" };
+                for row in header..self.out.lines.len() {
+                    let text = self.out.lines[row].to_string();
+                    if let Some(at) = text.find(label) {
+                        let start = text[..at].chars().count();
+                        self.out.diagrams.push(DiagramToggle {
+                            row,
+                            chars: start..start + label.len(),
+                            block: block.start,
+                            source,
+                        });
+                    }
+                }
+            }
+            if !source && let Some(lines) = drawing {
+                let start = self.out.lines.len();
+                self.diagram(lines, block);
+                self.code_targets(start, code);
+                self.gap = true;
+                return;
+            }
+        } else {
+            self.code_header(&lang, code);
         }
+        let start = self.out.lines.len();
         let width = self
             .width
             .saturating_sub(self.prefix_width() + CODE_INDENT.len())
@@ -458,29 +514,27 @@ impl Renderer {
         }
     }
 
-    /// A mermaid fence drawn as a diagram, or `false` when it is to be shown as source.
-    /// A diagram is art rather than text: splitting a line of it to fit the view leaves
-    /// something worse to read than the source it was drawn from, so one too wide for
-    /// the view is not drawn at all. Each char of it copies as the whole fence.
-    fn diagram(&mut self, source: &str, block: Origin) -> bool {
+    /// Diagram rows are clipped rather than wrapped, so their columns stay aligned.
+    fn diagram(&mut self, lines: Vec<String>, block: Origin) {
         let width = self
             .width
             .saturating_sub(self.prefix_width() + CODE_INDENT.len());
-        let Some(lines) = mermaid::render(source) else {
-            return false;
-        };
-        if lines.iter().any(|l| crate::wrap::width(l) > width) {
-            return false;
-        }
         for line in lines {
             let mut row: Vec<Cell> = CODE_INDENT
                 .chars()
                 .map(|c| (c, PLAIN, None, None))
                 .collect();
-            row.extend(line.chars().map(|c| (c, PLAIN, Some(block), None)));
+            let mut used = 0;
+            row.extend(
+                line.chars()
+                    .take_while(|c| {
+                        used += unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0);
+                        used <= width
+                    })
+                    .map(|c| (c, PLAIN, Some(block), None)),
+            );
             self.emit_code(row, Join::Newline);
         }
-        true
     }
 
     /// Tables as a grid, columns padded to line up. A cell too long for its column wraps
@@ -842,7 +896,7 @@ mod tests {
 
     #[test]
     fn inline_code_targets_survive_wrapping_and_nested_markup() {
-        let rendered = render("**before `one two three` and ``a ` b`` after**", 12);
+        let rendered = render("**before `one two three` and ``a ` b`` after**", 12, &[]);
         let mut seen = Vec::new();
         for (row, chars, code) in &rendered.copies {
             let line = rendered.lines[*row].to_string();
@@ -857,7 +911,7 @@ mod tests {
 
     #[test]
     fn inline_code_in_tables_keeps_separate_targets() {
-        let rendered = render("| a | b |\n|---|---|\n| `left` | `right` |", 30);
+        let rendered = render("| a | b |\n|---|---|\n| `left` | `right` |", 30, &[]);
         let codes: Vec<_> = rendered
             .copies
             .iter()
@@ -868,7 +922,7 @@ mod tests {
 
     #[test]
     fn code_rows_are_clickable_without_a_copy_label() {
-        let rendered = render("```\nabcdef\n\n  x\n```", 4);
+        let rendered = render("```\nabcdef\n\n  x\n```", 4, &[]);
         assert!(
             rendered
                 .lines
@@ -886,7 +940,7 @@ mod tests {
 
     /// The lines alone, for the tests that have nothing to say about the wrapping.
     fn lines(source: &str, width: usize) -> Vec<Line<'static>> {
-        render(source, width).lines
+        render(source, width, &[]).lines
     }
 
     fn text(lines: &[Line]) -> Vec<String> {
@@ -973,7 +1027,7 @@ mod tests {
         assert!(drawn.contains("hello"), "{drawn}");
         assert!(!drawn.contains("->>"), "{drawn}");
         assert!(!drawn.contains("sequenceDiagram"), "{drawn}");
-        assert_eq!(text(&lines)[0], "mermaid [copy]");
+        assert_eq!(text(&lines)[0], "mermaid [source] [copy]");
     }
 
     #[test]
@@ -989,7 +1043,56 @@ mod tests {
     #[test]
     fn a_mermaid_fence_that_does_not_parse_is_shown_as_its_source() {
         let lines = lines("```mermaid\nnot a diagram\n```", 80);
-        assert_eq!(text(&lines), vec!["mermaid [copy]", "  not a diagram"]);
+        assert_eq!(
+            text(&lines),
+            vec!["mermaid (cannot render) [copy]", "  not a diagram"]
+        );
+        assert!(
+            render("```mermaid\nnot a diagram\n```", 80, &[])
+                .diagrams
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mermaid_views_are_explicit_and_keep_the_copy_target() {
+        let text = "```mermaid\nsequenceDiagram\n    A->>B: hello\n```";
+        let source = render(text, 80, &[(0, true)]);
+        assert!(
+            source
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("sequenceDiagram"))
+        );
+        assert!(source.diagrams[0].source);
+        assert_eq!(source.diagrams[0].block, 0);
+        assert!(source.lines[0].to_string().contains("[diagram] [copy]"));
+        let drawn = render(text, 80, &[(0, false)]);
+        assert!(!drawn.diagrams[0].source);
+        assert!(
+            !drawn
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("sequenceDiagram"))
+        );
+        assert_eq!(source.copies[0].2, drawn.copies[0].2);
+        let narrow = render(text, 12, &[(0, false)]);
+        assert!(
+            narrow
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("(clipped)"))
+        );
+        assert!(narrow.lines.iter().all(|line| line.width() <= 12));
+        assert!(!narrow.diagrams[0].source);
+        let fallback = render(text, 12, &[]);
+        assert!(fallback.diagrams[0].source);
+        assert!(
+            fallback
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("(too wide)"))
+        );
     }
 
     #[test]

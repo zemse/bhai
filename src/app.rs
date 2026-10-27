@@ -215,6 +215,7 @@ pub struct App {
     pub sources: Vec<Option<Source>>,
     /// Clickable code: its line, its chars and the code.
     pub copies: Vec<(usize, Range<usize>, String)>,
+    pub diagrams: Vec<(usize, markdown::DiagramToggle)>,
     /// The transcript's text area, filled in by the renderer.
     pub transcript_area: Option<Rect>,
     /// The links the last frame drew over the transcript, filled in by the renderer.
@@ -392,6 +393,7 @@ impl App {
             margins: Vec::new(),
             sources: Vec::new(),
             copies: Vec::new(),
+            diagrams: Vec::new(),
             transcript_area: None,
             links: Vec::new(),
             pointer: None,
@@ -982,7 +984,8 @@ impl App {
                     return self.copy_selection(at) | self.rehover();
                 }
                 return clicked
-                    && (self.click_copy(mouse.column, mouse.row)
+                    && (self.click_diagram(mouse.column, mouse.row)
+                        || self.click_copy(mouse.column, mouse.row)
                         || self.click_link(mouse.column, mouse.row)
                         || self.click_entry(mouse.row));
             }
@@ -1032,7 +1035,11 @@ impl App {
             return false;
         };
         self.anchor = Some(cell);
-        let count = self.click_count(x, y);
+        let control = self
+            .diagrams
+            .iter()
+            .any(|(_, toggle)| toggle.row == cell.0 && toggle.chars.contains(&cell.1));
+        let count = if control { 1 } else { self.click_count(x, y) };
         // A single press drops the old selection; a drag builds the new one.
         self.selection = match count {
             2 => Some(Selection::word(&self.lines[cell.0], cell)),
@@ -1152,6 +1159,26 @@ impl App {
         if let Err(err) = crate::links::open(&link.target, self.opener) {
             self.note(Entry::Error(err));
         }
+        true
+    }
+
+    fn click_diagram(&mut self, x: u16, y: u16) -> bool {
+        if self.selection.is_some() {
+            return false;
+        }
+        let Some((line, column)) = self.cell_at(x, y) else {
+            return false;
+        };
+        let Some((entry, toggle)) = self
+            .diagrams
+            .iter()
+            .find(|(_, toggle)| toggle.row == line && toggle.chars.contains(&column))
+        else {
+            return false;
+        };
+        self.drawn
+            .toggle_diagram(*entry, toggle.block, toggle.source);
+        self.follow = false;
         true
     }
 
@@ -2499,6 +2526,8 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             self.bg = None;
         }
         self.expanded.clear();
+        self.drawn.clear_diagrams();
+        self.diagrams.clear();
         self.pinned.clear();
         self.folds.clear();
         self.selection = None;
@@ -2797,6 +2826,8 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     fn enter_pane(&mut self) {
         self.selection = None;
         self.expanded.clear();
+        self.drawn.clear_diagrams();
+        self.diagrams.clear();
         self.pinned.clear();
         self.follow = true;
         self.scroll = 0;
