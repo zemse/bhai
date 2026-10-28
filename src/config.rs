@@ -71,6 +71,8 @@ pub struct Config {
     /// `statusline`: the status bar's template, or `None` for the built-in bar. Not
     /// checked here: a bar that does not parse is no reason to refuse to start.
     pub statusline: Option<String>,
+    /// `[tart]`: the default VM for guest-only sessions.
+    pub tart: crate::tart::Settings,
     /// `[bash] pass_env`: credential-looking variable names that bash and stdio MCP
     /// children still inherit.
     pub pass_env: Vec<String>,
@@ -109,6 +111,7 @@ impl Default for Config {
             limits: Limits::default(),
             choice: crate::client::Choice::default(),
             statusline: None,
+            tart: crate::tart::Settings::default(),
             pass_env: Vec::new(),
             sandbox: crate::sandbox::Settings::default(),
             sudo: false,
@@ -203,6 +206,7 @@ struct Layer {
     context_window: Option<u64>,
     compact_at: Option<f64>,
     statusline: Option<String>,
+    tart: Option<crate::tart::Settings>,
     #[serde(default)]
     bash: BashLayer,
     egress: Option<crate::egress::Settings>,
@@ -273,11 +277,17 @@ pub struct Flags {
 impl Config {
     /// Read the global file under `home` (if any), then the project file under `cwd`.
     pub fn load(home: Option<&Path>, cwd: &Path) -> Result<Self> {
+        let mut config = Self::load_global(home)?;
+        config.apply_file(&cwd.join(".bhai/config.toml"), false)?;
+        Ok(config)
+    }
+
+    /// Read only the host's global file, before choosing a guest working directory.
+    pub(crate) fn load_global(home: Option<&Path>) -> Result<Self> {
         let mut config = Self::default();
         if let Some(home) = home {
             config.apply_file(&global_path(home), true)?;
         }
-        config.apply_file(&cwd.join(".bhai/config.toml"), false)?;
         Ok(config)
     }
 
@@ -415,6 +425,9 @@ impl Config {
             self.sudo = sudo;
         }
         if trusted {
+            if let Some(tart) = &layer.tart {
+                self.tart = tart.clone();
+            }
             if layer.statusline.is_some() {
                 self.statusline = layer.statusline.clone();
             }
@@ -605,6 +618,24 @@ mod tests {
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn tart_vm_is_host_global_only() {
+        let dir = temp_dir();
+        let home = dir.join("home");
+        let cwd = dir.join("project");
+        write(&global_path(&home), "[tart]\nvm = \"ubuntu-bhai\"\n");
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[tart]\nvm = \"project-vm\"\n",
+        );
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert_eq!(config.tart.vm.as_deref(), Some("ubuntu-bhai"));
+        assert_eq!(Config::load_global(Some(&home)).unwrap().tart, config.tart);
+        std::fs::remove_file(global_path(&home)).unwrap();
+        assert_eq!(Config::load(Some(&home), &cwd).unwrap().tart.vm, None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

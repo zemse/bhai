@@ -129,6 +129,8 @@ mod startup;
 mod statusline;
 #[path = "../../src/syntax.rs"]
 mod syntax;
+#[path = "../../src/tart.rs"]
+mod tart;
 #[path = "../../src/title.rs"]
 mod title;
 #[path = "../../src/tokens.rs"]

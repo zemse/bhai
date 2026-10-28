@@ -68,11 +68,15 @@ pub async fn entry() -> Result<()> {
     if args.first().is_some_and(|a| a == askpass::FLAG) {
         std::process::exit(askpass::helper(&args[1..]));
     }
-    tools::bash::kill_all_on_signal()?;
+    let forwarded = args.clone();
     let cli = arguments::Cli::try_parse_from(std::iter::once("bhai".to_string()).chain(args))
         .unwrap_or_else(|error| error.exit());
     // Validate run options before any command has effects.
     let mut args = cli.into_args().unwrap_or_else(|error| error.exit());
+    if args.tart {
+        return crate::tart::launch(forwarded).await;
+    }
+    tools::bash::kill_all_on_signal()?;
     if let Some(dir) = &args.cd {
         std::env::set_current_dir(dir)
             .with_context(|| format!("could not use project directory {}", dir.display()))?;
@@ -687,6 +691,7 @@ async fn shutdown(hub: Option<Arc<mcp::Hub>>) {
 /// Command-line flags, apart from `--probe` and `--cache-check`.
 #[derive(Debug, Default, PartialEq)]
 struct Args {
+    tart: bool,
     command: Option<arguments::Command>,
     cd: Option<PathBuf>,
     probe: Option<Option<String>>,

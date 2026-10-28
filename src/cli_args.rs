@@ -19,6 +19,9 @@ pub(super) struct Cli {
     /// Run one prompt without the terminal UI; omit the prompt or use - to read stdin.
     #[arg(short = 'p', long = "print", num_args = 0..=1, default_missing_value = "-", value_name = "PROMPT")]
     print: Option<String>,
+    /// Run the entire session in the default Tart VM configured on this host.
+    #[arg(long, global = true)]
+    tart: bool,
     /// Use this directory as the project root.
     #[arg(short = 'C', long, global = true, value_name = "DIR")]
     cd: Option<std::path::PathBuf>,
@@ -177,6 +180,7 @@ impl Cli {
             )
         });
         let parsed = Args {
+            tart: self.tart,
             command: self.command,
             cd: self.cd,
             probe: self.probe,
@@ -261,6 +265,23 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Args, clap::Error> {
         Cli::try_parse_from(std::iter::once("bhai").chain(args.iter().copied()))?.into_args()
+    }
+
+    #[test]
+    fn tart_is_available_before_and_after_exec() {
+        for args in [
+            vec!["--tart", "-C", "/guest/project", "exec", "review"],
+            vec!["exec", "review", "--tart", "-C", "/guest/project"],
+            vec!["--tart", "exec", "review", "--tart", "-C", "/guest/project"],
+        ] {
+            let parsed = parse(&args).unwrap();
+            assert!(parsed.tart);
+            assert_eq!(
+                parsed.cd.as_deref(),
+                Some(std::path::Path::new("/guest/project"))
+            );
+        }
+        assert!(!parse(&["exec", "--", "--tart"]).unwrap().tart);
     }
 
     #[test]

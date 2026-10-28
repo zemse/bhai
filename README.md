@@ -52,6 +52,31 @@ session options work before or after `exec`. approvals left at ask are rejected 
 
 `sessions [prune [n]]`, `identities`, `usage` and `mcp approve|login|logout <server>` also have command-specific help. existing `--workflow`, `--serve --headless` and diagnostic flags remain available.
 
+### Tart sessions
+
+`bhai --tart` runs the entire session inside an existing local [Tart](https://tart.run/) VM on macOS. set the default in the host's `~/.config/bhai/config.toml`; project configuration cannot select a VM.
+
+```toml
+[tart]
+vm = "ubuntu-24.04-bhai"
+```
+
+install bhai and the [Tart Guest Agent](https://github.com/cirruslabs/tart-guest-agent) in that VM first. configure model authentication inside the guest, or use its Ollama instance. the launcher does not install software, copy host credentials or forward host configuration. guest bhai must be on its login-shell PATH or in `~/.cargo/bin` or `~/.local/bin`.
+
+```sh
+bhai --tart
+bhai --tart -C /home/admin/project
+bhai --tart exec "review this code" --json
+```
+
+a stopped VM starts with no display, clipboard, audio or host shares. bhai waits up to two minutes for the guest agent, then attaches to guest bhai in the guest user's home directory. `-C`, resume IDs and all other session arguments refer to the guest. terminal sessions get a guest PTY; piped stdin and unattended output stay pipes. the VM stays running after disconnecting, including on setup failure; use `tart stop <vm>` when finished.
+
+all tools, child agents, MCP servers, hooks and session files run inside the guest. the host launcher only reads its global configuration and manages/attaches to Tart; it never starts a host agent as a fallback. running VMs are reused only when their Tart process has a verifiable share-free invocation with `--no-clipboard`; unknown options, directory shares, additional disks and VNC are refused. stop such a VM and let `bhai --tart` restart it safely.
+
+the launcher honors `TART_HOME` and checks the exact VM's PID lock and native Tart executable, rather than trusting a matching VM name in another storage directory. do not concurrently stop or restart the VM while attaching: Tart's name-based exec API cannot pin an attachment across external lifecycle changes.
+
+this isolates the session from the host filesystem, not the network. Tart's default network can reach host services and the internet. do not expose unauthenticated host services or place host-access credentials in the guest. the VM disk and Tart's own runtime state still live on the host, and pre-existing guest data is not reset.
+
 ### session storage
 
 new sessions get a UUID before startup services run. session state lives under `.bhai/sessions/<uuid>/`, beside its `<uuid>.jsonl` transcript. `debug/` holds that session's judge, authorization, permission, cache, MCP and profiling logs; debug exports do not read the old project-wide log directory. `scratch/` holds temporary working files and dictation recordings. Bash sets `BHAI_SESSION_DIR`, `BHAI_SCRATCH_DIR` and `TMPDIR` to these paths.

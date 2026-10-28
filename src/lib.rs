@@ -97,6 +97,7 @@ mod speed;
 mod startup;
 mod statusline;
 mod syntax;
+pub mod tart;
 mod title;
 pub mod tokens;
 pub mod tools;

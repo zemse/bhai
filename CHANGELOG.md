@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-10-28
 
+- `--tart` runs the whole session in a configured local VM, starts stopped guests headlessly without host shares or clipboard, and keeps tools, child agents and session files inside the guest with no host fallback.
 - CI runs only on manual dispatch, not automatically on pushes or pull requests; platform checks and dependency advisory checks remain available.
 
 ## 2026-10-27
