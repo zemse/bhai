@@ -802,6 +802,7 @@ pub(crate) async fn run_configured(
     let title_updated = Arc::new(std::sync::Mutex::new(false));
     let compact_requested: tools::compact::Requested = Arc::default();
     let context_usage: tools::status::Context = Arc::default();
+    let quota = Arc::new(tools::status::Quota::default());
     // The file this session is saved as, which a resume names after the session it continues.
     let own = saved
         .as_ref()
@@ -859,6 +860,7 @@ pub(crate) async fn run_configured(
                 cancel: Arc::clone(&stop),
                 monitors: delegation.as_ref().and_then(|d| d.monitors.clone()),
                 context: Arc::clone(&context_usage),
+                quota: Arc::clone(&quota),
             }));
         }
         if prompt.identity.allows_tool(tools::compact::NAME) {
@@ -1061,6 +1063,7 @@ pub(crate) async fn run_configured(
                                     continue;
                                 }
                                 if !same {
+                                    quota.clear();
                                     tokenizer = tokens::for_model(model.name());
                                     limits.reported = window;
                                     history.retain(|item| {
@@ -1352,6 +1355,7 @@ pub(crate) async fn run_configured(
             plan: &plan,
             compact_requested: &compact_requested,
             context_usage: &context_usage,
+            quota: &quota,
         };
         // A root per turn; `session.id` is what ties a session's turns together.
         let span = info_span!(
@@ -1457,6 +1461,8 @@ pub(crate) async fn run_configured(
                     g.pause("the turn failed");
                 } else if cancel.load(Ordering::Relaxed) {
                     g.pause("interrupted");
+                } else if quota.warning().is_some() {
+                    g.pause("weekly quota is at least 98%; checkpoint before resuming");
                 } else if on_goal.is_some() {
                     g.progress(result.acted);
                 }
@@ -1550,7 +1556,7 @@ pub(crate) async fn run_configured(
             || compact_next
             || size.is_some_and(|input| limits.over(model.name(), input));
         let mut compacted = false;
-        if over && !cancel.load(Ordering::Relaxed) {
+        if over && !cancel.load(Ordering::Relaxed) && (compact_next || quota.warning().is_none()) {
             let pass = Compaction {
                 model: model.as_ref(),
                 tools: &tools,
@@ -1685,6 +1691,7 @@ struct GoalContext<'a> {
     plan: &'a crate::plan::Shared,
     compact_requested: &'a tools::compact::Requested,
     context_usage: &'a tools::status::Context,
+    quota: &'a tools::status::Quota,
 }
 
 /// The update a model that takes them needs before the next turn: the effort it runs at,
@@ -1783,6 +1790,9 @@ async fn turn(
     let mut truncated = false;
     let mut acted = false;
     let mut continued = 0usize;
+    let mut quota_warned = false;
+    let local_quota = tools::status::Quota::default();
+    let quota = goal_context.map_or(&local_quota, |context| context.quota);
 
     let mut step = 0usize;
     loop {
@@ -1851,6 +1861,19 @@ async fn turn(
             }
             monitor.resume();
         }
+        if !quota_warned && let Some(warning) = quota.warning() {
+            let from = history.len();
+            history.push(json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": warning}],
+            }));
+            record(sink, &history[from..], tx);
+            let _ = tx.send(AgentEvent::Info(
+                "weekly quota is at least 98%; checkpointing".into(),
+            ));
+            quota_warned = true;
+        }
         if let Some(context) = goal_context {
             let now = lock_goal(context.goal).clone();
             if let Some(context) = goal::context(history, now.as_ref()) {
@@ -1915,7 +1938,10 @@ async fn turn(
                     monitor.sent(found.as_ref(), Instant::now());
                     AgentEvent::Cache(found)
                 }
-                Delta::RateLimits(limits) => AgentEvent::RateLimits(limits),
+                Delta::RateLimits(limits) => {
+                    quota.observe(limits);
+                    AgentEvent::RateLimits(limits)
+                }
                 Delta::Truncated => AgentEvent::Info(
                     "cut off at the model's output limit; the answer is what it had".to_string(),
                 ),
@@ -3884,6 +3910,15 @@ pub mod fake {
                     false => self.script.lock().unwrap().pop_front(),
                 };
                 let mut next = next.ok_or_else(|| anyhow!("the script ran out"))?;
+                if next
+                    .first()
+                    .is_some_and(|item| item["type"] == "codex.rate_limits")
+                {
+                    let event = next.remove(0);
+                    let limits =
+                        RateLimits::from_event(&event, chrono::Utc::now().timestamp()).unwrap();
+                    on_delta(Delta::RateLimits(limits));
+                }
                 let unmetered =
                     next.first().and_then(|item| item["type"].as_str()) == Some(UNMETERED);
                 if unmetered {
@@ -4421,6 +4456,7 @@ mod tests {
         for args in [json!({}), json!({"prompt": "preserve decisions"})] {
             let requested: tools::compact::Requested = Arc::default();
             let context_usage: tools::status::Context = Arc::default();
+            let quota = Arc::new(tools::status::Quota::default());
             let goal: goal::Shared = Arc::default();
             let plan = crate::plan::Shared::new(Arc::clone(&goal));
             let context = GoalContext {
@@ -4428,6 +4464,7 @@ mod tests {
                 plan: &plan,
                 compact_requested: &requested,
                 context_usage: &context_usage,
+                quota: &quota,
             };
             let registry = Registry::new(Vec::new())
                 .with_tool(Box::new(tools::compact::Compact {
@@ -4438,6 +4475,7 @@ mod tests {
                     cancel: Arc::default(),
                     monitors: None,
                     context: Arc::clone(&context_usage),
+                    quota: Arc::clone(&quota),
                 }));
             let compact_call = call("compact", args.clone());
             let status_call = call("status", json!({}));
@@ -5912,6 +5950,84 @@ mod tests {
         );
         assert_eq!(parent_calls(&fake).len(), 7);
         assert!(parent_calls(&fake)[6].contains("one more message"));
+    }
+
+    #[tokio::test]
+    async fn turns_without_a_goal_context_also_receive_quota_guidance() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![
+            vec![
+                json!({"type": "codex.rate_limits", "primary": {
+                    "used_percent": 99.0, "window_minutes": 10080,
+                }}),
+                json!({"type": fake::CONTINUES}),
+                say("continuing"),
+            ],
+            vec![say("checkpointed")],
+        ]);
+        let dir = tools::temp_dir();
+        let (_, result, events) = run_turn(&fake, &dir).await;
+        assert!(result.result.is_ok());
+        assert!(info(&events).iter().any(|s| s.contains("checkpointing")));
+        assert!(
+            fake.bodies.lock().unwrap()[1].1["input"]
+                .to_string()
+                .contains("Checkpoint now")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn weekly_quota_warns_once_and_pauses_goal_without_compaction() {
+        use fake::{Fake, call, say};
+
+        for weekly_primary in [false, true] {
+            let window = json!({
+                "used_percent": 98.0,
+                "window_minutes": 10080,
+                "resets_at": i64::MAX,
+            });
+            let quota = json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "primary": if weekly_primary { window.clone() } else { Value::Null },
+                    "secondary": if weekly_primary { Value::Null } else { window },
+                },
+            });
+            let fake = Fake::new(vec![
+                vec![quota, call("status", json!({}))],
+                vec![call("status", json!({}))],
+                vec![say("checkpoint saved; resume after reset")],
+            ])
+            .with_usage(Usage {
+                input: 1_000_000,
+                ..Usage::default()
+            });
+            let (mut rx, _user, _control, _cancel) = goal_session(&fake, vec![set_goal("work")]);
+            let events = settle(&mut rx).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Compacted { .. } | AgentEvent::Error(_))),
+                "{events:?}"
+            );
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::Goal(Some(g)) if g.state == goal::State::Paused && g.note.contains("weekly quota"))));
+            assert_eq!(
+                info(&events)
+                    .iter()
+                    .filter(|s| s.contains("checkpointing"))
+                    .count(),
+                1
+            );
+            let bodies = fake.bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 3);
+            for (_, body) in bodies.iter().skip(1) {
+                let input = body["input"].to_string();
+                assert_eq!(input.matches("Checkpoint now").count(), 1);
+                assert!(input.contains("checkpoint_recommended"));
+            }
+        }
     }
 
     #[tokio::test]

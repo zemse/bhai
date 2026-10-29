@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-10-29
+
+- `status` exposes reported subscription windows, credits, reset times and observation age; weekly usage at 98% prompts checkpointing, pauses goal continuation after the turn and skips automatic compaction.
+
 ## 2026-10-28
 
 - `--tart` runs the whole session in a configured local VM, starts stopped guests headlessly without host shares or clipboard, and keeps tools, child agents and session files inside the guest with no host fallback.

@@ -964,6 +964,7 @@ mod tests {
             cancel: Arc::clone(&harness.agent.cancel),
             monitors: None,
             context: Arc::default(),
+            quota: Arc::default(),
         };
         let (text, ok) = status.execute(&json!({})).await;
         assert!(ok);
