@@ -26,6 +26,10 @@ pub const DEFAULT_PORT: u16 = 7878;
 /// The header every request carries the run's token in.
 pub const TOKEN_HEADER: &str = "x-bhai-token";
 
+/// How often a quiet `/events` stream sends a comment, so a client can tell a link that
+/// went dead under an ssh tunnel, which leaves its socket open, from one with nothing to say.
+pub const KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// What `--serve` takes the token from when there is no `--token-file`.
 pub const TOKEN_ENV: &str = "BHAI_TOKEN";
 /// Shortest token accepted from a file or the environment; a minted one is 32.
@@ -341,7 +345,7 @@ async fn events(
         },
     };
     Sse::new(stream(session, after))
-        .keep_alive(KeepAlive::default())
+        .keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
         .into_response()
 }
 

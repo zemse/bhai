@@ -14,14 +14,18 @@ use tokio::sync::mpsc;
 
 use crate::entries::Entry;
 use crate::permissions::{Answer, Policy};
-use crate::server::{DEFAULT_PORT, TOKEN_ENV, TOKEN_HEADER};
+use crate::server::{DEFAULT_PORT, KEEP_ALIVE, TOKEN_ENV, TOKEN_HEADER};
 use crate::session::{self, Action, Link, Session};
 
 /// The wait between attempts to reconnect. The first after a drop goes at once; a fixed
 /// short wait after that, so a link that comes back is caught up within about this long.
 const RETRY: Duration = Duration::from_secs(1);
 /// How long a request other than the event stream may take.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the event stream may go without a byte before it is taken for dead. The
+/// server sends a keep-alive every [`KEEP_ALIVE`], so this is several of them missed.
+const IDLE: Duration = Duration::from_secs(10);
+const _: () = assert!(KEEP_ALIVE.as_secs() * 2 < IDLE.as_secs());
 
 /// The server's base URL from what the user typed: nothing, a port, `host:port` or a
 /// URL. Only `127.0.0.1` and `localhost` are accepted, since the server answers no
@@ -84,6 +88,8 @@ pub struct Remote {
     http: reqwest::Client,
     base: String,
     token: String,
+    /// [`IDLE`], shorter in tests.
+    idle: Duration,
 }
 
 /// Why a request got no answer worth reading.
@@ -106,10 +112,17 @@ impl std::fmt::Display for Failed {
 
 impl Remote {
     pub fn new(base: String, token: String) -> Self {
+        // Through a tunnel the connect is local, so a dead link shows as a request that
+        // never answers: the timeouts below are what end it.
+        let http = reqwest::Client::builder()
+            .connect_timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_default();
         Self {
-            http: reqwest::Client::new(),
+            http,
             base,
             token,
+            idle: IDLE,
         }
     }
 
@@ -165,12 +178,13 @@ impl Remote {
         Ok((body["state"].take(), transcript))
     }
 
-    /// The event stream from after `after`.
+    /// The event stream from after `after`. Only its headers are timed: the body runs
+    /// for as long as the link holds.
     async fn events(&self, after: u64) -> Result<reqwest::Response, Failed> {
-        let response = self
-            .request(reqwest::Method::GET, &format!("/events?since={after}"))
-            .send()
+        let request = self.request(reqwest::Method::GET, &format!("/events?since={after}"));
+        let response = tokio::time::timeout(self.idle, request.send())
             .await
+            .map_err(|_| Failed::Unreachable("no answer in time".to_string()))?
             .map_err(|e| Failed::Unreachable(e.to_string()))?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -423,7 +437,11 @@ async fn follow(
                 wait = Duration::ZERO;
                 let mut stream = response.bytes_stream();
                 let mut buf = Vec::new();
-                while let Some(Ok(chunk)) = stream.next().await {
+                // A stream with nothing, not even a keep-alive, for `idle` is a link that
+                // died without closing, so it is dropped and opened again.
+                while let Ok(Some(Ok(chunk))) =
+                    tokio::time::timeout(remote.idle, stream.next()).await
+                {
                     buf.extend_from_slice(&chunk);
                     for frame in frames(&mut buf) {
                         match frame {
@@ -854,6 +872,10 @@ mod tests {
             self.cut();
         }
 
+        fn freeze(&self) {
+            self.frozen.send_replace(true);
+        }
+
         fn up(&self) {
             self.down.store(false, Ordering::Relaxed);
             self.frozen.send_replace(false);
@@ -932,5 +954,48 @@ mod tests {
         })
         .await;
         assert!(timeout(WAIT, resync.recv()).await.unwrap().is_some());
+    }
+
+    /// A link that goes quiet without closing, as one under ssh does when the network
+    /// drops, is dropped after `idle` and reopened once bytes flow again; keep-alives
+    /// hold a quiet but live one open.
+    #[tokio::test]
+    async fn a_silent_link_is_dropped_and_reopened() {
+        let served = served().await;
+        let tunnel = Tunnel::to(served.port).await;
+        let idle = KEEP_ALIVE + Duration::from_millis(500);
+        let remote = Remote {
+            idle,
+            ..attach_to(tunnel.port)
+        };
+        let attached = connect(remote).await.unwrap();
+        let here = attached.session;
+        let lost = |s: &Session| {
+            shown(s)
+                .iter()
+                .any(|e| matches!(e, Event::Info(t) if t.starts_with("lost ")))
+        };
+        tokio::time::sleep(idle + Duration::from_millis(500)).await;
+        assert!(here.link().unwrap().connected() && !lost(&here));
+        tunnel.freeze();
+        served.session.publish(Event::Text("unseen".into()));
+        let quiet = std::time::Instant::now();
+        let wait = idle * 2;
+        timeout(wait, async {
+            while here.link().unwrap().connected() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the silent link is never dropped");
+        // Counted from the last keep-alive, which came at most one interval before.
+        assert!(
+            quiet.elapsed() >= idle - KEEP_ALIVE,
+            "{:?}",
+            quiet.elapsed()
+        );
+        assert!(texts(&here).is_empty());
+        tunnel.up();
+        until("what was missed arrives", || texts(&here) == ["unseen"]).await;
     }
 }
