@@ -11,7 +11,7 @@ use crate::{config::Flags, permissions};
     version,
     propagate_version = true,
     about = "An agent harness.",
-    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read.\nSIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints how to resume it.\n[notify] command in ~/.config/bhai/config.toml runs on approvals and turn ends; see the README."
+    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read.\nSIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints how to resume it.\n[notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends and failed logins; see the README."
 )]
 pub(super) struct Cli {
     #[command(subcommand)]

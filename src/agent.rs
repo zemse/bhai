@@ -527,6 +527,10 @@ pub const CHILD_RESULT: &str = "A child agent you started has finished.";
 const CHILD_RESULT_LATE: &str = " You have already answered the user, so say what this \
 adds or changes and leave the rest of your answer standing.";
 
+/// Said under a failure of the Codex credentials, which holds the session.
+pub const AUTH_HELD: &str =
+    "queued prompts and schedules wait until you send a message, after `codex login`";
+
 /// What a turn the user interrupted ends on, so the next one does not take its plan as
 /// finished or a command it cut off as never run. Constant, so it costs nothing to cache.
 pub const TURN_ABORTED: &str = "<turn_aborted>\nThe user interrupted the previous turn on \
@@ -1544,6 +1548,11 @@ pub(crate) async fn run_configured(
             }
             match overflowed {
                 true => failed = Some(format!("{e:#}")),
+                // The session holds its queue and schedules on this, so that every one of
+                // them does not fail the same way.
+                false if crate::client::auth_failed(&e) => {
+                    let _ = tx.send(AgentEvent::TurnFailed(format!("{e:#}\n{AUTH_HELD}")));
+                }
                 false => {
                     let _ = tx.send(AgentEvent::TurnFailed(format!("{e:#}")));
                 }

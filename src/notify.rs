@@ -248,10 +248,11 @@ fn line(body: &str) -> String {
 /// Run the command on what the session waits on the user for, from `events`.
 pub fn watch(mut events: broadcast::Receiver<session::Event>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut failed = false;
         loop {
             match events.recv().await {
                 Ok(event) => {
-                    if let Some((kind, body)) = about(&event) {
+                    if let Some((kind, body)) = about(&event, &mut failed) {
                         fire(kind, &body);
                     }
                 }
@@ -262,12 +263,18 @@ pub fn watch(mut events: broadcast::Receiver<session::Event>) -> tokio::task::Jo
     })
 }
 
-/// The kind and body of a run for `event`, if it is one the user is wanted for.
-fn about(event: &session::Event) -> Option<(Kind, String)> {
+/// The kind and body of a run for `event`, if it is one the user is wanted for. `failed`
+/// is set by a failed login, so the end of that turn is not reported as done as well.
+fn about(event: &session::Event, failed: &mut bool) -> Option<(Kind, String)> {
     match event {
         session::Event::Approval { tool, command, .. } => {
             Some((Kind::Approval, format!("{tool} needs approval: {command}")))
         }
+        session::Event::TurnFailed(message) if message.starts_with(crate::client::AUTH_FAILED) => {
+            *failed = true;
+            Some((Kind::Auth, message.clone()))
+        }
+        session::Event::TurnEnd if std::mem::take(failed) => None,
         session::Event::TurnEnd => Some((Kind::Done, "done".to_string())),
         _ => None,
     }
@@ -341,15 +348,38 @@ mod tests {
             preview: None,
             offers: Default::default(),
         };
+        let mut failed = false;
         assert_eq!(
-            about(&approval),
+            about(&approval, &mut failed),
             Some((Kind::Approval, "bash needs approval: ls".to_string()))
         );
         assert_eq!(
-            about(&session::Event::TurnEnd),
+            about(&session::Event::TurnEnd, &mut failed),
             Some((Kind::Done, "done".to_string()))
         );
-        assert_eq!(about(&session::Event::Info("x".to_string())), None);
+        assert_eq!(
+            about(&session::Event::Info("x".to_string()), &mut failed),
+            None
+        );
+    }
+
+    #[test]
+    fn a_failed_login_is_reported_as_auth_and_not_as_done() {
+        let mut failed = false;
+        let message = format!("{}: unauthorized (401)", crate::client::AUTH_FAILED);
+        assert_eq!(
+            about(&session::Event::TurnFailed(message.clone()), &mut failed),
+            Some((Kind::Auth, message))
+        );
+        assert_eq!(about(&session::Event::TurnEnd, &mut failed), None);
+        assert_eq!(
+            about(&session::Event::TurnFailed("500".to_string()), &mut failed),
+            None
+        );
+        assert_eq!(
+            about(&session::Event::TurnEnd, &mut failed),
+            Some((Kind::Done, "done".to_string()))
+        );
     }
 
     fn sent(notifier: &mut Notifier, message: &str) -> Option<Vec<u8>> {

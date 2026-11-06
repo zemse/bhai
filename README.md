@@ -87,12 +87,14 @@ SIGTERM or SIGHUP (from `kill`, a closed ssh session or a killed tmux pane) inte
 
 ### notifications
 
-`[notify] command` in `~/.config/bhai/config.toml` runs when the session wants you: an approval waiting (`approval`) or a turn ended (`done`). it runs through `$SHELL -c` whether or not the terminal has focus, and under `--headless` too. details arrive as `BHAI_NOTIFY_KIND`, `BHAI_NOTIFY_TITLE`, `BHAI_NOTIFY_BODY`, `BHAI_SESSION_ID` and `BHAI_PROJECT` in its environment, never in the command line. output is discarded, a run is killed after 30 seconds, and each kind runs at most once every 10 seconds. `events` limits the kinds; a project file cannot set `[notify]`.
+`[notify] command` in `~/.config/bhai/config.toml` runs when the session wants you: an approval waiting (`approval`), a turn ended (`done`) or the Codex login failed (`auth`). it runs through `$SHELL -c` whether or not the terminal has focus, and under `--headless` too. details arrive as `BHAI_NOTIFY_KIND`, `BHAI_NOTIFY_TITLE`, `BHAI_NOTIFY_BODY`, `BHAI_SESSION_ID` and `BHAI_PROJECT` in its environment, never in the command line. output is discarded, a run is killed after 30 seconds, and each kind runs at most once every 10 seconds. `events` limits the kinds; a project file cannot set `[notify]`.
+
+a failed login (a token refresh refused, or a 401 after one) fails the turn once with `auth failed` and holds the session: queued prompts, schedules and monitors wait until you run `codex login` and send a message, and a goal pauses as on any failed turn.
 
 ```toml
 [notify]
 command = 'curl -s -d "$BHAI_NOTIFY_TITLE: $BHAI_NOTIFY_BODY" ntfy.sh/my-topic'
-events = ["approval", "done"]
+events = ["approval", "done", "auth"]
 ```
 
 ### driving bhai from another harness

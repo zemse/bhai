@@ -579,10 +579,11 @@ pub async fn run(session: Weak<Session>, schedules: Arc<Schedules>) {
                         spec: fire.row.spec.to_string(),
                         text: fire.row.text.clone(),
                         missed: fire.missed,
-                        queued: hub.working(),
+                        queued: hub.working() || hub.held(),
                     });
-                    // Queued behind a running turn, or started; only a closed agent fails.
-                    if hub.submit(fire.prompt()).is_err() {
+                    // Queued behind a running turn or a failed login, or started; only a
+                    // closed agent fails.
+                    if hub.submit_automatic(fire.prompt()).is_err() {
                         return;
                     }
                 }

@@ -546,7 +546,10 @@ impl Monitors {
             clean(&hook.condition),
             clean(&hook.prompt)
         );
-        if session.submit(Prompt::automatic(text, shown)).is_ok() {
+        if session
+            .submit_automatic(Prompt::automatic(text, shown))
+            .is_ok()
+        {
             *last = Some(now);
             true
         } else {

@@ -133,6 +133,26 @@ pub fn context_overflow(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| cause.is::<ContextOverflow>())
 }
 
+/// What a failure of the Codex credentials says first: `auth.json` could not be read or
+/// refreshed, or the backend refused what it holds.
+pub const AUTH_FAILED: &str = "auth failed";
+
+/// The context that marks a failure of the Codex credentials. Every call after it fails
+/// the same way until the user signs in again.
+#[derive(Debug)]
+pub struct AuthFailed;
+
+impl std::fmt::Display for AuthFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(AUTH_FAILED)
+    }
+}
+
+/// Whether `e` is the Codex credentials failing.
+pub fn auth_failed(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<AuthFailed>().is_some()
+}
+
 /// Whether `model` takes an effort change as a `configuration_update` input item, which
 /// leaves the request's own `reasoning.effort`, and so the cached prefix, as it was. The
 /// GPT-6 family only: on any other model the effort is part of the rendered prefix.
@@ -848,7 +868,7 @@ impl Client {
         let mut auth = unless_cancelled(auth::load(&self.http), cancel)
             .await
             .ok_or(Error::Interrupted)?
-            .map_err(Error::Fatal)?;
+            .map_err(|e| Error::Fatal(e.context(AuthFailed)))?;
 
         if routed
             && let Some(ws) = &self.ws
@@ -867,7 +887,7 @@ impl Client {
             auth = unless_cancelled(auth::recover(&self.http, &auth), cancel)
                 .await
                 .ok_or(Error::Interrupted)?
-                .map_err(Error::Fatal)?;
+                .map_err(|e| Error::Fatal(e.context(AuthFailed)))?;
             resp = self.send(&auth, body, turn_state, cancel).await?;
         }
 
@@ -882,9 +902,10 @@ impl Client {
             let msg = api_error_message(&body).unwrap_or(body);
             let failed = anyhow!("{status}: {msg}");
             return Err(match classify(Some(status.as_u16()), error) {
-                Class::Unauthorized => Error::Fatal(anyhow!(
-                    "unauthorized ({status}): {msg}. Run `codex login`."
-                )),
+                Class::Unauthorized => Error::Fatal(
+                    anyhow!("unauthorized ({status}): {msg}. Run `codex login`.")
+                        .context(AuthFailed),
+                ),
                 Class::Retry => match after {
                     Some(after) => Error::RetryAfter(failed, after),
                     None => Error::Retryable(failed),
@@ -1918,6 +1939,18 @@ mod tests {
         for (status, error, want) in cases {
             assert_eq!(classify(status, &error), want, "{status:?} {error}");
         }
+    }
+
+    #[test]
+    fn a_credentials_failure_is_marked_and_says_so_first() {
+        let e = anyhow!("token refresh failed (400): bad.").context(AuthFailed);
+        assert_eq!(
+            format!("{e:#}"),
+            format!("{AUTH_FAILED}: token refresh failed (400): bad.")
+        );
+        assert!(auth_failed(&e));
+        assert!(auth_failed(&e.context("the turn")), "under more context");
+        assert!(!auth_failed(&anyhow!("500: overloaded")));
     }
 
     #[test]

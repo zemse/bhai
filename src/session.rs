@@ -545,6 +545,8 @@ struct Inner {
     pending: VecDeque<(Approval, oneshot::Sender<Answer>)>,
     /// When the front of `pending` was published.
     shown: Option<Instant>,
+    /// The Codex credentials failed, so the queue and the schedules wait for the user.
+    held: bool,
 }
 
 impl Inner {
@@ -706,6 +708,7 @@ impl Session {
     pub fn submit(&self, prompt: impl Into<Prompt>) -> Result<Submitted, SubmitError> {
         let prompt = prompt.into();
         let mut inner = self.lock();
+        inner.held = false;
         if inner.working {
             return Ok(self.enqueue(&mut inner, Waiting::Prompt(prompt)));
         }
@@ -718,6 +721,23 @@ impl Session {
         inner.start();
         self.publish(prompt.event());
         Ok(Submitted::Started)
+    }
+
+    /// [`Session::submit`] for a prompt no one typed, from a schedule or a monitor: queued,
+    /// not started, while a failure of the credentials holds the session, and never what
+    /// lets it go.
+    pub fn submit_automatic(&self, prompt: impl Into<Prompt>) -> Result<Submitted, SubmitError> {
+        let mut inner = self.lock();
+        if inner.held {
+            return Ok(self.enqueue(&mut inner, Waiting::Prompt(prompt.into())));
+        }
+        drop(inner);
+        self.submit(prompt)
+    }
+
+    /// Whether a failure of the credentials holds the queue and the schedules.
+    pub fn held(&self) -> bool {
+        self.lock().held
     }
 
     /// Start a turn on `prompt` from the compacted copy of the history, for
@@ -967,6 +987,9 @@ impl Session {
     /// Hand the next queued prompt to the agent, with the state locked. A prompt the
     /// agent will not take keeps its place rather than being lost.
     fn start_queued(&self, inner: &mut Inner) {
+        if inner.held {
+            return;
+        }
         let prompt = match inner.queue.pop_front() {
             None => return,
             Some(Waiting::Compact(asked)) => {
@@ -1597,7 +1620,12 @@ impl Session {
                 Event::Fast(on)
             }
             AgentEvent::Error(s) => Event::Error(s),
-            AgentEvent::TurnFailed(s) => Event::TurnFailed(s),
+            AgentEvent::TurnFailed(s) => {
+                if s.starts_with(crate::client::AUTH_FAILED) {
+                    inner.held = true;
+                }
+                Event::TurnFailed(s)
+            }
             // The agent is working again without anything having been typed, so the
             // session says so: what the user sends now queues behind it, as it would
             // behind any other turn.
@@ -1615,7 +1643,7 @@ impl Session {
                     });
                 }
                 // The session keeps working while queued prompts wait behind the turn.
-                inner.working = !inner.queue.is_empty();
+                inner.working = !inner.queue.is_empty() && !inner.held;
                 Event::TurnEnd
             }
         };
@@ -3013,6 +3041,39 @@ mod tests {
         assert!(session.interrupt());
         assert!(session.cancel.stopped());
         assert_eq!(wait.try_recv(), Ok(Answer::Reject));
+    }
+
+    #[test]
+    fn a_failed_login_holds_the_queue_and_schedules_until_the_user_sends() {
+        let (session, mut rx) = session();
+        session.submit("a".to_string()).unwrap();
+        session.submit("b".to_string()).unwrap();
+        assert!(rx.try_recv().is_ok());
+        session.on_agent(AgentEvent::TurnFailed(format!(
+            "{}: unauthorized (401)\n{}",
+            crate::client::AUTH_FAILED,
+            crate::agent::AUTH_HELD
+        )));
+        session.on_agent(AgentEvent::TurnEnd);
+        assert!(session.held());
+        assert!(!session.working());
+        assert!(rx.try_recv().is_err(), "the queued prompt waits");
+        assert_eq!(
+            session.submit_automatic(Prompt::automatic("tick".into(), "tick".into())),
+            Ok(Submitted::Queued { position: 2 })
+        );
+        assert!(rx.try_recv().is_err(), "a schedule does not let it go");
+
+        // The user sending something is the user acting.
+        assert_eq!(session.submit("c".to_string()), Ok(Submitted::Started));
+        assert!(!session.held());
+        assert!(rx.try_recv().is_ok());
+        session.on_agent(AgentEvent::TurnEnd);
+        assert!(rx.try_recv().is_ok(), "the queue runs again");
+
+        // Any other failure leaves the queue running.
+        session.on_agent(AgentEvent::TurnFailed("500: overloaded".to_string()));
+        assert!(!session.held());
     }
 
     #[tokio::test]

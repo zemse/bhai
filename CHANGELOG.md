@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-06
 
+- A failed Codex login fails the turn once with `auth failed`, runs the `[notify]` command as `auth`, and holds queued prompts, schedules and monitors until the user sends a message.
 - `[notify] command` in the global config runs through the shell on approvals and turn ends, with details in `BHAI_NOTIFY_*` variables, regardless of focus and under `--headless`; `events` filters the kinds.
 - SIGTERM and SIGHUP (and SIGINT under `--headless`) interrupt the turn, keep the session, restore the terminal and print the resume command before exiting 0; a second signal still kills.
 
