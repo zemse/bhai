@@ -218,7 +218,7 @@ pub enum Event {
 }
 
 /// How far a child agent got.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChildState {
     Running,
@@ -269,6 +269,25 @@ struct Pane {
 pub struct ChildLog {
     pub row: ChildRow,
     pub entries: Vec<Entry>,
+}
+
+/// What [`Session::snapshot`] reads together.
+pub struct Snapshot {
+    pub state: State,
+    pub transcript: Vec<Entry>,
+    /// The panel's children, each with its pane.
+    pub children: Vec<ChildLog>,
+    pub title: Option<String>,
+}
+
+/// What an attached session starts over from: the served session's `/state`, its
+/// transcript, the panel's children with their panes, and its title when it was given.
+#[derive(Default)]
+pub struct Seed {
+    pub state: serde_json::Value,
+    pub transcript: Vec<Entry>,
+    pub children: Vec<ChildLog>,
+    pub title: Option<String>,
 }
 
 /// A tool call waiting for approval.
@@ -544,7 +563,19 @@ pub enum Action {
     Allow(String),
     /// `/trust` when true, `/untrust` when false.
     Trust(bool),
+    /// `/bg kill`, of a row the served session's list has.
+    StopBackground {
+        kind: crate::background::Kind,
+        id: String,
+    },
 }
+
+/// A `GET` of one of the served session's routes, answering its body or why not.
+pub type Get = Box<
+    dyn Fn(String) -> futures_util::future::BoxFuture<'static, Result<serde_json::Value, String>>
+        + Send
+        + Sync,
+>;
 
 /// An attached session's way back to the one it shows.
 pub struct Link {
@@ -559,9 +590,31 @@ pub struct Link {
     pub held: std::sync::atomic::AtomicUsize,
     /// Why the link is down, as far as attach can tell, while it is.
     pub down: Mutex<String>,
+    /// What runs in the background over there, as last fetched.
+    pub background: Mutex<Vec<crate::background::Row>>,
+    /// Its monitors, as last fetched.
+    pub monitors: Mutex<Vec<crate::monitor::View>>,
+    /// How many of its schedules will fire, as last fetched.
+    pub scheduled: std::sync::atomic::AtomicUsize,
+    pub get: Get,
 }
 
 impl Link {
+    pub fn new(url: String, actions: mpsc::UnboundedSender<Action>, get: Get) -> Self {
+        Self {
+            url,
+            actions,
+            connected: true.into(),
+            permissions: Mutex::default(),
+            held: Default::default(),
+            down: Mutex::default(),
+            background: Mutex::default(),
+            monitors: Mutex::default(),
+            scheduled: Default::default(),
+            get,
+        }
+    }
+
     fn send(&self, action: Action) {
         let _ = self.actions.send(action);
     }
@@ -637,6 +690,11 @@ pub struct Session {
     log: Mutex<Log>,
     /// The newest `seq`, for `/events` readers to wait on.
     latest: watch::Sender<u64>,
+    /// Held while an event is applied and logged, so a snapshot sees all of one or none.
+    /// Taken after `inner` where both are.
+    gate: Mutex<()>,
+    /// What the last [`Event::Titled`] said.
+    title: Mutex<Option<String>>,
     inner: Mutex<Inner>,
     entries: Mutex<Entries>,
     /// The child agents of the running turn, oldest first.
@@ -692,6 +750,8 @@ impl Session {
             events: broadcast::channel(EVENT_BUFFER).0,
             log: Mutex::default(),
             latest: watch::Sender::new(0),
+            gate: Mutex::default(),
+            title: Mutex::default(),
             inner: Mutex::default(),
             entries: Mutex::default(),
             children: Mutex::default(),
@@ -719,12 +779,18 @@ impl Session {
         self.link.get()
     }
 
-    /// Start over from a snapshot of the session this one shows: its `/state` and its
-    /// transcript. Children are not in it, so their panes start again empty.
-    pub fn seed(&self, state: &serde_json::Value, transcript: Vec<Entry>) {
+    /// Start over from a snapshot of the session this one shows.
+    pub fn seed(&self, seed: Seed) {
         fn read<T: serde::de::DeserializeOwned>(state: &serde_json::Value, key: &str) -> Option<T> {
             serde_json::from_value(state.get(key)?.clone()).ok()
         }
+        let Seed {
+            state,
+            transcript,
+            children,
+            title,
+        } = seed;
+        let state = &state;
         let mut inner = self.lock();
         let model = state["model"].as_str().unwrap_or_default().to_string();
         let effort = state["effort"].as_str().unwrap_or_default().to_string();
@@ -745,6 +811,9 @@ impl Session {
             inner.shown = Some(Instant::now());
         }
         inner.rate_limits = read(state, "rate_limits");
+        if let Some(limits) = inner.rate_limits {
+            self.quota.observe(limits);
+        }
         inner.fast = state["fast"]
             .as_bool()
             .unwrap_or_default()
@@ -763,10 +832,67 @@ impl Session {
         inner.goal = read(state, "goal");
         inner.plan = read(state, "plan");
         inner.last_cache_break = read(state, "last_cache_break");
-        self.panes().clear();
+        if title.is_some() {
+            *self.title.lock().unwrap_or_else(|e| e.into_inner()) = title;
+        }
+        {
+            let mut panes = self.panes();
+            let mut kept = std::mem::take(&mut *panes);
+            // A pane already open keeps its entries' lock, so a view reading it reads on.
+            *panes = children
+                .into_iter()
+                .map(|log| {
+                    let entries = match kept.iter().position(|p| p.row.id == log.row.id) {
+                        Some(at) => kept.swap_remove(at).entries,
+                        None => Arc::default(),
+                    };
+                    let mut pane = Entries::default();
+                    pane.list = log.entries;
+                    *entries.lock().unwrap_or_else(|e| e.into_inner()) = pane;
+                    Pane {
+                        started: Instant::now(),
+                        row: log.row,
+                        entries,
+                    }
+                })
+                .collect();
+        }
+        self.ended.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let mut entries = self.entries();
         *entries = Entries::default();
         entries.list = transcript;
+    }
+
+    /// `/state`, the transcript, the panel's children with their panes and the title, all
+    /// as of the same `seq`: no event is half in it.
+    pub fn snapshot(&self) -> Snapshot {
+        let inner = self.lock();
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state_of(&inner, self.seq());
+        let children = self
+            .panes()
+            .iter()
+            .map(|pane| ChildLog {
+                row: pane.row.clone(),
+                entries: pane
+                    .entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .list
+                    .clone(),
+            })
+            .collect();
+        Snapshot {
+            state,
+            transcript: self.entries().list.clone(),
+            children,
+            title: self.title(),
+        }
+    }
+
+    /// What the session is working on, as the last [`Event::Titled`] said.
+    pub fn title(&self) -> Option<String> {
+        self.title.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Show `event`, which the session this one is attached to published: keep what the
@@ -934,6 +1060,10 @@ impl Session {
         // Read before the rest, so an event racing the snapshot is replayed, not lost.
         let seq = self.seq();
         let inner = self.lock();
+        self.state_of(&inner, seq)
+    }
+
+    fn state_of(&self, inner: &Inner, seq: u64) -> State {
         let (model, effort) = self.model();
         State {
             model,
@@ -1100,6 +1230,13 @@ impl Session {
 
     /// Everything running that the user did not start by typing, known secrets blanked.
     pub fn background(&self) -> Vec<crate::background::Row> {
+        if let Some(link) = self.link() {
+            return link
+                .background
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+        }
         let mut rows: Vec<_> = self
             .panes()
             .iter()
@@ -1126,6 +1263,14 @@ impl Session {
         id: &str,
     ) -> Result<String, crate::background::Refused> {
         use crate::background::{Kind, Refused};
+        if let Some(link) = self.link() {
+            let kind = crate::background::resolve(&self.background(), kind, id)?;
+            link.send(Action::StopBackground {
+                kind,
+                id: id.to_string(),
+            });
+            return Ok(format!("asked {} to stop {} {id}", link.url, kind.name()));
+        }
         match crate::background::resolve(&self.background(), kind, id)? {
             Kind::Bash => match id.parse() {
                 Ok(n) if crate::tools::bash::stop(n) => Ok(format!("stopped bash session {id}")),
@@ -1217,6 +1362,15 @@ impl Session {
         let position = inner.queue.len();
         self.publish(Event::Queued { position, text });
         Submitted::Queued { position }
+    }
+
+    /// Input and output tokens of every call, children's included, as the bar counts them.
+    pub fn totals(&self) -> (u64, u64) {
+        let inner = self.lock();
+        (
+            inner.total.input + inner.children.input,
+            inner.total.output + inner.children.output,
+        )
     }
 
     /// Whether a turn is running, so what is submitted now would queue.
@@ -1793,6 +1947,7 @@ impl Session {
                 images,
                 reply,
             } => {
+                let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
                 let mut entries = self.entries();
                 let eligible =
                     matches!(entries.list.last(), Some(Entry::User(last)) if last == &text);
@@ -2027,6 +2182,10 @@ impl Session {
     }
 
     pub fn publish(&self, event: Event) {
+        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Event::Titled(title) = &event {
+            *self.title.lock().unwrap_or_else(|e| e.into_inner()) = Some(title.clone());
+        }
         self.route(&event);
         self.entries().apply(&event);
         self.record(&event);

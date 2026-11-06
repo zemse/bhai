@@ -429,6 +429,8 @@ pub struct Picker {
     current: (String, String),
     /// Picking the default new sessions start on, for `/model-default`.
     pub default: bool,
+    /// Said above the backends' notes once the list arrives.
+    pub note: Option<String>,
     /// Where the backends' answer lands, filled in by the task that asks them.
     incoming: Arc<Mutex<Option<Catalogue>>>,
 }
@@ -442,6 +444,7 @@ impl Picker {
             selected: 0,
             current: (model.to_string(), effort.to_string()),
             default: false,
+            note: None,
             incoming: Arc::new(Mutex::new(None)),
         }
     }
@@ -484,7 +487,10 @@ impl Picker {
     }
 
     /// Show `found`, with the model the session is on highlighted.
-    pub fn fill(&mut self, found: Catalogue) {
+    pub fn fill(&mut self, mut found: Catalogue) {
+        if let Some(note) = &self.note {
+            found.notes.insert(0, note.clone());
+        }
         self.selected = found
             .models
             .iter()

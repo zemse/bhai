@@ -152,7 +152,7 @@ pub fn report(rows: &[Row], now: SystemTime) -> String {
 }
 
 /// One thing running.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Row {
     pub kind: Kind,
     /// Unique within its kind: a bash session's id, a child's, a schedule's, a server's
@@ -160,7 +160,11 @@ pub struct Row {
     pub id: String,
     pub label: String,
     /// `None` where nothing recorded it.
-    #[serde(serialize_with = "unix_secs")]
+    #[serde(
+        default,
+        serialize_with = "unix_secs",
+        deserialize_with = "from_unix_secs"
+    )]
     pub started: Option<SystemTime>,
     pub state: String,
     /// The process group, where it is one bhai started.
@@ -191,6 +195,11 @@ fn unix_secs<S: serde::Serializer>(at: &Option<SystemTime>, s: S) -> Result<S::O
         Some(since) => s.serialize_some(&since.as_secs()),
         None => s.serialize_none(),
     }
+}
+
+fn from_unix_secs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<SystemTime>, D::Error> {
+    let secs: Option<u64> = Deserialize::deserialize(d)?;
+    Ok(secs.map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs)))
 }
 
 /// The wall-clock time `at` stands for.

@@ -308,11 +308,22 @@ async fn state(State(session): State<Arc<Session>>) -> Response {
 
 /// `/state` with the whole transcript as the tui shows it, which is what `bhai attach`
 /// starts from: the event log only reaches back so far. `/events` from `state.seq` goes
-/// on from it.
+/// on from it. The panel's children come with their panes and the title with them, all
+/// as of that `seq`; a build before they were added sends neither.
 async fn snapshot(State(session): State<Arc<Session>>) -> Response {
-    let state = session.state();
-    let transcript = session.entries().list.clone();
-    Json(json!({ "state": state, "transcript": transcript })).into_response()
+    let snapshot = session.snapshot();
+    let children: Vec<_> = snapshot
+        .children
+        .into_iter()
+        .map(|log| json!({ "child": log.row, "entries": log.entries }))
+        .collect();
+    Json(json!({
+        "state": snapshot.state,
+        "transcript": snapshot.transcript,
+        "children": children,
+        "title": snapshot.title,
+    }))
+    .into_response()
 }
 
 /// The live stream, each event with its `seq` as the SSE `id`. `?since=N` or a

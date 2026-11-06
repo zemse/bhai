@@ -3,19 +3,20 @@
 //! there arrives over `/events` and goes through [`Session::mirror`], and what the user
 //! does here leaves through the session's [`Link`] as HTTP calls.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::entries::Entry;
 use crate::permissions::{Answer, Policy};
 use crate::server::{DEFAULT_PORT, KEEP_ALIVE, TOKEN_ENV, TOKEN_HEADER};
-use crate::session::{self, Action, Link, Session};
+use crate::session::{self, Action, ChildLog, ChildRow, Link, Seed, Session};
 use crate::tunnel;
 
 /// The wait between attempts to reconnect. The first after a drop goes at once; a fixed
@@ -23,6 +24,9 @@ use crate::tunnel;
 const RETRY: Duration = Duration::from_secs(1);
 /// How long a request other than the event stream may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the background list is read again while something runs there, for the
+/// output and state that change without an event saying so.
+const LISTS: Duration = Duration::from_secs(5);
 /// How long the event stream may go without a byte before it is taken for dead. The
 /// server sends a keep-alive every [`KEEP_ALIVE`], so this is several of them missed.
 const IDLE: Duration = Duration::from_secs(10);
@@ -95,6 +99,9 @@ pub struct Remote {
     name: String,
     /// The ssh tunnel attach runs to reach it, if it runs one.
     tunnel: Option<watch::Receiver<tunnel::State>>,
+    /// Its `/snapshot` has been seen to carry the children, so `/children` need not be
+    /// read around it.
+    full: Arc<AtomicBool>,
 }
 
 /// Why a request got no answer worth reading.
@@ -130,6 +137,7 @@ impl Remote {
             token,
             idle: IDLE,
             tunnel: None,
+            full: Arc::default(),
         }
     }
 
@@ -197,11 +205,56 @@ impl Remote {
         self.send(request).await
     }
 
-    /// `/state` and the transcript, read together.
-    async fn snapshot(&self) -> Result<(Value, Vec<Entry>), Failed> {
+    /// The served session as of one `seq`, that `seq`, and the child events after it
+    /// that the panes read with it may already hold.
+    async fn snapshot(&self) -> Result<(Seed, u64, Skips), Failed> {
+        let before = match self.full.load(Ordering::Relaxed) {
+            true => None,
+            false => Some(self.children().await?),
+        };
         let mut body = self.get("/snapshot").await?;
         let transcript = serde_json::from_value(body["transcript"].take()).unwrap_or_default();
-        Ok((body["state"].take(), transcript))
+        let title = body["title"].as_str().map(str::to_string);
+        let state = body["state"].take();
+        let seq = state["seq"].as_u64().unwrap_or_default();
+        let (children, skips) = match body["children"].as_array() {
+            Some(rows) => {
+                self.full.store(true, Ordering::Relaxed);
+                let children = rows
+                    .iter()
+                    .filter_map(|c| child(c, |e| serde_json::from_value(e.clone()).ok()))
+                    .collect();
+                (children, Skips::default())
+            }
+            // An older server: its panes are read on either side of the snapshot, and
+            // what moved between the two reads is taken as already held.
+            None => {
+                let after = self.children().await?;
+                let skips = before
+                    .map(|before| skips(&before, &after))
+                    .unwrap_or_default();
+                (after, skips)
+            }
+        };
+        let seed = Seed {
+            state,
+            transcript,
+            children,
+            title,
+        };
+        Ok((seed, seq, skips))
+    }
+
+    /// `/children`, whose panes give each entry's kind and text alone.
+    async fn children(&self) -> Result<Vec<ChildLog>, Failed> {
+        let body = self.get("/children").await?;
+        Ok(body["children"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| child(c, |e| Some(entry(e))))
+            .collect())
     }
 
     /// The event stream from after `after`. Only its headers are timed: the body runs
@@ -257,6 +310,116 @@ fn frames(buf: &mut Vec<u8>) -> Vec<Frame> {
         }
     }
     out
+}
+
+/// One child as `/children` or `/snapshot` lists it, its entries read by `entry`.
+fn child(value: &Value, entry: impl Fn(&Value) -> Option<Entry>) -> Option<ChildLog> {
+    let row = &value["child"];
+    let text = |key: &str| row[key].as_str().unwrap_or_default().to_string();
+    let idle = Duration::from_secs(row["idle_secs"].as_u64().unwrap_or_default());
+    let row = ChildRow {
+        id: row["id"].as_str()?.to_string(),
+        identity: text("identity"),
+        model: text("model"),
+        description: text("description"),
+        state: serde_json::from_value(row["state"].clone()).ok()?,
+        steps: u32::try_from(row["steps"].as_u64().unwrap_or_default()).unwrap_or(u32::MAX),
+        last: Instant::now()
+            .checked_sub(idle)
+            .unwrap_or_else(Instant::now),
+    };
+    let entries = value["entries"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(entry)
+        .collect();
+    Some(ChildLog { row, entries })
+}
+
+/// An entry from its kind and text, as `/children` gives it. What else it carried, a
+/// command's tool or who rejected a call, is not there to read.
+fn entry(value: &Value) -> Entry {
+    let text = value["text"].as_str().unwrap_or_default().to_string();
+    match value["kind"].as_str().unwrap_or_default() {
+        "user" => Entry::User(text),
+        "automatic" => Entry::Automatic(text),
+        "assistant" => Entry::Assistant(text),
+        "commentary" => Entry::Commentary(text),
+        "thinking" => Entry::Reasoning(text),
+        "command" => Entry::Command {
+            tool: String::new(),
+            summary: text,
+        },
+        "running" => Entry::Running {
+            tail: text,
+            lines: 0,
+        },
+        "output" => Entry::Output(text),
+        "diff" => Entry::Diff(text),
+        "rejected" => Entry::Rejected {
+            by: crate::agent::Rejecter::User,
+            reason: text,
+        },
+        "error" => Entry::Error(text),
+        "failed" => Entry::Failed(text),
+        "done" => Entry::Done(text),
+        "summary" => Entry::Summary(text),
+        _ => Entry::Info(text),
+    }
+}
+
+/// Child events the stream goes on to replay that the panes may already hold, by child:
+/// how many of its events, and whether its start is one.
+#[derive(Debug, Default, PartialEq)]
+struct Skips(HashMap<String, (u32, bool)>);
+
+impl Skips {
+    /// Whether `event` is one to drop, counting it off if so.
+    fn take(&mut self, event: &session::Event) -> bool {
+        let (id, start) = match event {
+            session::Event::Child { id, .. } => (id, false),
+            session::Event::ChildStarted { id, .. } => (id, true),
+            _ => return false,
+        };
+        let Some((events, started)) = self.0.get_mut(id) else {
+            return false;
+        };
+        let taken = match start {
+            true => std::mem::take(started),
+            false if *events > 0 => {
+                *events -= 1;
+                true
+            }
+            false => false,
+        };
+        if *events == 0 && !*started {
+            self.0.remove(id);
+        }
+        taken
+    }
+}
+
+/// What changed in the panes from `before` to `after`, read on either side of a
+/// snapshot. All of it is skipped in the stream, so a pane may miss an event that came
+/// in that window but never shows one twice.
+fn skips(before: &[ChildLog], after: &[ChildLog]) -> Skips {
+    let running = |log: &ChildLog| log.row.state == session::ChildState::Running;
+    let mut skips = HashMap::new();
+    for now in after {
+        let (events, started) = match before.iter().find(|b| b.row.id == now.row.id) {
+            Some(then) => (
+                now.row.steps.saturating_sub(then.row.steps),
+                running(now) && !running(then),
+            ),
+            None => (now.row.steps, true),
+        };
+        if events > 0 || started {
+            skips.insert(now.row.id.clone(), (events, started));
+        }
+    }
+    Skips(skips)
 }
 
 /// A session attached to a served one, and the signal that its whole state was read
@@ -374,7 +537,7 @@ fn ask(rows: &[(String, String)]) -> Result<String> {
 
 /// Read the served session and start following it.
 pub async fn connect(remote: Remote) -> Result<Attached> {
-    let (state, transcript) = remote.snapshot().await.map_err(|e| match e {
+    let (seed, after, skips) = remote.snapshot().await.map_err(|e| match e {
         Failed::Refused(403, message) => {
             anyhow::anyhow!("{} refused the token: {message}", remote.base)
         }
@@ -384,7 +547,7 @@ pub async fn connect(remote: Remote) -> Result<Attached> {
             remote.name
         ),
     })?;
-    let text = |key: &str| state[key].as_str().unwrap_or_default().to_string();
+    let text = |key: &str| seed.state[key].as_str().unwrap_or_default().to_string();
     let (tx_user, rx_user) = mpsc::channel(1);
     let (tx_control, rx_control) = mpsc::channel(1);
     let session = Session::new(
@@ -398,24 +561,30 @@ pub async fn connect(remote: Remote) -> Result<Attached> {
         None,
     );
     let (tx_actions, rx_actions) = mpsc::unbounded_channel();
-    let link = Arc::new(Link {
-        url: remote.name.clone(),
-        actions: tx_actions,
-        connected: true.into(),
-        permissions: Default::default(),
-        held: Default::default(),
-        down: Default::default(),
+    let getter = remote.clone();
+    let get: session::Get = Box::new(move |path| {
+        let remote = getter.clone();
+        Box::pin(async move { remote.get(&path).await.map_err(|e| e.to_string()) })
     });
+    let link = Arc::new(Link::new(remote.name.clone(), tx_actions, get));
     let (tx_up, up) = watch::channel(true);
     session.attach(Arc::clone(&link));
-    let after = state["seq"].as_u64().unwrap_or_default();
-    session.seed(&state, transcript);
+    session.seed(seed);
     refresh_permissions(&remote, &link).await;
+    refresh_lists(&remote, &session).await;
     let (tx_resync, resync) = mpsc::unbounded_channel();
+    let wake = Arc::new(Notify::new());
+    tokio::spawn(lists(
+        remote.clone(),
+        Arc::clone(&session),
+        Arc::clone(&wake),
+        tx_resync.clone(),
+    ));
     tokio::spawn(follow(
         remote.clone(),
         Arc::clone(&session),
-        after,
+        (after, skips),
+        wake,
         tx_resync,
         tx_up,
     ));
@@ -438,21 +607,88 @@ async fn refresh_permissions(remote: &Remote, link: &Link) {
     }
 }
 
-/// Read the served session again from scratch, returning the `seq` it leaves off at.
-async fn reseed(remote: &Remote, session: &Session) -> Option<u64> {
-    let (state, transcript) = remote.snapshot().await.ok()?;
-    let after = state["seq"].as_u64().unwrap_or_default();
-    session.seed(&state, transcript);
-    Some(after)
+/// Read again what the served session lists outside its event stream: what runs in the
+/// background, its monitors and its schedules. Each keeps what it last had when its
+/// route does not answer. Published as the count, which is what the view follows.
+async fn refresh_lists(remote: &Remote, session: &Session) {
+    let Some(link) = session.link() else {
+        return;
+    };
+    let background = match remote.get("/background").await {
+        Ok(mut body) => serde_json::from_value(body["background"].take()).ok(),
+        Err(_) => None,
+    };
+    let monitors = match remote.get("/monitors").await {
+        Ok(mut body) => serde_json::from_value(body["monitors"].take()).ok(),
+        Err(_) => None,
+    };
+    let scheduled = match remote.get("/schedules").await {
+        Ok(body) => Some(
+            body["schedules"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter(|row| row["paused"] != true)
+                .count(),
+        ),
+        // A server with no home directory keeps none.
+        Err(Failed::Refused(..)) => Some(0),
+        Err(Failed::Unreachable(_)) => None,
+    };
+    // Stored together, so the view never shows one read beside another's leftovers.
+    if let Some(rows) = background {
+        *link.background.lock().unwrap_or_else(|e| e.into_inner()) = rows;
+    }
+    if let Some(views) = monitors {
+        *link.monitors.lock().unwrap_or_else(|e| e.into_inner()) = views;
+    }
+    if let Some(scheduled) = scheduled {
+        link.scheduled.store(scheduled, Ordering::Relaxed);
+    }
+    let count = session.background().len();
+    session.publish(session::Event::Background(count));
+}
+
+/// Keep the lists current: read again when `wake` says the served session's changed, and
+/// every [`LISTS`] while something runs there.
+async fn lists(
+    remote: Remote,
+    session: Arc<Session>,
+    wake: Arc<Notify>,
+    resync: mpsc::UnboundedSender<()>,
+) {
+    loop {
+        let busy = !session.background().is_empty();
+        tokio::select! {
+            () = wake.notified() => {}
+            () = tokio::time::sleep(LISTS), if busy => {}
+            () = resync.closed() => return,
+        }
+        refresh_lists(&remote, &session).await;
+    }
+}
+
+/// Read the served session again from scratch, returning the `seq` it leaves off at and
+/// the child events after it to drop.
+async fn reseed(remote: &Remote, session: &Session) -> Option<(u64, Skips)> {
+    let (seed, after, skips) = remote.snapshot().await.ok()?;
+    session.seed(seed);
+    if let Some(link) = session.link() {
+        refresh_permissions(remote, link).await;
+    }
+    refresh_lists(remote, session).await;
+    Some((after, skips))
 }
 
 /// Follow `/events` into `session` for as long as the session lives, reconnecting every
 /// [`RETRY`] and picking up after the last event seen. `up` says whether the stream is
-/// open, for what [`act`] holds while it is not.
+/// open, for what [`act`] holds while it is not; `wake` has the lists read again.
 async fn follow(
     remote: Remote,
     session: Arc<Session>,
-    mut after: u64,
+    (mut after, mut skips): (u64, Skips),
+    wake: Arc<Notify>,
     resync: mpsc::UnboundedSender<()>,
     up: watch::Sender<bool>,
 ) {
@@ -465,6 +701,7 @@ async fn follow(
             Ok(response) => {
                 if !link.connected.swap(true, Ordering::Relaxed) {
                     session.publish(session::Event::Info(format!("reconnected to {}", link.url)));
+                    wake.notify_one();
                     let _ = resync.send(());
                 }
                 up.send_replace(true);
@@ -484,13 +721,20 @@ async fn follow(
                             Frame::Event(seq, _) if seq <= after => {}
                             Frame::Event(seq, event) => {
                                 after = seq;
-                                session.mirror(event);
+                                if skips.take(&event) {
+                                    continue;
+                                }
+                                match event {
+                                    // The count is published once the list it counts is.
+                                    session::Event::Background(_) => wake.notify_one(),
+                                    event => session.mirror(event),
+                                }
                             }
                             // What was missed is not in the stream, so the whole state
                             // is read again rather than left with a hole in it.
                             Frame::Lagged(_) => {
-                                if let Some(seq) = reseed(&remote, &session).await {
-                                    after = seq;
+                                if let Some(read) = reseed(&remote, &session).await {
+                                    (after, skips) = read;
                                     let _ = resync.send(());
                                 }
                             }
@@ -504,8 +748,8 @@ async fn follow(
             // An id newer than the server's latest: it restarted, and this run's ids
             // start again from 1.
             Err(Failed::Refused(409, _)) => {
-                if let Some(seq) = reseed(&remote, &session).await {
-                    after = seq;
+                if let Some(read) = reseed(&remote, &session).await {
+                    (after, skips) = read;
                     let _ = resync.send(());
                     session.publish(session::Event::Info(
                         "the served session restarted; read it again".to_string(),
@@ -588,7 +832,7 @@ async fn act<T>(
         );
         match remote.post(&next.path, next.body.clone()).await {
             Ok(answer) => {
-                let said = ["allowed", "trusted", "untrusted"]
+                let said = ["allowed", "trusted", "untrusted", "stopped"]
                     .iter()
                     .find_map(|key| answer[*key].as_str());
                 if let Some(said) = said {
@@ -686,6 +930,7 @@ fn described_action(action: &Action) -> String {
         Action::Allow(rule) => format!("rule {rule}"),
         Action::Trust(true) => "trust".into(),
         Action::Trust(false) => "untrust".into(),
+        Action::StopBackground { kind, id } => format!("stop of {} {id}", kind.name()),
     }
 }
 
@@ -718,6 +963,9 @@ fn route(action: &Action) -> (String, Value) {
         Action::Allow(rule) => ("/allow".into(), json!({ "rule": rule })),
         Action::Trust(true) => ("/trust".into(), Value::Null),
         Action::Trust(false) => ("/untrust".into(), Value::Null),
+        Action::StopBackground { kind, id } => {
+            ("/background/kill".into(), json!({ "id": id, "kind": kind }))
+        }
     }
 }
 
@@ -1289,5 +1537,370 @@ mod tests {
         .await;
         tunnel.up();
         until("it is back", || link.connected()).await;
+    }
+
+    fn plan(step: &str) -> crate::plan::Plan {
+        crate::plan::Plan {
+            explanation: String::new(),
+            steps: vec![crate::plan::Step {
+                step: step.to_string(),
+                status: crate::plan::Status::InProgress,
+                reason: String::new(),
+            }],
+        }
+    }
+
+    fn usage(input: u64, output: u64) -> crate::client::Usage {
+        crate::client::Usage {
+            input,
+            output,
+            ..Default::default()
+        }
+    }
+
+    fn started(id: &str, task: &str) -> AgentEvent {
+        AgentEvent::ChildStarted {
+            id: id.to_string(),
+            identity: "general".into(),
+            model: "child-model".into(),
+            description: format!("{id} work"),
+            task: task.to_string(),
+        }
+    }
+
+    fn said(id: &str, text: &str) -> AgentEvent {
+        AgentEvent::Child {
+            id: id.to_string(),
+            event: Box::new(AgentEvent::Text(text.to_string())),
+        }
+    }
+
+    /// The served session mid-turn, with a child running and one finished, a plan, a
+    /// schedule, a monitor sampled at least once, usage and a title, all before anyone
+    /// attaches. Returns the schedule's id.
+    async fn under_way(served: &mut Served) -> String {
+        let dir = crate::tools::temp_dir();
+        served
+            .session
+            .run_schedules(crate::schedules::Schedules::new(&dir, &dir, "attach-test"));
+        let reminder = served
+            .session
+            .schedules()
+            .unwrap()
+            .remind("in 20m check CI")
+            .unwrap();
+        let monitors = served.session.monitors();
+        monitors
+            .add(crate::monitor::Spec {
+                name: "bench".into(),
+                command: "printf '%s' '{\"summary\":\"63 of 65\"}'".into(),
+                workdir: std::env::temp_dir(),
+                interval_secs: 1,
+                timeout_secs: 2,
+                hooks: vec![],
+            })
+            .unwrap();
+        until("the monitor is sampled", || {
+            monitors
+                .views()
+                .first()
+                .is_some_and(|v| v.snapshot.is_some())
+        })
+        .await;
+        served.session.submit("go".to_string()).unwrap();
+        assert_eq!(served.prompts.recv().await.unwrap(), "go");
+        for event in [
+            AgentEvent::Titled("fixing ci".into()),
+            AgentEvent::Usage(usage(1200, 300)),
+            AgentEvent::Plan(Some(plan("build"))),
+            started("a1", "look around"),
+            said("a1", "halfway"),
+            started("b2", "check it"),
+            said("b2", "finished"),
+            AgentEvent::ChildEnded {
+                id: "b2".into(),
+                ok: true,
+            },
+            AgentEvent::ChildUsage(usage(100, 50)),
+        ] {
+            served.agent.send(event).unwrap();
+        }
+        until("the scene is set there", || {
+            served.session.children().len() == 2 && served.session.state().children.input == 100
+        })
+        .await;
+        reminder.id
+    }
+
+    /// What one child's pane holds, each entry as its kind and text.
+    fn pane(session: &Session, id: &str) -> Vec<(&'static str, String)> {
+        session
+            .child_entries(id)
+            .map(|e| {
+                let list = &e.lock().unwrap().list;
+                list.iter()
+                    .map(|e| (e.kind(), e.text().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Everything the served session's own tui would show is there in the view as it
+    /// attaches: the children and their panes, the plan, the monitor, the background
+    /// list, the schedule, the totals, the working turn and the title.
+    fn assert_shows_the_scene(app: &crate::app::App, session: &Session) {
+        use crate::session::ChildState;
+        let children: Vec<_> = app
+            .children()
+            .into_iter()
+            .map(|row| (row.id, row.state))
+            .collect();
+        assert_eq!(
+            children,
+            [
+                ("a1".to_string(), ChildState::Running),
+                ("b2".to_string(), ChildState::Done)
+            ]
+        );
+        assert_eq!(
+            pane(session, "a1"),
+            [
+                ("user", "look around".to_string()),
+                ("assistant", "halfway".to_string())
+            ]
+        );
+        assert_eq!(app.plan(), Some(plan("build")));
+        let monitors = app.monitors();
+        assert_eq!(monitors.len(), 1);
+        assert_eq!(monitors[0].name, "bench");
+        let kinds: Vec<_> = session.background().into_iter().map(|r| r.kind).collect();
+        use crate::background::Kind;
+        assert_eq!(kinds, [Kind::Child, Kind::Schedule, Kind::Monitor]);
+        assert_eq!(app.background, 3);
+        assert_eq!(app.scheduled(), 1);
+        assert_eq!((app.tokens_in, app.tokens_out), (1300, 350));
+        assert_eq!(app.last_usage, Some(usage(1200, 300)));
+        assert!(app.working);
+        assert_eq!(app.title().as_deref(), Some("fixing ci"));
+    }
+
+    /// Attached to a session already under way, the view shows all of it at once; cut
+    /// off while it moves on and reconnected, it shows where it got to, each thing once.
+    #[tokio::test]
+    async fn attach_shows_what_was_under_way_and_catches_up_after_a_drop() {
+        let mut served = served().await;
+        let reminder = under_way(&mut served).await;
+        let tunnel = Tunnel::to(served.port).await;
+        let attached = connect(attach_to(tunnel.port)).await.unwrap();
+        let (here, mut resync) = (attached.session, attached.resync);
+        let mut app = crate::app::App::new(Arc::clone(&here));
+        assert_shows_the_scene(&app, &here);
+
+        tunnel.down();
+        until("the drop is noticed", || !here.link().unwrap().connected()).await;
+        for event in [
+            said("a1", " and on"),
+            AgentEvent::ChildEnded {
+                id: "a1".into(),
+                ok: false,
+            },
+            started("c3", "one more"),
+            AgentEvent::Usage(usage(2000, 10)),
+            AgentEvent::Plan(Some(plan("ship"))),
+        ] {
+            served.agent.send(event).unwrap();
+        }
+        served
+            .session
+            .schedules()
+            .unwrap()
+            .cancel(&reminder)
+            .unwrap();
+        until("it moved on there", || served.session.children().len() == 3).await;
+        while resync.try_recv().is_ok() {}
+        tunnel.up();
+        until("it caught up here", || {
+            here.children().len() == 3 && here.plan() == Some(plan("ship"))
+        })
+        .await;
+        until("the lists are read again", || {
+            !here.background().iter().any(|r| r.id == reminder)
+        })
+        .await;
+        timeout(WAIT, resync.recv()).await.unwrap();
+        app.resync();
+        assert_eq!(
+            pane(&here, "a1"),
+            [
+                ("user", "look around".to_string()),
+                ("assistant", "halfway and on".to_string())
+            ]
+        );
+        assert_eq!(pane(&here, "c3"), [("user", "one more".to_string())]);
+        let states: Vec<_> = here.children().into_iter().map(|r| r.state).collect();
+        use crate::session::ChildState;
+        assert_eq!(
+            states,
+            [ChildState::Failed, ChildState::Done, ChildState::Running]
+        );
+        assert_eq!((app.tokens_in, app.tokens_out), (3300, 360));
+        assert_eq!(app.scheduled(), 0);
+        let transcript = |s: &Session| serde_json::to_value(&s.entries().list).unwrap();
+        // The notices said here are this view's own.
+        let shown: Vec<_> = here
+            .entries()
+            .list
+            .iter()
+            .filter(|e| e.kind() != "info")
+            .map(|e| e.text().to_string())
+            .collect();
+        assert_eq!(shown, ["go"]);
+
+        // Down past what the log keeps, it is read again from a snapshot, the panes
+        // with it.
+        tunnel.down();
+        until("the drop is noticed", || !here.link().unwrap().connected()).await;
+        served.agent.send(said("c3", "deep")).unwrap();
+        for n in 0..session::EVENT_LOG + 10 {
+            served.session.publish(Event::Info(format!("{n}")));
+        }
+        tunnel.up();
+        until("the snapshot is read again", || {
+            pane(&here, "c3").len() == 2 && transcript(&here) == transcript(&served.session)
+        })
+        .await;
+        assert_eq!(
+            pane(&here, "c3"),
+            [
+                ("user", "one more".to_string()),
+                ("assistant", "deep".to_string())
+            ]
+        );
+        assert_eq!(pane(&here, "a1"), pane(&served.session, "a1"));
+    }
+
+    /// In front of `port`, a server as built before `/snapshot` carried the children
+    /// and the title: everything else is passed through as it is.
+    async fn older(port: u16) -> u16 {
+        use axum::body::Body;
+        let http = reqwest::Client::new();
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let http = http.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let path = parts
+                    .uri
+                    .path_and_query()
+                    .map_or("/", |p| p.as_str())
+                    .to_string();
+                let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                let mut sent = http
+                    .request(parts.method, format!("http://127.0.0.1:{port}{path}"))
+                    .body(body);
+                for (name, value) in &parts.headers {
+                    if name != "host" {
+                        sent = sent.header(name, value);
+                    }
+                }
+                let response = sent.send().await.unwrap();
+                let status = response.status();
+                let reply = axum::response::Response::builder()
+                    .status(status)
+                    .header("content-type", response.headers()["content-type"].clone());
+                if path == "/snapshot" {
+                    let mut body: Value = response.json().await.unwrap();
+                    let body = body.as_object_mut().unwrap();
+                    body.retain(|key, _| key == "state" || key == "transcript");
+                    return reply
+                        .body(Body::from(Value::from(body.clone()).to_string()))
+                        .unwrap();
+                }
+                reply
+                    .body(Body::from_stream(response.bytes_stream()))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        local
+    }
+
+    /// A server whose snapshot lacks the children is read through `/children` instead,
+    /// and shows the same.
+    #[tokio::test]
+    async fn an_older_server_is_read_through_its_other_routes() {
+        let mut served = served().await;
+        under_way(&mut served).await;
+        let older = older(served.port).await;
+        let attached = connect(attach_to(older)).await.unwrap();
+        let here = attached.session;
+        let app = crate::app::App::new(Arc::clone(&here));
+        let title = app.title();
+        // The title is in no route such a server has.
+        assert_eq!(title, None);
+        here.publish(Event::Titled("fixing ci".into()));
+        assert_shows_the_scene(&app, &here);
+        served.agent.send(said("a1", " more")).unwrap();
+        until("the child goes on here", || {
+            pane(&here, "a1").last() == Some(&("assistant", "halfway more".to_string()))
+        })
+        .await;
+    }
+
+    /// The panes read before and after a snapshot bound what the stream replays: what
+    /// moved between the reads is dropped from it, a start included.
+    #[test]
+    fn what_moved_around_the_snapshot_is_skipped_once() {
+        use crate::session::ChildState;
+        let log = |id: &str, state, steps| ChildLog {
+            row: ChildRow {
+                id: id.into(),
+                identity: String::new(),
+                model: String::new(),
+                description: String::new(),
+                state,
+                steps,
+                last: Instant::now(),
+            },
+            entries: Vec::new(),
+        };
+        let before = [
+            log("a", ChildState::Running, 4),
+            log("b", ChildState::Done, 2),
+        ];
+        let after = [
+            log("a", ChildState::Running, 6),
+            log("b", ChildState::Running, 2),
+            log("c", ChildState::Running, 1),
+        ];
+        let mut skips = skips(&before, &after);
+        let child = |id: &str| Event::Child {
+            id: id.into(),
+            event: Box::new(Event::Text("x".into())),
+        };
+        let start = |id: &str| Event::ChildStarted {
+            id: id.into(),
+            identity: String::new(),
+            model: String::new(),
+            description: String::new(),
+            task: String::new(),
+        };
+        let taken: Vec<bool> = [
+            child("a"),
+            child("a"),
+            child("a"),
+            start("b"),
+            child("b"),
+            start("c"),
+            child("c"),
+            child("c"),
+        ]
+        .iter()
+        .map(|e| skips.take(e))
+        .collect();
+        assert_eq!(taken, [true, true, false, true, false, true, true, false]);
+        assert_eq!(skips, Skips::default());
+        assert_eq!(super::skips(&after, &after), Skips::default());
     }
 }

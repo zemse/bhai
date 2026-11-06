@@ -372,6 +372,7 @@ const QUIT_WINDOW: Duration = Duration::from_secs(1);
 /// The commands that act on the served session through its routes, or only on this view.
 const ATTACHED: &[&str] = &[
     "help",
+    "context",
     "quit",
     "exit",
     "tokens",
@@ -392,6 +393,26 @@ const ATTACHED: &[&str] = &[
     "queue",
 ];
 
+/// What `/context` says of an attached session: its largest items, as the export's
+/// summary would, written nowhere since the history is not on this machine.
+fn remote_context(profile: &serde_json::Value) -> String {
+    let mut out = format!(
+        "context ({}) over there: {} tokens",
+        profile["identity"].as_str().unwrap_or_default(),
+        profile["tokens"].as_u64().unwrap_or_default()
+    );
+    for item in profile["items"].as_array().into_iter().flatten().take(5) {
+        out.push_str(&format!(
+            "\n{:>5.1}% {:>8} tok  {} ({})",
+            item["share"].as_f64().unwrap_or_default(),
+            item["tokens"].as_u64().unwrap_or_default(),
+            item["label"].as_str().unwrap_or_default(),
+            item["method"].as_str().unwrap_or_default()
+        ));
+    }
+    out
+}
+
 /// What of `message` cannot be done while attached, by name: `!` commands run here, as
 /// do most slash commands and every skill, which this machine's list would name.
 fn refused_attached(message: &str) -> Option<String> {
@@ -411,7 +432,7 @@ impl App {
             "bhai · bash, read, write and edit. The mode on the prompt's border says what runs without asking; shift+tab changes it, / lists the commands. Type a task and hit enter."
                 .to_string(),
         ));
-        Self {
+        let mut app = Self {
             rows: Vec::new(),
             hover: None,
             mouse_row: None,
@@ -514,7 +535,12 @@ impl App {
             #[cfg(feature = "dictation")]
             dictation: crate::dictation::configured(),
             session,
+        };
+        // An attached session was read from one already under way.
+        if app.attached().is_some() {
+            app.resync();
         }
+        app
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -1722,9 +1748,16 @@ impl App {
             Event::Resolved { id, .. } if self.pending.as_ref().is_some_and(|p| p.id == id) => {
                 self.pending = None;
             }
+            // Attached, the session started from the served one's totals, so they are
+            // read from it rather than summed from what arrived since.
             Event::Usage(usage) => {
-                self.tokens_in += usage.input;
-                self.tokens_out += usage.output;
+                match self.attached() {
+                    Some(_) => (self.tokens_in, self.tokens_out) = self.session.totals(),
+                    None => {
+                        self.tokens_in += usage.input;
+                        self.tokens_out += usage.output;
+                    }
+                }
                 self.last_usage = Some(usage);
             }
             // The bar reads its context fill from the last call, which compaction and
@@ -1745,10 +1778,13 @@ impl App {
                 self.speed.streamed(Instant::now(), tokens as u64);
             }
             // Children count towards the status bar total, not the cache rate.
-            Event::ChildUsage(usage) => {
-                self.tokens_in += usage.input;
-                self.tokens_out += usage.output;
-            }
+            Event::ChildUsage(usage) => match self.attached() {
+                Some(_) => (self.tokens_in, self.tokens_out) = self.session.totals(),
+                None => {
+                    self.tokens_in += usage.input;
+                    self.tokens_out += usage.output;
+                }
+            },
             Event::Cache(found) => self.cache_break = found.map(|f| f.field),
             Event::CacheHit(hit) => {
                 self.cache_miss = hit
@@ -1784,11 +1820,13 @@ impl App {
     /// Reload from the session what the event stream would have set. A consumer that
     /// falls behind has events dropped, not delayed, so the parts of the view that are a
     /// running total of events would stay wrong until the next turn: whether a turn is
-    /// running, what is waiting for an answer, the mode, the model, the queue. The token
-    /// counts are not among them; they are summed from the stream, and adding the
-    /// session's totals here would count what did arrive twice.
+    /// running, what is waiting for an answer, the mode, the model, the queue, the token
+    /// counts and what the bar reads off the last call.
     pub fn resync(&mut self) {
         let state = self.session.state();
+        (self.tokens_in, self.tokens_out) = self.session.totals();
+        self.last_usage = state.last_usage;
+        self.rate_limits = state.rate_limits;
         self.working = state.working;
         self.queued = state.queued;
         self.pending = state.pending;
@@ -2287,7 +2325,10 @@ impl App {
 
     /// Schedules that will fire, for the status bar.
     pub fn scheduled(&self) -> usize {
-        self.session.schedules().map_or(0, |s| s.active())
+        match self.attached() {
+            Some(link) => link.scheduled.load(std::sync::atomic::Ordering::Relaxed),
+            None => self.session.schedules().map_or(0, |s| s.active()),
+        }
     }
 
     /// `/statusline` on its own shows the template and the variables; `set <template>`
@@ -2368,7 +2409,14 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     /// [effort]` skips both questions, for a model already known by name.
     fn model_command(&mut self, rest: &str) {
         if rest.is_empty() {
-            let picker = Picker::new(&self.model, &self.effort);
+            let mut picker = Picker::new(&self.model, &self.effort);
+            // The served session says nothing of what its backends serve.
+            if self.attached().is_some() {
+                picker.note = Some(format!(
+                    "this machine's list; the session there runs {}",
+                    self.model
+                ));
+            }
             picker.ask(&self.ollama_url);
             self.picker = Some(picker);
             return;
@@ -2525,9 +2573,24 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         self.session.plan()
     }
 
+    /// What the session is working on, as last said.
+    pub fn title(&self) -> Option<String> {
+        self.session.title()
+    }
+
     /// The live observers, for their cards.
     pub fn monitors(&self) -> Vec<crate::monitor::View> {
-        self.session.monitors().active_views()
+        match self.attached() {
+            Some(link) => link
+                .monitors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|view| !matches!(view.state.as_str(), "done" | "stopped" | "failed"))
+                .cloned()
+                .collect(),
+            None => self.session.monitors().active_views(),
+        }
     }
 
     /// What the working row says the turn is doing.
@@ -2670,6 +2733,17 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     /// Handle `/context` locally: export the breakdown and report where it went.
     fn export_context(&mut self) {
         self.follow = true;
+        if let Some(link) = self.attached() {
+            let get = (link.get)("/context".to_string());
+            let session = Arc::clone(&self.session);
+            tokio::spawn(async move {
+                session.publish(match get.await {
+                    Ok(profile) => Event::Info(remote_context(&profile)),
+                    Err(e) => Event::Error(format!("context: {e}")),
+                });
+            });
+            return;
+        }
         let transcript = self.transcript();
         let cwd = std::env::current_dir().unwrap_or_default();
         let diagnostics = crate::sessions::debug_dir(&cwd, &self.session_id);
@@ -3241,14 +3315,11 @@ mod tests {
     fn attached_ctrl_c_detaches_without_interrupting() {
         let app = App::detached();
         let (tx, mut actions) = tokio::sync::mpsc::unbounded_channel();
-        app.session.attach(Arc::new(crate::session::Link {
-            url: "http://127.0.0.1:7878".to_string(),
-            actions: tx,
-            connected: true.into(),
-            permissions: Mutex::default(),
-            held: Default::default(),
-            down: Mutex::default(),
-        }));
+        app.session.attach(Arc::new(crate::session::Link::new(
+            "http://127.0.0.1:7878".to_string(),
+            tx,
+            Box::new(|_| Box::pin(async { Err("offline".to_string()) })),
+        )));
         let mut app = app;
         app.session.mirror(Event::User("go".to_string()));
         app.on_event(Event::User("go".to_string()));
@@ -3269,6 +3340,7 @@ mod tests {
         for allowed in [
             "hi",
             "/model gpt-5.5",
+            "/context",
             "/btw why",
             "/queue",
             "/permissions",

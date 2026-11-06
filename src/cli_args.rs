@@ -172,9 +172,11 @@ const ATTACH_HELP: &str = "The server listens on 127.0.0.1 only. --ssh DEST runs
 Against bhai serve, --session ID picks a session; without it the only one is used, or you choose from a list.
 Leaving (ctrl+c twice, ctrl+d, /quit) only detaches: the session keeps running. esc twice interrupts its turn.
 To stop a session, DELETE /sessions/ID on bhai serve, or SIGTERM the bhai that serves it; bhai -r ID resumes it there.
+It opens on the session as it stands: transcript, subagent panes, plan, monitors, background list, schedules, totals and any approval waiting.
 A dropped or silent connection is retried every second and replays from the last event seen; the prompt's border says when it is down and why.
 Prompts, answers and settings given while it is down are held and sent once it is back; an interrupt is refused then.
 !commands, @ files, pasted images and the commands that act on this machine are off; GET /file and POST /upload move files.
+/context prints the server's breakdown; /model lists this machine's models, since the server does not say which it serves.
 The token comes from --token, then --token-file (which must exist), then BHAI_TOKEN; with --ssh and none of them, from --remote-token-file over ssh.
 ssh runs with BatchMode=yes, so it needs a key or an agent; --ssh-arg passes one argument before DEST and repeats.
 

@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-06
 
+- Attach opens on the served session as it stands and reads it again on every reload: subagent panes with their transcripts, the plan, monitors, the background list, the schedule count, token totals, context fill, rate limits, the working turn, any waiting approval and the title. `GET /snapshot` now carries the panel's children with their panes and the title, as of its `seq`; against an older server attach reads `/children` around the snapshot instead. `/context` works attached, stopping a row of the background list stops it on the server, and the `/model` picker says its list is this machine's.
 - `bhai attach PORT --ssh DEST [--ssh-arg ARG]...` runs and restarts its own `ssh -N -L` tunnel (BatchMode, 5s server-alive) from a free local port, kills it on detach, and reads the token over ssh from `--remote-token-file` (default `~/.config/bhai/server-token`) when none is given; the border says whether the tunnel or the server is down.
 - Attach holds prompts, approval answers and settings given while disconnected and sends them in order on reconnect, counted on the border; an answer to an approval settled meanwhile is reported, and an interrupt is refused at once.
 - `/events` sends a keep-alive every 3s, and attach drops a stream silent for 10s and reconnects; action requests time out after 10s.

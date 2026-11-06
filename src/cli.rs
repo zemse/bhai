@@ -1979,6 +1979,9 @@ async fn run(
     }
     // The tab says where the session is running until the model says what it is doing.
     let mut tab = title::Tab::new(std::env::current_dir().unwrap_or_default());
+    if let Some(name) = app.title() {
+        tab.named(&name);
+    }
     // Mouse motion arrives in floods, so it only redraws when the hover changes.
     let mut dirty = true;
     let mut captured = mouse;
@@ -2067,6 +2070,9 @@ fn apply(
         }
         Event::Resync => {
             app.resync();
+            if let Some(name) = app.title() {
+                tab.named(&name);
+            }
             true
         }
         Event::Resize => true,

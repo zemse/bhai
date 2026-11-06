@@ -216,7 +216,7 @@ impl Snapshot {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {
     pub id: String,
     pub name: String,
