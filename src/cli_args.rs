@@ -11,7 +11,7 @@ use crate::{config::Flags, permissions};
     version,
     propagate_version = true,
     about = "An agent harness.",
-    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read.\nSIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints how to resume it.\n[notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends and failed logins; see the README."
+    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read.\nSIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints how to resume it.\n[notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends and failed logins; see the README.\n--serve listens on 127.0.0.1 only. From a laptop: ssh -N -L PORT:127.0.0.1:PORT host, then send the token in the x-bhai-token header. --token-file or BHAI_TOKEN keeps the token across restarts."
 )]
 pub(super) struct Cli {
     #[command(subcommand)]
@@ -64,12 +64,15 @@ pub(super) struct Cli {
     /// Refuse requests that break the prompt cache.
     #[arg(long, global = true)]
     strict_cache: bool,
-    /// Start the local debug HTTP server (default port: 7878).
+    /// Start the debug HTTP server on 127.0.0.1 (default port: 7878).
     #[arg(long, num_args = 0..=1, default_missing_value = "7878", value_name = "PORT")]
     serve: Option<u16>,
     /// Run the debug server without the terminal UI; SIGINT ends it as SIGTERM does.
     #[arg(long, requires = "serve")]
     headless: bool,
+    /// Read the server token from this file, or create it (mode 600) with a new one; overrides BHAI_TOKEN.
+    #[arg(long, requires = "serve", value_name = "PATH")]
+    token_file: Option<std::path::PathBuf>,
     /// Run a workflow, with optional input.
     #[arg(long, num_args = 1..=2, value_names = ["NAME", "INPUT"])]
     workflow: Option<Vec<String>>,
@@ -188,6 +191,7 @@ impl Cli {
             judge_eval: self.judge_eval,
             serve: self.serve,
             headless: self.headless,
+            token_file: self.token_file,
             profile: self.profile,
             strict_cache: self.strict_cache,
             identity: self.identity,

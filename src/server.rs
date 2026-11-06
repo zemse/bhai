@@ -1,6 +1,7 @@
 //! A localhost debug server: inspect and drive a running session over HTTP.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -25,11 +26,110 @@ pub const DEFAULT_PORT: u16 = 7878;
 /// The header every request carries the run's token in.
 pub const TOKEN_HEADER: &str = "x-bhai-token";
 
+/// What `--serve` takes the token from when there is no `--token-file`.
+pub const TOKEN_ENV: &str = "BHAI_TOKEN";
+/// Shortest token accepted from a file or the environment; a minted one is 32.
+const MIN_TOKEN: usize = 16;
+
 /// A token for one run, printed where the server's address is. The server can run
 /// commands as the user, and a port on localhost is open to every process on the machine,
 /// so knowing the port is not enough.
 pub fn mint() -> String {
     uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// The run's token and where it came from.
+pub struct Token {
+    pub value: String,
+    source: Source,
+}
+
+enum Source {
+    Minted,
+    Env,
+    Read(PathBuf),
+    Written(PathBuf),
+}
+
+impl Token {
+    /// What the startup line says about it. Only a minted token is printed: one from a
+    /// file or the environment is already where the user keeps it.
+    pub fn shown(&self) -> String {
+        match &self.source {
+            Source::Minted => format!("{TOKEN_HEADER}: {}", self.value),
+            Source::Env => format!("{TOKEN_HEADER} from {TOKEN_ENV}"),
+            Source::Read(path) => format!("{TOKEN_HEADER} from {}", path.display()),
+            Source::Written(path) => format!("{TOKEN_HEADER} written to {}", path.display()),
+        }
+    }
+}
+
+/// The token from `file` when given, which is created with a fresh one if missing, else
+/// from `env`, else a new one for this run. A stable token is what lets a tunnel or a
+/// script reconnect to a restarted server.
+pub fn token(file: Option<&std::path::Path>, env: Option<String>) -> anyhow::Result<Token> {
+    let token = match (file, env) {
+        (Some(path), _) => from_file(path)?,
+        (None, Some(value)) => Token {
+            value: checked(value.trim(), TOKEN_ENV)?,
+            source: Source::Env,
+        },
+        (None, None) => Token {
+            value: mint(),
+            source: Source::Minted,
+        },
+    };
+    crate::redact::register(&token.value);
+    Ok(token)
+}
+
+fn from_file(path: &std::path::Path) -> anyhow::Result<Token> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let shown = path.display();
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let mode = std::fs::metadata(path)?.permissions().mode();
+            if mode & 0o077 != 0 {
+                anyhow::bail!("{shown} is readable by others; chmod 600 it");
+            }
+            let value = checked(text.trim(), &shown.to_string())?;
+            return Ok(Token {
+                value,
+                source: Source::Read(path.to_path_buf()),
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::anyhow!("cannot read {shown}: {e}")),
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let value = mint();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("cannot create {shown}: {e}"))?;
+    writeln!(file, "{value}")?;
+    Ok(Token {
+        value,
+        source: Source::Written(path.to_path_buf()),
+    })
+}
+
+/// `value` if it can be a token: long enough to guess at no better than a minted one,
+/// and nothing a header cannot carry.
+fn checked(value: &str, from: &str) -> anyhow::Result<String> {
+    if value.len() < MIN_TOKEN {
+        anyhow::bail!("the token in {from} is shorter than {MIN_TOKEN} characters");
+    }
+    if !value.bytes().all(|b| b.is_ascii_graphic()) {
+        anyhow::bail!("the token in {from} has characters other than printable ASCII");
+    }
+    Ok(value.to_string())
 }
 
 /// Bind to 127.0.0.1 only; the server can run commands, so it never faces the network.
@@ -1538,5 +1638,44 @@ mod tests {
             .unwrap()
             .status();
         assert_eq!(status.as_u16(), 403);
+    }
+
+    /// A restarted server keeps its token, so a tunnel or a script reconnects as it was.
+    #[test]
+    fn a_token_file_is_created_once_and_read_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = crate::tools::temp_dir();
+        let path = dir.join("nested/token");
+        let first = token(Some(&path), Some("ignored-because-the-file-wins".into())).unwrap();
+        assert!(first.shown().contains("written to"), "{}", first.shown());
+        assert!(!first.shown().contains(&first.value));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let again = token(Some(&path), None).unwrap();
+        assert_eq!(again.value, first.value);
+        assert!(again.shown().contains("from"), "{}", again.shown());
+
+        // A file anyone can read is not a secret any more.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(token(Some(&path), None).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for bad in ["", "short\n", "has a space in the middle"] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(token(Some(&path), None).is_err(), "{bad:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_env_token_is_checked_and_not_printed() {
+        let from_env = token(None, Some("0123456789abcdef-env\n".into())).unwrap();
+        assert_eq!(from_env.value, "0123456789abcdef-env");
+        assert_eq!(from_env.shown(), format!("{TOKEN_HEADER} from {TOKEN_ENV}"));
+        for bad in ["", "   ", "0123456789abcde"] {
+            assert!(token(None, Some(bad.into())).is_err(), "{bad:?}");
+        }
+        let minted = token(None, None).unwrap();
+        assert!(minted.shown().ends_with(&minted.value));
     }
 }

@@ -97,6 +97,18 @@ command = 'curl -s -d "$BHAI_NOTIFY_TITLE: $BHAI_NOTIFY_BODY" ntfy.sh/my-topic'
 events = ["approval", "done", "auth"]
 ```
 
+### remote use
+
+`--serve [port]` starts an HTTP server over the session on `127.0.0.1` only, and `--headless` runs it with no terminal. to drive a session on a remote box from a laptop, tunnel the port over ssh and talk to `localhost` as if it were local:
+
+```sh
+ssh -N -L 7878:127.0.0.1:7878 host            # on the laptop
+bhai --serve 7878 --headless --token-file ~/.config/bhai/server-token   # on the host
+curl -s -H "x-bhai-token: $(ssh host cat .config/bhai/server-token)" localhost:7878/state
+```
+
+every request carries the token in `x-bhai-token`, and a request with an `Origin` header or a host other than `127.0.0.1` or `localhost` is refused. without a token source the server mints one per run and prints it. `--token-file PATH` reads the token from that file, or creates it with a new one and mode 600, so a restarted server keeps it; a file others can read is refused. `BHAI_TOKEN` sets one from the environment when there is no `--token-file`. a token under 16 characters is refused. bash children never see `BHAI_TOKEN`, and the token is blanked out of tool output; keep the file outside the project, where the agent has no reason to read it.
+
 ### driving bhai from another harness
 
 `bhai models` lists exact model IDs, supported reasoning efforts and known context windows. `bhai models --json` returns one JSON object with `models` and `notes`, unlike the JSONL event stream from `exec --json`. listing reads backend metadata without starting an agent session or requesting inference.

@@ -390,15 +390,22 @@ allow it.",
     notices.extend(workflows.errors.iter().cloned());
     startup::mark("session");
 
-    // Bind before taking over the terminal so a busy port is a plain error.
+    // Bind before taking over the terminal so a busy port or a bad token is a plain error.
     let listener = match args.serve {
-        Some(port) => match server::bind(port).await {
-            Ok(listener) => Some(listener),
-            Err(e) => {
-                shutdown(hub).await;
-                return Err(e);
+        Some(port) => {
+            let env = std::env::var(server::TOKEN_ENV).ok();
+            let bound = match server::token(args.token_file.as_deref(), env) {
+                Ok(token) => server::bind(port).await.map(|l| (l, token)),
+                Err(e) => Err(e),
+            };
+            match bound {
+                Ok(bound) => Some(bound),
+                Err(e) => {
+                    shutdown(hub).await;
+                    return Err(e);
+                }
             }
-        },
+        }
         None => None,
     };
     let usage_log = args.profile.then(|| diagnostics.join("usage.jsonl"));
@@ -463,7 +470,7 @@ allow it.",
     session.watch_background(crate::background::sources(hub.clone()));
     notify::watch(session.subscribe());
     if args.headless {
-        let listener = listener.expect("--headless is only accepted with --serve");
+        let (listener, token) = listener.expect("--headless is only accepted with --serve");
         session.entries().restore(&history);
         if let Some(schedules) = schedules {
             session.run_schedules(schedules);
@@ -471,15 +478,14 @@ allow it.",
         for notice in &notices {
             eprintln!("bhai: {notice}");
         }
-        let token = server::mint();
         eprintln!(
-            "bhai: debug server on http://{} ({}: {token})",
+            "bhai: debug server on http://{} ({})",
             listener.local_addr()?,
-            server::TOKEN_HEADER
+            token.shown()
         );
         let mut signals = shutdown::take_ending(true);
         let result = tokio::select! {
-            result = server::serve(listener, Arc::clone(&session), token) => result,
+            result = server::serve(listener, Arc::clone(&session), token.value) => result,
             Some(signal) = signals.recv() => {
                 stopped(&session, signal).await;
                 Ok(())
@@ -740,6 +746,8 @@ struct Args {
     /// Port for the debug server, when `--serve` is given.
     serve: Option<u16>,
     headless: bool,
+    /// `--token-file`: where the debug server's token is kept across runs.
+    token_file: Option<PathBuf>,
     /// Log model usage and trace spans in this session's debug directory.
     profile: bool,
     /// Refuse to send a request that breaks the prompt cache.
@@ -1608,7 +1616,7 @@ async fn run(
     mut signals: mpsc::UnboundedReceiver<i32>,
     session: Arc<Session>,
     mut events: broadcast::Receiver<session::Event>,
-    listener: Option<TcpListener>,
+    listener: Option<(TcpListener, server::Token)>,
     notices: Vec<String>,
     skills: Vec<skills::Skill>,
     hub: Option<Arc<mcp::Hub>>,
@@ -1722,14 +1730,13 @@ async fn run(
     if let Some(schedules) = schedules {
         session.run_schedules(schedules);
     }
-    if let Some(listener) = listener {
+    if let Some((listener, token)) = listener {
         let addr = listener.local_addr()?;
-        let token = server::mint();
         app.entries().push(app::Entry::Info(format!(
-            "debug server on http://{addr} ({}: {token})",
-            server::TOKEN_HEADER
+            "debug server on http://{addr} ({})",
+            token.shown()
         )));
-        tokio::spawn(server::serve(listener, session, token));
+        tokio::spawn(server::serve(listener, session, token.value));
     }
     // The tab says where the session is running until the model says what it is doing.
     let mut tab = title::Tab::new(std::env::current_dir().unwrap_or_default());
