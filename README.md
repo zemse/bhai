@@ -109,6 +109,8 @@ curl -s -H "x-bhai-token: $(ssh host cat .config/bhai/server-token)" localhost:7
 
 every request carries the token in `x-bhai-token`, and a request with an `Origin` header or a host other than `127.0.0.1` or `localhost` is refused. without a token source the server mints one per run and prints it. `--token-file PATH` reads the token from that file, or creates it with a new one and mode 600, so a restarted server keeps it; a file others can read is refused. `BHAI_TOKEN` sets one from the environment when there is no `--token-file`. a token under 16 characters is refused. bash children never see `BHAI_TOKEN`, and the token is blanked out of tool output; keep the file outside the project, where the agent has no reason to read it.
 
+`GET /events` is a server-sent event stream; each event's `id:` is its `seq`, counted from 1 for the run. `?since=N` or a `Last-Event-ID` header replays the buffered events after `N` and then streams live, so a client that dropped reconnects with the last id it saw and misses nothing. the server keeps the last 4096 events; a client further back gets `{"type":"lagged","data":<missed>}` first and should refetch `/state`, whose `seq` is where that snapshot leaves off. an id newer than the run's latest is from a previous run and gets a 409.
+
 ### driving bhai from another harness
 
 `bhai models` lists exact model IDs, supported reasoning efforts and known context windows. `bhai models --json` returns one JSON object with `models` and `notes`, unlike the JSONL event stream from `exec --json`. listing reads backend metadata without starting an agent session or requesting inference.

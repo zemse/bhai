@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{self, KeepAlive, Sse};
@@ -296,32 +296,43 @@ async fn state(State(session): State<Arc<Session>>) -> Response {
     Json(session.state()).into_response()
 }
 
-/// The live stream, each event with its `seq` as the SSE `id`. A `Last-Event-ID` header
-/// replays what came after that id first, so a client that dropped picks up where it was;
-/// `0` replays all the log holds, and the `seq` in `/state` is where a snapshot leaves off.
-async fn events(State(session): State<Arc<Session>>, headers: HeaderMap) -> Response {
+/// The live stream, each event with its `seq` as the SSE `id`. `?since=N` or a
+/// `Last-Event-ID` header replays what came after that id first, so a client that dropped
+/// picks up where it was; the header wins, since a browser-style reconnect sends it with
+/// the URL it first used. `0` replays all the log holds, and the `seq` in `/state` is
+/// where a snapshot leaves off.
+async fn events(
+    State(session): State<Arc<Session>>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Response {
     let latest = session.seq();
-    let after = match headers.get("last-event-id") {
+    let given = match headers.get("last-event-id") {
+        Some(value) => Some(("Last-Event-ID", value.to_str().unwrap_or_default())),
+        None => query.since.as_deref().map(|since| ("since", since)),
+    };
+    let after = match given {
         None => latest,
-        Some(value) => match value
-            .to_str()
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-        {
-            Some(after) if after <= latest => after,
+        Some((name, value)) => match value.trim().parse::<u64>() {
+            Ok(after) if after <= latest => after,
             // Ids restart with each run, so one from the future is from another run.
-            Some(_) => {
-                return error(
-                    StatusCode::CONFLICT,
-                    "that event id is not from this run; reconnect without Last-Event-ID",
+            Ok(_) => {
+                let message = format!(
+                    "that event id is not from this run; refetch /state and reconnect from its seq, or without {name}"
                 );
+                return error(StatusCode::CONFLICT, &message);
             }
-            None => return error(StatusCode::BAD_REQUEST, "Last-Event-ID is not a number"),
+            Err(_) => return error(StatusCode::BAD_REQUEST, &format!("{name} is not a number")),
         },
     };
     Sse::new(stream(session, after))
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    since: Option<String>,
 }
 
 /// Events after `after`, read from the session's log as it grows.
@@ -917,6 +928,33 @@ mod tests {
         // Ids restart with each run, so one past the newest is from another.
         assert_eq!(status("2").await, 409);
         assert_eq!(status("1").await, 200);
+    }
+
+    /// `?since=N` is the same replay for a client that cannot set headers, and a
+    /// `Last-Event-ID` sent with it is the newer of the two.
+    #[tokio::test]
+    async fn since_replays_like_last_event_id_and_the_header_wins() {
+        let (base, session) = quiet().await;
+        let http = reqwest::Client::new();
+        for s in ["a", "b", "c"] {
+            session.publish(text(s));
+        }
+        let since = |n: &str| {
+            http.get(format!("{base}/events?since={n}"))
+                .header(TOKEN_HEADER, TOKEN)
+        };
+        let got = read_sse(since("1").send().await.unwrap(), 2).await;
+        let ids: Vec<_> = got.iter().map(|(id, _)| id.clone().unwrap()).collect();
+        assert_eq!(ids, ["2", "3"]);
+        let response = since("0")
+            .header("last-event-id", "2")
+            .send()
+            .await
+            .unwrap();
+        let got = read_sse(response, 1).await;
+        assert_eq!(got[0].0.as_deref(), Some("3"));
+        assert_eq!(since("x").send().await.unwrap().status().as_u16(), 400);
+        assert_eq!(since("9").send().await.unwrap().status().as_u16(), 409);
     }
 
     /// Start a server on an ephemeral port in front of a fake agent that says hi, asks
