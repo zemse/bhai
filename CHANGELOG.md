@@ -6,6 +6,10 @@ carries the shape of what is there.
 
 ## 2026-11-06
 
+- `bhai attach PORT --ssh DEST [--ssh-arg ARG]...` runs and restarts its own `ssh -N -L` tunnel (BatchMode, 5s server-alive) from a free local port, kills it on detach, and reads the token over ssh from `--remote-token-file` (default `~/.config/bhai/server-token`) when none is given; the border says whether the tunnel or the server is down.
+- Attach holds prompts, approval answers and settings given while disconnected and sends them in order on reconnect, counted on the border; an answer to an approval settled meanwhile is reported, and an interrupt is refused at once.
+- `/events` sends a keep-alive every 3s, and attach drops a stream silent for 10s and reconnects; action requests time out after 10s.
+- Attach reconnects at once and then every second instead of backing off to 10s, and no longer shows events twice after a lag reloads the snapshot.
 - `attach --help`, `serve --help` and `exec --help` list only the global options that apply; attach refuses session options. Help covers starting on a server, trust for auto and bypass, tunnels, detaching versus stopping, replay, notify, files, quota and resuming.
 - `bhai serve [PORT]` runs several sessions, each its own headless process, behind one server: `GET /sessions`, `POST /sessions/new`, `DELETE /sessions/{id}` and every session route under `/sessions/{id}/`; unprefixed routes reach the `--open` or only session, and SIGTERM winds all of them down. `bhai attach --session ID` picks one. Headless runs print `bhai: session ID`.
 - `bhai attach [PORT|URL]` runs the terminal UI on a session served by `--serve` or `exec --serve`, from `GET /snapshot` and `/events` with reconnect and replay, sending prompts, approvals, interrupts, steering and settings over HTTP; ctrl+c only detaches.

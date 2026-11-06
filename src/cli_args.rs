@@ -115,7 +115,7 @@ pub(super) enum Command {
     /// Open the terminal UI on a session another bhai serves with --serve.
     #[command(after_help = ATTACH_HELP)]
     Attach {
-        /// The server: a port, 127.0.0.1:PORT, localhost:PORT or an http:// URL (default: 7878).
+        /// The server: a port, 127.0.0.1:PORT, localhost:PORT or an http:// URL (default: 7878); with --ssh, its port there.
         target: Option<String>,
         /// The server's token; --token-file reads it from a file, else BHAI_TOKEN.
         #[arg(long, value_name = "TOKEN")]
@@ -168,20 +168,20 @@ pub(super) enum Command {
     },
 }
 
-const ATTACH_HELP: &str = "The server listens on 127.0.0.1 only, so reach a remote one through an ssh tunnel.
+const ATTACH_HELP: &str = "The server listens on 127.0.0.1 only. --ssh DEST runs the ssh tunnel to it and restarts it when it drops; without it, run your own.
 Against bhai serve, --session ID picks a session; without it the only one is used, or you choose from a list.
 Leaving (ctrl+c twice, ctrl+d, /quit) only detaches: the session keeps running. esc twice interrupts its turn.
 To stop a session, DELETE /sessions/ID on bhai serve, or SIGTERM the bhai that serves it; bhai -r ID resumes it there.
-A dropped connection is retried with backoff and replays from the last event seen; the prompt's border says when it is down.
+A dropped or silent connection is retried every second and replays from the last event seen; the prompt's border says when it is down and why.
+Prompts, answers and settings given while it is down are held and sent once it is back; an interrupt is refused then.
 !commands, @ files, pasted images and the commands that act on this machine are off; GET /file and POST /upload move files.
-The token comes from --token, then --token-file (which must exist), then BHAI_TOKEN.
+The token comes from --token, then --token-file (which must exist), then BHAI_TOKEN; with --ssh and none of them, from --remote-token-file over ssh.
+ssh runs with BatchMode=yes, so it needs a key or an agent; --ssh-arg passes one argument before DEST and repeats.
 
 On the server, in tmux or as the systemd unit in the README:
   bhai serve 7878 --token-file ~/.config/bhai/server-token --open
 On the laptop:
-  ssh -N -L 7878:127.0.0.1:7878 host &
-  scp host:.config/bhai/server-token ~/.config/bhai/remote-token && chmod 600 ~/.config/bhai/remote-token
-  bhai attach 7878 --token-file ~/.config/bhai/remote-token";
+  bhai attach 7878 --ssh ubuntu@HOST --ssh-arg=-i --ssh-arg=~/key.pem";
 
 const SERVE_HELP: &str = "Each session runs as its own bhai --serve --headless, in any project; the daemon opens, lists and stops them.
   GET /sessions         id, title, project, working, pending approval, created, updated
