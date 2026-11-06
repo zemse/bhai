@@ -81,6 +81,8 @@ this isolates the session from the host filesystem, not the network. Tart's defa
 
 new sessions get a UUID before startup services run. session state lives under `.bhai/sessions/<uuid>/`, beside its `<uuid>.jsonl` transcript. `debug/` holds that session's judge, authorization, permission, cache, MCP and profiling logs; debug exports do not read the old project-wide log directory. `scratch/` holds temporary working files and dictation recordings. Bash sets `BHAI_SESSION_DIR`, `BHAI_SCRATCH_DIR` and `TMPDIR` to these paths.
 
+SIGTERM or SIGHUP (from `kill`, a closed ssh session or a killed tmux pane) interrupts the running turn and its child agents, waits up to ten seconds for the transcript to record that, prints the resume command and exits with status 0. under `--headless` SIGINT does the same; in the terminal UI ctrl+c stays a key. queued prompts are not sent and are printed instead. a second signal kills at once.
+
 `--resume` keeps the same UUID and directories. project configuration, remembered permission rules, project memory and explicitly enabled workflow caches remain shared; session search and worktree coordination still work across sessions.
 
 ### driving bhai from another harness

@@ -4,8 +4,8 @@
 use crate::{
     agent, app, askpass, cache, childenv, client, config, egress, external, identity, input,
     instructions, judge, limits, mcp, memory, models, notify, permissions, profile, sandbox,
-    schedules, search, server, session, sessions, skills, startup, statusline, syntax, title,
-    tokens, tools, trace, ui, workflow, worktrees,
+    schedules, search, server, session, sessions, shutdown, skills, startup, statusline, syntax,
+    title, tokens, tools, trace, ui, workflow, worktrees,
 };
 
 #[path = "cli_args.rs"]
@@ -476,8 +476,18 @@ allow it.",
             listener.local_addr()?,
             server::TOKEN_HEADER
         );
-        let result = server::serve(listener, session, token).await;
+        let mut signals = shutdown::take_ending(true);
+        let result = tokio::select! {
+            result = server::serve(listener, Arc::clone(&session), token) => result,
+            Some(signal) = signals.recv() => {
+                stopped(&session, signal).await;
+                Ok(())
+            }
+        };
         shutdown(hub).await;
+        if let Some(hint) = sessions::exit_hint(&dir, &session_id) {
+            say(&hint);
+        }
         worktrees::settle();
         return result;
     }
@@ -523,9 +533,13 @@ allow it.",
     let prompts = input::History::load(
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/bhai/history.jsonl")),
     );
+    // ctrl+c is a key here, so an interrupt comes from outside and still kills.
+    let signals = shutdown::take_ending(false);
+    let held = Arc::clone(&session);
     let result = run(
         terminal,
         modes,
+        signals,
         session,
         events,
         listener,
@@ -549,13 +563,38 @@ allow it.",
     drop(guard);
     modes.release();
     title::pop();
-    ratatui::restore();
+    let signalled = result.as_ref().ok().copied().flatten();
+    match signalled {
+        // A hangup took the terminal, and `restore` panics when it cannot say so.
+        Some(signal) => {
+            let _ = ratatui::try_restore();
+            stopped(&held, signal).await;
+        }
+        None => ratatui::restore(),
+    }
     shutdown(hub).await;
     if let Some(hint) = sessions::exit_hint(&dir, &session_id) {
-        eprint!("{hint}");
+        say(&hint);
     }
     worktrees::settle();
-    result
+    result.map(|_| ())
+}
+
+/// Write to stderr, which a hangup may have closed, so a failed write is not a panic.
+fn say(text: &str) {
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), text.as_bytes());
+}
+
+/// After `signal`: interrupt the turn so the history records it, and say what is lost.
+async fn stopped(session: &Session, signal: i32) {
+    let queued = session.wind_down(shutdown::SETTLE).await;
+    say(&format!(
+        "bhai: {} stopped the session\n",
+        shutdown::name(signal)
+    ));
+    for text in queued {
+        say(&format!("bhai: queued and never sent: {text}\n"));
+    }
 }
 
 /// Turn mouse capture on or off while running, for `/mouse`; returns the state it left.
@@ -1564,6 +1603,7 @@ fn cache_check_passed(rows: &[CacheRow]) -> bool {
 async fn run(
     mut terminal: ratatui::DefaultTerminal,
     modes: Modes,
+    mut signals: mpsc::UnboundedReceiver<i32>,
     session: Arc<Session>,
     mut events: broadcast::Receiver<session::Event>,
     listener: Option<TcpListener>,
@@ -1582,7 +1622,7 @@ async fn run(
     defaults: (String, String),
     askpass: Option<mpsc::UnboundedReceiver<askpass::Request>>,
     schedules: Option<Arc<schedules::Schedules>>,
-) -> Result<()> {
+) -> Result<Option<i32>> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
     if let Some(mut requests) = askpass {
@@ -1695,6 +1735,7 @@ async fn run(
     let mut dirty = true;
     let mut captured = mouse;
     let mut notifier = notify::Notifier::from_env();
+    let mut signalled = None;
     while !app.quit {
         if let Some(text) = tab.refresh(tab_state(&app)) {
             title::set(&text);
@@ -1703,7 +1744,14 @@ async fn run(
             terminal.draw(|frame| ui::render(frame, &mut app))?;
             app.drawn();
         }
-        let Some(event) = rx_event.recv().await else {
+        let event = tokio::select! {
+            event = rx_event.recv() => event,
+            Some(signal) = signals.recv() => {
+                signalled = Some(signal);
+                break;
+            }
+        };
+        let Some(event) = event else {
             break;
         };
         dirty = apply(&mut app, &mut notifier, event, &mut tab);
@@ -1737,7 +1785,7 @@ async fn run(
     if captured != mouse {
         set_capture(mouse);
     }
-    Ok(())
+    Ok(signalled)
 }
 
 /// Apply one event to the view; returns whether it has to be drawn again.

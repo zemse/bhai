@@ -1171,7 +1171,8 @@ const PANIC_WAIT: Duration = Duration::from_millis(100);
 
 /// Make a hangup, an interrupt or a terminate end every session before bhai dies of it,
 /// as it still does: the sessions' process groups would outlive it, holding their ports.
-/// The session's worktrees are settled after, as quitting settles them.
+/// The session's worktrees are settled after, as quitting settles them. A signal a
+/// running session took with `shutdown::take` goes to it instead, the first time.
 pub fn kill_all_on_signal() -> io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     for kind in [
@@ -1181,7 +1182,10 @@ pub fn kill_all_on_signal() -> io::Result<()> {
     ] {
         let mut stream = signal(kind)?;
         tokio::spawn(async move {
-            if stream.recv().await.is_some() {
+            while stream.recv().await.is_some() {
+                if crate::shutdown::hand_over(kind.as_raw_value()) {
+                    continue;
+                }
                 kill_all();
                 super::browser::kill_all();
                 #[cfg(feature = "dictation")]

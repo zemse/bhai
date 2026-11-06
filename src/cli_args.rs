@@ -11,7 +11,7 @@ use crate::{config::Flags, permissions};
     version,
     propagate_version = true,
     about = "An agent harness.",
-    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read."
+    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read.\nSIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints how to resume it."
 )]
 pub(super) struct Cli {
     #[command(subcommand)]
@@ -67,7 +67,7 @@ pub(super) struct Cli {
     /// Start the local debug HTTP server (default port: 7878).
     #[arg(long, num_args = 0..=1, default_missing_value = "7878", value_name = "PORT")]
     serve: Option<u16>,
-    /// Run the debug server without the terminal UI.
+    /// Run the debug server without the terminal UI; SIGINT ends it as SIGTERM does.
     #[arg(long, requires = "serve")]
     headless: bool,
     /// Run a workflow, with optional input.

@@ -119,6 +119,8 @@ mod server;
 mod session;
 #[path = "../../src/sessions.rs"]
 mod sessions;
+#[path = "../../src/shutdown.rs"]
+mod shutdown;
 #[path = "../../src/skills.rs"]
 mod skills;
 #[path = "../../src/speed.rs"]

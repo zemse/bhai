@@ -92,6 +92,7 @@ mod search;
 pub mod server;
 pub mod session;
 pub mod sessions;
+mod shutdown;
 pub mod skills;
 mod speed;
 mod startup;

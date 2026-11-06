@@ -1068,6 +1068,19 @@ impl Session {
         true
     }
 
+    /// Interrupt whatever runs, as bhai is about to exit, and wait up to `within` for the
+    /// turn to end, which is when the history records that it was cut off. Returns the
+    /// queued prompts, as typed, which would otherwise start a turn of their own.
+    pub async fn wind_down(&self, within: Duration) -> Vec<String> {
+        let queued = self.unqueue();
+        self.interrupt();
+        let began = Instant::now();
+        while (self.working() || self.child_running()) && began.elapsed() < within {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        queued
+    }
+
     /// The model the session talks to and the effort it runs at.
     pub fn model(&self) -> (String, String) {
         self.model.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -3000,6 +3013,36 @@ mod tests {
         assert!(session.interrupt());
         assert!(session.cancel.stopped());
         assert_eq!(wait.try_recv(), Ok(Answer::Reject));
+    }
+
+    #[tokio::test]
+    async fn winding_down_waits_for_the_turn_and_keeps_the_queue_from_starting() {
+        let (session, mut rx) = session();
+        session.submit("a".to_string()).unwrap();
+        session.submit("b".to_string()).unwrap();
+        let mut wait = approval(&session);
+        let ending = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                session.on_agent(AgentEvent::TurnEnd);
+            })
+        };
+        let queued = session.wind_down(Duration::from_secs(5)).await;
+        ending.await.unwrap();
+        assert_eq!(queued, vec!["b".to_string()]);
+        assert!(session.cancel.stopped());
+        assert_eq!(wait.try_recv(), Ok(Answer::Reject));
+        assert!(!session.working());
+        assert!(rx.try_recv().is_ok(), "the first prompt");
+        assert!(rx.try_recv().is_err(), "the queued one never started");
+
+        // An agent that never ends its turn holds the exit up only as long as asked.
+        let (stuck, _rx) = self::session();
+        stuck.submit("a".to_string()).unwrap();
+        let began = Instant::now();
+        assert!(stuck.wind_down(Duration::from_millis(100)).await.is_empty());
+        assert!(began.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

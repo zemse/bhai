@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-11-06
+
+- SIGTERM and SIGHUP (and SIGINT under `--headless`) interrupt the turn, keep the session, restore the terminal and print the resume command before exiting 0; a second signal still kills.
+
 ## 2026-10-29
 
 - `status` exposes reported subscription windows, credits, reset times and observation age; weekly usage at 98% prompts checkpointing, pauses goal continuation after the turn and skips automatic compaction.
