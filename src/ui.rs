@@ -537,7 +537,7 @@ const ALWAYS: u8 = 0;
 /// whole screen above it to scroll through.
 fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
     let area = render_chip(frame, area, app);
-    let app: &App = app;
+    let previous_repo = app.repo_area.take();
     // Where a click would go, in place of the bar while the pointer is on a link.
     if let Some(link) = app.hovered_link() {
         let line = Span::styled(format!(" ↗ {}", link.target), Style::new().fg(Color::Cyan));
@@ -573,10 +573,28 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
         .ok()
         .and_then(|cwd| cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_default();
-    match app.branch.name() {
-        Some(branch) => segment(&mut bar, Span::styled(format!("{dir}:{branch}"), dim)),
-        None if !dir.is_empty() => segment(&mut bar, Span::styled(dir, dim)),
-        None => {}
+    if !dir.is_empty() || app.branch.name().is_some() {
+        let collapsed = repo_label(&dir, app.branch.name(), false);
+        let full = repo_label(&dir, app.branch.name(), true);
+        let start = bar.iter().map(|(_, span)| span.width()).sum::<usize>() + 3;
+        let hit_area = |width: usize| {
+            Rect::new(
+                area.x.saturating_add(start.min(area.width as usize) as u16),
+                area.y,
+                width.min((area.width as usize).saturating_sub(start)) as u16,
+                area.height,
+            )
+        };
+        let collapsed_area = hit_area(Span::raw(collapsed.as_str()).width());
+        let expanded = app.pointing_at(collapsed_area)
+            || previous_repo.is_some_and(|previous| {
+                previous.x == collapsed_area.x
+                    && previous.y == collapsed_area.y
+                    && app.pointing_at(previous)
+            });
+        let label = if expanded { full } else { collapsed };
+        app.repo_area = Some(hit_area(Span::raw(label.as_str()).width()));
+        segment(&mut bar, Span::styled(label, dim));
     }
     // How full the window is, from what the last call actually read: the number
     // compaction watches, and the only one here that says how much room is left.
@@ -765,6 +783,24 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
     spans.push(Span::styled(" · ctrl+c interrupt", dim));
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn repo_label(dir: &str, branch: Option<&str>, expanded: bool) -> String {
+    let suffix = branch
+        .map(|branch| format!(":{branch}"))
+        .unwrap_or_default();
+    let budget = 15usize.saturating_sub(suffix.chars().count());
+    let dir = if !expanded && dir.chars().count() > budget && dir.chars().count() > 3 {
+        format!(
+            "{}...",
+            dir.chars()
+                .take(budget.saturating_sub(3))
+                .collect::<String>()
+        )
+    } else {
+        dir.to_string()
+    };
+    format!("{dir}{suffix}")
 }
 
 /// A span on the bar, after a ` | ` when it is not the first.
@@ -4185,6 +4221,74 @@ mod tests {
         let bar = status(&terminal);
         let expected = format!("5h:none | 7d:17% resets@{}", at.format("%a %H:%M"));
         assert!(bar.contains(&expected), "{bar}");
+    }
+
+    #[test]
+    fn repo_labels_shorten_only_the_directory() {
+        assert_eq!(repo_label("bhai", Some("main"), false), "bhai:main");
+        assert_eq!(
+            repo_label("abcdefghij", Some("main"), false),
+            "abcdefghij:main"
+        );
+        assert_eq!(
+            repo_label("abcdefghijk", Some("main"), false),
+            "abcdefg...:main"
+        );
+        assert_eq!(repo_label("long-directory", None, false), "long-directory");
+        assert_eq!(
+            repo_label("a-very-long-directory", None, false),
+            "a-very-long-..."
+        );
+        assert_eq!(
+            repo_label("directory", Some("feature/long-branch"), false),
+            "...:feature/long-branch"
+        );
+        assert_eq!(
+            repo_label("dir", Some("feature/long-branch"), false),
+            "dir:feature/long-branch"
+        );
+        assert_eq!(
+            repo_label("目录目录目录目录目录目录", Some("main"), false),
+            "目录目录目录目...:main"
+        );
+        assert_eq!(
+            repo_label("a-very-long-directory", Some("main"), true),
+            "a-very-long-directory:main"
+        );
+    }
+
+    #[test]
+    fn repo_status_expands_on_hover_and_collapses_on_leaving() {
+        let mut app = App::detached();
+        app.branch = crate::branch::Branch::named("feature/a-long-branch");
+        let mut terminal = Terminal::new(TestBackend::new(200, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let collapsed = status(&terminal);
+        let area = app.repo_area.unwrap();
+        let dir = std::env::current_dir().unwrap();
+        let dir = dir.file_name().unwrap().to_string_lossy();
+        let full = format!("{dir}:feature/a-long-branch");
+        assert!(collapsed.contains(&repo_label(&dir, app.branch.name(), false)));
+        let moved = |x, y| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(moved(area.x, area.y)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(status(&terminal).contains(&full));
+        let expanded = app.repo_area.unwrap();
+        app.on_mouse(moved(expanded.right() - 1, expanded.y));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(status(&terminal).contains(&full));
+        assert!(app.on_mouse(moved(expanded.right(), expanded.y)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(status(&terminal), collapsed);
+
+        app.statusline = Some(crate::statusline::Template::parse("$branch").unwrap());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.repo_area.is_none());
     }
 
     #[test]

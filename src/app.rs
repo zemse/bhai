@@ -328,6 +328,8 @@ pub struct App {
     pub monitor_area: Option<Rect>,
     pub plan_collapsed: bool,
     pub monitors_collapsed: bool,
+    /// The directory and branch hit area on the built-in status bar.
+    pub repo_area: Option<Rect>,
     /// The background list, shown over the transcript while open.
     pub bg: Option<BgView>,
     /// The `/model` picker, shown instead of the prompt while open.
@@ -456,6 +458,7 @@ impl App {
             monitor_area: None,
             plan_collapsed: false,
             monitors_collapsed: false,
+            repo_area: None,
             bg: None,
             picker: None,
             search: None,
@@ -956,9 +959,10 @@ impl App {
             MouseEventKind::ScrollDown => self.wheel(WHEEL_LINES as isize),
             MouseEventKind::Moved => {
                 self.mouse_row = Some(mouse.row);
-                let before = (self.hovered_index(), self.on_chip());
+                let before = (self.hovered_index(), self.on_chip(), self.on_repo());
                 self.pointer = Some((Position::new(mouse.column, mouse.row), self.scroll));
-                return self.rehover() | ((self.hovered_index(), self.on_chip()) != before);
+                return self.rehover()
+                    | ((self.hovered_index(), self.on_chip(), self.on_repo()) != before);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_row = Some(mouse.row);
@@ -1071,6 +1075,10 @@ impl App {
 
     fn on_chip(&self) -> bool {
         self.chip.is_some_and(|chip| self.pointing_at(chip))
+    }
+
+    fn on_repo(&self) -> bool {
+        self.repo_area.is_some_and(|area| self.pointing_at(area))
     }
 
     /// Open the background list on what runs now, or shut it.

@@ -66,6 +66,7 @@ carries the shape of what is there.
 
 ## 2026-10-09
 
+- Long `dir:branch` status labels shorten only the directory with `...` to fit 15 characters where possible; hovering restores the full label without shortening the branch.
 - Clicking inline code or a code block copies the code without Markdown delimiters; drag selection keeps its existing Markdown copy behavior.
 - Legacy sessions preview ambiguous original messages through `/permissions recover`; native confirmation replays selected evidence before later human restrictions without renewing timestamps, with bounded journals and checkpoint/fork reconciliation.
 - `aws_instance` arms exact stopped EC2 resources with independent cloud stop schedules before starting; scoped cleanup survives lease expiry, current restrictions and permission rules remain enforced, and detectable raw starts/launches require the user in auto mode.
