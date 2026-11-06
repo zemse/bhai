@@ -1,9 +1,21 @@
 //! The command-line grammar, shared by the frontend and offline parser tests.
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches as _, Parser, Subcommand};
 
 use super::Args;
 use crate::{config::Flags, permissions};
+
+const TOP_HELP: &str = "Run bhai with no command for the terminal UI. -r resumes the latest session here, -r ID a given one; bhai sessions lists them.
+exec or --print runs one unattended turn: text on stdout, progress on stderr, --json for JSONL events.
+--mode auto lets the judge approve; bypass runs all but ask rules and protected paths (.git, .env, keys, credentials), which still ask, and deny rules, which refuse.
+Both need the project trusted (--trust), else the session runs in ask. BHAI_MODE takes ask or auto, never bypass.
+SIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints the -r command that resumes it.
+[notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends, failed logins and a 98% used week.
+
+On a server, bhai serve (or --serve PORT --headless) runs sessions with no terminal, under tmux or systemd: see serve --help.
+From a laptop, tunnel the port with ssh -L and run bhai attach: see attach --help. The servers listen on 127.0.0.1 only.
+Requests carry the token in x-bhai-token; --token-file or BHAI_TOKEN keeps it across restarts.
+Over HTTP: GET /state (with quota), GET /events?since=N replays then streams, GET /file and POST /upload move files under the project root.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -11,7 +23,7 @@ use crate::{config::Flags, permissions};
     version,
     propagate_version = true,
     about = "An agent harness.",
-    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected, unless exec --serve lets them wait for /approve.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read.\nSIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints how to resume it.\n[notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends, failed logins and a 98% used week; see the README.\n--serve listens on 127.0.0.1 only; --token-file or BHAI_TOKEN keeps the token across restarts. bhai attach opens the terminal UI on a served session through an ssh tunnel (see attach --help).\nOver HTTP, send the token in x-bhai-token: GET /events?since=N replays then streams, GET /file and POST /upload move files under the project root."
+    after_help = TOP_HELP
 )]
 pub(super) struct Cli {
     #[command(subcommand)]
@@ -43,10 +55,10 @@ pub(super) struct Cli {
     /// Choose a session interactively.
     #[arg(long, global = true)]
     pick: bool,
-    /// Set the permission mode (overrides BHAI_MODE).
+    /// Set the permission mode; auto and bypass need a trusted project.
     #[arg(long, global = true, value_parser = ["ask", "auto", "bypass"])]
     mode: Option<String>,
-    /// Honour the project-supplied permission rules as they are now.
+    /// Trust the project as it is now: honour its permission rules and allow auto or bypass.
     #[arg(long, global = true)]
     trust: bool,
     /// Skip global instruction files.
@@ -94,7 +106,7 @@ pub(super) struct Cli {
 pub(super) enum Command {
     /// Run one unattended turn; use - as the prompt to read stdin.
     #[command(
-        after_help = "Text output goes to stdout, progress to stderr. --json emits session events as JSONL.\nApprovals left at ask are rejected; configure allow rules or explicitly select --mode auto.\n\nWith --serve [PORT] (after the prompt, or as --serve=PORT) the debug server serves the run:\nan approval left at ask waits for POST /approve or /reject and fires the [notify] command,\n/prompt joins or queues behind the turn, and /steer, /interrupt and /events work.\nThe process exits once the turn and anything queued behind it have ended, with the usual status.\nThere is no terminal UI to leave out, so --headless is refused.\n  bhai exec 'fix the flaky test' --serve 7878 --token-file ~/.config/bhai/token"
+        after_help = "Text output goes to stdout, progress to stderr. --json emits session events as JSONL.\nApprovals left at ask are rejected; configure allow rules or select --mode auto (with --trust in a project not yet trusted).\n-r [ID] continues a saved session. A failed or interrupted turn exits 1.\n\nWith --serve [PORT] (after the prompt, or as --serve=PORT) the debug server serves the run:\nan approval left at ask waits for POST /approve or /reject (or bhai attach) and fires the [notify] command,\n/prompt joins or queues behind the turn, and /steer, /interrupt and /events work.\nThe process exits once the turn and anything queued behind it have ended, with the usual status.\nThere is no terminal UI to leave out, so --headless is refused.\n  bhai exec 'fix the flaky test' --serve 7878 --token-file ~/.config/bhai/server-token"
     )]
     Exec {
         /// Instructions for the agent, or - to read stdin.
@@ -142,28 +154,32 @@ pub(super) enum Command {
     },
 }
 
-const ATTACH_HELP: &str = "The server only listens on 127.0.0.1, so a session on another machine is reached through an ssh tunnel.
-Leaving (ctrl+c twice, ctrl+d, /quit) only detaches: the session keeps running there. esc twice interrupts its turn.
-A dropped connection is retried with backoff, picking up from the last event seen; the prompt's border says when it is down.
-!commands, @ files, pasted images and the commands that act on this machine are off while attached.
+const ATTACH_HELP: &str = "The server listens on 127.0.0.1 only, so reach a remote one through an ssh tunnel.
+Against bhai serve, --session ID picks a session; without it the only one is used, or you choose from a list.
+Leaving (ctrl+c twice, ctrl+d, /quit) only detaches: the session keeps running. esc twice interrupts its turn.
+To stop a session, DELETE /sessions/ID on bhai serve, or SIGTERM the bhai that serves it; bhai -r ID resumes it there.
+A dropped connection is retried with backoff and replays from the last event seen; the prompt's border says when it is down.
+!commands, @ files, pasted images and the commands that act on this machine are off; GET /file and POST /upload move files.
+The token comes from --token, then --token-file (which must exist), then BHAI_TOKEN.
 
-On the server, in tmux so it outlives the ssh login:
-  tmux new -s bhai 'bhai --serve 7878 --token-file ~/.config/bhai/server-token'
-  (or bhai --serve 7878 --headless ..., or bhai exec PROMPT --serve 7878 ... for one turn)
+On the server, in tmux or as the systemd unit in the README:
+  bhai serve 7878 --token-file ~/.config/bhai/server-token --open
 On the laptop:
   ssh -N -L 7878:127.0.0.1:7878 host &
   scp host:.config/bhai/server-token ~/.config/bhai/remote-token && chmod 600 ~/.config/bhai/remote-token
   bhai attach 7878 --token-file ~/.config/bhai/remote-token";
 
-const SERVE_HELP: &str = "Each session runs as its own bhai --serve --headless; the daemon starts, lists and stops them.
-  GET /sessions                      id, title, project, working, pending approval, created, updated
-  POST /sessions/new                 {\"project\", \"model\", \"mode\", \"effort\", \"resume\", \"trust\", \"as\"}, all optional
-  DELETE /sessions/ID                stops one as SIGTERM would; POST /sessions/ID/close does the same
-  /sessions/ID/ROUTE                 any --serve route of that session: state, events, prompt, approve, file, ...
-The unprefixed routes reach the --open session while it runs, else the only one open.
-SIGTERM, SIGHUP or SIGINT stops every session (each gets the usual 10s wind-down) and exits.
---model, --mode and the other session options go to the --open session; --profile, --bare and the like to all.
-  bhai serve 7878 --token-file ~/.config/bhai/server-token --open
+const SERVE_HELP: &str = "Each session runs as its own bhai --serve --headless, in any project; the daemon opens, lists and stops them.
+  GET /sessions         id, title, project, working, pending approval, created, updated
+  POST /sessions/new    optional JSON: project, model, mode, effort, resume (an id or latest), trust, as
+  DELETE /sessions/ID   stops one as SIGTERM would; POST /sessions/ID/close does the same
+  /sessions/ID/ROUTE    any --serve route of that session: state, events, prompt, approve, file, upload, ...
+Unprefixed routes reach the --open session while it runs, else the only one open.
+--model, --mode, --resume and the other session options shape the --open session; --profile, --bare and the like apply to all.
+An approval waits for /approve (or bhai attach) and fires [notify]. auto and bypass need trust: --trust, \"trust\": true or POST /sessions/ID/trust.
+SIGTERM, SIGHUP or SIGINT stops every session, each with its 10s wind-down, then exits; {\"resume\": ID} or bhai -r ID picks one up again.
+Under systemd, set KillMode=mixed so only the daemon gets the SIGTERM (the README has a unit).
+  bhai serve 7878 --token-file ~/.config/bhai/server-token --open --mode auto --trust
   bhai attach 7878 --token-file ~/.config/bhai/remote-token --session ID";
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -193,7 +209,88 @@ fn cache_wait(value: &str) -> Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_secs(seconds))
 }
 
+/// The global options each command's help shows; the rest still parse there, for
+/// `into_args` to refuse or ignore, but would only mislead in its help.
+const SHOWN: &[(&str, &[&str])] = &[
+    ("attach", &["token_file"]),
+    (
+        "serve",
+        &[
+            "cd",
+            "model",
+            "effort",
+            "identity",
+            "resume",
+            "mode",
+            "trust",
+            "no_global",
+            "no_project",
+            "bare",
+            "profile",
+            "strict_cache",
+            "token_file",
+        ],
+    ),
+    (
+        "exec",
+        &[
+            "tart",
+            "cd",
+            "json",
+            "model",
+            "effort",
+            "identity",
+            "resume",
+            "mode",
+            "trust",
+            "no_global",
+            "no_project",
+            "bare",
+            "profile",
+            "strict_cache",
+            "serve",
+            "token_file",
+        ],
+    ),
+];
+
 impl Cli {
+    /// The grammar, with each command's help trimmed to the global options it takes.
+    /// clap copies a global option into a command only where it has none of that id, so
+    /// a hidden copy put there first is the one the command parses and leaves out of help.
+    pub fn grammar() -> clap::Command {
+        let mut grammar = Self::command();
+        let globals: Vec<clap::Arg> = grammar
+            .get_arguments()
+            .filter(|arg| arg.is_global_set())
+            .cloned()
+            .collect();
+        for (name, shown) in SHOWN {
+            grammar = grammar.mut_subcommand(name, |mut command| {
+                for arg in &globals {
+                    if !shown.contains(&arg.get_id().as_str()) {
+                        command = command.arg(arg.clone().hide(true));
+                    } else if *name == "attach" && arg.get_id() == "token_file" {
+                        // attach only reads the file; it never makes one.
+                        command =
+                            command.arg(arg.clone().help("Read the server's token from this file"));
+                    }
+                }
+                command
+            });
+        }
+        grammar
+    }
+
+    /// Parse `args`, the program name first, with the help [`Self::grammar`] gives.
+    pub fn parse<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        Self::from_arg_matches(&Self::grammar().try_get_matches_from(args)?)
+    }
+
     pub fn into_args(self) -> Result<Args, clap::Error> {
         if (self.probe.is_some() || self.cache_check.is_some() || self.judge_eval.is_some())
             && (self.command.is_some()
@@ -324,7 +421,19 @@ impl Cli {
                 || parsed.workflow.is_some()
                 || parsed.resume.is_some()
                 || parsed.pick
-                || parsed.json)
+                || parsed.json
+                || parsed.tart
+                || parsed.cd.is_some()
+                || parsed.model.is_some()
+                || parsed.effort.is_some()
+                || parsed.identity.is_some()
+                || parsed.flags.mode.is_some()
+                || parsed.trust
+                || parsed.profile
+                || parsed.strict_cache
+                || parsed.flags.no_global
+                || parsed.flags.no_project
+                || parsed.flags.bare)
         {
             return Err(Self::invalid(
                 "attach shows a session another bhai runs, so it takes no session options",
@@ -368,7 +477,7 @@ mod tests {
     use clap::error::ErrorKind;
 
     fn parse(args: &[&str]) -> Result<Args, clap::Error> {
-        Cli::try_parse_from(std::iter::once("bhai").chain(args.iter().copied()))?.into_args()
+        Cli::parse(std::iter::once("bhai").chain(args.iter().copied()))?.into_args()
     }
 
     #[test]
@@ -391,6 +500,51 @@ mod tests {
     #[test]
     fn grammar_is_consistent() {
         Cli::command().debug_assert();
+        Cli::grammar().debug_assert();
+    }
+
+    #[test]
+    fn command_help_shows_only_the_options_that_apply() {
+        // The options section alone: the after_help names other commands' flags.
+        let help = |name: &str| {
+            let mut grammar = Cli::grammar();
+            grammar.build();
+            let help = grammar
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_help()
+                .to_string();
+            let options = help.split("Options:").nth(1).unwrap_or_default();
+            options.split("\n\n").next().unwrap_or_default().to_string()
+        };
+        let attach = help("attach");
+        for shown in ["--token-file", "--token ", "--session"] {
+            assert!(attach.contains(shown), "{shown} missing:\n{attach}");
+        }
+        for hidden in [
+            "--tart",
+            "--json",
+            "--model",
+            "--resume",
+            "--pick",
+            "--serve",
+            "--headless",
+        ] {
+            assert!(!attach.contains(hidden), "{hidden} shown:\n{attach}");
+        }
+        let serve = help("serve");
+        assert!(
+            serve.contains("--open") && serve.contains("--token-file") && serve.contains("--model")
+        );
+        for hidden in ["  --tart", "  --json", "--pick", "  --serve", "--headless"] {
+            assert!(!serve.contains(hidden), "{hidden} shown:\n{serve}");
+        }
+        let exec = help("exec");
+        assert!(
+            exec.contains("--serve") && !exec.contains("--pick") && !exec.contains("--headless")
+        );
+        let top = Cli::grammar().render_help().to_string();
+        assert!(top.contains("--pick") && top.contains("--headless"));
     }
 
     #[test]
@@ -569,6 +723,9 @@ mod tests {
             vec!["attach", "--headless"],
             vec!["attach", "--resume"],
             vec!["attach", "--json"],
+            vec!["attach", "-m", "x"],
+            vec!["attach", "--mode", "auto"],
+            vec!["--tart", "attach"],
             vec!["attach", "1", "2"],
             vec!["--token-file", "/t"],
         ] {

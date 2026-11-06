@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-06
 
+- `attach --help`, `serve --help` and `exec --help` list only the global options that apply; attach refuses session options. Help covers starting on a server, trust for auto and bypass, tunnels, detaching versus stopping, replay, notify, files, quota and resuming.
 - `bhai serve [PORT]` runs several sessions, each its own headless process, behind one server: `GET /sessions`, `POST /sessions/new`, `DELETE /sessions/{id}` and every session route under `/sessions/{id}/`; unprefixed routes reach the `--open` or only session, and SIGTERM winds all of them down. `bhai attach --session ID` picks one. Headless runs print `bhai: session ID`.
 - `bhai attach [PORT|URL]` runs the terminal UI on a session served by `--serve` or `exec --serve`, from `GET /snapshot` and `/events` with reconnect and replay, sending prompts, approvals, interrupts, steering and settings over HTTP; ctrl+c only detaches.
 - `bhai exec PROMPT --serve [PORT]` serves the run's session: approvals left at ask wait for `/approve` or `/reject` and fire `[notify]` instead of being rejected, and the process exits with exec's status once the turn and its queue end.

@@ -11,8 +11,6 @@ use crate::{
 #[path = "cli_args.rs"]
 mod arguments;
 
-use clap::Parser;
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,7 +67,7 @@ pub async fn entry() -> Result<()> {
         std::process::exit(askpass::helper(&args[1..]));
     }
     let forwarded = args.clone();
-    let cli = arguments::Cli::try_parse_from(std::iter::once("bhai".to_string()).chain(args))
+    let cli = arguments::Cli::parse(std::iter::once("bhai".to_string()).chain(args))
         .unwrap_or_else(|error| error.exit());
     // Validate run options before any command has effects.
     let mut args = cli.into_args().unwrap_or_else(|error| error.exit());
@@ -1122,10 +1120,10 @@ fn identities() -> Result<()> {
 
 #[cfg(test)]
 fn parse_args(args: &[String]) -> Result<Args> {
-    Ok(arguments::Cli::try_parse_from(
-        std::iter::once("bhai").chain(args.iter().map(String::as_str)),
-    )?
-    .into_args()?)
+    Ok(
+        arguments::Cli::parse(std::iter::once("bhai").chain(args.iter().map(String::as_str)))?
+            .into_args()?,
+    )
 }
 
 /// `BHAI_MODE` where `--mode` was not given. It is read like the flag, but `bypass` is
