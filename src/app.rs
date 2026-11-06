@@ -3247,6 +3247,7 @@ mod tests {
             connected: true.into(),
             permissions: Mutex::default(),
             held: Default::default(),
+            down: Mutex::default(),
         }));
         let mut app = app;
         app.session.mirror(Event::User("go".to_string()));

@@ -557,6 +557,8 @@ pub struct Link {
     pub permissions: Mutex<String>,
     /// How many actions taken while the link was down wait to be sent once it is back.
     pub held: std::sync::atomic::AtomicUsize,
+    /// Why the link is down, as far as attach can tell, while it is.
+    pub down: Mutex<String>,
 }
 
 impl Link {
@@ -570,6 +572,10 @@ impl Link {
 
     pub fn held(&self) -> usize {
         self.held.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn down(&self) -> String {
+        self.down.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 

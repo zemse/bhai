@@ -105,6 +105,7 @@ mod title;
 pub mod tokens;
 pub mod tools;
 mod trace;
+mod tunnel;
 mod ui;
 mod websocket;
 pub mod workflow;

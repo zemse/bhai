@@ -5,7 +5,7 @@ use crate::{
     agent, app, askpass, cache, childenv, client, config, daemon, egress, external, identity,
     input, instructions, judge, limits, mcp, memory, models, notify, ollama, permissions, profile,
     remote, sandbox, schedules, search, server, session, sessions, shutdown, skills, startup,
-    statusline, syntax, title, tokens, tools, trace, ui, workflow, worktrees,
+    statusline, syntax, title, tokens, tools, trace, tunnel, ui, workflow, worktrees,
 };
 
 #[path = "cli_args.rs"]
@@ -113,12 +113,17 @@ pub async fn entry() -> Result<()> {
             target,
             token,
             session,
+            ssh,
+            ssh_args,
+            remote_token_file,
         }) => {
+            let ssh = ssh.map(|dest| (tunnel::Ssh::new(dest, ssh_args), remote_token_file));
             return attach(
                 target.as_deref(),
                 token,
                 args.token_file.as_deref(),
                 session.as_deref(),
+                ssh,
             )
             .await;
         }
@@ -675,16 +680,58 @@ async fn serve(port: Option<u16>, open: bool, args: Args) -> Result<()> {
 
 /// `bhai attach`: the tui over a session served elsewhere. Leaving only detaches, so
 /// nothing here is stopped or saved on the way out.
+/// With `ssh`, attach runs the tunnel to the server's port itself, and reads the token
+/// from the file there when none is given here.
 async fn attach(
     target: Option<&str>,
     token: Option<String>,
     file: Option<&std::path::Path>,
     session: Option<&str>,
+    ssh: Option<(tunnel::Ssh, Option<String>)>,
 ) -> Result<()> {
-    let base = remote::base_url(target)?;
-    let token = remote::token(token, file, std::env::var(server::TOKEN_ENV).ok())?;
-    let base = remote::choose(&base, &token, session).await?;
-    let attached = remote::connect(remote::Remote::new(base.clone(), token)).await?;
+    let env = std::env::var(server::TOKEN_ENV).ok();
+    let (base, token, through) = match ssh {
+        None => (
+            remote::base_url(target)?,
+            remote::token(token, file, env)?,
+            None,
+        ),
+        Some((ssh, remote_file)) => {
+            let port = match target.map(str::trim) {
+                None | Some("") => server::DEFAULT_PORT,
+                Some(port) => match port.parse() {
+                    Ok(port) => port,
+                    Err(_) => bail!(
+                        "with --ssh the target is the server's port on that machine, not `{port}`"
+                    ),
+                },
+            };
+            let token = match (token, file, env) {
+                (None, None, None) => {
+                    let path = remote_file.as_deref().unwrap_or(tunnel::REMOTE_TOKEN);
+                    ssh.token(path).await?
+                }
+                (token, file, env) => remote::token(token, file, env)?,
+            };
+            let name = format!("{}:{port}", ssh.dest);
+            let tunnel = tunnel::Tunnel::open(ssh, tunnel::free_port()?, port);
+            tunnel.first().await?;
+            let base = format!("http://127.0.0.1:{}", tunnel.local);
+            (base, token, Some((tunnel, name)))
+        }
+    };
+    let chosen = remote::choose(&base, &token, session).await?;
+    let mut remote = remote::Remote::new(chosen.clone(), token);
+    let base = match &through {
+        // The tunnel's local end means nothing to the user; the host and port do.
+        Some((tunnel, name)) => {
+            let shown = format!("{name}{}", chosen.strip_prefix(&base).unwrap_or_default());
+            remote = remote.through(shown.clone(), tunnel.state());
+            shown
+        }
+        None => chosen,
+    };
+    let attached = remote::connect(remote).await?;
     let session = attached.session;
     let (model, effort) = session.model();
     let notices = vec![format!(
@@ -728,6 +775,9 @@ async fn attach(
         Some(attached.resync),
     )
     .await;
+    if let Some((tunnel, _)) = through {
+        tunnel.close().await;
+    }
     modes.release();
     title::pop();
     let _ = ratatui::try_restore();

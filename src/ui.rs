@@ -1836,7 +1836,10 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
                     Style::new().fg(Color::Green),
                 ),
                 false => Line::styled(
-                    format!(" disconnected from {host} · reconnecting {held}"),
+                    format!(
+                        " disconnected from {host} · {} · reconnecting {held}",
+                        clip(&link.down(), 60)
+                    ),
                     Style::new().fg(Color::Red).bold(),
                 ),
             }

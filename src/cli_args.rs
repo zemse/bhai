@@ -123,6 +123,20 @@ pub(super) enum Command {
         /// The session to show when the server is bhai serve, by its id or a prefix of it.
         #[arg(long, value_name = "ID")]
         session: Option<String>,
+        /// Reach the server over ssh to DEST (user@host): attach runs the tunnel and restarts it when it drops.
+        #[arg(long, value_name = "DEST")]
+        ssh: Option<String>,
+        /// An argument for ssh, before DEST; repeat it: --ssh-arg=-i --ssh-arg=~/key.pem.
+        #[arg(
+            long = "ssh-arg",
+            value_name = "ARG",
+            requires = "ssh",
+            allow_hyphen_values = true
+        )]
+        ssh_args: Vec<String>,
+        /// With --ssh and no token given, read it from this file on the server (default: ~/.config/bhai/server-token).
+        #[arg(long, value_name = "PATH", requires = "ssh")]
+        remote_token_file: Option<String>,
     },
     /// Serve several sessions from one headless process, opened and closed over HTTP.
     #[command(after_help = SERVE_HELP)]
@@ -701,6 +715,9 @@ mod tests {
                 target: Some("8791".to_string()),
                 token: None,
                 session: None,
+                ssh: None,
+                ssh_args: Vec::new(),
+                remote_token_file: None,
             })
         );
         assert_eq!(args.token_file.as_deref(), Some(std::path::Path::new("/t")));
@@ -711,6 +728,9 @@ mod tests {
                 target: None,
                 token: Some("abc".to_string()),
                 session: None,
+                ssh: None,
+                ssh_args: Vec::new(),
+                remote_token_file: None,
             })
         );
         let args = parse(&["attach", "7878", "--session", "ab12"]).unwrap();
@@ -718,7 +738,25 @@ mod tests {
             args.command,
             Some(Command::Attach { session: Some(ref id), .. }) if id == "ab12"
         ));
+        let args = parse(&[
+            "attach",
+            "8791",
+            "--ssh",
+            "ubuntu@host",
+            "--ssh-arg=-i",
+            "--ssh-arg",
+            "-p",
+            "--ssh-arg=2222",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Attach { ssh: Some(ref dest), ref ssh_args, .. })
+                if dest == "ubuntu@host" && ssh_args == &["-i", "-p", "2222"]
+        ));
         for refused in [
+            vec!["attach", "--ssh-arg=-v"],
+            vec!["attach", "--remote-token-file", "/t"],
             vec!["attach", "--serve"],
             vec!["attach", "--headless"],
             vec!["attach", "--resume"],

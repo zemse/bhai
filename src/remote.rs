@@ -16,6 +16,7 @@ use crate::entries::Entry;
 use crate::permissions::{Answer, Policy};
 use crate::server::{DEFAULT_PORT, KEEP_ALIVE, TOKEN_ENV, TOKEN_HEADER};
 use crate::session::{self, Action, Link, Session};
+use crate::tunnel;
 
 /// The wait between attempts to reconnect. The first after a drop goes at once; a fixed
 /// short wait after that, so a link that comes back is caught up within about this long.
@@ -90,6 +91,10 @@ pub struct Remote {
     token: String,
     /// [`IDLE`], shorter in tests.
     idle: Duration,
+    /// How the user knows the server, for notices: the URL, or the ssh host and port.
+    name: String,
+    /// The ssh tunnel attach runs to reach it, if it runs one.
+    tunnel: Option<watch::Receiver<tunnel::State>>,
 }
 
 /// Why a request got no answer worth reading.
@@ -120,9 +125,30 @@ impl Remote {
             .unwrap_or_default();
         Self {
             http,
+            name: base.clone(),
             base,
             token,
             idle: IDLE,
+            tunnel: None,
+        }
+    }
+
+    /// Reached through the tunnel whose state is `tunnel`, and named `name` for the user.
+    pub fn through(self, name: String, tunnel: watch::Receiver<tunnel::State>) -> Self {
+        Self {
+            name,
+            tunnel: Some(tunnel),
+            ..self
+        }
+    }
+
+    /// Why nothing answers, as far as can be told from here.
+    fn why_down(&self) -> String {
+        match self.tunnel.as_ref().map(|t| t.borrow().clone()) {
+            None => "no answer".to_string(),
+            Some(tunnel::State::Starting) => "ssh tunnel starting".to_string(),
+            Some(tunnel::State::Down(why)) => format!("ssh tunnel down: {why}"),
+            Some(tunnel::State::Up) => "tunnel up, server not answering".to_string(),
         }
     }
 
@@ -355,7 +381,7 @@ pub async fn connect(remote: Remote) -> Result<Attached> {
         Failed::Refused(_, message) => anyhow::anyhow!("{}: {message}", remote.base),
         Failed::Unreachable(e) => anyhow::anyhow!(
             "cannot reach {} ({e}); is bhai running there with --serve, and the ssh tunnel up?",
-            remote.base
+            remote.name
         ),
     })?;
     let text = |key: &str| state[key].as_str().unwrap_or_default().to_string();
@@ -373,11 +399,12 @@ pub async fn connect(remote: Remote) -> Result<Attached> {
     );
     let (tx_actions, rx_actions) = mpsc::unbounded_channel();
     let link = Arc::new(Link {
-        url: remote.base.clone(),
+        url: remote.name.clone(),
         actions: tx_actions,
         connected: true.into(),
         permissions: Default::default(),
         held: Default::default(),
+        down: Default::default(),
     });
     let (tx_up, up) = watch::channel(true);
     session.attach(Arc::clone(&link));
@@ -492,6 +519,7 @@ async fn follow(
             return;
         }
         up.send_replace(false);
+        *link.down.lock().unwrap_or_else(|e| e.into_inner()) = remote.why_down();
         if link.connected.swap(false, Ordering::Relaxed) {
             session.publish(session::Event::Info(format!(
                 "lost {}; reconnecting. The session there keeps running. Prompts and answers given meanwhile are held and sent once it is back.",
@@ -499,7 +527,16 @@ async fn follow(
             )));
             let _ = resync.send(());
         }
-        tokio::time::sleep(wait).await;
+        // A tunnel coming back up is tried at once rather than at the next tick.
+        match remote.tunnel.clone() {
+            Some(mut tunnel) if *tunnel.borrow() != tunnel::State::Up => {
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    _ = tunnel.wait_for(|s| *s == tunnel::State::Up) => {}
+                }
+            }
+            _ => tokio::time::sleep(wait).await,
+        }
         wait = RETRY;
     }
 }
@@ -1226,5 +1263,31 @@ mod tests {
         })
         .await;
         assert_eq!(here.link().unwrap().held(), 0);
+    }
+
+    /// Through a tunnel attach runs, the link is named for the host, and while it is
+    /// down it says whether the tunnel or the server is what failed.
+    #[tokio::test]
+    async fn a_down_link_says_whether_the_tunnel_or_the_server_failed() {
+        let served = served().await;
+        let tunnel = Tunnel::to(served.port).await;
+        let (state, rx) = watch::channel(tunnel::State::Up);
+        let remote = attach_to(tunnel.port).through("ubuntu@host:7878".into(), rx);
+        let attached = connect(remote).await.unwrap();
+        let link = Arc::clone(attached.session.link().unwrap());
+        assert_eq!(link.url, "ubuntu@host:7878");
+        tunnel.down();
+        state.send_replace(tunnel::State::Down("Connection refused".into()));
+        until("the tunnel is blamed", || {
+            link.down() == "ssh tunnel down: Connection refused"
+        })
+        .await;
+        state.send_replace(tunnel::State::Up);
+        until("the server is blamed", || {
+            link.down() == "tunnel up, server not answering"
+        })
+        .await;
+        tunnel.up();
+        until("it is back", || link.connected()).await;
     }
 }
