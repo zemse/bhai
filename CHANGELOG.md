@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-06
 
+- `GET /file` refuses paths the user's `Read` deny rules cover, and `POST /upload` those their `Write` or `Edit` deny rules cover, in every mode.
 - `GET /file?path=REL` and `POST /upload?path=REL` read and write files under the project root over the debug server, refusing escapes, protected paths and anything over 16 MiB; uploads replace a file only with `overwrite=1`.
 - `GET /state` reports `quota` as `status` does, with `checkpoint_recommended`; the `[notify]` command runs as `quota` once per weekly window when usage reaches 98%.
 - `GET /events?since=N` replays buffered events after id `N` like `Last-Event-ID` does, the header winning when both are sent.

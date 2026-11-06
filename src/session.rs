@@ -656,6 +656,15 @@ impl Session {
         (self.policy.cwd(), self.policy.home())
     }
 
+    /// The user's deny rule that keeps `tool` off `path`, as its reason, if one does.
+    pub fn denies(&self, tool: &str, path: &std::path::Path) -> Option<String> {
+        let args = serde_json::json!({ "path": path });
+        match self.policy.check(tool, &args, false) {
+            crate::permissions::Decision::Deny(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
     /// The `seq` of the newest event, 0 before the first.
     pub fn seq(&self) -> u64 {
         *self.latest.borrow()

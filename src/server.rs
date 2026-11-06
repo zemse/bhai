@@ -782,8 +782,7 @@ async fn read_file(
     State(session): State<Arc<Session>>,
     Query(query): Query<FileQuery>,
 ) -> Response {
-    let (root, home) = session.roots();
-    let path = match confined(root, home, &query.path) {
+    let path = match confined(&session, &query.path, &["read"]) {
         Ok(path) => path,
         Err((status, message)) => return error(status, &message),
     };
@@ -820,8 +819,7 @@ async fn upload(
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let overwrite = matches!(query.overwrite.as_deref(), Some("1" | "true"));
-    let (root, home) = session.roots();
-    let path = match confined(root, home, &query.path) {
+    let path = match confined(&session, &query.path, WRITE) {
         Ok(path) => path,
         Err((status, message)) => return error(status, &message),
     };
@@ -831,7 +829,7 @@ async fn upload(
         return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
     // Made above, so resolve it again in case a link sat where a directory was expected.
-    let path = match confined(root, home, &query.path) {
+    let path = match confined(&session, &query.path, WRITE) {
         Ok(path) => path,
         Err((status, message)) => return error(status, &message),
     };
@@ -860,16 +858,17 @@ async fn upload(
     }
 }
 
-/// `rel` under `root` with links resolved as far as it exists, or why it may not be
-/// touched: outside the root by `..`, an absolute path or a link, or a path the
-/// permission rules protect, by its own name or by where a link leads.
-fn confined(
-    root: &std::path::Path,
-    home: Option<&std::path::Path>,
-    rel: &str,
-) -> Result<PathBuf, (StatusCode, String)> {
+/// The tools whose deny rules keep `/upload` off a path: `Edit` rules cover `write`.
+const WRITE: &[&str] = &["write"];
+
+/// `rel` under the session's root with links resolved as far as it exists, or why it may
+/// not be touched: outside the root by `..`, an absolute path or a link, a path the
+/// permission rules protect, or one the user's deny rules for `tools` cover, by its own
+/// name or by where a link leads.
+fn confined(session: &Session, rel: &str, tools: &[&str]) -> Result<PathBuf, (StatusCode, String)> {
     use std::path::Component;
 
+    let (root, home) = session.roots();
     let refuse = |status, message: &str| Err((status, message.to_string()));
     let given = std::path::Path::new(rel);
     if rel.is_empty() || given.file_name().is_none() {
@@ -894,6 +893,22 @@ fn confined(
     let protected = |p: &std::path::Path| crate::permissions::rules::is_protected(p, home);
     if protected(&joined) || protected(&resolved) {
         return refuse(StatusCode::FORBIDDEN, "path is protected");
+    }
+    // Rules are anchored at the root as the session was given it, which may itself
+    // sit behind a link, so each path is also tried from there.
+    let given_root = session.roots().0;
+    let rebased = |path: &std::path::Path| {
+        path.strip_prefix(&root)
+            .map_or_else(|_| path.to_path_buf(), |rest| given_root.join(rest))
+    };
+    let paths = [&joined, &resolved];
+    let paths = paths.iter().flat_map(|p| [p.to_path_buf(), rebased(p)]);
+    for path in paths {
+        for tool in tools {
+            if let Some(reason) = session.denies(tool, &path) {
+                return refuse(StatusCode::FORBIDDEN, &format!("refused by {reason}"));
+            }
+        }
     }
     Ok(resolved)
 }
@@ -1895,11 +1910,15 @@ mod tests {
 
     /// A server over a session whose project root is `root`.
     async fn rooted(root: &std::path::Path) -> String {
+        rooted_with(root, crate::permissions::Rules::default()).await
+    }
+
+    async fn rooted_with(root: &std::path::Path, rules: crate::permissions::Rules) -> String {
         let (tx_user, _) = mpsc::channel(1);
         let (tx_control, _) = mpsc::channel(1);
         let policy = Policy::new(
-            crate::permissions::Mode::Ask,
-            crate::permissions::Rules::default(),
+            crate::permissions::Mode::Bypass,
+            rules,
             None,
             root.to_path_buf(),
         );
@@ -2024,6 +2043,69 @@ mod tests {
         let big = vec![0u8; FILE_LIMIT as usize + 1];
         assert_eq!(put("big.bin", false, big).await, 413);
         assert!(!root.join("big.bin").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The user's own deny rules reach the file routes as they reach the tools, whatever
+    /// the mode, and by where a link leads as well as by its name.
+    #[tokio::test]
+    async fn file_routes_honour_the_users_deny_rules() {
+        use crate::permissions::rules::Rule;
+        use std::os::unix::fs::symlink;
+
+        let dir = crate::tools::temp_dir();
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join("private")).unwrap();
+        std::fs::create_dir_all(root.join("locked")).unwrap();
+        std::fs::create_dir_all(root.join("frozen")).unwrap();
+        std::fs::write(root.join("private/notes"), "n").unwrap();
+        std::fs::write(root.join("locked/a"), "a").unwrap();
+        std::fs::write(root.join("open"), "o").unwrap();
+        symlink(root.join("private/notes"), root.join("alias")).unwrap();
+        let rule = |text: &str| Rule::parse(text).unwrap();
+        let rules = crate::permissions::Rules {
+            deny: vec![
+                rule("Read(/private/**)"),
+                rule("Write(/locked/**)"),
+                rule("Edit(/frozen/**)"),
+            ],
+            ..Default::default()
+        };
+        let base = rooted_with(&root, rules).await;
+        let http = reqwest::Client::new();
+        let get = |path: &str| {
+            let url = url::Url::parse_with_params(&format!("{base}/file"), [("path", path)]);
+            let request = http.get(url.unwrap()).header(TOKEN_HEADER, TOKEN);
+            async move { request.send().await.unwrap().status().as_u16() }
+        };
+        let put = |path: &str| {
+            let query = [("path", path), ("overwrite", "1")];
+            let url = url::Url::parse_with_params(&format!("{base}/upload"), query);
+            let request = http
+                .post(url.unwrap())
+                .header(TOKEN_HEADER, TOKEN)
+                .body("x");
+            async move { request.send().await.unwrap().status().as_u16() }
+        };
+        for (path, want) in [
+            ("private/notes", 403),
+            ("alias", 403),
+            ("locked/a", 200),
+            ("open", 200),
+        ] {
+            assert_eq!(get(path).await, want, "read {path}");
+        }
+        for (path, want) in [
+            ("locked/a", 403),
+            ("locked/new", 403),
+            ("frozen/new", 403),
+            ("private/notes", 200),
+            ("open", 200),
+        ] {
+            assert_eq!(put(path).await, want, "write {path}");
+        }
+        assert_eq!(std::fs::read(root.join("locked/a")).unwrap(), b"a");
+        assert!(!root.join("frozen/new").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
