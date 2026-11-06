@@ -651,6 +651,11 @@ impl Session {
         self.events.subscribe()
     }
 
+    /// The project root and the home directory, as the permission rules see them.
+    pub fn roots(&self) -> (&std::path::Path, Option<&std::path::Path>) {
+        (self.policy.cwd(), self.policy.home())
+    }
+
     /// The `seq` of the newest event, 0 before the first.
     pub fn seq(&self) -> u64 {
         *self.latest.borrow()

@@ -113,6 +113,13 @@ every request carries the token in `x-bhai-token`, and a request with an `Origin
 
 `GET /state` has `quota`: the latest reported usage windows and credits, `observed_at` and `age_seconds`, and `checkpoint_recommended` once the weekly window is at least 98% used. it is null until the backend has reported any.
 
+`GET /file?path=REL` returns a file's bytes and `POST /upload?path=REL` writes the request body to one, making its directories; an existing file is a 409 unless `overwrite=1` is given. both are confined to the project root: `..`, absolute paths outside it and symlinks that lead out are refused, as is anything the permission rules protect (`.git`, `.env`, `.bhai/sessions`, `auth.json`, keys and other credential files), by its own name or by where a link points. files over 16 MiB are refused with 413.
+
+```sh
+curl -s -H "x-bhai-token: $T" 'localhost:7878/file?path=src/main.rs'
+curl -s -H "x-bhai-token: $T" --data-binary @plot.png 'localhost:7878/upload?path=assets/plot.png&overwrite=1'
+```
+
 ### driving bhai from another harness
 
 `bhai models` lists exact model IDs, supported reasoning efforts and known context windows. `bhai models --json` returns one JSON object with `models` and `notes`, unlike the JSONL event stream from `exec --json`. listing reads backend metadata without starting an agent session or requesting inference.

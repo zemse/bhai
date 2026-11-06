@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{self, KeepAlive, Sse};
@@ -172,6 +172,11 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/monitors", get(monitors))
         .route("/background", get(background))
         .route("/background/kill", post(kill_background))
+        .route("/file", get(read_file))
+        .route(
+            "/upload",
+            post(upload).layer(DefaultBodyLimit::max(FILE_LIMIT as usize)),
+        )
         .layer(middleware::from_fn(move |request, next| {
             let token = token.clone();
             async move { local_only(&token, request, next).await }
@@ -759,6 +764,148 @@ async fn kill_background(
         Err(e @ Refused::Missing(_)) => error(StatusCode::NOT_FOUND, &e.to_string()),
         Err(e @ Refused::Ambiguous(_)) => error(StatusCode::BAD_REQUEST, &e.to_string()),
         Err(e @ Refused::Fixed(_)) => error(StatusCode::CONFLICT, &e.to_string()),
+    }
+}
+
+/// Largest file `/file` reads or `/upload` writes.
+const FILE_LIMIT: u64 = 16 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct FileQuery {
+    path: String,
+    /// `1` or `true` lets `/upload` replace a file that is there.
+    overwrite: Option<String>,
+}
+
+/// `?path=REL`: a file under the project root, as bytes.
+async fn read_file(
+    State(session): State<Arc<Session>>,
+    Query(query): Query<FileQuery>,
+) -> Response {
+    let (root, home) = session.roots();
+    let path = match confined(root, home, &query.path) {
+        Ok(path) => path,
+        Err((status, message)) => return error(status, &message),
+    };
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error(StatusCode::NOT_FOUND, "no such file");
+        }
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if !meta.is_file() {
+        return error(StatusCode::BAD_REQUEST, "not a regular file");
+    }
+    if meta.len() > FILE_LIMIT {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("larger than {FILE_LIMIT} bytes"),
+        );
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// `?path=REL[&overwrite=1]`: the body becomes that file under the project root, its
+/// directories made as needed. A file already there is a 409 without `overwrite`.
+async fn upload(
+    State(session): State<Arc<Session>>,
+    Query(query): Query<FileQuery>,
+    body: Bytes,
+) -> Response {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let overwrite = matches!(query.overwrite.as_deref(), Some("1" | "true"));
+    let (root, home) = session.roots();
+    let path = match confined(root, home, &query.path) {
+        Ok(path) => path,
+        Err((status, message)) => return error(status, &message),
+    };
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    }
+    // Made above, so resolve it again in case a link sat where a directory was expected.
+    let path = match confined(root, home, &query.path) {
+        Ok(path) => path,
+        Err((status, message)) => return error(status, &message),
+    };
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.is_file()) {
+        return error(StatusCode::CONFLICT, "something other than a file is there");
+    }
+    let mut options = std::fs::OpenOptions::new();
+    // A link put there since the check is not followed out of the root.
+    options.write(true).custom_flags(libc::O_NOFOLLOW);
+    match overwrite {
+        true => options.create(true).truncate(true),
+        false => options.create_new(true),
+    };
+    let written = options
+        .open(&path)
+        .and_then(|mut file| file.write_all(&body));
+    match written {
+        Ok(()) => {
+            Json(json!({ "ok": true, "path": query.path, "bytes": body.len() })).into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => error(
+            StatusCode::CONFLICT,
+            "the file exists; pass overwrite=1 to replace it",
+        ),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// `rel` under `root` with links resolved as far as it exists, or why it may not be
+/// touched: outside the root by `..`, an absolute path or a link, or a path the
+/// permission rules protect, by its own name or by where a link leads.
+fn confined(
+    root: &std::path::Path,
+    home: Option<&std::path::Path>,
+    rel: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    use std::path::Component;
+
+    let refuse = |status, message: &str| Err((status, message.to_string()));
+    let given = std::path::Path::new(rel);
+    if rel.is_empty() || given.file_name().is_none() {
+        return refuse(StatusCode::BAD_REQUEST, "path names no file");
+    }
+    if given.components().any(|c| c == Component::ParentDir) {
+        return refuse(StatusCode::FORBIDDEN, "path has `..`");
+    }
+    if root.as_os_str().is_empty() {
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the session has no project root",
+        );
+    }
+    let root = std::fs::canonicalize(root)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let joined = root.join(given);
+    if !crate::permissions::rules::is_inside(&joined, &root) {
+        return refuse(StatusCode::FORBIDDEN, "path is outside the project root");
+    }
+    let resolved = resolve(&joined);
+    let protected = |p: &std::path::Path| crate::permissions::rules::is_protected(p, home);
+    if protected(&joined) || protected(&resolved) {
+        return refuse(StatusCode::FORBIDDEN, "path is protected");
+    }
+    Ok(resolved)
+}
+
+/// `path` with links resolved as far as it exists, the rest appended as written.
+fn resolve(path: &std::path::Path) -> PathBuf {
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return real;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => resolve(parent).join(name),
+        _ => path.to_path_buf(),
     }
 }
 
@@ -1744,5 +1891,139 @@ mod tests {
         }
         let minted = token(None, None).unwrap();
         assert!(minted.shown().ends_with(&minted.value));
+    }
+
+    /// A server over a session whose project root is `root`.
+    async fn rooted(root: &std::path::Path) -> String {
+        let (tx_user, _) = mpsc::channel(1);
+        let (tx_control, _) = mpsc::channel(1);
+        let policy = Policy::new(
+            crate::permissions::Mode::Ask,
+            crate::permissions::Rules::default(),
+            None,
+            root.to_path_buf(),
+        );
+        let session = Session::new(
+            "test-model".to_string(),
+            "medium".to_string(),
+            "router".to_string(),
+            tx_user,
+            tx_control,
+            Arc::new(crate::agent::Cancel::default()),
+            Arc::new(policy),
+            None,
+        );
+        let listener = bind(0).await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(serve(listener, session, TOKEN.to_string()));
+        base
+    }
+
+    #[tokio::test]
+    async fn files_are_read_only_from_inside_the_root_and_never_protected_ones() {
+        use std::os::unix::fs::symlink;
+
+        let dir = crate::tools::temp_dir();
+        let (root, outside) = (dir.join("root"), dir.join("outside"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("src/a.txt"), b"hello\x00bytes").unwrap();
+        std::fs::write(root.join(".env"), "KEY=1").unwrap();
+        std::fs::write(root.join(".git/config"), "x").unwrap();
+        std::fs::write(outside.join("secret"), "s").unwrap();
+        symlink(outside.join("secret"), root.join("escape")).unwrap();
+        symlink(root.join(".env"), root.join("innocent")).unwrap();
+        symlink(&outside, root.join("out")).unwrap();
+        let base = rooted(&root).await;
+        let http = reqwest::Client::new();
+        let get = |path: String| {
+            let url = url::Url::parse_with_params(&format!("{base}/file"), [("path", path)]);
+            http.get(url.unwrap()).header(TOKEN_HEADER, TOKEN).send()
+        };
+        let read = get("src/a.txt".into()).await.unwrap();
+        assert_eq!(read.status().as_u16(), 200);
+        assert_eq!(&read.bytes().await.unwrap()[..], b"hello\x00bytes");
+        let inside = root.join("src/a.txt").to_string_lossy().into_owned();
+        assert_eq!(get(inside).await.unwrap().status().as_u16(), 200);
+        for (path, want) in [
+            ("src/missing", 404),
+            ("src", 400),
+            ("", 400),
+            ("../outside/secret", 403),
+            ("src/../src/a.txt", 403),
+            ("/etc/hosts", 403),
+            ("escape", 403),
+            ("out/secret", 403),
+            (".env", 403),
+            ("innocent", 403),
+            (".git/config", 403),
+            ("sub/.codex/auth.json", 403),
+            ("id_ed25519", 403),
+        ] {
+            let status = get(path.into()).await.unwrap().status().as_u16();
+            assert_eq!(status, want, "{path}");
+        }
+        let status = http
+            .get(format!("{base}/file?path=src/a.txt"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 403);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn uploads_stay_inside_the_root_and_overwrite_only_when_asked() {
+        use std::os::unix::fs::symlink;
+
+        let dir = crate::tools::temp_dir();
+        let (root, outside) = (dir.join("root"), dir.join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("target"), "old").unwrap();
+        symlink(&outside, root.join("out")).unwrap();
+        symlink(outside.join("target"), root.join("link")).unwrap();
+        let base = rooted(&root).await;
+        let http = reqwest::Client::new();
+        let put = |path: &str, overwrite: bool, body: Vec<u8>| {
+            let mut query = vec![("path", path.to_string())];
+            if overwrite {
+                query.push(("overwrite", "1".to_string()));
+            }
+            let url = url::Url::parse_with_params(&format!("{base}/upload"), &query);
+            let request = http
+                .post(url.unwrap())
+                .header(TOKEN_HEADER, TOKEN)
+                .body(body);
+            async move { request.send().await.unwrap().status().as_u16() }
+        };
+        assert_eq!(put("new/dir/f.bin", false, b"one".to_vec()).await, 200);
+        assert_eq!(std::fs::read(root.join("new/dir/f.bin")).unwrap(), b"one");
+        assert_eq!(put("new/dir/f.bin", false, b"two".to_vec()).await, 409);
+        assert_eq!(std::fs::read(root.join("new/dir/f.bin")).unwrap(), b"one");
+        assert_eq!(put("new/dir/f.bin", true, b"two".to_vec()).await, 200);
+        assert_eq!(std::fs::read(root.join("new/dir/f.bin")).unwrap(), b"two");
+        for (path, want) in [
+            ("out/planted", 403),
+            ("out/target", 403),
+            ("link", 403),
+            ("../outside/planted", 403),
+            ("/tmp/planted", 403),
+            (".git/hooks/pre-commit", 403),
+            (".env", 403),
+            (".bhai/config.toml", 403),
+            ("new", 409),
+        ] {
+            assert_eq!(put(path, true, b"x".to_vec()).await, want, "{path}");
+        }
+        assert!(!outside.join("planted").exists());
+        assert_eq!(std::fs::read(outside.join("target")).unwrap(), b"old");
+        assert!(!root.join(".git").exists());
+        let big = vec![0u8; FILE_LIMIT as usize + 1];
+        assert_eq!(put("big.bin", false, big).await, 413);
+        assert!(!root.join("big.bin").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

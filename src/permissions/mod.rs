@@ -243,6 +243,10 @@ impl Policy {
         &self.cwd
     }
 
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
     pub fn with_store(self, store: PathBuf) -> Self {
         Self {
             store: Some(store),
