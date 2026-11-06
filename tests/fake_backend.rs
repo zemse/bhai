@@ -343,6 +343,7 @@ fn logged_in(dir: &std::path::Path) -> (PathBuf, PathBuf) {
 /// A bhai `--serve 0 --headless` in a scratch home and project, killed on drop.
 struct Bhai {
     child: Child,
+    stdout: Option<tokio::process::ChildStdout>,
     base: String,
     token: String,
     http: reqwest::Client,
@@ -385,6 +386,20 @@ impl Bhai {
         config: Option<&str>,
         prepare: impl FnOnce(&std::path::Path, &std::path::Path),
     ) -> Bhai {
+        let lead = ["--serve", "0", "--headless"];
+        Self::launch(backend, &lead, flags, env, config, prepare).await
+    }
+
+    /// As `start_prepared`, with `lead` in place of the server's flags. Its stdout is
+    /// kept in `stdout`.
+    async fn launch(
+        backend: &str,
+        lead: &[&str],
+        flags: &[&str],
+        env: &[(&str, &str)],
+        config: Option<&str>,
+        prepare: impl FnOnce(&std::path::Path, &std::path::Path),
+    ) -> Bhai {
         let dir = std::env::temp_dir().join(format!("bhai-fake-{}", uuid::Uuid::new_v4()));
         let (home, codex) = logged_in(&dir);
         if let Some(config) = config {
@@ -397,7 +412,7 @@ impl Bhai {
         prepare(&home, &project);
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_bhai"))
-            .args(["--serve", "0", "--headless"])
+            .args(lead)
             .args(flags)
             .current_dir(&project)
             .env("HOME", &home)
@@ -411,11 +426,12 @@ impl Bhai {
             .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
             .envs(env.iter().copied())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let stdout = child.stdout.take();
 
         let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
         let mut said = String::new();
@@ -443,6 +459,7 @@ impl Bhai {
 
         Bhai {
             child,
+            stdout,
             base: base.to_string(),
             token,
             http: reqwest::Client::new(),
@@ -1037,6 +1054,87 @@ async fn a_tool_call_waits_for_approve_runs_and_its_output_goes_back() {
         outputs.iter().any(|o| o["call_id"] == "call_1"),
         "{outputs:?}"
     );
+}
+
+/// `exec --serve`: the turn's approval waits for `/approve` rather than being refused, a
+/// prompt sent over the server while it waits joins the turn at its next step, and the
+/// process exits once the turn is done, with the answer on stdout.
+#[tokio::test]
+async fn a_served_exec_waits_for_approve_takes_a_prompt_and_exits() {
+    use tokio::io::AsyncReadExt as _;
+
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(runs("call_1", "touch made-by-exec"));
+        replies.push_back(says("made it"));
+    }
+    let backend = serve_fake(fake.clone()).await;
+    let lead = ["exec", "make a file", "--serve", "0"];
+    let mut bhai = Bhai::launch(&backend, &lead, &[], &[], None, |_, _| {}).await;
+    let mut events = bhai.events().await;
+
+    let approval = events.until("approval").await;
+    assert_eq!(approval["data"]["tool"], "bash", "{approval}");
+    let (status, answer) = bhai.post("/prompt", json!({ "text": "then this" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["queued"], 1, "{answer}");
+    let id = approval["data"]["id"].clone();
+    let (status, answer) = bhai.post("/approve", json!({ "id": id })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let exited = timeout(WAIT, bhai.child.wait())
+        .await
+        .expect("exec did not exit");
+    assert!(exited.unwrap().success());
+    let mut out = String::new();
+    let mut stdout = bhai.stdout.take().unwrap();
+    stdout.read_to_string(&mut out).await.unwrap();
+    assert_eq!(out, "made it\n");
+    assert!(bhai.project().join("made-by-exec").exists());
+    let sent = fake.responses();
+    assert_eq!(sent.len(), 2, "{sent:#?}");
+    assert!(mentions(&sent[1].body, "then this"), "{}", sent[1].body);
+}
+
+/// Without `--serve`, `exec` still refuses what is left at ask, at once.
+#[tokio::test]
+async fn an_exec_without_the_server_rejects_the_approval() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(runs("call_1", "touch made-by-exec"));
+        replies.push_back(says("could not"));
+    }
+    let backend = serve_fake(fake.clone()).await;
+    let dir = std::env::temp_dir().join(format!("bhai-fake-exec-{}", uuid::Uuid::new_v4()));
+    let (home, codex) = logged_in(&dir);
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let ran = timeout(
+        WAIT,
+        Command::new(env!("CARGO_BIN_EXE_bhai"))
+            .args(["exec", "make a file"])
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("CODEX_HOME", &codex)
+            .env("BHAI_TEST_BASE_URL", &backend)
+            .env_remove("BHAI_MODEL")
+            .env_remove("BHAI_MODE")
+            .env_remove("BHAI_EFFORT")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("exec did not exit")
+    .unwrap();
+    let said = String::from_utf8_lossy(&ran.stderr).into_owned();
+    assert!(ran.status.success(), "{said}");
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "could not\n");
+    assert!(said.contains("[rejected]"), "{said}");
+    assert!(!project.join("made-by-exec").exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

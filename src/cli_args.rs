@@ -11,7 +11,7 @@ use crate::{config::Flags, permissions};
     version,
     propagate_version = true,
     about = "An agent harness.",
-    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read.\nSIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints how to resume it.\n[notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends, failed logins and a 98% used week; see the README.\n--serve listens on 127.0.0.1 only. From a laptop: ssh -N -L PORT:127.0.0.1:PORT host, then send the token in the x-bhai-token header. --token-file or BHAI_TOKEN keeps the token across restarts.\nGET /events?since=N (or Last-Event-ID) replays the events after id N, then streams live; a lagged event means refetch /state.\nGET /file?path=REL and POST /upload?path=REL[&overwrite=1] move files in and out of the project root, never protected ones."
+    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected, unless exec --serve lets them wait for /approve.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read.\nSIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints how to resume it.\n[notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends, failed logins and a 98% used week; see the README.\n--serve listens on 127.0.0.1 only. From a laptop: ssh -N -L PORT:127.0.0.1:PORT host, then send the token in the x-bhai-token header. --token-file or BHAI_TOKEN keeps the token across restarts.\nGET /events?since=N (or Last-Event-ID) replays the events after id N, then streams live; a lagged event means refetch /state.\nGET /file?path=REL and POST /upload?path=REL[&overwrite=1] move files in and out of the project root, never protected ones."
 )]
 pub(super) struct Cli {
     #[command(subcommand)]
@@ -65,13 +65,13 @@ pub(super) struct Cli {
     #[arg(long, global = true)]
     strict_cache: bool,
     /// Start the debug HTTP server on 127.0.0.1 (default port: 7878).
-    #[arg(long, num_args = 0..=1, default_missing_value = "7878", value_name = "PORT")]
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "7878", value_name = "PORT")]
     serve: Option<u16>,
     /// Run the debug server without the terminal UI; SIGINT ends it as SIGTERM does.
-    #[arg(long, requires = "serve")]
+    #[arg(long, global = true, requires = "serve")]
     headless: bool,
     /// Read the server token from this file, or create it (mode 600) with a new one; overrides BHAI_TOKEN.
-    #[arg(long, requires = "serve", value_name = "PATH")]
+    #[arg(long, global = true, requires = "serve", value_name = "PATH")]
     token_file: Option<std::path::PathBuf>,
     /// Run a workflow, with optional input.
     #[arg(long, num_args = 1..=2, value_names = ["NAME", "INPUT"])]
@@ -94,7 +94,7 @@ pub(super) struct Cli {
 pub(super) enum Command {
     /// Run one unattended turn; use - as the prompt to read stdin.
     #[command(
-        after_help = "Text output goes to stdout, progress to stderr. --json emits session events as JSONL.\nApprovals left at ask are rejected; configure allow rules or explicitly select --mode auto."
+        after_help = "Text output goes to stdout, progress to stderr. --json emits session events as JSONL.\nApprovals left at ask are rejected; configure allow rules or explicitly select --mode auto.\n\nWith --serve [PORT] (after the prompt, or as --serve=PORT) the debug server serves the run:\nan approval left at ask waits for POST /approve or /reject and fires the [notify] command,\n/prompt joins or queues behind the turn, and /steer, /interrupt and /events work.\nThe process exits once the turn and anything queued behind it have ended, with the usual status.\nThere is no terminal UI to leave out, so --headless is refused.\n  bhai exec 'fix the flaky test' --serve 7878 --token-file ~/.config/bhai/token"
     )]
     Exec {
         /// Instructions for the agent, or - to read stdin.
@@ -220,14 +220,28 @@ impl Cli {
                 "--workflow runs on its own, without --serve, --headless or --pick",
             ));
         }
-        if parsed.exec.is_some()
-            && (parsed.serve.is_some()
-                || parsed.headless
-                || parsed.workflow.is_some()
-                || parsed.pick)
-        {
+        if parsed.exec.is_some() && parsed.headless {
             return Err(Self::invalid(
-                "exec and --print run on their own, without --serve, --headless, --workflow or --pick",
+                "exec and --print never draw the terminal UI, so drop --headless; --serve alone serves the run",
+            ));
+        }
+        if parsed.exec.is_some() && (parsed.workflow.is_some() || parsed.pick) {
+            return Err(Self::invalid(
+                "exec and --print run on their own, without --workflow or --pick",
+            ));
+        }
+        let utility = matches!(
+            parsed.command,
+            Some(
+                Command::Identities
+                    | Command::Usage
+                    | Command::Sessions { .. }
+                    | Command::Mcp { .. }
+            )
+        );
+        if utility && (parsed.serve.is_some() || parsed.headless) {
+            return Err(Self::invalid(
+                "--serve and --headless run a session; this command does not start one",
             ));
         }
         let models = matches!(parsed.command, Some(Command::Models));

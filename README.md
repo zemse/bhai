@@ -120,6 +120,8 @@ curl -s -H "x-bhai-token: $T" 'localhost:7878/file?path=src/main.rs'
 curl -s -H "x-bhai-token: $T" --data-binary @plot.png 'localhost:7878/upload?path=assets/plot.png&overwrite=1'
 ```
 
+`bhai exec PROMPT --serve [port]` runs one turn exactly as `exec` does, with stdout and `--json` unchanged, while the server serves that session. an approval left at ask then waits for `/approve` or `/reject` (and fires the `[notify]` command) instead of being rejected, and is shown on stderr in text mode; `/prompt` joins the turn, and `/steer`, `/interrupt` and `/events` work as they do for `--headless`. the process exits once the turn and anything queued behind it have ended, with exec's usual status. put `--serve` after the prompt or write `--serve=PORT`, since a bare `--serve` before it takes the prompt for a port. `--headless` is refused with exec, which never draws the terminal anyway.
+
 ### driving bhai from another harness
 
 `bhai models` lists exact model IDs, supported reasoning efforts and known context windows. `bhai models --json` returns one JSON object with `models` and `notes`, unlike the JSONL event stream from `exec --json`. listing reads backend metadata without starting an agent session or requesting inference.

@@ -228,8 +228,9 @@ pub async fn entry() -> Result<()> {
     } = load(args.flags, &name, Some(&session_id)).await?;
     // `--workflow` and `exec` answer every approval but the workflow's own with no, so a
     // call the rules leave at `Ask` is refused for good. The agent is told that rather
-    // than told to ask someone who is not there.
-    let policy = match args.workflow.is_some() || args.exec.is_some() {
+    // than told to ask someone who is not there. `exec --serve` has the server to ask.
+    let unattended = args.workflow.is_some() || (args.exec.is_some() && args.serve.is_none());
+    let policy = match unattended {
         true => policy.unattended(),
         false => policy,
     };
@@ -458,7 +459,24 @@ allow it.",
         for notice in &notices {
             eprintln!("bhai: {notice}");
         }
-        let result = headless_exec(&session, prompt, args.json).await;
+        let served = match listener {
+            Some((listener, token)) => {
+                session.watch_background(crate::background::sources(hub.clone()));
+                notify::watch(session.subscribe());
+                eprintln!(
+                    "bhai: debug server on http://{} ({})",
+                    listener.local_addr()?,
+                    token.shown()
+                );
+                let session = Arc::clone(&session);
+                Some(tokio::spawn(server::serve(listener, session, token.value)))
+            }
+            None => None,
+        };
+        let result = headless_exec(&session, prompt, args.json, served.is_some()).await;
+        if let Some(server) = served {
+            server.abort();
+        }
         shutdown(hub).await;
         worktrees::settle();
         if !result? {
@@ -1169,6 +1187,8 @@ async fn headless_workflow(
 #[derive(Default)]
 struct ExecRun {
     failed: bool,
+    /// The debug server is up, so an approval waits for it and text mode says so.
+    served: bool,
 }
 
 impl ExecRun {
@@ -1205,6 +1225,16 @@ impl ExecRun {
                     writeln!(err, "[error] {message}")?
                 }
                 Event::Interrupted => writeln!(err, "[interrupted]")?,
+                Event::Approval {
+                    id, tool, command, ..
+                } if self.served => writeln!(
+                    err,
+                    "[approval {id}] {tool}: {command} (POST /approve or /reject)"
+                )?,
+                Event::Resolved { id, accepted, .. } if self.served => {
+                    let said = if *accepted { "approved" } else { "rejected" };
+                    writeln!(err, "[approval {id}] {said}")?
+                }
                 Event::TurnEnd => writeln!(out)?,
                 _ => {}
             }
@@ -1234,12 +1264,22 @@ fn exec_prompt(prompt: String, input: impl std::io::Read) -> Result<String> {
 }
 
 /// Run one prompt to the end of its turn without the TUI. Returns `false` when the turn
-/// failed or was interrupted, which is the exit status. The policy is unattended, so an
-/// approval is not expected; one that arrives anyway is rejected.
-async fn headless_exec(session: &Arc<Session>, prompt: String, json: bool) -> Result<bool> {
+/// failed or was interrupted, which is the exit status. Unless `served`, the policy is
+/// unattended, so an approval is not expected; one that arrives anyway is rejected.
+/// Served, an approval waits for the server, and the run goes on through the prompts
+/// queued behind the turn.
+async fn headless_exec(
+    session: &Arc<Session>,
+    prompt: String,
+    json: bool,
+    served: bool,
+) -> Result<bool> {
     let mut events = session.subscribe();
     session.submit(prompt).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut run = ExecRun::default();
+    let mut run = ExecRun {
+        served,
+        ..ExecRun::default()
+    };
     loop {
         let event = match events.recv().await {
             Ok(event) => event,
@@ -1252,7 +1292,9 @@ async fn headless_exec(session: &Arc<Session>, prompt: String, json: bool) -> Re
                 break;
             }
         };
-        if let session::Event::Approval { id, .. } = &event {
+        if let session::Event::Approval { id, .. } = &event
+            && !served
+        {
             session.answer(permissions::Answer::Reject, Some(*id));
         }
         let over = run.event(
@@ -1261,7 +1303,9 @@ async fn headless_exec(session: &Arc<Session>, prompt: String, json: bool) -> Re
             &mut std::io::stdout().lock(),
             &mut std::io::stderr().lock(),
         )?;
-        if over {
+        // A prompt queued behind the turn has started by the time its end is published,
+        // and one still in the channel was sent before the end was read.
+        if over && !(served && (session.working() || !events.is_empty())) {
             break;
         }
     }
@@ -2089,6 +2133,56 @@ mod tests {
         assert!(parsed(&["--json"]).is_err());
         assert!(parsed(&["exec", "x", "--serve", "--headless"]).is_err());
         assert!(parsed(&["exec", "x", "--workflow", "w"]).is_err());
+        let served = parsed(&["exec", "x", "--serve", "9000", "--token-file", "/t"]).unwrap();
+        assert_eq!((served.serve, served.headless), (Some(9000), false));
+        assert_eq!(
+            served.token_file.as_deref(),
+            Some(std::path::Path::new("/t"))
+        );
+        assert_eq!(parsed(&["--serve", "-p", "x"]).unwrap().serve, Some(7878));
+        assert_eq!(parsed(&["exec", "--serve=1", "x"]).unwrap().serve, Some(1));
+        for refused in [
+            vec!["sessions", "--serve"],
+            vec!["usage", "--serve", "1"],
+            vec!["identities", "--serve", "--headless"],
+            vec!["exec", "x", "--token-file", "/t"],
+        ] {
+            assert!(parsed(&refused).is_err(), "{refused:?}");
+        }
+    }
+
+    /// Served, an approval is shown on stderr while it waits, and its answer after.
+    #[test]
+    fn served_exec_says_an_approval_is_waiting() {
+        use session::Event;
+        let approval = Event::Approval {
+            id: 3,
+            tool: "bash".to_string(),
+            command: "ls".to_string(),
+            preview: None,
+            offers: permissions::Offers::default(),
+        };
+        let resolved = Event::Resolved {
+            id: 3,
+            accepted: true,
+            remember: None,
+        };
+        let events = [approval, resolved, Event::TurnEnd];
+        let (_, out, err, _) = exec_run(&events, false);
+        assert_eq!((out.as_str(), err.as_str()), ("\n", ""));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut run = ExecRun {
+            served: true,
+            ..ExecRun::default()
+        };
+        for event in &events {
+            run.event(event, false, &mut out, &mut err).unwrap();
+        }
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(
+            err,
+            "[approval 3] bash: ls (POST /approve or /reject)\n[approval 3] approved\n"
+        );
     }
 
     fn exec_run(events: &[session::Event], json: bool) -> (bool, String, String, bool) {
