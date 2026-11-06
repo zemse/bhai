@@ -3069,12 +3069,9 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         }
     }
 
-    /// Where the session this one shows is served, and whether it is reachable now,
-    /// when it is attached to one.
-    pub fn attached(&self) -> Option<(&str, bool)> {
-        self.session
-            .link()
-            .map(|link| (link.url.as_str(), link.connected()))
+    /// The link to where the session this one shows is served, when it is attached.
+    pub fn attached(&self) -> Option<&crate::session::Link> {
+        self.session.link().map(|link| &**link)
     }
 
     fn busy(&self) -> bool {
@@ -3249,6 +3246,7 @@ mod tests {
             actions: tx,
             connected: true.into(),
             permissions: Mutex::default(),
+            held: Default::default(),
         }));
         let mut app = app;
         app.session.mirror(Event::User("go".to_string()));

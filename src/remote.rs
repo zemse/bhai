@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use futures_util::StreamExt as _;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::entries::Entry;
 use crate::permissions::{Answer, Policy};
@@ -377,7 +377,9 @@ pub async fn connect(remote: Remote) -> Result<Attached> {
         actions: tx_actions,
         connected: true.into(),
         permissions: Default::default(),
+        held: Default::default(),
     });
+    let (tx_up, up) = watch::channel(true);
     session.attach(Arc::clone(&link));
     let after = state["seq"].as_u64().unwrap_or_default();
     session.seed(&state, transcript);
@@ -388,12 +390,14 @@ pub async fn connect(remote: Remote) -> Result<Attached> {
         Arc::clone(&session),
         after,
         tx_resync,
+        tx_up,
     ));
     // Nothing is sent to an agent here; the receivers are held so a send fails quietly.
     tokio::spawn(act(
         remote,
         Arc::clone(&session),
         rx_actions,
+        up,
         (rx_user, rx_control),
     ));
     Ok(Attached { session, resync })
@@ -416,12 +420,14 @@ async fn reseed(remote: &Remote, session: &Session) -> Option<u64> {
 }
 
 /// Follow `/events` into `session` for as long as the session lives, reconnecting every
-/// [`RETRY`] and picking up after the last event seen.
+/// [`RETRY`] and picking up after the last event seen. `up` says whether the stream is
+/// open, for what [`act`] holds while it is not.
 async fn follow(
     remote: Remote,
     session: Arc<Session>,
     mut after: u64,
     resync: mpsc::UnboundedSender<()>,
+    up: watch::Sender<bool>,
 ) {
     let Some(link) = session.link().cloned() else {
         return;
@@ -434,6 +440,7 @@ async fn follow(
                     session.publish(session::Event::Info(format!("reconnected to {}", link.url)));
                     let _ = resync.send(());
                 }
+                up.send_replace(true);
                 wait = Duration::ZERO;
                 let mut stream = response.bytes_stream();
                 let mut buf = Vec::new();
@@ -484,9 +491,10 @@ async fn follow(
         if resync.is_closed() {
             return;
         }
+        up.send_replace(false);
         if link.connected.swap(false, Ordering::Relaxed) {
             session.publish(session::Event::Info(format!(
-                "lost {}; reconnecting. The session there keeps running.",
+                "lost {}; reconnecting. The session there keeps running. Prompts and answers given meanwhile are held and sent once it is back.",
                 link.url
             )));
             let _ = resync.send(());
@@ -496,20 +504,52 @@ async fn follow(
     }
 }
 
-/// Carry each action to the served session, one at a time, in the order taken.
+/// An action waiting to be sent, routed when it was taken so a retry carries the same
+/// prompt id.
+struct Held {
+    action: Action,
+    path: String,
+    body: Value,
+    /// Taken while the link was down.
+    late: bool,
+}
+
+/// Carry each action to the served session, one at a time, in the order taken. While
+/// the link is down they are held and sent once it is back, except an interrupt, which
+/// then could stop a turn the user never saw and so is refused at once.
 async fn act<T>(
     remote: Remote,
     session: Arc<Session>,
     mut actions: mpsc::UnboundedReceiver<Action>,
-    _held: T,
+    mut up: watch::Receiver<bool>,
+    _keep: T,
 ) {
-    while let Some(action) = actions.recv().await {
+    let Some(link) = session.link().cloned() else {
+        return;
+    };
+    let mut held = std::collections::VecDeque::new();
+    loop {
+        if held.is_empty() || !*up.borrow() {
+            tokio::select! {
+                action = actions.recv() => match action {
+                    Some(action) => take(&session, &mut held, action, *up.borrow()),
+                    None => return,
+                },
+                changed = up.changed() => if changed.is_err() {
+                    return;
+                },
+            }
+            link.held.store(held.len(), Ordering::Relaxed);
+            continue;
+        }
+        let Some(next) = held.front() else {
+            continue;
+        };
         let refresh = matches!(
-            action,
+            next.action,
             Action::Mode(_) | Action::Allow(_) | Action::Trust(_)
         );
-        let (path, body) = route(&action);
-        match remote.post(&path, body).await {
+        match remote.post(&next.path, next.body.clone()).await {
             Ok(answer) => {
                 let said = ["allowed", "trusted", "untrusted"]
                     .iter()
@@ -518,11 +558,97 @@ async fn act<T>(
                     session.publish(session::Event::Info(said.to_string()));
                 }
             }
-            Err(e) => session.publish(session::Event::Error(format!("{path}: {e}"))),
+            // A prompt carries its id and an answer names its approval, so sending
+            // either again cannot do it twice; the rest are not sent blind.
+            Err(Failed::Unreachable(_)) if retried(&next.action) => {
+                if let Some(next) = held.front_mut().filter(|next| !next.late) {
+                    next.late = true;
+                    session.publish(session::Event::Info(format!(
+                        "no answer from {}; {} is held and sent again once it answers",
+                        link.url,
+                        described_action(&next.action)
+                    )));
+                }
+                let _ = tokio::time::timeout(RETRY, up.wait_for(|up| !*up)).await;
+                continue;
+            }
+            Err(Failed::Unreachable(e)) => session.publish(session::Event::Error(format!(
+                "{} may not have reached {}: {e}",
+                described_action(&next.action),
+                link.url
+            ))),
+            Err(Failed::Refused(409, _)) if next.late && matches!(next.action, Action::Answer { .. }) => {
+                session.publish(session::Event::Error(
+                    "the approval answered while disconnected was settled there before the link came back, so the answer was not used".to_string(),
+                ))
+            }
+            Err(e) => session.publish(session::Event::Error(format!("{}: {e}", next.path))),
         }
-        if refresh && let Some(link) = session.link() {
-            refresh_permissions(&remote, link).await;
+        held.pop_front();
+        link.held.store(held.len(), Ordering::Relaxed);
+        if refresh {
+            refresh_permissions(&remote, &link).await;
         }
+    }
+}
+
+/// Queue `action` to be sent, saying so when the link is down.
+fn take(session: &Session, held: &mut std::collections::VecDeque<Held>, action: Action, up: bool) {
+    if !up {
+        if matches!(action, Action::Interrupt | Action::InterruptChild(_)) {
+            session.publish(session::Event::Error(format!(
+                "not connected, so the {} was not sent; try again once reconnected",
+                described_action(&action)
+            )));
+            return;
+        }
+        let said = match &action {
+            Action::Prompt(text) => format!("held until reconnected: {text}"),
+            Action::Answer { .. } => "held until reconnected: your answer to the approval, used if it is still waiting then".to_string(),
+            other => format!("held until reconnected: {}", described_action(other)),
+        };
+        session.publish(session::Event::Info(said));
+    }
+    let (path, body) = route(&action);
+    held.push_back(Held {
+        action,
+        path,
+        body,
+        late: !up,
+    });
+}
+
+/// Whether `action` is sent again after a request that got no answer.
+fn retried(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Prompt(_)
+            | Action::Answer { .. }
+            | Action::Mode(_)
+            | Action::Model { .. }
+            | Action::Fast(_)
+            | Action::Goal(_)
+            | Action::Allow(_)
+            | Action::Trust(_)
+    )
+}
+
+/// What `action` is, in a few words for a notice.
+fn described_action(action: &Action) -> String {
+    match action {
+        Action::Prompt(_) => "the prompt".into(),
+        Action::Answer { .. } => "the answer to the approval".into(),
+        Action::Interrupt => "interrupt".into(),
+        Action::InterruptChild(id) => format!("interrupt of {id}"),
+        Action::Steer { id, .. } => format!("message to {id}"),
+        Action::Mode(mode) => format!("mode change to {}", mode.as_str()),
+        Action::Model { model, .. } => format!("model change to {model}"),
+        Action::Fast(_) => "fast mode change".into(),
+        Action::Retry => "retry".into(),
+        Action::Goal(_) => "goal".into(),
+        Action::Allow(rule) => format!("rule {rule}"),
+        Action::Trust(true) => "trust".into(),
+        Action::Trust(false) => "untrust".into(),
     }
 }
 
@@ -997,5 +1123,108 @@ mod tests {
         assert!(texts(&here).is_empty());
         tunnel.up();
         until("what was missed arrives", || texts(&here) == ["unseen"]).await;
+    }
+
+    fn errors(session: &Session) -> Vec<String> {
+        shown(session)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Error(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Start a turn there from here and park it on an approval, returning the approval's
+    /// id and where its answer lands.
+    async fn parked(served: &mut Served, here: &Session) -> (u64, oneshot::Receiver<Answer>) {
+        here.submit("go".to_string()).unwrap();
+        assert_eq!(served.prompts.recv().await.unwrap(), "go");
+        let (reply, decided) = oneshot::channel();
+        served
+            .agent
+            .send(AgentEvent::Approval {
+                tool: "bash".into(),
+                command: "touch x".into(),
+                preview: None,
+                offers: Offers::default(),
+                reply,
+            })
+            .unwrap();
+        until("the approval shows here", || here.state().pending.is_some()).await;
+        (here.state().pending.unwrap().id, decided)
+    }
+
+    /// While the link is down, prompts and an answer to the approval on screen are held,
+    /// said to be, counted on the link, and sent in order once it is back; an interrupt
+    /// is refused at once rather than sent late.
+    #[tokio::test]
+    async fn what_is_done_while_disconnected_is_held_or_refused() {
+        let mut served = served().await;
+        let tunnel = Tunnel::to(served.port).await;
+        let attached = connect(attach_to(tunnel.port)).await.unwrap();
+        let here = attached.session;
+        let (id, decided) = parked(&mut served, &here).await;
+        tunnel.down();
+        until("the drop is noticed", || !here.link().unwrap().connected()).await;
+        assert_eq!(here.answer(Answer::Accept(None), Some(id)), Some(id));
+        here.submit("first".to_string()).unwrap();
+        here.submit("second".to_string()).unwrap();
+        assert!(here.interrupt());
+        until("three are held", || here.link().unwrap().held() == 3).await;
+        let infos: Vec<_> = shown(&here)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Info(t) if t.starts_with("held until reconnected") => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(infos.len(), 3, "{infos:?}");
+        assert!(infos[1].ends_with("first"), "{infos:?}");
+        until("the interrupt is refused", || {
+            errors(&here)
+                .iter()
+                .any(|e| e.contains("interrupt was not sent"))
+        })
+        .await;
+        tokio::time::sleep(RETRY).await;
+        assert!(served.session.state().pending.is_some());
+
+        tunnel.up();
+        let answer = timeout(WAIT, decided).await.unwrap().unwrap();
+        assert_eq!(answer, Answer::Accept(None));
+        until("the prompts queue there", || {
+            served.session.queued() == ["first", "second"]
+        })
+        .await;
+        until("nothing is held", || here.link().unwrap().held() == 0).await;
+        assert!(!shown(&served.session).contains(&Event::Interrupted));
+        served.agent.send(AgentEvent::TurnEnd).unwrap();
+        assert_eq!(served.prompts.recv().await.unwrap(), "first");
+    }
+
+    /// An answer held while the link was down, to an approval settled there meanwhile,
+    /// is said not to have been used.
+    #[tokio::test]
+    async fn a_held_answer_to_a_settled_approval_is_reported() {
+        let mut served = served().await;
+        let tunnel = Tunnel::to(served.port).await;
+        let attached = connect(attach_to(tunnel.port)).await.unwrap();
+        let here = attached.session;
+        let (id, decided) = parked(&mut served, &here).await;
+        tunnel.down();
+        until("the drop is noticed", || !here.link().unwrap().connected()).await;
+        assert_eq!(here.answer(Answer::Reject, Some(id)), Some(id));
+        assert_eq!(
+            served.session.answer(Answer::Accept(None), Some(id)),
+            Some(id)
+        );
+        assert_eq!(decided.await.unwrap(), Answer::Accept(None));
+        tunnel.up();
+        until("the late answer is reported", || {
+            errors(&here).iter().any(|e| e.contains("was not used"))
+        })
+        .await;
+        assert_eq!(here.link().unwrap().held(), 0);
     }
 }

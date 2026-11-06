@@ -1823,16 +1823,20 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
         ));
     }
     // Attached, the prompt goes to another machine, and ctrl+c leaves it running there.
-    if let Some((url, connected)) = app.attached() {
-        let host = url.trim_start_matches("http://");
+    if let Some(link) = app.attached() {
+        let host = link.url.trim_start_matches("http://");
+        let held = match link.held() {
+            0 => String::new(),
+            n => format!("· {n} held to send "),
+        };
         block = block.title(
-            match connected {
+            match link.connected() {
                 true => Line::styled(
-                    format!(" attached to {host} · ctrl+c detaches "),
+                    format!(" attached to {host} · ctrl+c detaches {held}"),
                     Style::new().fg(Color::Green),
                 ),
                 false => Line::styled(
-                    format!(" disconnected from {host} · reconnecting "),
+                    format!(" disconnected from {host} · reconnecting {held}"),
                     Style::new().fg(Color::Red).bold(),
                 ),
             }

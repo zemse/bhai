@@ -555,6 +555,8 @@ pub struct Link {
     pub connected: std::sync::atomic::AtomicBool,
     /// What `/permissions` says over there, as last fetched.
     pub permissions: Mutex<String>,
+    /// How many actions taken while the link was down wait to be sent once it is back.
+    pub held: std::sync::atomic::AtomicUsize,
 }
 
 impl Link {
@@ -564,6 +566,10 @@ impl Link {
 
     pub fn connected(&self) -> bool {
         self.connected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn held(&self) -> usize {
+        self.held.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
