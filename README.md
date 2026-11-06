@@ -85,6 +85,16 @@ SIGTERM or SIGHUP (from `kill`, a closed ssh session or a killed tmux pane) inte
 
 `--resume` keeps the same UUID and directories. project configuration, remembered permission rules, project memory and explicitly enabled workflow caches remain shared; session search and worktree coordination still work across sessions.
 
+### notifications
+
+`[notify] command` in `~/.config/bhai/config.toml` runs when the session wants you: an approval waiting (`approval`) or a turn ended (`done`). it runs through `$SHELL -c` whether or not the terminal has focus, and under `--headless` too. details arrive as `BHAI_NOTIFY_KIND`, `BHAI_NOTIFY_TITLE`, `BHAI_NOTIFY_BODY`, `BHAI_SESSION_ID` and `BHAI_PROJECT` in its environment, never in the command line. output is discarded, a run is killed after 30 seconds, and each kind runs at most once every 10 seconds. `events` limits the kinds; a project file cannot set `[notify]`.
+
+```toml
+[notify]
+command = 'curl -s -d "$BHAI_NOTIFY_TITLE: $BHAI_NOTIFY_BODY" ntfy.sh/my-topic'
+events = ["approval", "done"]
+```
+
 ### driving bhai from another harness
 
 `bhai models` lists exact model IDs, supported reasoning efforts and known context windows. `bhai models --json` returns one JSON object with `models` and `notes`, unlike the JSONL event stream from `exec --json`. listing reads backend metadata without starting an agent session or requesting inference.

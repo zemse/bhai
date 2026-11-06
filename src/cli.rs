@@ -461,6 +461,7 @@ allow it.",
     }
     // Only a run that stays up has a list to show it in.
     session.watch_background(crate::background::sources(hub.clone()));
+    notify::watch(session.subscribe());
     if args.headless {
         let listener = listener.expect("--headless is only accepted with --serve");
         session.entries().restore(&history);
@@ -798,6 +799,7 @@ async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> 
     childenv::set_pass(&config.pass_env);
     #[cfg(feature = "dictation")]
     crate::dictation::set(config.dictation.clone());
+    notify::set(config.notify.clone(), session, &roots.cwd);
     // With no network there is nothing for the allowlist to let through.
     let proxy = match &config.egress {
         Some(settings) if config.sandbox.network => Some(egress::start(settings).await?.port()),
