@@ -459,6 +459,7 @@ mod tests {
                 judge: Usage::default(),
                 last_cache_break: None,
                 rate_limits: None,
+                quota: None,
                 goal: None,
                 plan: None,
                 pending: None,

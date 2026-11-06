@@ -957,6 +957,35 @@ mod tests {
         assert_eq!(since("9").send().await.unwrap().status().as_u16(), 409);
     }
 
+    /// `/state` carries the quota the way `status` shows it to the model, so a client
+    /// knows the week is nearly spent without parsing the windows itself.
+    #[tokio::test]
+    async fn state_reports_the_quota_and_the_checkpoint() {
+        use crate::limits::{RateLimits, Window};
+
+        let (base, session) = quiet().await;
+        let http = reqwest::Client::new();
+        assert!(get_json(&http, format!("{base}/state")).await["quota"].is_null());
+        let week = |used: f64| {
+            AgentEvent::RateLimits(RateLimits {
+                secondary: Some(Window {
+                    used_percent: used,
+                    window_minutes: Some(7 * 24 * 60),
+                    resets_at: Some(i64::MAX),
+                }),
+                ..RateLimits::default()
+            })
+        };
+        session.on_agent(week(40.0));
+        let quota = get_json(&http, format!("{base}/state")).await["quota"].clone();
+        assert_eq!(quota["secondary"]["used_percent"], 40.0);
+        assert_eq!(quota["checkpoint_recommended"], false);
+        assert!(quota["observed_at"].is_i64() && quota["age_seconds"].is_i64());
+        session.on_agent(week(98.0));
+        let quota = get_json(&http, format!("{base}/state")).await["quota"].clone();
+        assert_eq!(quota["checkpoint_recommended"], true);
+    }
+
     /// Start a server on an ephemeral port in front of a fake agent that says hi, asks
     /// to run one command, and reports the decision on the returned channel.
     /// The token the test server is started with.

@@ -315,6 +315,9 @@ pub struct State {
     pub last_cache_break: Option<CacheBreak>,
     /// The latest rate-limit headroom, once the backend has reported it.
     pub rate_limits: Option<RateLimits>,
+    /// The same, with when it was reported and `checkpoint_recommended` once the weekly
+    /// window is at least 98% used.
+    pub quota: Option<serde_json::Value>,
     /// The goal's specification, progress and lifecycle state.
     pub goal: Option<crate::goal::Goal>,
     /// The checklist the model keeps with `update_plan`.
@@ -588,6 +591,8 @@ pub struct Session {
     /// [`Session::watch_background`] is given them.
     sources: std::sync::OnceLock<Vec<Box<dyn crate::background::Source>>>,
     monitors: std::sync::OnceLock<Arc<crate::monitor::Monitors>>,
+    /// The headroom as `status` shows it to the model, for `/state`.
+    quota: crate::tools::status::Quota,
 }
 
 impl Drop for Session {
@@ -629,6 +634,7 @@ impl Session {
             schedules: std::sync::OnceLock::new(),
             sources: std::sync::OnceLock::new(),
             monitors: std::sync::OnceLock::new(),
+            quota: crate::tools::status::Quota::default(),
         })
     }
 
@@ -696,6 +702,7 @@ impl Session {
                 .map_or_else(Usage::default, |j| j.total()),
             last_cache_break: inner.last_cache_break.clone(),
             rate_limits: inner.rate_limits,
+            quota: self.quota.snapshot(chrono::Utc::now().timestamp()),
             goal: inner.goal.clone(),
             plan: inner.plan.clone(),
             pending: inner.pending.front().map(|(approval, _)| approval.clone()),
@@ -1547,6 +1554,7 @@ impl Session {
             AgentEvent::RateLimits(limits) => {
                 let limits = limits.over(inner.rate_limits);
                 inner.rate_limits = Some(limits);
+                self.quota.observe(limits);
                 Event::RateLimits(limits)
             }
             AgentEvent::Sending(tokens) => Event::Sending(tokens),

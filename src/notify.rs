@@ -14,6 +14,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use chrono::TimeZone as _;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
@@ -248,11 +249,12 @@ fn line(body: &str) -> String {
 /// Run the command on what the session waits on the user for, from `events`.
 pub fn watch(mut events: broadcast::Receiver<session::Event>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut failed = false;
+        let mut seen = Seen::default();
         loop {
             match events.recv().await {
                 Ok(event) => {
-                    if let Some((kind, body)) = about(&event, &mut failed) {
+                    let now = chrono::Utc::now().timestamp();
+                    if let Some((kind, body)) = about(&event, &mut seen, now) {
                         fire(kind, &body);
                     }
                 }
@@ -263,19 +265,48 @@ pub fn watch(mut events: broadcast::Receiver<session::Event>) -> tokio::task::Jo
     })
 }
 
-/// The kind and body of a run for `event`, if it is one the user is wanted for. `failed`
-/// is set by a failed login, so the end of that turn is not reported as done as well.
-fn about(event: &session::Event, failed: &mut bool) -> Option<(Kind, String)> {
+/// What earlier events decide about later ones.
+#[derive(Default)]
+struct Seen {
+    /// A login failed, so the end of that turn is not reported as done as well.
+    failed: bool,
+    /// The weekly window is past the checkpoint line. Usage only climbs within a window,
+    /// so it is under the line again only once the window has reset.
+    low: bool,
+}
+
+/// The kind and body of a run for `event`, if it is one the user is wanted for.
+fn about(event: &session::Event, seen: &mut Seen, now: i64) -> Option<(Kind, String)> {
     match event {
         session::Event::Approval { tool, command, .. } => {
             Some((Kind::Approval, format!("{tool} needs approval: {command}")))
         }
         session::Event::TurnFailed(message) if message.starts_with(crate::client::AUTH_FAILED) => {
-            *failed = true;
+            seen.failed = true;
             Some((Kind::Auth, message.clone()))
         }
-        session::Event::TurnEnd if std::mem::take(failed) => None,
+        session::Event::TurnEnd if std::mem::take(&mut seen.failed) => None,
         session::Event::TurnEnd => Some((Kind::Done, "done".to_string())),
+        // A report without the weekly window says nothing about it.
+        session::Event::RateLimits(limits)
+            if limits
+                .windows()
+                .any(|w| w.window_minutes == Some(7 * 24 * 60)) =>
+        {
+            let window = crate::tools::status::checkpoint(limits, now);
+            if std::mem::replace(&mut seen.low, window.is_some()) {
+                return None;
+            }
+            let window = window?;
+            let resets = chrono::Local
+                .timestamp_opt(now, 0)
+                .single()
+                .and_then(|now| window.resets_at_clock(now))
+                .map(|at| format!(", resets {at}"))
+                .unwrap_or_default();
+            let used = window.used_percent;
+            Some((Kind::Quota, format!("weekly quota {used:.0}% used{resets}")))
+        }
         _ => None,
     }
 }
@@ -348,38 +379,81 @@ mod tests {
             preview: None,
             offers: Default::default(),
         };
-        let mut failed = false;
+        let mut seen = Seen::default();
         assert_eq!(
-            about(&approval, &mut failed),
+            about(&approval, &mut seen, 0),
             Some((Kind::Approval, "bash needs approval: ls".to_string()))
         );
         assert_eq!(
-            about(&session::Event::TurnEnd, &mut failed),
+            about(&session::Event::TurnEnd, &mut seen, 0),
             Some((Kind::Done, "done".to_string()))
         );
         assert_eq!(
-            about(&session::Event::Info("x".to_string()), &mut failed),
+            about(&session::Event::Info("x".to_string()), &mut seen, 0),
             None
         );
     }
 
     #[test]
     fn a_failed_login_is_reported_as_auth_and_not_as_done() {
-        let mut failed = false;
+        let mut seen = Seen::default();
         let message = format!("{}: unauthorized (401)", crate::client::AUTH_FAILED);
         assert_eq!(
-            about(&session::Event::TurnFailed(message.clone()), &mut failed),
+            about(&session::Event::TurnFailed(message.clone()), &mut seen, 0),
             Some((Kind::Auth, message))
         );
-        assert_eq!(about(&session::Event::TurnEnd, &mut failed), None);
+        assert_eq!(about(&session::Event::TurnEnd, &mut seen, 0), None);
         assert_eq!(
-            about(&session::Event::TurnFailed("500".to_string()), &mut failed),
+            about(&session::Event::TurnFailed("500".to_string()), &mut seen, 0),
             None
         );
         assert_eq!(
-            about(&session::Event::TurnEnd, &mut failed),
+            about(&session::Event::TurnEnd, &mut seen, 0),
             Some((Kind::Done, "done".to_string()))
         );
+    }
+
+    /// Once as the weekly window crosses the line, not on every report after, and again
+    /// only after a reset has brought it back under.
+    #[test]
+    fn a_nearly_spent_week_is_reported_once_per_window() {
+        use crate::limits::{RateLimits, Window};
+
+        let week = |used: f64, resets_at: i64| {
+            session::Event::RateLimits(RateLimits {
+                secondary: Some(Window {
+                    used_percent: used,
+                    window_minutes: Some(7 * 24 * 60),
+                    resets_at: Some(resets_at),
+                }),
+                ..RateLimits::default()
+            })
+        };
+        let mut seen = Seen::default();
+        let now = 1_000;
+        assert_eq!(about(&week(97.0, 5_000), &mut seen, now), None);
+        let (kind, body) = about(&week(98.0, 5_000), &mut seen, now).unwrap();
+        assert_eq!(kind, Kind::Quota);
+        assert!(body.starts_with("weekly quota 98% used, resets "), "{body}");
+        assert_eq!(about(&week(99.0, 5_000), &mut seen, now), None);
+        assert_eq!(about(&week(100.0, 5_001), &mut seen, now), None);
+        // The next window starts low and crosses again.
+        assert_eq!(about(&week(3.0, 90_000), &mut seen, 6_000), None);
+        assert!(about(&week(98.5, 90_000), &mut seen, 6_000).is_some());
+        // A short window is not the week.
+        let mut seen = Seen::default();
+        let five_hours = session::Event::RateLimits(RateLimits {
+            primary: Some(Window {
+                used_percent: 99.0,
+                window_minutes: Some(300),
+                resets_at: None,
+            }),
+            ..RateLimits::default()
+        });
+        assert_eq!(about(&five_hours, &mut seen, now), None);
+        assert!(about(&week(99.0, 5_000), &mut seen, now).is_some());
+        assert_eq!(about(&five_hours, &mut seen, now), None);
+        assert_eq!(about(&week(99.0, 5_000), &mut seen, now), None);
     }
 
     fn sent(notifier: &mut Notifier, message: &str) -> Option<Vec<u8>> {

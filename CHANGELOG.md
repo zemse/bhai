@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-06
 
+- `GET /state` reports `quota` as `status` does, with `checkpoint_recommended`; the `[notify]` command runs as `quota` once per weekly window when usage reaches 98%.
 - `GET /events?since=N` replays buffered events after id `N` like `Last-Event-ID` does, the header winning when both are sent.
 - `--token-file PATH` and `BHAI_TOKEN` give the debug server a token that survives restarts; the file is created with mode 600 if missing, and short, unprintable or world-readable tokens are refused.
 - A failed Codex login fails the turn once with `auth failed`, runs the `[notify]` command as `auth`, and holds queued prompts, schedules and monitors until the user sends a message.

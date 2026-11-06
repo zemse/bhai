@@ -30,11 +30,7 @@ impl Quota {
         let mut value = serde_json::to_value(limits).ok()?;
         value["observed_at"] = json!(observed_at);
         value["age_seconds"] = json!((now - observed_at).max(0));
-        value["checkpoint_recommended"] = json!(limits.windows().any(|w| {
-            w.window_minutes == Some(7 * 24 * 60)
-                && w.used_percent >= 98.0
-                && w.resets_at.is_none_or(|reset| reset > now)
-        }));
+        value["checkpoint_recommended"] = json!(checkpoint(&limits, now).is_some());
         Some(value)
     }
 
@@ -54,6 +50,15 @@ low. Latest reported quota (not a reservation or guarantee of remaining calls): 
             )
         })
     }
+}
+
+/// The weekly window when it is at least 98% used and has not reached its known reset.
+pub fn checkpoint(limits: &crate::limits::RateLimits, now: i64) -> Option<crate::limits::Window> {
+    limits.windows().find(|w| {
+        w.window_minutes == Some(7 * 24 * 60)
+            && w.used_percent >= 98.0
+            && w.resets_at.is_none_or(|reset| reset > now)
+    })
 }
 
 pub fn context(input: u64, window: u64, estimated: bool) -> Value {
