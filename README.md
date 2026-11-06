@@ -122,6 +122,15 @@ curl -s -H "x-bhai-token: $T" --data-binary @plot.png 'localhost:7878/upload?pat
 
 `bhai exec PROMPT --serve [port]` runs one turn exactly as `exec` does, with stdout and `--json` unchanged, while the server serves that session. an approval left at ask then waits for `/approve` or `/reject` (and fires the `[notify]` command) instead of being rejected, and is shown on stderr in text mode; `/prompt` joins the turn, and `/steer`, `/interrupt` and `/events` work as they do for `--headless`. the process exits once the turn and anything queued behind it have ended, with exec's usual status. put `--serve` after the prompt or write `--serve=PORT`, since a bare `--serve` before it takes the prompt for a port. `--headless` is refused with exec, which never draws the terminal anyway.
 
+`bhai attach [port|url]` opens the terminal UI on a served session, so the laptop gets the same transcript, prompt, approvals and status bar as the box. it reads `GET /snapshot` (`/state` plus the whole transcript), then follows `/events` from that `seq`; a dropped stream is reopened with backoff from the last event seen, the prompt's border says when it is down, and a `lagged` event or a restarted server reads the snapshot again. what you do goes over the routes: prompts (queued while a turn runs), approvals with their remember choice, esc twice to interrupt, typing into a subagent's pane to steer it, shift+tab, `/model`, `/effort`, `/fast`, `/goal`, `/allow`, `/trust`, `/btw`, `/fork` and `/compact-then`. `!` commands, `@` file completion, pasted images and the commands that act on the local machine are off. ctrl+c (twice), ctrl+d and `/quit` only detach; the session keeps running there. it works against `bhai --serve`, `--serve --headless` and `exec --serve`. the token comes from `--token`, `--token-file` or `BHAI_TOKEN`; the target is a port, `127.0.0.1:PORT`, `localhost:PORT` or an `http://` URL, defaulting to 7878.
+
+```sh
+tmux new -s bhai 'bhai --serve 7878 --token-file ~/.config/bhai/server-token'   # on the host
+ssh -N -L 7878:127.0.0.1:7878 host &                                             # on the laptop
+scp host:.config/bhai/server-token ~/.config/bhai/remote-token && chmod 600 ~/.config/bhai/remote-token
+bhai attach 7878 --token-file ~/.config/bhai/remote-token
+```
+
 ### driving bhai from another harness
 
 `bhai models` lists exact model IDs, supported reasoning efforts and known context windows. `bhai models --json` returns one JSON object with `models` and `notes`, unlike the JSONL event stream from `exec --json`. listing reads backend metadata without starting an agent session or requesting inference.

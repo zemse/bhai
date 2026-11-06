@@ -266,7 +266,7 @@ pub enum Delta {
 }
 
 /// Token counts for one model call, as `response.completed` reports them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
 pub struct Usage {
     pub input: u64,
     /// Input tokens served from the prompt cache.

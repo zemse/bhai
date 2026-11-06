@@ -36,7 +36,7 @@ static LAST_FETCH: AtomicI64 = AtomicI64::new(0);
 const DAY: u64 = 24 * 60;
 
 /// The latest usage of each limit window.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
 pub struct RateLimits {
     pub primary: Option<Window>,
     pub secondary: Option<Window>,
@@ -45,7 +45,7 @@ pub struct RateLimits {
 
 /// Credits, spent once the windows run out. A Team seat's allowance is under
 /// `spend_control`, with `credits.balance` null; other plans put it in the balance.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
 pub struct Credits {
     pub unlimited: bool,
     pub remaining: Option<f64>,
@@ -56,7 +56,7 @@ pub struct Credits {
 }
 
 /// One limit window.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
 pub struct Window {
     pub used_percent: f64,
     pub window_minutes: Option<u64>,

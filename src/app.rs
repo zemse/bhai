@@ -369,6 +369,42 @@ pub struct App {
 
 const QUIT_WINDOW: Duration = Duration::from_secs(1);
 
+/// The commands that act on the served session through its routes, or only on this view.
+const ATTACHED: &[&str] = &[
+    "help",
+    "quit",
+    "exit",
+    "tokens",
+    "copy",
+    "btw",
+    "fork",
+    "compact-then",
+    "permissions",
+    "allow",
+    "trust",
+    "untrust",
+    "model",
+    "effort",
+    "fast",
+    "goal",
+    "plan",
+    "mouse",
+    "queue",
+];
+
+/// What of `message` cannot be done while attached, by name: `!` commands run here, as
+/// do most slash commands and every skill, which this machine's list would name.
+fn refused_attached(message: &str) -> Option<String> {
+    if message.starts_with('!') {
+        return Some("!".to_string());
+    }
+    let (name, rest) = command(message)?;
+    let allowed = ATTACHED.contains(&name)
+        && !(name == "permissions" && rest.trim_start().starts_with("recover"))
+        && !(name == "queue" && !rest.trim().is_empty());
+    (!allowed).then(|| format!("/{name}"))
+}
+
 impl App {
     pub fn new(session: Arc<Session>) -> Self {
         session.entries().push(Entry::Info(
@@ -487,6 +523,14 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        // Attached, ctrl+c only ever detaches: what runs is the other machine's, and
+        // stopping it is esc twice, as asked for on purpose.
+        if ctrl && key.code == KeyCode::Char('c') && self.attached().is_some() {
+            self.search = None;
+            self.picker = None;
+            return self.confirm_quit();
+        }
 
         // The trust question is modal and comes first: the mode it decides governs every
         // approval after it.
@@ -1863,6 +1907,15 @@ impl App {
             }
             return;
         }
+        if self.attached().is_some()
+            && let Some(name) = refused_attached(&message)
+        {
+            self.follow = true;
+            self.note(Entry::Error(format!(
+                "{name} is not available while attached: it acts on this machine, not the one the session runs on"
+            )));
+            return;
+        }
         if let Some(command) = message.strip_prefix('!') {
             self.follow = true;
             match command.trim() {
@@ -2990,7 +3043,11 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             _ => {
                 self.quit_armed = Some(now);
                 self.follow = true;
-                self.note(Entry::Info("press again to quit".to_string()));
+                let said = match self.attached() {
+                    Some(_) => "press again to detach; the session keeps running there",
+                    None => "press again to quit",
+                };
+                self.note(Entry::Info(said.to_string()));
             }
         }
     }
@@ -3010,6 +3067,14 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
                 self.note(Entry::Info("esc again to interrupt".to_string()));
             }
         }
+    }
+
+    /// Where the session this one shows is served, and whether it is reachable now,
+    /// when it is attached to one.
+    pub fn attached(&self) -> Option<(&str, bool)> {
+        self.session
+            .link()
+            .map(|link| (link.url.as_str(), link.connected()))
     }
 
     fn busy(&self) -> bool {
@@ -3172,6 +3237,62 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Attached, ctrl+c twice detaches mid-turn and never sends the interrupt, while esc
+    /// twice is still how the turn there is stopped.
+    #[test]
+    fn attached_ctrl_c_detaches_without_interrupting() {
+        let app = App::detached();
+        let (tx, mut actions) = tokio::sync::mpsc::unbounded_channel();
+        app.session.attach(Arc::new(crate::session::Link {
+            url: "http://127.0.0.1:7878".to_string(),
+            actions: tx,
+            connected: true.into(),
+            permissions: Mutex::default(),
+        }));
+        let mut app = app;
+        app.session.mirror(Event::User("go".to_string()));
+        app.on_event(Event::User("go".to_string()));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_c);
+        assert!(!app.quit);
+        app.on_key(ctrl_c);
+        assert!(app.quit);
+        assert!(actions.try_recv().is_err());
+        app.quit = false;
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(actions.try_recv(), Ok(crate::session::Action::Interrupt));
+    }
+
+    #[test]
+    fn attached_only_the_commands_that_reach_the_session_are_taken() {
+        for allowed in [
+            "hi",
+            "/model gpt-5.5",
+            "/btw why",
+            "/queue",
+            "/permissions",
+            "/allow Bash(ls)",
+        ] {
+            assert_eq!(refused_attached(allowed), None, "{allowed}");
+        }
+        for (refused, name) in [
+            ("!ls", "!"),
+            ("/diff", "/diff"),
+            ("/clear", "/clear"),
+            ("/queue clear", "/queue"),
+            ("/permissions recover", "/permissions"),
+            ("/model-default x", "/model-default"),
+            ("/some-skill go", "/some-skill"),
+        ] {
+            assert_eq!(
+                refused_attached(refused).as_deref(),
+                Some(name),
+                "{refused}"
+            );
+        }
+    }
 
     /// An app whose session still has an agent listening, so a switch reaches it. The
     /// receivers come back with it: dropped, the channels close and nothing is accepted.

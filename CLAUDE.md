@@ -17,7 +17,7 @@ items are the internal format everywhere, so both backends carry the same histor
   `branch.rs` (the branch on the status bar), `statusline.rs` (the user's template for it),
   `bgview.rs` (the background list)
 - **session**: `session.rs` (the hub every consumer reads), `sessions.rs` (on disk),
-  `server.rs` (the debug server)
+  `server.rs` (the debug server), `remote.rs` (`bhai attach`, a session mirrored over it)
 - **context**: `prompt.rs`, `instructions.rs`, `identity.rs`, `skills.rs`, `config.rs`,
   `profile.rs`, `tokens.rs`, `cache.rs`
 - **tools**: `tools/` one file per tool, `mcp/`, `permissions/` (rules, settings, trust),

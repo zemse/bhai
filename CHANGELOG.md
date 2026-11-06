@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-06
 
+- `bhai attach [PORT|URL]` runs the terminal UI on a session served by `--serve` or `exec --serve`, from `GET /snapshot` and `/events` with reconnect and replay, sending prompts, approvals, interrupts, steering and settings over HTTP; ctrl+c only detaches.
 - `bhai exec PROMPT --serve [PORT]` serves the run's session: approvals left at ask wait for `/approve` or `/reject` and fire `[notify]` instead of being rejected, and the process exits with exec's status once the turn and its queue end.
 - `GET /file` refuses paths the user's `Read` deny rules cover, and `POST /upload` those their `Write` or `Edit` deny rules cover, in every mode.
 - `GET /file?path=REL` and `POST /upload?path=REL` read and write files under the project root over the debug server, refusing escapes, protected paths and anything over 16 MiB; uploads replace a file only with `overwrite=1`.

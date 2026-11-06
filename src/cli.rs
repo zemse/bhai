@@ -3,9 +3,9 @@
 
 use crate::{
     agent, app, askpass, cache, childenv, client, config, egress, external, identity, input,
-    instructions, judge, limits, mcp, memory, models, notify, permissions, profile, sandbox,
-    schedules, search, server, session, sessions, shutdown, skills, startup, statusline, syntax,
-    title, tokens, tools, trace, ui, workflow, worktrees,
+    instructions, judge, limits, mcp, memory, models, notify, ollama, permissions, profile, remote,
+    sandbox, schedules, search, server, session, sessions, shutdown, skills, startup, statusline,
+    syntax, title, tokens, tools, trace, ui, workflow, worktrees,
 };
 
 #[path = "cli_args.rs"]
@@ -110,6 +110,9 @@ pub async fn entry() -> Result<()> {
                 None => print!("{}", sessions::report(&sessions::list(&dir))),
             }
             return Ok(());
+        }
+        Some(arguments::Command::Attach { target, token }) => {
+            return attach(target.as_deref(), token, args.token_file.as_deref()).await;
         }
         Some(arguments::Command::Usage) => {
             let body = limits::fetch_now().await?;
@@ -517,31 +520,11 @@ allow it.",
         return result;
     }
 
-    let terminal = ratatui::init();
-    // The terminal keeps the title it had, for as far as it is willing to put it back.
-    title::push();
-    // Mouse capture is what turns the wheel into scroll events. It also takes over
-    // click-drag, so terminals need shift (or option) held to select text while bhai runs.
-    let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let paste = execute!(std::io::stdout(), EnableBracketedPaste).is_ok();
-    let focus = execute!(std::io::stdout(), EnableFocusChange).is_ok();
-    // Disambiguated keys are how a terminal reports shift+enter; not all of them can.
-    let keyboard = terminal::supports_keyboard_enhancement().unwrap_or(false)
-        && execute!(
-            std::io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )
-        .is_ok();
+    let (terminal, modes) = take_terminal();
     // ratatui's own panic hook only leaves raw mode and the alternate screen. A crash is
     // exactly when the id is wanted, so the hint goes out after the panic message.
     let hook = std::panic::take_hook();
     let crashed = (dir.clone(), session_id.clone());
-    let modes = Modes {
-        mouse,
-        paste,
-        keyboard,
-        focus,
-    };
     std::panic::set_hook(Box::new(move |info| {
         // The sessions are in a static, so no unwinding or drop would end them.
         tools::bash::kill_all_panicking();
@@ -579,10 +562,11 @@ allow it.",
         session_id.clone(),
         limits,
         statusline,
-        designer,
+        Some(designer),
         defaults,
         requests,
         schedules,
+        None,
     )
     .await;
     drop(guard);
@@ -602,6 +586,94 @@ allow it.",
         say(&hint);
     }
     worktrees::settle();
+    result.map(|_| ())
+}
+
+/// Take over the terminal for the tui, with every mode it can be put in.
+fn take_terminal() -> (ratatui::DefaultTerminal, Modes) {
+    let terminal = ratatui::init();
+    // The terminal keeps the title it had, for as far as it is willing to put it back.
+    title::push();
+    // Mouse capture is what turns the wheel into scroll events. It also takes over
+    // click-drag, so terminals need shift (or option) held to select text while bhai runs.
+    let mouse = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
+    let paste = execute!(std::io::stdout(), EnableBracketedPaste).is_ok();
+    let focus = execute!(std::io::stdout(), EnableFocusChange).is_ok();
+    // Disambiguated keys are how a terminal reports shift+enter; not all of them can.
+    let keyboard = terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
+    let modes = Modes {
+        mouse,
+        paste,
+        keyboard,
+        focus,
+    };
+    (terminal, modes)
+}
+
+/// `bhai attach`: the tui over a session served elsewhere. Leaving only detaches, so
+/// nothing here is stopped or saved on the way out.
+async fn attach(
+    target: Option<&str>,
+    token: Option<String>,
+    file: Option<&std::path::Path>,
+) -> Result<()> {
+    let base = remote::base_url(target)?;
+    let token = remote::token(token, file, std::env::var(server::TOKEN_ENV).ok())?;
+    let attached = remote::connect(remote::Remote::new(base.clone(), token)).await?;
+    let session = attached.session;
+    let (model, effort) = session.model();
+    let notices = vec![format!(
+        "attached to {base}. What you type runs there; ctrl+c detaches and leaves the session running, esc twice interrupts its turn. \
+!commands, @ files, pasted images and the commands that act on this machine are off."
+    )];
+    let (terminal, modes) = take_terminal();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        modes.release();
+        title::pop();
+        hook(info);
+    }));
+    let prompts = input::History::load(
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/bhai/history.jsonl")),
+    );
+    let signals = shutdown::take_ending(false);
+    let events = session.subscribe();
+    let result = run(
+        terminal,
+        modes,
+        signals,
+        session,
+        events,
+        None,
+        notices,
+        Vec::new(),
+        None,
+        &[],
+        prompts,
+        workflow::Found::default(),
+        None,
+        ollama::DEFAULT_URL.to_string(),
+        String::new(),
+        Limits::default(),
+        None,
+        None,
+        (model, effort),
+        None,
+        None,
+        Some(attached.resync),
+    )
+    .await;
+    modes.release();
+    title::pop();
+    let _ = ratatui::try_restore();
+    say(&format!(
+        "bhai: detached from {base}; the session keeps running there\n"
+    ));
     result.map(|_| ())
 }
 
@@ -1672,12 +1744,25 @@ async fn run(
     session_id: String,
     limits: Limits,
     statusline: Option<String>,
-    designer: Arc<dyn statusline::Design>,
+    designer: Option<Arc<dyn statusline::Design>>,
     defaults: (String, String),
     askpass: Option<mpsc::UnboundedReceiver<askpass::Request>>,
     schedules: Option<Arc<schedules::Schedules>>,
+    resync: Option<mpsc::UnboundedReceiver<()>>,
 ) -> Result<Option<i32>> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
+
+    // An attached session read its whole state again, which the view follows.
+    if let Some(mut resync) = resync {
+        let resync_tx = tx_event.clone();
+        tokio::spawn(async move {
+            while resync.recv().await.is_some() {
+                if resync_tx.send(Event::Resync).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     if let Some(mut requests) = askpass {
         let asked_tx = tx_event.clone();
@@ -1762,7 +1847,7 @@ async fn run(
     app.statusline = statusline.and_then(|t| statusline::Template::parse(&t).ok());
     app.config_path = std::env::var_os("HOME").map(|home| config::global_path(home.as_ref()));
     app.defaults = defaults;
-    app.designer = Some(designer);
+    app.designer = designer;
     {
         let mut entries = app.entries();
         entries.restore(history);

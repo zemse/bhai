@@ -26,7 +26,7 @@ const FIXED: [&str; 9] = [
 ];
 
 /// Why a request would miss the cached prefix of the one before it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct CacheBreak {
     /// The first differing field, or `input[i]` for a history item.
     pub field: String,
@@ -154,7 +154,7 @@ const WARMUP_CALLS: u64 = 5;
 pub const MAX_MISSES: usize = 8;
 
 /// How much of one call's input the cache was expected to serve, and how much it did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
 pub struct Hit {
     /// `None` when the call was not judged.
     pub expected_cached: Option<u64>,

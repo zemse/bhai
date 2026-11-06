@@ -84,6 +84,7 @@ pub mod plan;
 pub mod profile;
 pub mod prompt;
 mod redact;
+pub mod remote;
 mod runtime;
 mod sandbox;
 pub mod schedule;

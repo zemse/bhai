@@ -148,7 +148,7 @@ impl Answer {
 }
 
 /// Allow rules an approval prompt may offer to remember, as rule text.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
 pub struct Offers {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exact: Option<String>,

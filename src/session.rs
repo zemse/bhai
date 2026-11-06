@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::agent::{AgentEvent, Cancel, Control, Mailboxes, Rejecter, UserInput};
@@ -46,7 +46,7 @@ pub struct Since {
 }
 
 /// An agent event as consumers see it: cloneable, serializable, approvals by id.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Event {
     /// A user message was accepted and a turn started.
@@ -272,7 +272,7 @@ pub struct ChildLog {
 }
 
 /// A tool call waiting for approval.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Approval {
     pub id: u64,
     pub tool: String,
@@ -437,6 +437,8 @@ pub enum SubmitError {
     NoFork,
     /// A message to a child over [`STEER_MAX`] bytes.
     TooLong(usize),
+    /// Something only the machine the session runs on can do, asked of an attached one.
+    Attached,
 }
 
 impl fmt::Display for SubmitError {
@@ -452,6 +454,9 @@ impl fmt::Display for SubmitError {
             ),
             SubmitError::NoFork => f.write_str(
                 "there is no compacted copy yet: one is made while the conversation is idle, just before its cache lapses",
+            ),
+            SubmitError::Attached => f.write_str(
+                "not available while attached: it acts on the machine the session runs on",
             ),
             SubmitError::TooLong(len) => write!(
                 f,
@@ -508,6 +513,57 @@ fn fast_notice(on: bool, was: Option<Option<RateLimits>>, now: Option<RateLimits
                 false => format!("fast: off. While it was on: {}.", moved.join(", ")),
             }
         }
+    }
+}
+
+/// What the user does in a session attached to one served elsewhere, which the link
+/// carries over HTTP instead of acting on this copy of it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// As typed, so the other end reads `/btw`, `/fork` and `/compact-then` as it would
+    /// from its own prompt.
+    Prompt(String),
+    Answer {
+        id: u64,
+        answer: Answer,
+    },
+    Interrupt,
+    InterruptChild(String),
+    Steer {
+        id: String,
+        text: String,
+    },
+    Mode(Mode),
+    Model {
+        model: String,
+        effort: String,
+    },
+    Fast(bool),
+    Retry,
+    Goal(String),
+    Allow(String),
+    /// `/trust` when true, `/untrust` when false.
+    Trust(bool),
+}
+
+/// An attached session's way back to the one it shows.
+pub struct Link {
+    /// Where it is served, as the user gave it.
+    pub url: String,
+    pub actions: mpsc::UnboundedSender<Action>,
+    /// Whether the event stream is up right now.
+    pub connected: std::sync::atomic::AtomicBool,
+    /// What `/permissions` says over there, as last fetched.
+    pub permissions: Mutex<String>,
+}
+
+impl Link {
+    fn send(&self, action: Action) {
+        let _ = self.actions.send(action);
+    }
+
+    pub fn connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -593,6 +649,9 @@ pub struct Session {
     monitors: std::sync::OnceLock<Arc<crate::monitor::Monitors>>,
     /// The headroom as `status` shows it to the model, for `/state`.
     quota: crate::tools::status::Quota,
+    /// Set when this session only shows one served elsewhere: what the user does goes
+    /// there, and what happens there arrives through [`Session::mirror`].
+    link: std::sync::OnceLock<Arc<Link>>,
 }
 
 impl Drop for Session {
@@ -635,7 +694,177 @@ impl Session {
             sources: std::sync::OnceLock::new(),
             monitors: std::sync::OnceLock::new(),
             quota: crate::tools::status::Quota::default(),
+            link: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Make this session a view of one served elsewhere, reached through `link`.
+    pub fn attach(&self, link: Arc<Link>) {
+        let _ = self.link.set(link);
+    }
+
+    pub fn link(&self) -> Option<&Arc<Link>> {
+        self.link.get()
+    }
+
+    /// Start over from a snapshot of the session this one shows: its `/state` and its
+    /// transcript. Children are not in it, so their panes start again empty.
+    pub fn seed(&self, state: &serde_json::Value, transcript: Vec<Entry>) {
+        fn read<T: serde::de::DeserializeOwned>(state: &serde_json::Value, key: &str) -> Option<T> {
+            serde_json::from_value(state.get(key)?.clone()).ok()
+        }
+        let mut inner = self.lock();
+        let model = state["model"].as_str().unwrap_or_default().to_string();
+        let effort = state["effort"].as_str().unwrap_or_default().to_string();
+        *self.model.lock().unwrap_or_else(|e| e.into_inner()) = (model, effort);
+        if let Some(mode) = read(state, "mode") {
+            self.policy.set_mode(mode);
+        }
+        inner.working = state["working"].as_bool().unwrap_or_default();
+        inner.started = inner.working.then(Instant::now);
+        let queued: Vec<String> = read(state, "queued").unwrap_or_default();
+        inner.queue = queued
+            .into_iter()
+            .map(|text| Waiting::Prompt(text.into()))
+            .collect();
+        inner.pending.clear();
+        if let Some(approval) = read(state, "pending") {
+            inner.pending.push_back((approval, oneshot::channel().0));
+            inner.shown = Some(Instant::now());
+        }
+        inner.rate_limits = read(state, "rate_limits");
+        inner.fast = state["fast"]
+            .as_bool()
+            .unwrap_or_default()
+            .then_some(inner.rate_limits);
+        let count = |key: &str| state[key].as_u64().unwrap_or_default();
+        inner.total = Usage {
+            input: count("input_tokens"),
+            cached: count("cached_tokens"),
+            cache_write: count("cache_write_tokens"),
+            output: count("output_tokens"),
+            reasoning: count("reasoning_tokens"),
+        };
+        inner.calls = count("calls");
+        inner.last_usage = read(state, "last_usage");
+        inner.children = read(state, "children").unwrap_or_default();
+        inner.goal = read(state, "goal");
+        inner.plan = read(state, "plan");
+        inner.last_cache_break = read(state, "last_cache_break");
+        self.panes().clear();
+        let mut entries = self.entries();
+        *entries = Entries::default();
+        entries.list = transcript;
+    }
+
+    /// Show `event`, which the session this one is attached to published: keep what the
+    /// state says in step with it, then publish it here as that session did.
+    pub fn mirror(&self, event: Event) {
+        let mut inner = self.lock();
+        match &event {
+            // A prompt with a queue behind the turn is the front of that queue starting.
+            Event::User(_) | Event::Automatic { steered: false, .. } | Event::Compacting(_) => {
+                inner.queue.pop_front();
+                inner.start();
+            }
+            Event::Resumed(_) => inner.start(),
+            Event::Steered(_) | Event::Automatic { steered: true, .. } => {
+                inner.queue.pop_front();
+            }
+            Event::Queued { position, text } => {
+                inner.queue.truncate(position.saturating_sub(1));
+                inner.queue.push_back(Waiting::Prompt(text.clone().into()));
+            }
+            Event::Approval {
+                id,
+                tool,
+                command,
+                preview,
+                offers,
+            } => {
+                let approval = Approval {
+                    id: *id,
+                    tool: tool.clone(),
+                    command: command.clone(),
+                    preview: preview.clone(),
+                    offers: offers.clone(),
+                };
+                inner.pending.retain(|(a, _)| a.id != *id);
+                inner.pending.push_front((approval, oneshot::channel().0));
+                inner.shown = Some(Instant::now());
+            }
+            Event::Resolved { id, .. } => inner.pending.retain(|(a, _)| a.id != *id),
+            Event::Usage(usage) => {
+                inner.total += *usage;
+                inner.last_usage = Some(*usage);
+            }
+            Event::ChildUsage(usage) => inner.children += *usage,
+            Event::Call(_) => inner.calls += 1,
+            Event::Cache(found) => {
+                if let Some(found) = found {
+                    inner.last_cache_break = Some(found.clone());
+                }
+            }
+            Event::RateLimits(limits) => {
+                inner.rate_limits = Some(*limits);
+                self.quota.observe(*limits);
+            }
+            Event::Streaming(true) if !inner.working => inner.start(),
+            Event::Compacted { freed, .. } => {
+                if let Some(usage) = &mut inner.last_usage {
+                    usage.shrink(*freed);
+                }
+            }
+            Event::Cleared => inner.last_usage = None,
+            Event::Goal(goal) => {
+                if goal.is_some() || inner.goal.is_some() {
+                    inner.plan = goal.as_ref().and_then(|g| g.plan.clone());
+                }
+                inner.goal = goal.clone();
+            }
+            Event::Plan(plan) => inner.plan = plan.clone(),
+            Event::Fork(tokens) => inner.fork = *tokens,
+            Event::Model { model, effort } => {
+                *self.model.lock().unwrap_or_else(|e| e.into_inner()) =
+                    (model.clone(), effort.clone());
+            }
+            Event::Mode(mode) => {
+                self.policy.set_mode(*mode);
+            }
+            Event::Fast(on) => inner.fast = on.then_some(inner.rate_limits),
+            Event::TurnEnd => {
+                inner.started = None;
+                inner.working = !inner.queue.is_empty();
+            }
+            Event::PromptEdited { .. }
+            | Event::Titled(_)
+            | Event::Reasoning(_)
+            | Event::Text(_)
+            | Event::Commentary(_)
+            | Event::ToolStart { .. }
+            | Event::ToolProgress(_)
+            | Event::ToolOutput(_)
+            | Event::ToolRejected { .. }
+            | Event::ChildStarted { .. }
+            | Event::ChildEnded { .. }
+            | Event::Child { .. }
+            | Event::Item(_)
+            | Event::CacheHit(_)
+            | Event::CacheStalled(_)
+            | Event::Sending(_)
+            | Event::Streaming(_)
+            | Event::Scheduled { .. }
+            | Event::Background(_)
+            | Event::Info(_)
+            | Event::Retrying(_)
+            | Event::Judging(_)
+            | Event::Error(_)
+            | Event::TurnFailed(_)
+            | Event::Interrupted
+            | Event::Done { .. } => {}
+        }
+        // Under the lock, as `on_agent` publishes, so the state and the events agree.
+        self.publish(event);
     }
 
     /// What the running turn is said to be doing, as in `chabārau`.
@@ -728,6 +957,9 @@ impl Session {
     /// Start a turn with `prompt`, or queue it when one is already running.
     pub fn submit(&self, prompt: impl Into<Prompt>) -> Result<Submitted, SubmitError> {
         let prompt = prompt.into();
+        if let Some(link) = self.link() {
+            return Ok(self.forward(link, &prompt, prompt.text.clone()));
+        }
         let mut inner = self.lock();
         inner.held = false;
         if inner.working {
@@ -742,6 +974,23 @@ impl Session {
         inner.start();
         self.publish(prompt.event());
         Ok(Submitted::Started)
+    }
+
+    /// Send `text` for `prompt` down `link`. Images stay here: the other end takes text.
+    fn forward(&self, link: &Link, prompt: &Prompt, text: String) -> Submitted {
+        if !prompt.images.is_empty() {
+            self.publish(Event::Error(
+                "images are not sent to an attached session; the text went alone".to_string(),
+            ));
+        }
+        link.send(Action::Prompt(text));
+        let inner = self.lock();
+        match inner.working {
+            true => Submitted::Queued {
+                position: inner.queue.len() + 1,
+            },
+            false => Submitted::Started,
+        }
     }
 
     /// [`Session::submit`] for a prompt no one typed, from a schedule or a monitor: queued,
@@ -766,6 +1015,10 @@ impl Session {
     /// rather than queued while a turn runs on it.
     pub fn submit_forked(&self, prompt: impl Into<Prompt>) -> Result<(), SubmitError> {
         let prompt = prompt.into();
+        if let Some(link) = self.link() {
+            self.forward(link, &prompt, prompt.shown.clone());
+            return Ok(());
+        }
         let mut inner = self.lock();
         if inner.working {
             return Err(SubmitError::Busy);
@@ -936,6 +1189,10 @@ impl Session {
     /// an active goal once it is idle; it says what came of it in the transcript.
     pub fn set_goal(&self, text: &str) -> Result<(), String> {
         let command = crate::goal::Command::parse(text)?;
+        if let Some(link) = self.link() {
+            link.send(Action::Goal(text.to_string()));
+            return Ok(());
+        }
         self.tx_control
             .try_send(Control::Goal(command))
             .map_err(|_| SubmitError::Closed.to_string())
@@ -962,6 +1219,10 @@ impl Session {
 
     /// Drop every queued prompt, for `/queue clear`. Returns how many there were.
     pub fn clear_queue(&self) -> usize {
+        if self.link().is_some() {
+            self.publish(Event::Error(SubmitError::Attached.to_string()));
+            return 0;
+        }
         let dropped = self.lock().queue.drain(..).count();
         if dropped > 0 {
             self.publish(Event::Info(format!("dropped {dropped} queued prompt(s)")));
@@ -989,6 +1250,9 @@ impl Session {
     /// Take everything waiting back out of the queue, as typed, to be edited.
     /// Their images are dropped, since the text alone goes back into the prompt box.
     pub fn unqueue(&self) -> Vec<String> {
+        if self.link().is_some() {
+            return Vec::new();
+        }
         let taken: Vec<Waiting> = self.lock().queue.drain(..).collect();
         let images: usize = taken
             .iter()
@@ -1058,6 +1322,12 @@ impl Session {
         {
             return None;
         }
+        // The other end resolves it, and says so with an event of its own.
+        if let Some(link) = self.link() {
+            let id = approval.id;
+            link.send(Action::Answer { id, answer });
+            return Some(id);
+        }
         let (approval, reply) = inner.pending.pop_front()?;
         let _ = reply.send(answer);
         self.publish(Event::Resolved {
@@ -1081,6 +1351,9 @@ impl Session {
 
     /// Interrupt for editing only while the transcript still ends with a user prompt.
     pub fn edit_prompt(&self) -> bool {
+        if self.link().is_some() {
+            return false;
+        }
         let inner = self.lock();
         if !inner.working || !inner.queue.is_empty() || !inner.pending.is_empty() {
             return false;
@@ -1100,6 +1373,10 @@ impl Session {
         // have work in flight to stop.
         if !self.lock().working && !self.child_running() {
             return false;
+        }
+        if let Some(link) = self.link() {
+            link.send(Action::Interrupt);
+            return true;
         }
         // Cancel first so the agent does not move on to the next call once rejected.
         self.cancel.stop();
@@ -1144,6 +1421,10 @@ impl Session {
         if inner.working {
             return Err(SubmitError::Busy);
         }
+        if let Some(link) = self.link() {
+            link.send(Action::Model { model, effort });
+            return Ok(());
+        }
         if crate::client::Provider::of(&model) == crate::client::Provider::Codex
             && !crate::client::EFFORTS.contains(&effort.as_str())
         {
@@ -1167,6 +1448,10 @@ impl Session {
     /// Ask for the priority tier from the next call on, or stop, for `/fast`. Taken
     /// while a turn runs too. `Event::Fast` says what the backend is now asked for.
     pub fn set_fast(&self, on: bool) -> Result<(), SubmitError> {
+        if let Some(link) = self.link() {
+            link.send(Action::Fast(on));
+            return Ok(());
+        }
         self.tx_control
             .try_send(Control::Fast(on))
             .map_err(|_| SubmitError::Closed)
@@ -1221,6 +1506,10 @@ impl Session {
     /// Switch the permission mode. The prompt and tools stay as they are.
     /// Set the mode, as far as trust allows, and return the mode now in force.
     pub fn set_mode(&self, mode: Mode) -> Mode {
+        if let Some(link) = self.link() {
+            link.send(Action::Mode(mode));
+            return mode;
+        }
         let _inner = self.lock();
         let mode = self.policy.set_mode(mode);
         self.publish(Event::Mode(mode));
@@ -1230,6 +1519,9 @@ impl Session {
     /// Move to the next permission mode the project may be in, and return it. In an
     /// untrusted project that is `ask` and stays `ask`.
     pub fn cycle_mode(&self) -> Mode {
+        if self.link().is_some() {
+            return self.set_mode(self.policy.next_mode());
+        }
         let _inner = self.lock();
         let mode = self.policy.set_mode(self.policy.next_mode());
         self.publish(Event::Mode(mode));
@@ -1238,6 +1530,13 @@ impl Session {
 
     /// What `/permissions` prints.
     pub fn permissions(&self) -> String {
+        if let Some(link) = self.link() {
+            return link
+                .permissions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+        }
         let mut out = self.policy.describe();
         if let Some(judge) = &self.judge
             && judge
@@ -1273,6 +1572,10 @@ impl Session {
     /// call and shown as a note, so it never reaches the model's history.
     pub fn shell(self: &Arc<Self>, command: &str) {
         use crate::permissions::Decision;
+        if self.link().is_some() {
+            self.publish(Event::Error(SubmitError::Attached.to_string()));
+            return;
+        }
         use crate::tools::bash;
         let args = serde_json::json!({ "command": command });
         if let Decision::Deny(reason) = self.policy.check(bash::NAME, &args, true) {
@@ -1297,6 +1600,11 @@ impl Session {
     /// is the only way to permit a call from the prompt rather than by changing mode:
     /// saying "allow that" in a message reaches the model, which cannot grant it.
     pub fn allow(&self, rule: &str) -> anyhow::Result<String> {
+        if let Some(link) = self.link() {
+            crate::permissions::rules::Rule::parse(rule).map_err(anyhow::Error::msg)?;
+            link.send(Action::Allow(rule.to_string()));
+            return Ok(format!("asked the session to allow {rule}"));
+        }
         Ok(match self.policy.remember(rule)? {
             Some(store) => format!("allowed {rule}, saved to {}", store.display()),
             None => format!("allowed {rule} for this session"),
@@ -1305,6 +1613,10 @@ impl Session {
 
     /// Honour the repo-supplied allow rules, for `/trust`.
     pub fn trust(&self) -> anyhow::Result<String> {
+        if let Some(link) = self.link() {
+            link.send(Action::Trust(true));
+            return Ok("asked the session to trust its project".to_string());
+        }
         let notice = self.policy.trust()?;
         // Trusting the project lets it into the mode the config asked for.
         self.publish(Event::Mode(self.policy.mode()));
@@ -1313,6 +1625,10 @@ impl Session {
 
     /// Stop honouring the repo-supplied allow rules, for `/untrust`.
     pub fn untrust(&self) -> anyhow::Result<String> {
+        if let Some(link) = self.link() {
+            link.send(Action::Trust(false));
+            return Ok("asked the session to stop trusting its project".to_string());
+        }
         let notice = self.policy.untrust()?;
         self.publish(Event::Mode(self.policy.mode()));
         Ok(notice)
@@ -1322,6 +1638,9 @@ impl Session {
     /// everything queued before it are done. `asked` is what the user wants the summary
     /// to keep, from `/compact <prompt>`.
     pub fn compact(&self, asked: Option<String>) -> Result<Submitted, SubmitError> {
+        if self.link().is_some() {
+            return Err(SubmitError::Attached);
+        }
         let mut inner = self.lock();
         if inner.working {
             return Ok(self.enqueue(&mut inner, Waiting::Compact(asked)));
@@ -1361,6 +1680,10 @@ impl Session {
         if inner.working {
             return Err(SubmitError::Busy);
         }
+        if let Some(link) = self.link() {
+            link.send(Action::Retry);
+            return Ok(());
+        }
         self.cancel.clear();
         self.tx_control
             .try_send(Control::Retry)
@@ -1376,6 +1699,10 @@ impl Session {
         let mut inner = self.lock();
         if inner.working {
             return Err(SubmitError::Busy);
+        }
+        if let Some(link) = self.link() {
+            link.send(Action::Prompt(format!("/btw {question}")));
+            return Ok(());
         }
         self.cancel.clear();
         self.tx_control
@@ -1395,6 +1722,10 @@ impl Session {
         if inner.working {
             return Err(SubmitError::Busy);
         }
+        if let Some(link) = self.link() {
+            link.send(Action::Prompt("/fork".to_string()));
+            return Ok(());
+        }
         self.tx_control
             .try_send(Control::ForkSession)
             .map_err(|_| SubmitError::Closed)?;
@@ -1404,6 +1735,9 @@ impl Session {
     /// Drop the conversation: the agent's history and the transcript that showed it.
     /// Refused while a turn runs, since the turn holds the history it would drop.
     pub fn clear(&self) -> Result<(), SubmitError> {
+        if self.link().is_some() {
+            return Err(SubmitError::Attached);
+        }
         let inner = self.lock();
         if inner.working {
             return Err(SubmitError::Busy);
@@ -1417,6 +1751,9 @@ impl Session {
     /// Run `workflow` now, as a turn of its own, unless one is already running. The
     /// agent asks for confirmation before it launches anything.
     pub fn workflow(&self, workflow: Arc<Workflow>, input: String) -> Result<(), SubmitError> {
+        if self.link().is_some() {
+            return Err(SubmitError::Attached);
+        }
         let mut inner = self.lock();
         if inner.working {
             return Err(SubmitError::Busy);
@@ -1797,6 +2134,13 @@ impl Session {
         if text.len() > STEER_MAX {
             return Err(SubmitError::TooLong(text.len()));
         }
+        if let Some(link) = self.link() {
+            link.send(Action::Steer {
+                id: id.to_string(),
+                text,
+            });
+            return Ok(());
+        }
         let posted = self
             .mailboxes
             .lock()
@@ -1817,6 +2161,10 @@ impl Session {
     /// Stop child agent `id` alone, as ctrl+x in its pane does. False when no child of
     /// that id is running, which includes a workflow step: it shares its run's flag.
     pub fn interrupt_child(&self, id: &str) -> bool {
+        if let Some(link) = self.link() {
+            link.send(Action::InterruptChild(id.to_string()));
+            return true;
+        }
         if !self.cancel.stop_child(id) {
             return false;
         }

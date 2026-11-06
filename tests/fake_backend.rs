@@ -1097,6 +1097,42 @@ async fn a_served_exec_waits_for_approve_takes_a_prompt_and_exits() {
     assert!(mentions(&sent[1].body, "then this"), "{}", sent[1].body);
 }
 
+/// `bhai attach`'s session works against `exec --serve` too: the approval shows on the
+/// attached side, is answered there, and the run exits.
+#[tokio::test]
+async fn an_attached_session_answers_a_served_execs_approval() {
+    let fake = Arc::new(Fake::default());
+    {
+        let mut replies = fake.replies.lock().unwrap();
+        replies.push_back(runs("call_1", "touch made-by-attach"));
+        replies.push_back(says("attached it"));
+    }
+    let backend = serve_fake(fake.clone()).await;
+    let lead = ["exec", "make a file", "--serve", "0"];
+    let mut bhai = Bhai::launch(&backend, &lead, &[], &[], None, |_, _| {}).await;
+    let remote = bhai::remote::Remote::new(bhai.base.clone(), bhai.token.clone());
+    let attached = bhai::remote::connect(remote).await.unwrap();
+    let here = attached.session;
+    let pending = timeout(WAIT, async {
+        loop {
+            if let Some(pending) = here.state().pending {
+                return pending;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the approval never showed on the attached side");
+    assert_eq!(pending.tool, "bash");
+    let accept = bhai::permissions::Answer::Accept(None);
+    assert_eq!(here.answer(accept, Some(pending.id)), Some(pending.id));
+    let exited = timeout(WAIT, bhai.child.wait())
+        .await
+        .expect("exec did not exit");
+    assert!(exited.unwrap().success());
+    assert!(bhai.project().join("made-by-attach").exists());
+}
+
 /// Without `--serve`, `exec` still refuses what is left at ask, at once.
 #[tokio::test]
 async fn an_exec_without_the_server_rejects_the_approval() {

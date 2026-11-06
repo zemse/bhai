@@ -11,7 +11,7 @@ use crate::{config::Flags, permissions};
     version,
     propagate_version = true,
     about = "An agent harness.",
-    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected, unless exec --serve lets them wait for /approve.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read.\nSIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints how to resume it.\n[notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends, failed logins and a 98% used week; see the README.\n--serve listens on 127.0.0.1 only. From a laptop: ssh -N -L PORT:127.0.0.1:PORT host, then send the token in the x-bhai-token header. --token-file or BHAI_TOKEN keeps the token across restarts.\nGET /events?since=N (or Last-Event-ID) replays the events after id N, then streams live; a lagged event means refetch /state.\nGET /file?path=REL and POST /upload?path=REL[&overwrite=1] move files in and out of the project root, never protected ones."
+    after_help = "Run bhai with no command for the terminal UI.\nUse exec or --print for one unattended turn; approvals left at ask are rejected, unless exec --serve lets them wait for /approve.\nText output goes to stdout, progress to stderr. exec --json emits session events as JSONL.\nUse models --json for a model catalogue other harnesses can read.\nSIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints how to resume it.\n[notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends, failed logins and a 98% used week; see the README.\n--serve listens on 127.0.0.1 only; --token-file or BHAI_TOKEN keeps the token across restarts. bhai attach opens the terminal UI on a served session through an ssh tunnel (see attach --help).\nOver HTTP, send the token in x-bhai-token: GET /events?since=N replays then streams, GET /file and POST /upload move files under the project root."
 )]
 pub(super) struct Cli {
     #[command(subcommand)]
@@ -71,7 +71,7 @@ pub(super) struct Cli {
     #[arg(long, global = true, requires = "serve")]
     headless: bool,
     /// Read the server token from this file, or create it (mode 600) with a new one; overrides BHAI_TOKEN.
-    #[arg(long, global = true, requires = "serve", value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH")]
     token_file: Option<std::path::PathBuf>,
     /// Run a workflow, with optional input.
     #[arg(long, num_args = 1..=2, value_names = ["NAME", "INPUT"])]
@@ -100,6 +100,15 @@ pub(super) enum Command {
         /// Instructions for the agent, or - to read stdin.
         prompt: String,
     },
+    /// Open the terminal UI on a session another bhai serves with --serve.
+    #[command(after_help = ATTACH_HELP)]
+    Attach {
+        /// The server: a port, 127.0.0.1:PORT, localhost:PORT or an http:// URL (default: 7878).
+        target: Option<String>,
+        /// The server's token; --token-file reads it from a file, else BHAI_TOKEN.
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+    },
     /// List available model IDs, reasoning efforts and context windows.
     #[command(
         after_help = "Use --json for a single object with models and discovery notes.\nPass models[].id to --model and an efforts[].name to --effort.\nCached Codex results are labelled in notes; no agent session or inference call is started."
@@ -120,6 +129,19 @@ pub(super) enum Command {
         command: McpCommand,
     },
 }
+
+const ATTACH_HELP: &str = "The server only listens on 127.0.0.1, so a session on another machine is reached through an ssh tunnel.
+Leaving (ctrl+c twice, ctrl+d, /quit) only detaches: the session keeps running there. esc twice interrupts its turn.
+A dropped connection is retried with backoff, picking up from the last event seen; the prompt's border says when it is down.
+!commands, @ files, pasted images and the commands that act on this machine are off while attached.
+
+On the server, in tmux so it outlives the ssh login:
+  tmux new -s bhai 'bhai --serve 7878 --token-file ~/.config/bhai/server-token'
+  (or bhai --serve 7878 --headless ..., or bhai exec PROMPT --serve 7878 ... for one turn)
+On the laptop:
+  ssh -N -L 7878:127.0.0.1:7878 host &
+  scp host:.config/bhai/server-token ~/.config/bhai/remote-token && chmod 600 ~/.config/bhai/remote-token
+  bhai attach 7878 --token-file ~/.config/bhai/remote-token";
 
 #[derive(Debug, PartialEq, Subcommand)]
 pub(super) enum SessionsCommand {
@@ -239,9 +261,24 @@ impl Cli {
                     | Command::Mcp { .. }
             )
         );
-        if utility && (parsed.serve.is_some() || parsed.headless) {
+        let attach = matches!(parsed.command, Some(Command::Attach { .. }));
+        if (utility || attach) && (parsed.serve.is_some() || parsed.headless) {
             return Err(Self::invalid(
                 "--serve and --headless run a session; this command does not start one",
+            ));
+        }
+        if parsed.token_file.is_some() && parsed.serve.is_none() && !attach {
+            return Err(Self::invalid("--token-file goes with --serve or attach"));
+        }
+        if attach
+            && (parsed.exec.is_some()
+                || parsed.workflow.is_some()
+                || parsed.resume.is_some()
+                || parsed.pick
+                || parsed.json)
+        {
+            return Err(Self::invalid(
+                "attach shows a session another bhai runs, so it takes no session options",
             ));
         }
         let models = matches!(parsed.command, Some(Command::Models));
@@ -312,6 +349,7 @@ mod tests {
         for args in [
             vec!["--help"],
             vec!["exec", "--help"],
+            vec!["attach", "--help"],
             vec!["sessions", "prune", "--help"],
             vec!["mcp", "login", "--help"],
         ] {
@@ -449,5 +487,36 @@ mod tests {
         assert!(parse(&["--probe", "--judge-eval"]).is_err());
         assert!(parse(&["--probe", "--print", "hi"]).is_err());
         assert!(parse(&["--probe", "exec", "hi"]).is_err());
+    }
+
+    #[test]
+    fn attach_takes_a_target_and_a_token_and_no_session_options() {
+        let args = parse(&["attach", "8791", "--token-file", "/t"]).unwrap();
+        assert_eq!(
+            args.command,
+            Some(Command::Attach {
+                target: Some("8791".to_string()),
+                token: None
+            })
+        );
+        assert_eq!(args.token_file.as_deref(), Some(std::path::Path::new("/t")));
+        let args = parse(&["attach", "--token", "abc"]).unwrap();
+        assert_eq!(
+            args.command,
+            Some(Command::Attach {
+                target: None,
+                token: Some("abc".to_string())
+            })
+        );
+        for refused in [
+            vec!["attach", "--serve"],
+            vec!["attach", "--headless"],
+            vec!["attach", "--resume"],
+            vec!["attach", "--json"],
+            vec!["attach", "1", "2"],
+            vec!["--token-file", "/t"],
+        ] {
+            assert!(parse(&refused).is_err(), "{refused:?}");
+        }
     }
 }

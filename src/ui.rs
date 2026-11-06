@@ -573,7 +573,8 @@ fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
         .ok()
         .and_then(|cwd| cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_default();
-    if !dir.is_empty() || app.branch.name().is_some() {
+    // Attached, this machine's directory says nothing about where the session runs.
+    if app.attached().is_none() && (!dir.is_empty() || app.branch.name().is_some()) {
         let collapsed = repo_label(&dir, app.branch.name(), false);
         let full = repo_label(&dir, app.branch.name(), true);
         let start = bar.iter().map(|(_, span)| span.width()).sum::<usize>() + 3;
@@ -1820,6 +1821,23 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
             format!(" to {} · {} ", inside.identity, inside.description),
             Style::new().fg(Color::Cyan),
         ));
+    }
+    // Attached, the prompt goes to another machine, and ctrl+c leaves it running there.
+    if let Some((url, connected)) = app.attached() {
+        let host = url.trim_start_matches("http://");
+        block = block.title(
+            match connected {
+                true => Line::styled(
+                    format!(" attached to {host} · ctrl+c detaches "),
+                    Style::new().fg(Color::Green),
+                ),
+                false => Line::styled(
+                    format!(" disconnected from {host} · reconnecting "),
+                    Style::new().fg(Color::Red).bold(),
+                ),
+            }
+            .right_aligned(),
+        );
     }
     #[cfg(feature = "dictation")]
     if let Some(dictation) = &app.dictation {

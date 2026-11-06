@@ -148,6 +148,7 @@ pub async fn serve(
 fn router(session: Arc<Session>, token: String) -> Router {
     Router::new()
         .route("/state", get(state))
+        .route("/snapshot", get(snapshot))
         .route("/events", get(events))
         .route("/prompt", post(prompt))
         .route("/approve", post(approve))
@@ -299,6 +300,15 @@ struct Steer {
 
 async fn state(State(session): State<Arc<Session>>) -> Response {
     Json(session.state()).into_response()
+}
+
+/// `/state` with the whole transcript as the tui shows it, which is what `bhai attach`
+/// starts from: the event log only reaches back so far. `/events` from `state.seq` goes
+/// on from it.
+async fn snapshot(State(session): State<Arc<Session>>) -> Response {
+    let state = session.state();
+    let transcript = session.entries().list.clone();
+    Json(json!({ "state": state, "transcript": transcript })).into_response()
 }
 
 /// The live stream, each event with its `seq` as the SSE `id`. `?since=N` or a

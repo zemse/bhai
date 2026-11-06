@@ -46,7 +46,7 @@ pub struct Span {
 }
 
 /// How a row's tokens were counted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Method {
     Exact,
@@ -200,7 +200,7 @@ pub fn attribute(calls: &[Call]) -> Vec<Span> {
 }
 
 /// One finished call split for the transcript: what was new to it and what it wrote.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
 pub struct CallTokens {
     pub usage: Usage,
     /// History items the call was sent.
