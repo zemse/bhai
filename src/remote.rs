@@ -17,9 +17,9 @@ use crate::permissions::{Answer, Policy};
 use crate::server::{DEFAULT_PORT, TOKEN_ENV, TOKEN_HEADER};
 use crate::session::{self, Action, Link, Session};
 
-/// The first wait before reconnecting, doubled after each failure up to `BACKOFF_MAX`.
-const BACKOFF_MIN: Duration = Duration::from_millis(250);
-const BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// The wait between attempts to reconnect. The first after a drop goes at once; a fixed
+/// short wait after that, so a link that comes back is caught up within about this long.
+const RETRY: Duration = Duration::from_secs(1);
 /// How long a request other than the event stream may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -401,8 +401,8 @@ async fn reseed(remote: &Remote, session: &Session) -> Option<u64> {
     Some(after)
 }
 
-/// Follow `/events` into `session` for as long as the session lives, reconnecting with
-/// backoff and picking up after the last event seen.
+/// Follow `/events` into `session` for as long as the session lives, reconnecting every
+/// [`RETRY`] and picking up after the last event seen.
 async fn follow(
     remote: Remote,
     session: Arc<Session>,
@@ -412,7 +412,7 @@ async fn follow(
     let Some(link) = session.link().cloned() else {
         return;
     };
-    let mut wait = BACKOFF_MIN;
+    let mut wait = Duration::ZERO;
     loop {
         match remote.events(after).await {
             Ok(response) => {
@@ -420,13 +420,16 @@ async fn follow(
                     session.publish(session::Event::Info(format!("reconnected to {}", link.url)));
                     let _ = resync.send(());
                 }
-                wait = BACKOFF_MIN;
+                wait = Duration::ZERO;
                 let mut stream = response.bytes_stream();
                 let mut buf = Vec::new();
                 while let Some(Ok(chunk)) = stream.next().await {
                     buf.extend_from_slice(&chunk);
                     for frame in frames(&mut buf) {
                         match frame {
+                            // A snapshot read after a lag already holds what the
+                            // stream goes on to replay up to its `seq`.
+                            Frame::Event(seq, _) if seq <= after => {}
                             Frame::Event(seq, event) => {
                                 after = seq;
                                 session.mirror(event);
@@ -471,7 +474,7 @@ async fn follow(
             let _ = resync.send(());
         }
         tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(BACKOFF_MAX);
+        wait = RETRY;
     }
 }
 
@@ -792,10 +795,14 @@ mod tests {
         .await;
     }
 
-    /// Forwards a port and can cut every connection through it, as a dropped tunnel does.
+    /// Forwards a port and can cut every connection through it, as a dropped tunnel does,
+    /// refuse new ones while it is `down`, or go quiet while it is `frozen`, holding
+    /// every connection open without passing a byte, as a network cut under ssh does.
     struct Tunnel {
         port: u16,
         open: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+        down: Arc<std::sync::atomic::AtomicBool>,
+        frozen: tokio::sync::watch::Sender<bool>,
     }
 
     impl Tunnel {
@@ -803,19 +810,36 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let local = listener.local_addr().unwrap().port();
             let open: Arc<Mutex<Vec<tokio::task::AbortHandle>>> = Arc::default();
-            let held = Arc::clone(&open);
+            let down: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+            let (frozen, _) = tokio::sync::watch::channel(false);
+            let (held, refusing, freezing) = (Arc::clone(&open), Arc::clone(&down), frozen.clone());
             tokio::spawn(async move {
                 while let Ok((mut inbound, _)) = listener.accept().await {
+                    if refusing.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let mut frozen = freezing.subscribe();
                     let task = tokio::spawn(async move {
                         let mut outbound = tokio::net::TcpStream::connect(("127.0.0.1", port))
                             .await
                             .unwrap();
-                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        let quiet = tokio::select! {
+                            _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => false,
+                            _ = frozen.wait_for(|f| *f) => true,
+                        };
+                        if quiet {
+                            std::future::pending::<()>().await;
+                        }
                     });
                     held.lock().unwrap().push(task.abort_handle());
                 }
             });
-            Tunnel { port: local, open }
+            Tunnel {
+                port: local,
+                open,
+                down,
+                frozen,
+            }
         }
 
         fn cut(&self) {
@@ -823,10 +847,32 @@ mod tests {
                 task.abort();
             }
         }
+
+        /// Cut every connection and refuse new ones until `up`.
+        fn down(&self) {
+            self.down.store(true, Ordering::Relaxed);
+            self.cut();
+        }
+
+        fn up(&self) {
+            self.down.store(false, Ordering::Relaxed);
+            self.frozen.send_replace(false);
+        }
+    }
+
+    fn texts(session: &Session) -> Vec<String> {
+        shown(session)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A dropped stream is reopened from the last event seen: what was published while
-    /// it was down arrives once each, in order, and the drop is said and undone.
+    /// the link was down shows within about a [`RETRY`] of it coming back, once each and
+    /// in order, and the drop is said and undone.
     #[tokio::test]
     async fn a_dropped_stream_reconnects_and_replays_what_it_missed() {
         let served = served().await;
@@ -834,28 +880,21 @@ mod tests {
         let attached = connect(attach_to(tunnel.port)).await.unwrap();
         let here = attached.session;
         served.session.publish(Event::Text("one".into()));
-        until("the first event arrives", || {
-            shown(&here).contains(&Event::Text("one".into()))
-        })
-        .await;
-        tunnel.cut();
+        until("the first event arrives", || texts(&here) == ["one"]).await;
+        tunnel.down();
         until("the drop is noticed", || !here.link().unwrap().connected()).await;
-        for text in ["two", "three"] {
+        for text in ["two", "three", "four"] {
             served.session.publish(Event::Text(text.into()));
         }
-        until("the stream is back", || here.link().unwrap().connected()).await;
-        until("what was missed arrives", || {
-            shown(&here).contains(&Event::Text("three".into()))
-        })
-        .await;
-        let texts: Vec<_> = shown(&here)
-            .into_iter()
-            .filter_map(|e| match e {
-                Event::Text(t) => Some(t),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts, ["one", "two", "three"]);
+        // Long enough for attempts to fail against the closed link.
+        tokio::time::sleep(RETRY * 2).await;
+        assert_eq!(texts(&here), ["one"]);
+        tunnel.up();
+        let back = std::time::Instant::now();
+        until("what was missed arrives", || texts(&here).len() == 4).await;
+        assert!(back.elapsed() < RETRY * 2, "{:?}", back.elapsed());
+        assert_eq!(texts(&here), ["one", "two", "three", "four"]);
+        assert!(here.link().unwrap().connected());
         let said: Vec<_> = shown(&here)
             .into_iter()
             .filter_map(|e| match e {
@@ -868,5 +907,30 @@ mod tests {
             said.iter().any(|s| s.starts_with("reconnected")),
             "{said:?}"
         );
+    }
+
+    /// Down for longer than the log reaches back, the attached session is read again
+    /// from a snapshot rather than left with a hole.
+    #[tokio::test]
+    async fn a_link_down_past_the_log_reloads_the_snapshot() {
+        let served = served().await;
+        let tunnel = Tunnel::to(served.port).await;
+        let attached = connect(attach_to(tunnel.port)).await.unwrap();
+        let (here, mut resync) = (attached.session, attached.resync);
+        tunnel.down();
+        until("the drop is noticed", || !here.link().unwrap().connected()).await;
+        served.session.publish(Event::User("long".into()));
+        for n in 0..session::EVENT_LOG + 10 {
+            served.session.publish(Event::Text(format!("{n} ")));
+        }
+        served.session.publish(Event::Text("end".into()));
+        while resync.try_recv().is_ok() {}
+        tunnel.up();
+        let transcript = |s: &Session| serde_json::to_value(&s.entries().list).unwrap();
+        until("the snapshot is read again", || {
+            transcript(&here) == transcript(&served.session)
+        })
+        .await;
+        assert!(timeout(WAIT, resync.recv()).await.unwrap().is_some());
     }
 }
