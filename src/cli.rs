@@ -2,10 +2,10 @@
 //! Inference runs through the Codex CLI's ChatGPT-subscription credentials.
 
 use crate::{
-    agent, app, askpass, cache, childenv, client, config, egress, external, identity, input,
-    instructions, judge, limits, mcp, memory, models, notify, ollama, permissions, profile, remote,
-    sandbox, schedules, search, server, session, sessions, shutdown, skills, startup, statusline,
-    syntax, title, tokens, tools, trace, ui, workflow, worktrees,
+    agent, app, askpass, cache, childenv, client, config, daemon, egress, external, identity,
+    input, instructions, judge, limits, mcp, memory, models, notify, ollama, permissions, profile,
+    remote, sandbox, schedules, search, server, session, sessions, shutdown, skills, startup,
+    statusline, syntax, title, tokens, tools, trace, ui, workflow, worktrees,
 };
 
 #[path = "cli_args.rs"]
@@ -111,9 +111,20 @@ pub async fn entry() -> Result<()> {
             }
             return Ok(());
         }
-        Some(arguments::Command::Attach { target, token }) => {
-            return attach(target.as_deref(), token, args.token_file.as_deref()).await;
+        Some(arguments::Command::Attach {
+            target,
+            token,
+            session,
+        }) => {
+            return attach(
+                target.as_deref(),
+                token,
+                args.token_file.as_deref(),
+                session.as_deref(),
+            )
+            .await;
         }
+        Some(arguments::Command::Serve { port, open }) => return serve(port, open, args).await,
         Some(arguments::Command::Usage) => {
             let body = limits::fetch_now().await?;
             println!("{}", limits::report(&body, chrono::Local::now()));
@@ -499,6 +510,8 @@ allow it.",
         for notice in &notices {
             eprintln!("bhai: {notice}");
         }
+        // `bhai serve` reads this to know the session it started.
+        eprintln!("bhai: session {session_id}");
         eprintln!(
             "bhai: debug server on http://{} ({})",
             listener.local_addr()?,
@@ -615,15 +628,64 @@ fn take_terminal() -> (ratatui::DefaultTerminal, Modes) {
     (terminal, modes)
 }
 
+/// `bhai serve`: the daemon, with a first session in the project root when `open`.
+async fn serve(port: Option<u16>, open: bool, args: Args) -> Result<()> {
+    let token = server::token(
+        args.token_file.as_deref(),
+        std::env::var(server::TOKEN_ENV).ok(),
+    )?;
+    let listener = server::bind(port.unwrap_or(server::DEFAULT_PORT)).await?;
+    let common = [
+        (args.profile, "--profile"),
+        (args.strict_cache, "--strict-cache"),
+        (args.flags.no_global, "--no-global"),
+        (args.flags.no_project, "--no-project"),
+        (args.flags.bare, "--bare"),
+    ]
+    .into_iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, flag)| flag.to_string())
+    .collect();
+    let daemon = daemon::Daemon::new(std::env::current_exe()?, std::env::current_dir()?, common);
+    if open {
+        let first = daemon::Open {
+            model: args.model,
+            effort: args.effort,
+            mode: args.flags.mode,
+            resume: args
+                .resume
+                .map(|id| id.unwrap_or_else(|| "latest".to_string())),
+            trust: args.trust,
+            identity: args.identity,
+            ..daemon::Open::default()
+        };
+        let id = daemon
+            .open(first)
+            .await
+            .map_err(|(_, message)| anyhow::anyhow!(message))?;
+        daemon.set_default(&id);
+        eprintln!("bhai: session {id}");
+    }
+    // The same line `--serve` prints, so what reads one reads the other.
+    eprintln!(
+        "bhai: debug server on http://{} ({})",
+        listener.local_addr()?,
+        token.shown()
+    );
+    daemon::run(daemon, listener, token.value).await
+}
+
 /// `bhai attach`: the tui over a session served elsewhere. Leaving only detaches, so
 /// nothing here is stopped or saved on the way out.
 async fn attach(
     target: Option<&str>,
     token: Option<String>,
     file: Option<&std::path::Path>,
+    session: Option<&str>,
 ) -> Result<()> {
     let base = remote::base_url(target)?;
     let token = remote::token(token, file, std::env::var(server::TOKEN_ENV).ok())?;
+    let base = remote::choose(&base, &token, session).await?;
     let attached = remote::connect(remote::Remote::new(base.clone(), token)).await?;
     let session = attached.session;
     let (model, effort) = session.model();

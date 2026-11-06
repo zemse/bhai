@@ -226,6 +226,112 @@ pub struct Attached {
     pub resync: mpsc::UnboundedReceiver<()>,
 }
 
+/// The base URL of the session to attach to. A `bhai serve` daemon answers
+/// `/sessions`: `wanted` picks one by id or prefix, else the only one, else the user
+/// does at a terminal. A `--serve` server has no such route and is its own session.
+pub async fn choose(base: &str, token: &str, wanted: Option<&str>) -> Result<String> {
+    let remote = Remote::new(base.to_string(), token.to_string());
+    let listed = match remote.get("/sessions").await {
+        Ok(body) => body,
+        Err(Failed::Refused(404, _)) if wanted.is_some() => {
+            bail!("{base} serves one session, so it takes no --session")
+        }
+        // A plain server, or a refusal `connect` reports in its own words.
+        Err(_) => return Ok(base.to_string()),
+    };
+    let rows: Vec<(String, String)> = listed["sessions"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|row| {
+            (
+                row["id"].as_str().unwrap_or_default().to_string(),
+                described(row),
+            )
+        })
+        .collect();
+    let id = match pick(&rows, wanted)? {
+        Some(id) => id,
+        None => ask(&rows)?,
+    };
+    Ok(format!("{base}/sessions/{id}"))
+}
+
+/// One line for a session in the list: its id, whether it is busy and what it is about.
+fn described(row: &Value) -> String {
+    let state = match (row["pending"].is_null(), row["working"].as_bool()) {
+        (false, _) => "approval waiting",
+        (true, Some(true)) => "working",
+        _ => "idle",
+    };
+    let title = row["title"].as_str().unwrap_or("(no prompt yet)");
+    let project = row["project"].as_str().unwrap_or_default();
+    format!(
+        "{}  {state:<16}  {project}  {title}",
+        row["id"].as_str().unwrap_or_default()
+    )
+}
+
+/// The session `wanted` names among `rows`, or the only one; `None` when the user must
+/// choose among several.
+fn pick(rows: &[(String, String)], wanted: Option<&str>) -> Result<Option<String>> {
+    let listing = || {
+        rows.iter()
+            .map(|(_, line)| format!("\n  {line}"))
+            .collect::<String>()
+    };
+    if let Some(wanted) = wanted {
+        let found: Vec<_> = rows
+            .iter()
+            .filter(|(id, _)| id.starts_with(wanted))
+            .collect();
+        return match found.as_slice() {
+            [(id, _)] => Ok(Some(id.clone())),
+            [] => bail!(
+                "no session `{wanted}` is open there; open ones:{}",
+                listing()
+            ),
+            _ => bail!("`{wanted}` matches more than one session:{}", listing()),
+        };
+    }
+    match rows {
+        [] => bail!(
+            "no session is open there; open one with --open on the server, or POST /sessions/new"
+        ),
+        [(id, _)] => Ok(Some(id.clone())),
+        _ if !std::io::IsTerminal::is_terminal(&std::io::stdin()) => bail!(
+            "several sessions are open; choose one with --session ID:{}",
+            listing()
+        ),
+        _ => Ok(None),
+    }
+}
+
+/// Ask at the terminal which of `rows` to attach to, by number or id.
+fn ask(rows: &[(String, String)]) -> Result<String> {
+    eprintln!("several sessions are open:");
+    for (n, (_, line)) in rows.iter().enumerate() {
+        eprintln!("  {}) {line}", n + 1);
+    }
+    eprint!("attach to: ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim();
+    if let Some((id, _)) = answer
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|n| rows.get(n))
+    {
+        return Ok(id.clone());
+    }
+    match pick(rows, Some(answer).filter(|a| !a.is_empty()))? {
+        Some(id) => Ok(id),
+        None => bail!("no session chosen"),
+    }
+}
+
 /// Read the served session and start following it.
 pub async fn connect(remote: Remote) -> Result<Attached> {
     let (state, transcript) = remote.snapshot().await.map_err(|e| match e {
@@ -445,6 +551,33 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(5);
     const TOKEN: &str = "attach-test-token-0123";
+
+    #[test]
+    fn a_session_is_picked_by_prefix_or_by_being_the_only_one() {
+        let rows = |ids: &[&str]| -> Vec<(String, String)> {
+            ids.iter()
+                .map(|id| (id.to_string(), id.to_string()))
+                .collect()
+        };
+        let two = rows(&["ab12", "cd34"]);
+        assert_eq!(pick(&two, Some("cd")).unwrap().as_deref(), Some("cd34"));
+        assert!(
+            pick(&two, Some("ef"))
+                .unwrap_err()
+                .to_string()
+                .contains("ab12")
+        );
+        assert!(pick(&rows(&["ab1", "ab2"]), Some("ab")).is_err());
+        assert_eq!(
+            pick(&rows(&["ab12"]), None).unwrap().as_deref(),
+            Some("ab12")
+        );
+        assert!(pick(&[], None).is_err());
+        let line = described(&json!({
+            "id": "ab12", "working": true, "pending": null, "project": "/p", "title": "fix it"
+        }));
+        assert_eq!(line, "ab12  working           /p  fix it");
+    }
 
     #[test]
     fn targets_are_local_urls_and_nothing_else() {

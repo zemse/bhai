@@ -190,7 +190,7 @@ fn router(session: Arc<Session>, token: String) -> Router {
 /// rebound DNS name could drive the whole session. The token is what makes the rest of
 /// the machine's processes, which can reach the port as easily as the user can, say where
 /// they got it: it is printed once, where the address is.
-async fn local_only(token: &str, request: Request, next: Next) -> Response {
+pub(crate) async fn local_only(token: &str, request: Request, next: Next) -> Response {
     let headers = request.headers();
     let host = headers
         .get(header::HOST)
@@ -778,7 +778,7 @@ async fn kill_background(
 }
 
 /// Largest file `/file` reads or `/upload` writes.
-const FILE_LIMIT: u64 = 16 * 1024 * 1024;
+pub(crate) const FILE_LIMIT: u64 = 16 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct FileQuery {

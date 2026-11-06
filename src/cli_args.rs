@@ -108,6 +108,18 @@ pub(super) enum Command {
         /// The server's token; --token-file reads it from a file, else BHAI_TOKEN.
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
+        /// The session to show when the server is bhai serve, by its id or a prefix of it.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+    },
+    /// Serve several sessions from one headless process, opened and closed over HTTP.
+    #[command(after_help = SERVE_HELP)]
+    Serve {
+        /// The port on 127.0.0.1 (default: 7878).
+        port: Option<u16>,
+        /// Open a session in the project root at startup, with --model, --mode, --resume and the rest.
+        #[arg(long)]
+        open: bool,
     },
     /// List available model IDs, reasoning efforts and context windows.
     #[command(
@@ -142,6 +154,17 @@ On the laptop:
   ssh -N -L 7878:127.0.0.1:7878 host &
   scp host:.config/bhai/server-token ~/.config/bhai/remote-token && chmod 600 ~/.config/bhai/remote-token
   bhai attach 7878 --token-file ~/.config/bhai/remote-token";
+
+const SERVE_HELP: &str = "Each session runs as its own bhai --serve --headless; the daemon starts, lists and stops them.
+  GET /sessions                      id, title, project, working, pending approval, created, updated
+  POST /sessions/new                 {\"project\", \"model\", \"mode\", \"effort\", \"resume\", \"trust\", \"as\"}, all optional
+  DELETE /sessions/ID                stops one as SIGTERM would; POST /sessions/ID/close does the same
+  /sessions/ID/ROUTE                 any --serve route of that session: state, events, prompt, approve, file, ...
+The unprefixed routes reach the --open session while it runs, else the only one open.
+SIGTERM, SIGHUP or SIGINT stops every session (each gets the usual 10s wind-down) and exits.
+--model, --mode and the other session options go to the --open session; --profile, --bare and the like to all.
+  bhai serve 7878 --token-file ~/.config/bhai/server-token --open
+  bhai attach 7878 --token-file ~/.config/bhai/remote-token --session ID";
 
 #[derive(Debug, PartialEq, Subcommand)]
 pub(super) enum SessionsCommand {
@@ -267,8 +290,34 @@ impl Cli {
                 "--serve and --headless run a session; this command does not start one",
             ));
         }
-        if parsed.token_file.is_some() && parsed.serve.is_none() && !attach {
-            return Err(Self::invalid("--token-file goes with --serve or attach"));
+        if let Some(Command::Serve { open, .. }) = parsed.command {
+            if parsed.serve.is_some() || parsed.headless {
+                return Err(Self::invalid(
+                    "bhai serve is always headless; give the port as bhai serve PORT",
+                ));
+            }
+            if parsed.exec.is_some() || parsed.workflow.is_some() || parsed.pick || parsed.json {
+                return Err(Self::invalid(
+                    "bhai serve opens sessions over HTTP, without exec, --workflow, --pick or --json",
+                ));
+            }
+            let session = parsed.model.is_some()
+                || parsed.effort.is_some()
+                || parsed.flags.mode.is_some()
+                || parsed.resume.is_some()
+                || parsed.identity.is_some()
+                || parsed.trust;
+            if session && !open {
+                return Err(Self::invalid(
+                    "--model, --effort, --mode, --resume, --as and --trust are for the session --open starts; POST /sessions/new takes them per session",
+                ));
+            }
+        }
+        let daemon = matches!(parsed.command, Some(Command::Serve { .. }));
+        if parsed.token_file.is_some() && parsed.serve.is_none() && !attach && !daemon {
+            return Err(Self::invalid(
+                "--token-file goes with --serve, serve or attach",
+            ));
         }
         if attach
             && (parsed.exec.is_some()
@@ -496,7 +545,8 @@ mod tests {
             args.command,
             Some(Command::Attach {
                 target: Some("8791".to_string()),
-                token: None
+                token: None,
+                session: None,
             })
         );
         assert_eq!(args.token_file.as_deref(), Some(std::path::Path::new("/t")));
@@ -505,9 +555,15 @@ mod tests {
             args.command,
             Some(Command::Attach {
                 target: None,
-                token: Some("abc".to_string())
+                token: Some("abc".to_string()),
+                session: None,
             })
         );
+        let args = parse(&["attach", "7878", "--session", "ab12"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Attach { session: Some(ref id), .. }) if id == "ab12"
+        ));
         for refused in [
             vec!["attach", "--serve"],
             vec!["attach", "--headless"],
@@ -515,6 +571,34 @@ mod tests {
             vec!["attach", "--json"],
             vec!["attach", "1", "2"],
             vec!["--token-file", "/t"],
+        ] {
+            assert!(parse(&refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn serve_takes_a_port_and_session_options_only_with_open() {
+        let args = parse(&["serve", "9000", "--token-file", "/t", "-C", "/p"]).unwrap();
+        assert_eq!(
+            args.command,
+            Some(Command::Serve {
+                port: Some(9000),
+                open: false
+            })
+        );
+        assert_eq!(args.token_file.as_deref(), Some(std::path::Path::new("/t")));
+        let args = parse(&["serve", "--open", "-m", "ollama:x", "--mode", "auto", "-r"]).unwrap();
+        assert_eq!(args.model.as_deref(), Some("ollama:x"));
+        assert_eq!(args.resume, Some(None));
+        assert!(parse(&["serve", "--profile"]).is_ok());
+        for refused in [
+            vec!["serve", "--serve"],
+            vec!["serve", "--headless"],
+            vec!["serve", "-m", "x"],
+            vec!["serve", "--resume"],
+            vec!["serve", "--json"],
+            vec!["serve", "--pick"],
+            vec!["serve", "nope"],
         ] {
             assert!(parse(&refused).is_err(), "{refused:?}");
         }

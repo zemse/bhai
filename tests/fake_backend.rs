@@ -499,9 +499,14 @@ impl Bhai {
 
     /// `/events` from the first event on.
     async fn events(&self) -> Events {
+        self.events_at("/events").await
+    }
+
+    /// `path`, an `/events` route, from the first event on.
+    async fn events_at(&self, path: &str) -> Events {
         let response = self
             .http
-            .get(format!("{}/events", self.base))
+            .get(format!("{}{path}", self.base))
             .header("x-bhai-token", &self.token)
             .header("last-event-id", "0")
             .send()
@@ -1131,6 +1136,131 @@ async fn an_attached_session_answers_a_served_execs_approval() {
         .expect("exec did not exit");
     assert!(exited.unwrap().success());
     assert!(bhai.project().join("made-by-attach").exists());
+}
+
+/// `bhai serve` runs each session as a process of its own, reached under
+/// `/sessions/{id}`, and the unprefixed routes go to the `--open` one while it runs.
+#[tokio::test]
+async fn serve_opens_lists_forwards_to_and_closes_sessions() {
+    let fake = Arc::new(Fake::default());
+    fake.replies
+        .lock()
+        .unwrap()
+        .extend([says("from the first"), says("from the second")]);
+    let backend = serve_fake(fake.clone()).await;
+    let lead = ["serve", "0", "--open"];
+    let mut bhai = Bhai::launch(&backend, &lead, &[], &[], None, |_, project| {
+        std::fs::create_dir(project.join("sub")).unwrap();
+    })
+    .await;
+    let first = bhai
+        .said
+        .lines()
+        .find_map(|l| l.strip_prefix("bhai: session "))
+        .expect("the daemon names the session it opened")
+        .to_string();
+    let list = |bhai: &Bhai| {
+        let request = bhai
+            .http
+            .get(format!("{}/sessions", bhai.base))
+            .header("x-bhai-token", &bhai.token);
+        async move { request.send().await.unwrap().json::<Value>().await.unwrap() }
+    };
+    assert_eq!(list(&bhai).await["sessions"][0]["id"], first.as_str());
+
+    let mut events = bhai.events().await;
+    let (status, answer) = bhai.post("/prompt", json!({ "text": "one" })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    events.until("turn_end").await;
+    assert_eq!(events.text(), "from the first");
+
+    let (status, opened) = bhai
+        .post("/sessions/new", json!({ "project": "sub" }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{opened}");
+    let second = opened["id"].as_str().unwrap().to_string();
+    let listed = list(&bhai).await;
+    let rows = listed["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{listed}");
+    assert!(
+        rows[1]["project"].as_str().unwrap().ends_with("/sub"),
+        "{listed}"
+    );
+    assert_eq!(rows[0]["title"], "one", "{listed}");
+    assert_eq!(rows[0]["working"], false, "{listed}");
+    let (status, _) = bhai
+        .post("/sessions/new", json!({ "resume": first.as_str() }))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an open session is not opened twice"
+    );
+
+    let unchosen = bhai::remote::choose(&bhai.base, &bhai.token, None).await;
+    let listing = unchosen.unwrap_err().to_string();
+    assert!(
+        listing.contains(&first) && listing.contains(&second),
+        "{listing}"
+    );
+    let prefix = &second[..8];
+    let chosen = bhai::remote::choose(&bhai.base, &bhai.token, Some(prefix))
+        .await
+        .unwrap();
+    assert_eq!(chosen, format!("{}/sessions/{second}", bhai.base));
+    let remote = bhai::remote::Remote::new(chosen, bhai.token.clone());
+    let attached = bhai::remote::connect(remote).await.unwrap();
+    assert!(!attached.session.state().working);
+    let mut events = bhai.events_at(&format!("/sessions/{prefix}/events")).await;
+    let (status, _) = bhai
+        .post(
+            &format!("/sessions/{prefix}/prompt"),
+            json!({ "text": "two" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    events.until("turn_end").await;
+    assert_eq!(events.text(), "from the second");
+    let uploaded = bhai
+        .http
+        .post(format!("{}/sessions/{second}/upload?path=a.txt", bhai.base))
+        .header("x-bhai-token", &bhai.token)
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+    assert!(uploaded.status().is_success(), "{}", uploaded.status());
+    let written = std::fs::read_to_string(bhai.project().join("sub/a.txt")).unwrap();
+    assert_eq!(written, "hello");
+
+    let closed = bhai
+        .http
+        .delete(format!("{}/sessions/{first}", bhai.base))
+        .header("x-bhai-token", &bhai.token)
+        .send()
+        .await
+        .unwrap();
+    assert!(closed.status().is_success(), "{}", closed.status());
+    let listed = list(&bhai).await;
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1, "{listed}");
+    let state = bhai.state().await;
+    assert_eq!(
+        state["calls"], 1,
+        "the only session left answers unprefixed: {state}"
+    );
+
+    let pid = i32::try_from(bhai.child.id().unwrap()).unwrap();
+    #[allow(unsafe_code)]
+    // SAFETY: only sends a signal, to the daemon this test started.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let exited = timeout(WAIT, bhai.child.wait())
+        .await
+        .expect("the daemon did not stop on SIGTERM");
+    assert!(exited.unwrap().success());
+    let saved = bhai.project().join("sub/.bhai/sessions");
+    assert!(saved.join(format!("{second}.jsonl")).exists());
 }
 
 /// Without `--serve`, `exec` still refuses what is left at ask, at once.

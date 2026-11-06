@@ -131,6 +131,36 @@ scp host:.config/bhai/server-token ~/.config/bhai/remote-token && chmod 600 ~/.c
 bhai attach 7878 --token-file ~/.config/bhai/remote-token
 ```
 
+`bhai serve [port]` is a daemon for several sessions: it starts headless with none open (`--open` opens one in the project root, taking `--model`, `--mode`, `--effort`, `--resume`, `--as` and `--trust`), and each session runs as a `bhai --serve --headless` process of its own, so they can sit in different projects. it takes the same token and the same local-only checks as `--serve`.
+
+- `GET /sessions` lists `id`, `title` (the first prompt), `project`, `working`, `pending` (the waiting approval or null), `model`, `mode`, `created` and `updated`.
+- `POST /sessions/new` opens one; the body is optional and may hold `project` (relative to the daemon's root), `model`, `mode`, `effort`, `resume` (an id, a prefix or `latest`), `trust` and `as`. it answers with the `id` once that session's server is up; a session already open is not resumed twice (409).
+- `DELETE /sessions/ID` or `POST /sessions/ID/close` stops one as SIGTERM stops a lone session: the turn is interrupted and recorded, and it can be resumed later.
+- `/sessions/ID/...` reaches any route of that session (`state`, `events?since=N`, `prompt`, `approve`, `snapshot`, `file`, `upload`, ...). an id prefix works when only one session has it.
+- the unprefixed routes reach the `--open` session while it runs, else the only one open, so `curl localhost:7878/state` keeps working; with several and no default they answer 409 with the ids.
+
+SIGTERM, SIGHUP or SIGINT stops every session at once, each with its ten second wind-down, and the daemon exits 0; the sessions' output, resume hints included, goes to the daemon's stderr prefixed with their ids. `bhai attach PORT --session ID` picks a session; without `--session` it attaches to the only one, asks at a terminal when there are several, and otherwise fails with the list.
+
+a systemd unit for a box that should keep sessions across logins (`KillMode=mixed` sends SIGTERM to the daemon alone, which stops each session once):
+
+```ini
+[Unit]
+Description=bhai sessions
+After=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/project
+ExecStart=/home/ubuntu/.cargo/bin/bhai serve 7878 --token-file /home/ubuntu/.config/bhai/server-token
+Restart=on-failure
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
 ### driving bhai from another harness
 
 `bhai models` lists exact model IDs, supported reasoning efforts and known context windows. `bhai models --json` returns one JSON object with `models` and `notes`, unlike the JSONL event stream from `exec --json`. listing reads backend metadata without starting an agent session or requesting inference.
