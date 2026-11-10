@@ -479,7 +479,7 @@ allow it.",
         let served = match listener {
             Some((listener, token)) => {
                 session.watch_background(crate::background::sources(hub.clone()));
-                notify::watch(session.subscribe());
+                notify::watch(session.subscribe(), Arc::clone(&session.privacy));
                 eprintln!(
                     "bhai: debug server on http://{} ({})",
                     listener.local_addr()?,
@@ -503,7 +503,7 @@ allow it.",
     }
     // Only a run that stays up has a list to show it in.
     session.watch_background(crate::background::sources(hub.clone()));
-    notify::watch(session.subscribe());
+    notify::watch(session.subscribe(), Arc::clone(&session.privacy));
     if args.headless {
         let (listener, token) = listener.expect("--headless is only accepted with --serve");
         session.entries().restore(&history);
@@ -1571,6 +1571,9 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
                 if let Some(summary) = summary {
                     println!("{summary}");
                 }
+            }
+            AgentEvent::Private { active, ready } => {
+                println!("[info] private={active} ready={ready}")
             }
             AgentEvent::Cleared => println!("[info] history cleared"),
             AgentEvent::Fork(Some(tokens)) => {

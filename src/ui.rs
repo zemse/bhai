@@ -887,6 +887,18 @@ pub fn compact(n: u64) -> String {
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
+    let area = if app.session().privacy.active() {
+        let [banner, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        frame.render_widget(
+            Paragraph::new(" PRIVATE MODE · memory only · /clear to start over ")
+                .style(Style::new().fg(Color::Black).bg(Color::Magenta)),
+            banner,
+        );
+        rest
+    } else {
+        area
+    };
     let [text_area, bar_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     let width = text_area.width.max(10) as usize;
@@ -1813,7 +1825,11 @@ fn menu_row(item: &Item, width: usize, selected: bool) -> Line<'static> {
 
 fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut block = Block::bordered()
-        .border_style(Style::new().fg(Color::DarkGray))
+        .border_style(Style::new().fg(if app.session().privacy.active() {
+            Color::Magenta
+        } else {
+            Color::DarkGray
+        }))
         .title_bottom(mode_chip(app.mode));
     // Inside a pane the prompt goes to that child, so it says so where the eye lands.
     if let Some(inside) = &app.inside {
@@ -4080,6 +4096,32 @@ mod tests {
         let before = app.scroll;
         assert!(!app.on_mouse(left(MouseEventKind::Drag(MouseButton::Left), 5, bar.y)));
         assert_eq!(app.scroll, before, "a drag after release does nothing");
+    }
+
+    #[test]
+    fn private_mode_has_a_banner_and_distinct_input_border() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        for private in [false, true, false] {
+            if private {
+                app.session().privacy.begin();
+                app.session().privacy.finish(true);
+            } else {
+                app.session().privacy.clear();
+            }
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(screen(&terminal).contains("PRIVATE MODE"), private);
+            let (area, ..) = app.input_area.unwrap();
+            let border = &terminal.backend().buffer()[(area.x, area.y - 1)];
+            assert_eq!(
+                border.fg,
+                if private {
+                    Color::Magenta
+                } else {
+                    Color::DarkGray
+                }
+            );
+        }
     }
 
     #[test]

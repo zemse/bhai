@@ -535,6 +535,14 @@ impl Registry {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+        if crate::privacy::active()
+            && matches!(
+                name,
+                "agent" | "remember" | "schedule" | "monitor" | "image_gen"
+            )
+        {
+            return None;
+        }
         self.tools
             .iter()
             .find(|t| t.name() == name)

@@ -39,6 +39,11 @@ pub const COMMANDS: &[Command] = &[
         help: "continue from the copy compacted while the cache was warm",
     },
     Command {
+        name: "private",
+        args: "",
+        help: "keep this conversation in memory until /clear",
+    },
+    Command {
         name: "clear",
         args: "",
         help: "drop the conversation and start over",

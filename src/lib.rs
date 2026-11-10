@@ -82,6 +82,7 @@ mod ollama;
 mod palette;
 pub mod permissions;
 pub mod plan;
+pub mod privacy;
 pub mod profile;
 pub mod prompt;
 mod redact;

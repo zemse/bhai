@@ -517,6 +517,24 @@ async fn prompt(
 
 /// Submit `text`, answering `{"ok": true}` or, when it joined the queue, the position too.
 fn admit(session: &Session, text: &str) -> Result<Value, (StatusCode, String)> {
+    if text == "/private" {
+        return session
+            .enable_private()
+            .map(|()| json!({"ok": true}))
+            .map_err(|error| (StatusCode::CONFLICT, error));
+    }
+    if text == "/clear" {
+        return session
+            .clear()
+            .map(|()| json!({"ok": true}))
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()));
+    }
+    if text.starts_with("/private ") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "/private takes no arguments".into(),
+        ));
+    }
     if let Some(rest) = crate::session::compact_then(text) {
         if rest.is_empty() {
             return Err((
@@ -750,7 +768,12 @@ async fn schedule(State(session): State<Arc<Session>>, Json(body): Json<Schedule
                 .transpose()?,
         })
     })();
-    match new.and_then(|new| store.add(new)) {
+    match new.and_then(|new| {
+        session
+            .privacy
+            .public(|| store.add(new).map_err(anyhow::Error::msg))
+            .map_err(|error| error.to_string())
+    }) {
         Ok(row) => Json(json!({ "ok": true, "schedule": row })).into_response(),
         Err(e) => error(StatusCode::BAD_REQUEST, &e),
     }
@@ -1705,6 +1728,26 @@ mod tests {
         assert_eq!(post(&http, url("a1"), json!({})).await, StatusCode::OK);
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!cancel.stopped(), "the turn was not interrupted");
+    }
+
+    #[tokio::test]
+    async fn private_http_schedule_does_not_persist() {
+        let (base, session) = quiet().await;
+        let dir = crate::tools::temp_dir();
+        session.run_schedules(crate::schedules::Schedules::new(&dir, &dir, "private-http"));
+        session.privacy.begin();
+        session.privacy.finish(true);
+        let http = reqwest::Client::new();
+        assert_eq!(
+            post(
+                &http,
+                format!("{base}/schedule"),
+                json!({"spec":"in 20m", "text":"PRIVATE_HTTP_SCHEDULE"})
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(session.schedules().unwrap().active(), 0);
     }
 
     #[tokio::test]

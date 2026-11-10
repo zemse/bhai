@@ -761,7 +761,15 @@ impl App {
             KeyCode::Char('l') if ctrl => self.toggle_folds(),
             KeyCode::Char('y') if ctrl => self.copy(),
             KeyCode::Char('v') if ctrl => self.paste(),
-            KeyCode::Char('g') if ctrl => self.editing = true,
+            KeyCode::Char('g') if ctrl => {
+                if self.session.privacy.active() {
+                    self.note(Entry::Error(
+                        "external editing is unavailable in private mode".into(),
+                    ));
+                } else {
+                    self.editing = true;
+                }
+            }
             KeyCode::Char('a') if ctrl && !self.input.is_empty() => self.input.select_all(),
             // With nothing drafted there is nothing in the prompt to take, so ctrl+a
             // reaches past it to the transcript, which is the thing worth taking whole.
@@ -1603,6 +1611,12 @@ impl App {
     /// ctrl+space: start recording, or stop and transcribe into the prompt.
     #[cfg(feature = "dictation")]
     fn dictate(&mut self) {
+        if self.session.privacy.active() {
+            self.note(Entry::Error(
+                "dictation is unavailable in private mode".into(),
+            ));
+            return;
+        }
         let Some(dictation) = &mut self.dictation else {
             return self.note(Entry::Info(
                 "dictation is off: add a [dictation] table to ~/.config/bhai/config.toml"
@@ -1920,9 +1934,18 @@ impl App {
         let images = self.attachments.take(&message);
         self.selection = None;
         self.menu = None;
-        if kept_out(&raw) {
+        if kept_out(&raw)
+            || self.session.privacy.active()
+            || self.attached().is_some()
+            || message.starts_with("/private")
+        {
             self.history.end_walk();
-        } else if let Err(e) = self.history.push(&message) {
+        } else if let Err(e) = {
+            self.session.privacy.track(&message);
+            self.session
+                .privacy
+                .public(|| self.history.push_owned(&message, Some(&self.session_id)))
+        } {
             self.note(Entry::Error(format!("could not save prompt history: {e}")));
         }
         // Inside a child's pane the prompt types into that child, not the session, so
@@ -2004,6 +2027,23 @@ impl App {
         }
         if message.starts_with("/context") {
             self.export_context();
+            return;
+        }
+        if message == "/private" {
+            self.follow = true;
+            #[cfg(feature = "dictation")]
+            if let Some(dictation) = &mut self.dictation {
+                dictation.cancel();
+            }
+            if let Err(error) = self.session.enable_private() {
+                self.note(Entry::Error(error));
+            }
+            return;
+        }
+        if message.starts_with("/private ") {
+            self.note(Entry::Error(
+                "/private takes no arguments; /clear starts a new persistent conversation".into(),
+            ));
             return;
         }
         if message == "/clear" {
@@ -2316,7 +2356,11 @@ impl App {
         f: impl FnOnce(&crate::schedules::Schedules) -> Result<String, String>,
     ) -> Result<String, String> {
         match self.session.schedules() {
-            Some(schedules) => f(&schedules),
+            Some(schedules) => self
+                .session
+                .privacy
+                .public(|| f(&schedules).map_err(anyhow::Error::msg))
+                .map_err(|error| error.to_string()),
             None => Err(
                 "schedules are off here: there is no home directory to keep them in".to_string(),
             ),
@@ -2733,6 +2777,12 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     /// Handle `/context` locally: export the breakdown and report where it went.
     fn export_context(&mut self) {
         self.follow = true;
+        if self.session.privacy.active() {
+            self.note(Entry::Error(
+                "context export is unavailable in private mode".into(),
+            ));
+            return;
+        }
         if let Some(link) = self.attached() {
             let get = (link.get)("/context".to_string());
             let session = Arc::clone(&self.session);
@@ -2747,12 +2797,16 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         let transcript = self.transcript();
         let cwd = std::env::current_dir().unwrap_or_default();
         let diagnostics = crate::sessions::debug_dir(&cwd, &self.session_id);
+        let epoch = self.session.privacy.epoch();
         let session = Arc::clone(&self.session);
         tokio::spawn(async move {
             let event = match session.context().await {
                 Some(mut profile) => {
                     profile.transcript = Some(transcript);
-                    match profile::export(&profile, &diagnostics) {
+                    match session
+                        .privacy
+                        .public_at(epoch, || profile::export(&profile, &diagnostics))
+                    {
                         Ok(path) => Event::Info(profile.summary(&path)),
                         Err(e) => Event::Error(format!("context export failed: {e:#}")),
                     }
@@ -2770,19 +2824,31 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     /// here and the write waits on it.
     fn export_debug(&mut self) {
         self.follow = true;
+        if self.session.privacy.active() {
+            self.note(Entry::Error(
+                "debug export is unavailable in private mode".into(),
+            ));
+            return;
+        }
         let transcript = self.transcript();
         let session = Arc::clone(&self.session);
         let mut bundle = self.debug_bundle();
+        let epoch = self.session.privacy.epoch();
         tokio::spawn(async move {
             bundle.profile = session.context().await.map(|mut profile| {
                 profile.transcript = Some(transcript);
                 profile
             });
             let dir = std::env::current_dir().unwrap_or_default();
-            session.publish(match debug::export(&bundle, &dir) {
-                Ok(path) => Event::Info(bundle.summary(&path)),
-                Err(e) => Event::Error(format!("debug export failed: {e:#}")),
-            });
+            session.publish(
+                match session
+                    .privacy
+                    .public_at(epoch, || debug::export(&bundle, &dir))
+                {
+                    Ok(path) => Event::Info(bundle.summary(&path)),
+                    Err(e) => Event::Error(format!("debug export failed: {e:#}")),
+                },
+            );
         });
     }
 
@@ -2889,7 +2955,6 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         self.session.children()
     }
 
-    #[cfg(test)]
     pub fn session(&self) -> &Arc<Session> {
         &self.session
     }
@@ -3873,6 +3938,25 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn private_remind_does_not_save_a_schedule() {
+        let mut app = App::detached();
+        let dir = crate::tools::temp_dir();
+        app.session.run_schedules(crate::schedules::Schedules::new(
+            &dir,
+            &dir,
+            "private-remind",
+        ));
+        app.session.privacy.begin();
+        app.session.privacy.finish(true);
+        app.input.set("/remind in 20m PRIVATE_REMINDER".into());
+        app.submit();
+        assert_eq!(app.session.schedules().unwrap().active(), 0);
+        assert!(
+            matches!(app.entries().list.last(), Some(Entry::Error(error)) if error.contains("private mode"))
+        );
     }
 
     #[tokio::test]

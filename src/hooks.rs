@@ -205,6 +205,9 @@ impl Hooks {
     ) -> futures_util::future::BoxFuture<'a, Outcome> {
         Box::pin(async move {
             let mut outcome = Outcome::default();
+            if crate::privacy::active() {
+                return outcome;
+            }
             let Some(object) = input.as_object_mut() else {
                 outcome.notices.push("hook input must be an object".into());
                 return outcome;

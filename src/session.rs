@@ -186,6 +186,10 @@ pub enum Event {
     },
     /// History was dropped, so the transcript that showed it goes too.
     Cleared,
+    Private {
+        active: bool,
+        ready: bool,
+    },
     /// A compacted copy of the history is ready for `/compact-then`, and a call on it
     /// would read this many tokens; `None` once it no longer stands for the history.
     Fork(Option<u64>),
@@ -307,6 +311,8 @@ pub struct Approval {
 /// A snapshot of the session, as `GET /state` reports it.
 #[derive(Debug, Clone, Serialize)]
 pub struct State {
+    pub private: bool,
+    pub privacy_ready: bool,
     pub model: String,
     /// The reasoning effort the model runs at.
     pub effort: String,
@@ -446,6 +452,7 @@ pub enum Submitted {
 #[derive(Debug, PartialEq)]
 pub enum SubmitError {
     Busy,
+    Private,
     Closed,
     /// An effort change would re-read the whole conversation uncached; the cache goes
     /// cold on its own after this long.
@@ -464,6 +471,7 @@ impl fmt::Display for SubmitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SubmitError::Busy => f.write_str("a turn is already running"),
+            SubmitError::Private => f.write_str("private mode: this action is blocked. If erasure failed, retry /private; otherwise use /clear to start a new persistent conversation"),
             SubmitError::Closed => f.write_str("the agent is not accepting messages"),
             SubmitError::CacheWarm(left) => write!(
                 f,
@@ -683,6 +691,8 @@ impl Inner {
 }
 
 pub struct Session {
+    pub privacy: Arc<crate::privacy::Privacy>,
+    shells: std::sync::atomic::AtomicUsize,
     /// The model and the reasoning effort it runs at; `/model` changes both.
     model: Mutex<(String, String)>,
     identity: String,
@@ -745,6 +755,8 @@ impl Session {
         judge: Option<Arc<Judge>>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            privacy: Arc::default(),
+            shells: Default::default(),
             model: Mutex::new((model, effort)),
             identity,
             events: broadcast::channel(EVENT_BUFFER).0,
@@ -797,6 +809,12 @@ impl Session {
         *self.model.lock().unwrap_or_else(|e| e.into_inner()) = (model, effort);
         if let Some(mode) = read(state, "mode") {
             self.policy.set_mode(mode);
+        }
+        if state["private"].as_bool().unwrap_or(false) {
+            self.privacy
+                .finish(state["privacy_ready"].as_bool().unwrap_or(false));
+        } else {
+            self.privacy.clear();
         }
         inner.working = state["working"].as_bool().unwrap_or_default();
         inner.started = inner.working.then(Instant::now);
@@ -953,6 +971,13 @@ impl Session {
                     usage.shrink(*freed);
                 }
             }
+            Event::Private { active, ready } => {
+                if *active {
+                    self.privacy.finish(*ready);
+                } else {
+                    self.privacy.clear();
+                }
+            }
             Event::Cleared => inner.last_usage = None,
             Event::Goal(goal) => {
                 if goal.is_some() || inner.goal.is_some() {
@@ -1066,6 +1091,8 @@ impl Session {
     fn state_of(&self, inner: &Inner, seq: u64) -> State {
         let (model, effort) = self.model();
         State {
+            private: self.privacy.active(),
+            privacy_ready: self.privacy.ready(),
             model,
             effort,
             fast: inner.fast.is_some(),
@@ -1098,11 +1125,18 @@ impl Session {
 
     /// Start a turn with `prompt`, or queue it when one is already running.
     pub fn submit(&self, prompt: impl Into<Prompt>) -> Result<Submitted, SubmitError> {
+        if !self.privacy.ready() {
+            return Err(SubmitError::Private);
+        }
         let prompt = prompt.into();
         if let Some(link) = self.link() {
             return Ok(self.forward(link, &prompt, prompt.text.clone()));
         }
         let mut inner = self.lock();
+        if !self.privacy.ready() {
+            return Err(SubmitError::Private);
+        }
+        self.privacy.track(&prompt.shown);
         inner.held = false;
         if inner.working {
             return Ok(self.enqueue(&mut inner, Waiting::Prompt(prompt)));
@@ -1156,6 +1190,9 @@ impl Session {
     /// `/compact-then`. The full history is dropped for the copy, so this is refused
     /// rather than queued while a turn runs on it.
     pub fn submit_forked(&self, prompt: impl Into<Prompt>) -> Result<(), SubmitError> {
+        if !self.privacy.ready() {
+            return Err(SubmitError::Private);
+        }
         let prompt = prompt.into();
         if let Some(link) = self.link() {
             self.forward(link, &prompt, prompt.shown.clone());
@@ -1334,6 +1371,9 @@ impl Session {
 
     /// Native recovery control, refused while model work is in flight.
     pub fn recover_authorization(&self, command: &str) -> Result<(), String> {
+        if !self.privacy.ready() {
+            return Err(SubmitError::Private.to_string());
+        }
         if self.lock().working {
             return Err("finish or interrupt the turn before recovering authorization".into());
         }
@@ -1345,6 +1385,9 @@ impl Session {
     /// `/goal` with what followed it. The agent takes it even mid-turn, and opens a turn on
     /// an active goal once it is idle; it says what came of it in the transcript.
     pub fn set_goal(&self, text: &str) -> Result<(), String> {
+        if !self.privacy.ready() {
+            return Err(SubmitError::Private.to_string());
+        }
         let command = crate::goal::Command::parse(text)?;
         if let Some(link) = self.link() {
             link.send(Action::Goal(text.to_string()));
@@ -1737,7 +1780,15 @@ impl Session {
     /// deny rule or a mode that refuses the call stops it. It is audited like a tool
     /// call and shown as a note, so it never reaches the model's history.
     pub fn shell(self: &Arc<Self>, command: &str) {
+        let _inner = self.lock();
         use crate::permissions::Decision;
+        if self.privacy.active() {
+            self.publish(Event::Error(
+                "! commands are unavailable in private mode; ask the agent to run a tool instead"
+                    .into(),
+            ));
+            return;
+        }
         if self.link().is_some() {
             self.publish(Event::Error(SubmitError::Attached.to_string()));
             return;
@@ -1752,12 +1803,17 @@ impl Session {
         }
         let session = Arc::clone(self);
         let command = command.to_string();
+        self.shells
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
             session
                 .policy
                 .audit(bash::NAME, &command, "ran", "you", "typed after !");
             let output = bash::typed(&command).await;
             session.publish(Event::Info(format!("$ {command}\n{}", output.trim_end())));
+            session
+                .shells
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         });
     }
 
@@ -1804,6 +1860,9 @@ impl Session {
     /// everything queued before it are done. `asked` is what the user wants the summary
     /// to keep, from `/compact <prompt>`.
     pub fn compact(&self, asked: Option<String>) -> Result<Submitted, SubmitError> {
+        if !self.privacy.ready() {
+            return Err(SubmitError::Private);
+        }
         if self.link().is_some() {
             return Err(SubmitError::Attached);
         }
@@ -1842,6 +1901,9 @@ impl Session {
     /// Run the last turn again, after it failed. Nothing is added to the history, so the
     /// call goes out as the failed one did, and the user retypes nothing.
     pub fn retry(&self) -> Result<(), SubmitError> {
+        if !self.privacy.ready() {
+            return Err(SubmitError::Private);
+        }
         let mut inner = self.lock();
         if inner.working {
             return Err(SubmitError::Busy);
@@ -1862,6 +1924,9 @@ impl Session {
     /// `/btw`: one call on the history with `question` after it, the answer shown and
     /// neither kept. Refused while a turn runs, which holds the history it would read.
     pub fn btw(&self, question: &str) -> Result<(), SubmitError> {
+        if !self.privacy.ready() {
+            return Err(SubmitError::Private);
+        }
         let mut inner = self.lock();
         if inner.working {
             return Err(SubmitError::Busy);
@@ -1884,6 +1949,9 @@ impl Session {
     /// `/fork`: copy the conversation into a new session file, which the agent names in
     /// the transcript. Refused while a turn runs, since its history is half written.
     pub fn fork_session(&self) -> Result<(), SubmitError> {
+        if self.privacy.active() {
+            return Err(SubmitError::Private);
+        }
         let inner = self.lock();
         if inner.working {
             return Err(SubmitError::Busy);
@@ -1898,25 +1966,72 @@ impl Session {
         Ok(())
     }
 
+    /// Enable private recording policy only at a quiescent conversation boundary.
+    pub fn enable_private(&self) -> Result<(), String> {
+        if let Some(link) = self.link() {
+            link.send(Action::Prompt("/private".to_string()));
+            return Ok(());
+        }
+        let inner = self.lock();
+        if inner.working
+            || !inner.queue.is_empty()
+            || self.shells.load(std::sync::atomic::Ordering::SeqCst) > 0
+            || !self.background().is_empty()
+        {
+            return Err("cannot enable private mode while a turn, queued prompt or background activity remains; interrupt or stop it first".to_string());
+        }
+        let _guard = self.privacy.io.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.background().is_empty() {
+            return Err(
+                "cannot enable private mode while background activity remains; stop it first"
+                    .into(),
+            );
+        }
+        if self.privacy.active() && self.privacy.ready() {
+            return Err("private mode cannot be disabled for this conversation; use /clear to start a new persistent conversation".to_string());
+        }
+        let permit = self.tx_control.try_reserve().map_err(|_| {
+            "cannot enable private mode: the agent is not accepting control requests".to_string()
+        })?;
+        self.privacy.begin();
+        self.publish(Event::Private {
+            active: true,
+            ready: false,
+        });
+        permit.send(Control::Private(Arc::clone(&self.privacy)));
+        drop(inner);
+        Ok(())
+    }
+
     /// Drop the conversation: the agent's history and the transcript that showed it.
     /// Refused while a turn runs, since the turn holds the history it would drop.
     pub fn clear(&self) -> Result<(), SubmitError> {
-        if self.link().is_some() {
-            return Err(SubmitError::Attached);
+        if !self.privacy.ready() {
+            return Err(SubmitError::Private);
         }
-        let inner = self.lock();
+        if let Some(link) = self.link() {
+            link.send(Action::Prompt("/clear".into()));
+            return Ok(());
+        }
+        let mut inner = self.lock();
         if inner.working {
             return Err(SubmitError::Busy);
         }
         self.tx_control
             .try_send(Control::Clear)
             .map_err(|_| SubmitError::Closed)?;
+        if self.privacy.active() {
+            inner.start();
+        }
         Ok(())
     }
 
     /// Run `workflow` now, as a turn of its own, unless one is already running. The
     /// agent asks for confirmation before it launches anything.
     pub fn workflow(&self, workflow: Arc<Workflow>, input: String) -> Result<(), SubmitError> {
+        if self.privacy.active() {
+            return Err(SubmitError::Private);
+        }
         if self.link().is_some() {
             return Err(SubmitError::Attached);
         }
@@ -2102,7 +2217,13 @@ impl Session {
                     freed,
                 }
             }
+            AgentEvent::Private { active, ready } => Event::Private { active, ready },
             AgentEvent::Cleared => {
+                self.children
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                self.ended.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 inner.last_call = None;
                 inner.last_usage = None;
                 Event::Cleared
@@ -2302,6 +2423,9 @@ impl Session {
     /// Post `text` to a running child agent. It joins that child's history before its
     /// next model call, and shows in its pane straight away.
     pub fn steer(&self, id: &str, text: String) -> Result<(), SubmitError> {
+        if self.privacy.active() {
+            return Err(SubmitError::Private);
+        }
         if text.len() > STEER_MAX {
             return Err(SubmitError::TooLong(text.len()));
         }
@@ -2498,6 +2622,58 @@ mod tests {
             ),
             rx_user,
         )
+    }
+
+    #[test]
+    fn private_closed_control_channel_does_not_latch_privacy() {
+        let (session, _rx) = session();
+        assert!(
+            session
+                .enable_private()
+                .unwrap_err()
+                .contains("control requests")
+        );
+        assert!(!session.privacy.active());
+    }
+
+    #[tokio::test]
+    async fn private_activation_refuses_a_shell_before_its_task_is_polled() {
+        let (session, _rx) = session();
+        session.shell("printf private-shell-race-test");
+        assert_eq!(session.shells.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(session.enable_private().is_err());
+        assert!(!session.privacy.active());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while session.shells.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn private_admission_is_irreversible_and_failed_erasure_blocks_clear() {
+        let (session, _rx) = session();
+        session.privacy.begin();
+        session.privacy.finish(false);
+        assert_eq!(
+            session.submit("must not run".to_string()),
+            Err(SubmitError::Private)
+        );
+        assert_eq!(session.clear(), Err(SubmitError::Private));
+        session.privacy.finish(true);
+        assert!(session.enable_private().unwrap_err().contains("/clear"));
+        assert_eq!(session.fork_session(), Err(SubmitError::Private));
+        assert!(session.state().private && session.state().privacy_ready);
+    }
+
+    #[test]
+    fn private_activation_refuses_a_running_turn_without_changing_policy() {
+        let (session, _rx) = session();
+        session.submit("running".to_string()).unwrap();
+        assert!(session.enable_private().is_err());
+        assert!(!session.state().private);
     }
 
     #[test]

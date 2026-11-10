@@ -210,14 +210,20 @@ pub fn set(settings: Option<Settings>, session: &str, project: &Path) {
 
 /// Run the `[notify]` command about `kind`, when there is one and it wants that kind.
 /// Returns at once: the command runs on a thread of its own.
-pub fn fire(kind: Kind, body: &str) {
+pub fn fire(kind: Kind, body: &str, privacy: std::sync::Arc<crate::privacy::Privacy>) {
+    let epoch = privacy.epoch();
     let command = HOOK
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
         .and_then(|hook| hook.prepare(kind, body, Instant::now()));
     if let Some(command) = command {
-        std::thread::spawn(move || run(command, TIMEOUT));
+        std::thread::spawn(move || {
+            privacy.public_at(epoch, || {
+                run(command, TIMEOUT)?;
+                Ok(())
+            })
+        });
     }
 }
 
@@ -247,15 +253,21 @@ fn line(body: &str) -> String {
 }
 
 /// Run the command on what the session waits on the user for, from `events`.
-pub fn watch(mut events: broadcast::Receiver<session::Event>) -> tokio::task::JoinHandle<()> {
+pub fn watch(
+    mut events: broadcast::Receiver<session::Event>,
+    privacy: std::sync::Arc<crate::privacy::Privacy>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut seen = Seen::default();
         loop {
             match events.recv().await {
                 Ok(event) => {
+                    if privacy.active() {
+                        continue;
+                    }
                     let now = chrono::Utc::now().timestamp();
                     if let Some((kind, body)) = about(&event, &mut seen, now) {
-                        fire(kind, &body);
+                        fire(kind, &body, std::sync::Arc::clone(&privacy));
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {}

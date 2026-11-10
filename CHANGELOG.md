@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-11-11
+
+- `/private` keeps the current conversation in memory until `/clear`, erases its saved transcript, owned artifacts and prompt-history entries, and blocks prompts if erasure fails. The top banner and magenta input border show privacy, including on attach. Activation requires idle turns and background work; private sessions refuse forks, children, workflows, memory writes, schedules, monitors, generated images, browser rendering, exports, dictation and external editing, and skip hooks and notification commands. Tool writes, provider retention, independent copies and filesystem backups are outside this boundary.
+
 ## 2026-11-06
 
 - Attach opens on the served session as it stands and reads it again on every reload: subagent panes with their transcripts, the plan, monitors, the background list, the schedule count, token totals, context fill, rate limits, the working turn, any waiting approval and the title. `GET /snapshot` now carries the panel's children with their panes and the title, as of its `seq`; against an older server attach reads `/children` around the snapshot instead. `/context` works attached, stopping a row of the background list stops it on the server, and the `/model` picker says its list is this machine's.

@@ -101,6 +101,10 @@ pub enum AgentEvent {
     },
     /// History was dropped: the conversation starts again from nothing.
     Cleared,
+    Private {
+        active: bool,
+        ready: bool,
+    },
     /// A compacted copy of the history is ready for `/compact-then`, and a call on it
     /// would read this many tokens; `None` once the history has moved on without it.
     Fork(Option<u64>),
@@ -222,6 +226,8 @@ pub enum Control {
     /// Summarise the history now, as a turn of its own, with what the user asked the
     /// summary to keep, if anything.
     Compact(Option<String>),
+    /// Erase the saved conversation and keep subsequent turns in memory.
+    Private(Arc<crate::privacy::Privacy>),
     /// Drop the history, so the next turn starts from nothing.
     Clear,
     /// Run a turn on this message from the compacted copy of the history, for
@@ -779,6 +785,7 @@ pub(crate) async fn run_configured(
     mut limits: Limits,
     registry_factory: Option<crate::runtime::RegistryFactory>,
 ) {
+    crate::privacy::CURRENT.scope(std::cell::RefCell::new(Arc::default()), async move {
     // The loop reads the turn's flag; the `agent` tool needs the whole signal, so it can
     // hand each detached child a flag that an interrupt latches.
     let stop = cancel;
@@ -964,10 +971,11 @@ pub(crate) async fn run_configured(
     // last attempt at one read, so an idle stretch makes at most one.
     let mut fork: Option<Fork> = None;
     let mut forked_at: Option<Instant> = None;
+    let mut title_task: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         let wake =
-            !cancel.load(Ordering::Relaxed) && lock_goal(&goal).as_ref().is_some_and(Goal::active);
+            !cancel.load(Ordering::Relaxed) && crate::privacy::current().ready() && lock_goal(&goal).as_ref().is_some_and(Goal::active);
         announce(&goal, &mut shown, &tx);
         persist(&goal, writer.as_mut(), &tx);
         // Only a backend with a prompt cache has one to lapse, and only a conversation
@@ -976,7 +984,7 @@ pub(crate) async fn run_configured(
         let fork_at = monitor
             .last_sent()
             .filter(|sent| fork.is_none() && model.reports_cache() && forked_at != Some(*sent))
-            .filter(|_| !cancel.load(Ordering::Relaxed))
+            .filter(|_| !cancel.load(Ordering::Relaxed) && !crate::privacy::active())
             .filter(|_| {
                 calls
                     .last()
@@ -999,9 +1007,50 @@ pub(crate) async fn run_configured(
                         set_fast(model.as_ref(), on, &tx);
                         continue;
                     }
+                    Control::Private(privacy) => {
+                        crate::privacy::set(Arc::clone(&privacy));
+                        drop_fork(&mut fork, &tx);
+                        namer = None;
+                        if let Some(task) = title_task.take() { task.abort(); let _ = task.await; }
+                        let result = (|| -> anyhow::Result<()> {
+                            crate::privacy::raw_logging_disabled(std::env::var_os("BHAI_DEBUG_SSE").as_deref())?;
+                            if let Some(writer) = &mut writer {
+                                for input in writer.recorded_prompts()? { privacy.track(&input); }
+                                writer.erase()?;
+                            }
+                            crate::privacy::erase_state(policy.cwd(), &session_id)?;
+                            crate::privacy::erase_exports(policy.cwd(), &own)?;
+                            let mut inputs = privacy.inputs();
+                            for item in &history {
+                                if item["role"] == "user" {
+                                    if let Some(parts) = item["content"].as_array() {
+                                        inputs.extend(parts.iter().filter_map(|part| part["text"].as_str().map(str::to_string)));
+                                    }
+                                }
+                            }
+                            crate::privacy::erase_history(policy.home(), &inputs, &[&session_id, &own])?;
+                            Ok(())
+                        })();
+                        privacy.finish(result.is_ok());
+                        let _ = tx.send(AgentEvent::Private { active: true, ready: result.is_ok() });
+                        let event = match result {
+                            Ok(()) => AgentEvent::Info("private mode: conversation stays in memory. The saved transcript, session artifacts and this conversation's prompt-history entries were erased. /clear starts a new persistent conversation. Tool writes and provider retention are not prevented.".to_string()),
+                            Err(error) => AgentEvent::Error(format!("private mode erasure failed: {error:#}. Prompts are blocked; retry /private. /clear cannot restore persistence until erasure succeeds.")),
+                        };
+                        let _ = tx.send(event);
+                        continue;
+                    }
                     // Nothing is summarised: the conversation is over, so the history
                     // goes, and the session file records that it did so a resume agrees.
                     Control::Clear => {
+                        if !crate::privacy::current().ready() {
+                            let _ = tx.send(AgentEvent::Error("erasure has not succeeded; retry /private before /clear".into()));
+                            let _ = tx.send(AgentEvent::TurnEnd);
+                            continue;
+                        }
+                        while rx_results.try_recv().is_ok() {}
+                        children.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                        let private = crate::privacy::active();
                         let before = compact::estimate(&history, tokenizer);
                         history.clear();
                         drop_fork(&mut fork, &tx);
@@ -1016,10 +1065,24 @@ pub(crate) async fn run_configured(
                         {
                             let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
                         }
+                        if private {
+                            if let Some(judge) = &judge { judge.clear_conversation(); }
+                            if let Some(writer) = &mut writer {
+                                writer.goal = None; writer.plan = None; writer.authorization = None;
+                            }
+                            crate::privacy::current().clear();
+                            let _ = tx.send(AgentEvent::Private { active: false, ready: true });
+                        }
                         let _ = tx.send(AgentEvent::Cleared);
+                        let _ = tx.send(AgentEvent::TurnEnd);
                         continue;
                     }
                     Control::Workflow { workflow, input } => {
+                        if crate::privacy::active() {
+                            let _ = tx.send(AgentEvent::Error("workflows are unavailable in private mode".into()));
+                            let _ = tx.send(AgentEvent::TurnEnd);
+                            continue;
+                        }
                         match &delegation {
                             Some(delegation) => {
                                 workflow::run(workflow::Run {
@@ -1149,6 +1212,11 @@ pub(crate) async fn run_configured(
         // The summary call only appends to the history, so it reads the cached prefix and
         // refreshes it; the guard is put back on the history after, which the next call
         // on it extends.
+        if !crate::privacy::current().ready() {
+            let _ = tx.send(AgentEvent::Error("private erasure has not succeeded; retry /private".into()));
+            let _ = tx.send(AgentEvent::TurnEnd);
+            continue;
+        }
         if let Next::Fork = next {
             forked_at = monitor.last_sent();
             let pass = Compaction {
@@ -1332,14 +1400,14 @@ pub(crate) async fn run_configured(
             if let Some(namer) = namer.take() {
                 let (tx, message) = (tx.clone(), message.text.clone());
                 let updated = Arc::clone(&title_updated);
-                tokio::spawn(async move {
+                title_task = Some(tokio::spawn(async move {
                     if let Some(name) = namer.name(&message).await {
                         let updated = updated.lock().unwrap_or_else(|e| e.into_inner());
                         if !*updated {
                             let _ = tx.send(AgentEvent::Titled(name));
                         }
                     }
-                });
+                }));
             }
             // `Session::submit` clears `cancel` before sending, so an early interrupt
             // holds.
@@ -1423,6 +1491,10 @@ pub(crate) async fn run_configured(
                             let _ = tx.send(AgentEvent::Error(
                                 "the model cannot change while a turn is running".to_string(),
                             ));
+                        }
+                        Control::Private(privacy) => {
+                            privacy.finish(false);
+                            let _ = tx.send(AgentEvent::Error("cannot enable private mode while a turn runs; interrupt it first".into()));
                         }
                         Control::Clear => {
                             let _ = tx.send(AgentEvent::Error(
@@ -1610,6 +1682,7 @@ pub(crate) async fn run_configured(
         sync(writer.as_ref(), &tx);
         let _ = tx.send(AgentEvent::TurnEnd);
     }
+    }).await;
 }
 
 fn lock_goal(goal: &goal::Shared) -> std::sync::MutexGuard<'_, Option<Goal>> {
@@ -3062,7 +3135,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 })),
                 // The parent's own calls are what the speed readout times, and a child's
                 // turn ends inside this call. Calls and items index its own history.
-                AgentEvent::Sending(_)
+                AgentEvent::Private { .. }
+                | AgentEvent::Sending(_)
                 | AgentEvent::Streaming(_)
                 | AgentEvent::TurnEnd
                 // A child has no children, so it never resumes on one's report.

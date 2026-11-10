@@ -167,6 +167,11 @@ struct Browser {
 
 impl Browser {
     async fn launch(exe: &Path, url: &Url) -> Result<(Browser, String), String> {
+        if crate::privacy::active() {
+            return Err(
+                "browser rendering is unavailable in private mode; use render: never".into(),
+            );
+        }
         let profile = std::env::temp_dir().join(format!("bhai-chrome-{}", uuid::Uuid::new_v4()));
         {
             use std::os::unix::fs::DirBuilderExt;

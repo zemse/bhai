@@ -48,6 +48,7 @@ pub fn private_dir(dir: &Path) -> std::io::Result<()> {
 /// Open `path` for appending, creating it readable only by the user. A file that already
 /// exists keeps the mode it has.
 pub fn private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    crate::privacy::writable()?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -60,6 +61,7 @@ pub fn private_append(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Write `contents` to `path`, creating it readable only by the user.
 pub fn private_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    crate::privacy::writable()?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(unix)]
@@ -195,6 +197,49 @@ impl Writer {
         Ok(writer)
     }
 
+    /// Original user wording survives compaction in the append-only records.
+    pub(crate) fn recorded_prompts(&self) -> Result<Vec<String>> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).context("could not read original prompts before erasure");
+            }
+        };
+        let mut prompts = Vec::new();
+        for line in text.lines() {
+            let record: Value = serde_json::from_str(line)?;
+            let item = &record["item"];
+            if item["role"] != "user" {
+                continue;
+            }
+            if let Some(text) = item["content"].as_str() {
+                prompts.push(text.to_string());
+            }
+            if let Some(parts) = item["content"].as_array() {
+                prompts.extend(
+                    parts
+                        .iter()
+                        .filter_map(|part| part["text"].as_str().map(str::to_string)),
+                );
+            }
+        }
+        Ok(prompts)
+    }
+
+    /// Erase the transcript and owned artifacts without dropping in-memory history.
+    pub(crate) fn erase(&mut self) -> Result<()> {
+        if let Some(file) = &self.file {
+            file.set_len(0)?;
+            file.sync_all()?;
+        }
+        crate::privacy::remove_file(&self.path)?;
+        self.file = None;
+        self.last = None;
+        crate::privacy::erase_directory(&self.children)?;
+        Ok(())
+    }
+
     /// Append one history item, flushed before returning.
     pub fn append(&mut self, item: &Value) -> Result<()> {
         let mut record = json!({ "type": "item", "item": item });
@@ -276,6 +321,7 @@ impl Writer {
     /// model and prompt cache key, and return its id. A child transcript an item points
     /// at stays this session's.
     pub fn fork(&self, items: &[Value], plan: Option<&crate::plan::Plan>) -> Result<String> {
+        crate::privacy::writable()?;
         let memory = self
             .authorization
             .clone()
@@ -338,6 +384,9 @@ impl Writer {
 
     /// Append `record` with its id and parent, flushed before returning.
     fn write(&mut self, mut record: Value) -> Result<()> {
+        if crate::privacy::active() {
+            return Ok(());
+        }
         let id = uuid::Uuid::new_v4().simple().to_string();
         record["id"] = json!(id);
         record["parent_id"] = json!(self.last);

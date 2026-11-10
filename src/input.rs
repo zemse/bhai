@@ -359,7 +359,12 @@ impl History {
     }
 
     /// Record a submitted prompt and end any walk.
+    #[cfg(test)]
     pub fn push(&mut self, text: &str) -> Result<()> {
+        self.push_owned(text, None)
+    }
+
+    pub fn push_owned(&mut self, text: &str, session: Option<&str>) -> Result<()> {
         self.end_walk();
         if self.entries.last().is_some_and(|last| last == text) {
             return Ok(());
@@ -372,7 +377,15 @@ impl History {
             crate::sessions::private_dir(dir)?;
         }
         let mut file = crate::sessions::private_append(path)?;
-        writeln!(file, "{}", line(text)?)?;
+        file.lock()?;
+        let mut record = serde_json::to_value(Record {
+            text: text.to_string(),
+        })?;
+        if let Some(session) = session {
+            record["session"] = serde_json::json!(session);
+        }
+        writeln!(file, "{record}")?;
+        file.flush()?;
         Ok(())
     }
 
@@ -558,6 +571,7 @@ pub fn pasted_path(text: &str) -> Option<PathBuf> {
     (path.is_absolute() && path.is_file()).then_some(path)
 }
 
+#[cfg(test)]
 fn line(text: &str) -> Result<String> {
     Ok(serde_json::to_string(&Record {
         text: text.to_string(),
@@ -565,11 +579,13 @@ fn line(text: &str) -> Result<String> {
 }
 
 fn rewrite(path: &Path, entries: &[String]) -> Result<()> {
-    let mut out = String::new();
-    for entry in entries {
-        out.push_str(&line(entry)?);
-        out.push('\n');
-    }
+    let text = std::fs::read_to_string(path)?;
+    let records: Vec<_> = text
+        .lines()
+        .filter(|line| serde_json::from_str::<Record>(line).is_ok())
+        .collect();
+    let mut out = records[records.len().saturating_sub(entries.len())..].join("\n");
+    out.push('\n');
     crate::sessions::private_write(path, &out)?;
     Ok(())
 }

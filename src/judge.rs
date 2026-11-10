@@ -511,6 +511,19 @@ impl Judge {
         self
     }
 
+    pub(crate) fn clear_conversation(&self) {
+        let mut state = self.lock();
+        let project_context = std::mem::take(&mut state.project_context);
+        let goal = state.goal.take();
+        *state = State {
+            project_context,
+            goal,
+            ..State::default()
+        };
+        *self.authorization.lock().unwrap_or_else(|e| e.into_inner()) = Memory::default();
+        *self.failed_update.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// A new turn on `task`, which refills the budget. The message joins the ledger
     /// rather than replacing what came before: a task like "now do the same for the
     /// other file" says nothing on its own.
@@ -639,6 +652,9 @@ impl Judge {
     }
 
     fn persist_authorization(&self, memory: &Memory) -> Result<()> {
+        if crate::privacy::active() {
+            return Ok(());
+        }
         let Some(path) = self
             .authorization_store
             .lock()
