@@ -85,6 +85,16 @@ SIGTERM or SIGHUP (from `kill`, a closed ssh session or a killed tmux pane) inte
 
 `--resume` keeps the same UUID and directories. project configuration, remembered permission rules, project memory and explicitly enabled workflow caches remain shared; session search and worktree coordination still work across sessions.
 
+### private conversations
+
+`/private` keeps the current conversation in memory and erases its saved transcript, session artifacts and matching prompt-history entries. the top of the transcript says `PRIVATE MODE` and the input border changes colour. finish or interrupt the running turn and stop background activity before enabling it. if erasure fails, new prompts stay blocked; retry `/private` after fixing the error.
+
+private mode cannot be turned off for the same conversation. `/private` again explains this; `/clear` drops the conversation and starts fresh with recording enabled. private conversations cannot be resumed after quitting or saved with `/fork`. erasure covers the current session, not separately saved forks, their source sessions or source-owned child transcripts.
+
+subagents, workflows, remembered notes, reminders, monitors, image generation, browser rendering, dictation, external editing, context/debug exports and `!` commands are unavailable in private mode. hooks and notification commands are suppressed. ordinary agent tools still work. configured `BHAI_DEBUG_SSE` logging blocks activation because bhai cannot safely erase an arbitrary shared raw log; handle that log yourself and restart without the setting.
+
+this controls bhai's conversation recording, not model-provider retention, terminal scrollback, filesystem snapshots or backups. it does not prevent an explicitly run tool or external program from writing files.
+
 ### notifications
 
 `[notify] command` in `~/.config/bhai/config.toml` runs when the session wants you: an approval waiting (`approval`), a turn ended (`done`), the Codex login failed (`auth`) or weekly usage reached 98% (`quota`, once per weekly window). it runs through `$SHELL -c` whether or not the terminal has focus, and under `--headless` too. details arrive as `BHAI_NOTIFY_KIND`, `BHAI_NOTIFY_TITLE`, `BHAI_NOTIFY_BODY`, `BHAI_SESSION_ID` and `BHAI_PROJECT` in its environment, never in the command line. output is discarded, a run is killed after 30 seconds, and each kind runs at most once every 10 seconds. `events` limits the kinds; a project file cannot set `[notify]`.
