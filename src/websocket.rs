@@ -217,6 +217,24 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_conversation_does_not_extend_a_private_response() {
+        let first = body(&[say("PRIVATE_PROMPT")]);
+        let answer = json!({ "type": "message", "role": "assistant", "content": [
+            { "type": "output_text", "text": "PRIVATE_ANSWER" }
+        ] });
+        let last = Last::after("private_response".to_string(), &first, &[answer]);
+        for prompt in ["PUBLIC_PROMPT", "PRIVATE_PROMPT"] {
+            let next = body(&[say(prompt)]);
+            let (frame, delta) = frame(last.as_ref(), &next);
+            let frame = sent(&frame);
+            assert!(!delta);
+            assert!(frame.get("previous_response_id").is_none());
+            assert_eq!(frame["input"], next["input"]);
+            assert!(!frame.to_string().contains("PRIVATE_ANSWER"));
+        }
+    }
+
+    #[test]
     fn a_missing_previous_response_is_recognised_in_either_shape() {
         let error = json!({ "type": "error", "error": { "code": STALE_CODE, "message": "gone" } });
         assert!(stale(&error));
