@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-12
 
+- Wrapped links in user messages keep their complete destination when a wide character leaves background padding at a row break; that padding stays out of transcript text.
 - Subagents and workflow children have no model-step limit; the 40-step cutoff and forced wrap-up prompt are gone. Step counts remain in reports, and explicit cancellation, permission checks and failure-loop guards still apply.
 
 ## 2026-11-11

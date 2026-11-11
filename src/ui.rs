@@ -1557,7 +1557,18 @@ fn entry_lines(
     margins.resize(lines.len(), 0);
     Rows {
         origins: vec![None; lines.len()],
-        plains: lines.iter().map(plain).collect(),
+        // The user background's padding is not transcript text.
+        plains: lines
+            .iter()
+            .map(|line| {
+                let text = plain(line);
+                if ground {
+                    text.trim_end_matches(' ').to_string()
+                } else {
+                    text
+                }
+            })
+            .collect(),
         lines,
         joins,
         margins,
@@ -5167,6 +5178,39 @@ mod tests {
             })
             .collect();
         assert_eq!(linked, "https://example.com/d");
+    }
+
+    #[test]
+    fn wrapped_links_keep_the_complete_destination() {
+        for width in 12..50 {
+            for url in [
+                "https://example.com/a/very/long/path/to/wrap?one=1&two=2",
+                "https://example.com/例/very/long/path/to/wrap?one=1&two=2",
+            ] {
+                for entry in [
+                    Entry::User(format!("see {url} next")),
+                    Entry::Assistant(format!("see {url} next")),
+                    Entry::Assistant(format!("see [docs]({url}) next")),
+                ] {
+                    let mut app = App::detached();
+                    app.entries().push(entry);
+                    let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                    terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                    assert_eq!(app.links.len(), 1, "{width}: {:?}", app.links);
+                    assert_eq!(app.links[0].target, url, "{width}: {:?}", app.lines);
+                    assert!(app.links[0].spans.len() > 1);
+                    let buffer = terminal.backend().buffer();
+                    for (y, xs) in &app.links[0].spans {
+                        for x in xs.clone() {
+                            let cell = &buffer[(x, *y)];
+                            if !cell.symbol().is_empty() && cell.symbol() != " " {
+                                assert!(cell.symbol().contains(&format!(";{url}\x1b\\")));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
