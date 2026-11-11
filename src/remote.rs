@@ -935,6 +935,7 @@ fn described_action(action: &Action) -> String {
         Action::Model { model, .. } => format!("model change to {model}"),
         Action::Fast(_) => "fast mode change".into(),
         Action::Retry => "retry".into(),
+        Action::Resume => "resume".into(),
         Action::Goal(_) => "goal".into(),
         Action::Allow(rule) => format!("rule {rule}"),
         Action::Trust(true) => "trust".into(),
@@ -969,6 +970,7 @@ fn route(action: &Action) -> (String, Value) {
         }
         Action::Fast(on) => ("/fast".into(), json!({ "on": on })),
         Action::Retry => ("/retry".into(), Value::Null),
+        Action::Resume => ("/resume".into(), Value::Null),
         Action::Goal(text) => ("/goal".into(), json!({ "text": text })),
         Action::Allow(rule) => ("/allow".into(), json!({ "rule": rule })),
         Action::Trust(true) => ("/trust".into(), Value::Null),
@@ -1473,6 +1475,28 @@ mod tests {
             .unwrap();
         until("the approval shows here", || here.state().pending.is_some()).await;
         (here.state().pending.unwrap().id, decided)
+    }
+
+    #[tokio::test]
+    async fn attached_sessions_resume_an_interrupted_parent_from_the_snapshot() {
+        let mut served = served().await;
+        served.session.submit("go".to_string()).unwrap();
+        assert_eq!(served.prompts.recv().await.unwrap(), "go");
+        assert!(served.session.interrupt_turn());
+        served.session.on_agent(AgentEvent::TurnEnd);
+        let attached = connect(attach_to(served.port)).await.unwrap();
+        let here = attached.session;
+        assert!(here.can_resume());
+        here.resume_turn().unwrap();
+        until("the parent resumes there", || {
+            served.session.state().working
+        })
+        .await;
+        until("the resumed turn shows here", || here.state().working).await;
+        assert!(!here.can_resume());
+        served.agent.send(AgentEvent::TurnEnd).unwrap();
+        until("the resumed turn ends", || !here.state().working).await;
+        assert!(!here.can_resume());
     }
 
     #[tokio::test]

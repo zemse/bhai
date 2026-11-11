@@ -357,8 +357,6 @@ pub struct App {
     pub quit: bool,
     /// When a first quit key was pressed; a second one within `QUIT_WINDOW` quits.
     quit_armed: Option<Instant>,
-    /// When a first esc was pressed mid-turn; a second one within `QUIT_WINDOW` interrupts.
-    esc_armed: Option<Instant>,
     /// The draft ctrl+c last cleared, which ctrl+z puts back.
     cleared: Option<String>,
     /// `ctrl+g` asked for the draft in the user's editor; the loop that owns the
@@ -534,7 +532,6 @@ impl App {
             designing: None,
             quit: false,
             quit_armed: None,
-            esc_armed: None,
             cleared: None,
             editing: false,
             clear_pending: false,
@@ -557,7 +554,7 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         // Attached, ctrl+c only ever detaches: what runs is the other machine's, and
-        // stopping it is esc twice, as asked for on purpose.
+        // stopping its turn is esc.
         if ctrl && key.code == KeyCode::Char('c') && self.attached().is_some() {
             self.search = None;
             self.picker = None;
@@ -761,7 +758,7 @@ impl App {
                 self.note(Entry::Info("dictation dropped".to_string()));
             }
             KeyCode::Esc if self.inside.is_some() => self.leave_child(),
-            KeyCode::Esc if self.working => self.confirm_interrupt(),
+            KeyCode::Esc if self.working => self.interrupt_turn(),
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
             KeyCode::Char('s') if ctrl => self.toggle_bg(),
@@ -1954,6 +1951,11 @@ impl App {
 
     fn submit(&mut self) {
         if self.input.value().trim().is_empty() {
+            if self.inside.is_none() && !self.working && self.session.can_resume() {
+                if let Err(e) = self.session.resume_turn() {
+                    self.note(Entry::Error(e.to_string()));
+                }
+            }
             return;
         }
         let raw = self.input.take();
@@ -3272,23 +3274,12 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         }
     }
 
-    /// Restore an unanswered prompt; otherwise interrupt on the second esc.
-    fn confirm_interrupt(&mut self) {
+    /// Restore an unanswered prompt; otherwise interrupt the parent turn.
+    fn interrupt_turn(&mut self) {
         if self.input.is_empty() && self.session.edit_prompt() {
-            self.esc_armed = None;
             return;
         }
-        let now = Instant::now();
-        match self.esc_armed.take() {
-            Some(at) if now.duration_since(at) <= QUIT_WINDOW => {
-                self.session.interrupt_turn();
-            }
-            _ => {
-                self.esc_armed = Some(now);
-                self.follow = true;
-                self.note(Entry::Info("esc again to interrupt".to_string()));
-            }
-        }
+        self.session.interrupt_turn();
     }
 
     /// The link to where the session this one shows is served, when it is attached.
@@ -3458,7 +3449,7 @@ mod tests {
     use super::*;
 
     /// Attached, ctrl+c twice detaches mid-turn and never sends the interrupt, while esc
-    /// twice is still how the turn there is stopped.
+    /// stops the turn there with one press.
     #[test]
     fn attached_ctrl_c_detaches_without_interrupting() {
         let app = App::detached();
@@ -3479,11 +3470,11 @@ mod tests {
         assert!(actions.try_recv().is_err());
         app.quit = false;
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(
             actions.try_recv(),
             Ok(crate::session::Action::InterruptTurn)
         );
+        assert!(actions.try_recv().is_err());
     }
 
     #[test]
@@ -5496,7 +5487,6 @@ mod tests {
         app.session.submit("edit me".to_string()).unwrap();
         app.on_event(Event::User("edit me".into()));
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.esc_armed.is_none());
         assert!(matches!(app.entries().list.last(), Some(Entry::User(text)) if text == "edit me"));
         let (reply, mut ready) = tokio::sync::oneshot::channel();
         app.session.on_agent(crate::agent::AgentEvent::EditPrompt {
@@ -5547,8 +5537,6 @@ mod tests {
         app.input.set("draft".into());
         let esc = key(KeyCode::Esc, KeyModifiers::NONE);
         app.on_key(esc);
-        assert!(!cancel.stopped());
-        app.on_key(esc);
         assert!(cancel.stopped());
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
         session.on_agent(crate::agent::AgentEvent::TurnEnd);
@@ -5569,34 +5557,70 @@ mod tests {
         app.on_event(Event::User("original".into()));
         app.input.set("draft".into());
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.esc_armed.is_some());
+        assert!(app.session.state().resumable);
         assert_eq!(app.input.value(), "draft");
     }
 
     #[test]
-    fn esc_mid_turn_asks_and_interrupts_on_a_second_press_inside_the_window() {
-        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
-        let mut app = App::detached();
-        app.working = true;
-        app.on_key(esc);
-        assert!(app.esc_armed.is_some());
-        let asked = |app: &App| {
-            app.session
-                .entries()
-                .list
-                .iter()
-                .filter(|e| matches!(e, Entry::Info(t) if t == "esc again to interrupt"))
-                .count()
-        };
-        assert_eq!(asked(&app), 1);
-        app.on_key(esc);
-        assert!(app.esc_armed.is_none(), "the second press spends it");
+    fn empty_enter_resumes_only_an_interrupted_parent() {
+        let (mut app, mut user, mut control) = connected();
+        let enter = key(KeyCode::Enter, KeyModifiers::NONE);
+        app.on_key(enter);
+        assert!(user.try_recv().is_err());
+        assert!(control.try_recv().is_err());
+        app.session.submit("go".to_string()).unwrap();
+        user.try_recv().unwrap();
+        app.on_event(Event::User("go".into()));
+        app.session
+            .on_agent(crate::agent::AgentEvent::Text("working".into()));
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.session.state().resumable);
+        app.on_key(enter);
+        assert!(
+            control.try_recv().is_err(),
+            "wait for cancellation to settle"
+        );
+        app.session.on_agent(crate::agent::AgentEvent::TurnEnd);
+        app.on_event(Event::TurnEnd);
+        app.on_key(enter);
+        assert!(matches!(
+            control.try_recv(),
+            Ok(crate::agent::Control::Resume)
+        ));
+        assert!(user.try_recv().is_err());
+        app.session.on_agent(crate::agent::AgentEvent::TurnEnd);
+        app.on_event(Event::TurnEnd);
+        app.on_key(enter);
+        assert!(
+            control.try_recv().is_err(),
+            "normal completion is not resumable"
+        );
+    }
 
-        // Outside the window it asks again instead of interrupting.
-        app.esc_armed = Some(Instant::now() - QUIT_WINDOW * 2);
-        app.on_key(esc);
-        assert!(app.esc_armed.is_some());
-        assert_eq!(asked(&app), 2);
+    #[test]
+    fn typing_a_new_prompt_or_clearing_discards_the_resume_shortcut() {
+        let (mut app, mut user, mut control) = connected();
+        app.session.submit("go".to_string()).unwrap();
+        user.try_recv().unwrap();
+        app.on_event(Event::User("go".into()));
+        app.session.interrupt_turn();
+        app.session.on_agent(crate::agent::AgentEvent::TurnEnd);
+        app.on_event(Event::TurnEnd);
+        assert!(app.session.can_resume());
+        app.input.set("different task".into());
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(user.try_recv().unwrap().text, "different task");
+        assert!(!app.session.can_resume());
+        assert!(control.try_recv().is_err());
+        app.session.interrupt_turn();
+        app.session.on_agent(crate::agent::AgentEvent::TurnEnd);
+        assert!(app.session.can_resume());
+        app.session.clear().unwrap();
+        assert!(!app.session.can_resume());
+        assert!(matches!(
+            control.try_recv(),
+            Ok(crate::agent::Control::Clear)
+        ));
     }
 
     #[test]

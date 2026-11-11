@@ -160,6 +160,7 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/interrupt", post(interrupt))
         .route("/interrupt/turn", post(interrupt_turn))
         .route("/retry", post(retry))
+        .route("/resume", post(resume))
         .route("/goal", post(goal))
         .route("/mode", post(mode))
         .route("/model", post(model))
@@ -659,6 +660,13 @@ async fn interrupt_turn(State(session): State<Arc<Session>>) -> Response {
 /// the same call going out again rather than a new message.
 async fn retry(State(session): State<Arc<Session>>) -> Response {
     match session.retry() {
+        Ok(()) => ok(),
+        Err(e) => error(StatusCode::CONFLICT, &e.to_string()),
+    }
+}
+
+async fn resume(State(session): State<Arc<Session>>) -> Response {
+    match session.resume_turn() {
         Ok(()) => ok(),
         Err(e) => error(StatusCode::CONFLICT, &e.to_string()),
     }

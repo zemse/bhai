@@ -1869,6 +1869,12 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::new().fg(Color::Yellow),
         ));
     }
+    if app.inside.is_none() && app.input.is_empty() && !app.working && app.session().can_resume() {
+        block = block.title(Line::styled(
+            " interrupted · enter to resume ",
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     // Inside a pane the prompt goes to that child, so it says so where the eye lands.
     if let Some(inside) = &app.inside {
         block = block.title(Line::styled(
@@ -2780,6 +2786,26 @@ mod tests {
         // A caller works its room out by subtraction, so it can reach zero.
         assert_eq!(clip("abc", 0), "\u{2026}");
         assert_eq!(clip("", 0), "");
+    }
+
+    #[test]
+    fn the_empty_prompt_offers_to_resume_only_after_interruption() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        app.session().mirror(Event::User("go".into()));
+        app.session().mirror(Event::Interrupted);
+        app.session().mirror(Event::TurnEnd);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("interrupted · enter to resume"));
+        app.input.set("new prompt".into());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("enter to resume"));
+        app.input.set(String::new());
+        app.session()
+            .mirror(Event::Resumed("after interruption".into()));
+        app.session().mirror(Event::TurnEnd);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!screen(&terminal).contains("enter to resume"));
     }
 
     #[test]

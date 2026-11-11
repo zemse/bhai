@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-12
 
+- One Esc interrupts the parent turn. After interruption, Enter on an empty prompt continues with the existing context; the prompt shows an enter-to-resume hint, including attached sessions. Subagents keep running, and empty Enter after normal completion does nothing.
 - `stream_timing` is an authenticated Codex SSE example that logs timestamped events, deltas and characters, text boundaries, gaps and final usage as JSONL.
 - Running subagent rows show live elapsed time separately from quiet time, including attached sessions; continuing a child restarts its timer.
 - Wrapped links in user messages keep their complete destination when a wide character leaves background padding at a row break; that padding stays out of transcript text.

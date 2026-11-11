@@ -449,6 +449,7 @@ mod tests {
                 identity: "general".to_string(),
                 mode: Mode::Auto,
                 working: false,
+                resumable: false,
                 queued: Vec::new(),
                 input_tokens: 400,
                 cached_tokens: 300,

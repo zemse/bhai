@@ -238,6 +238,8 @@ pub enum Control {
     /// Run a turn again on the history as it stands, after one failed. Nothing is added
     /// to the history, so the call goes out as the failed one did.
     Retry,
+    /// Continue the interrupted conversation with an internal continuation message.
+    Resume,
     /// Answer this side question from the history as it stands, for `/btw`, keeping
     /// neither the question nor the answer.
     Btw(String),
@@ -455,6 +457,14 @@ pub struct UserInput {
 }
 
 impl UserInput {
+    fn continuation() -> Self {
+        Self {
+            text: "Continue the interrupted task from the existing context. Check the effects of interrupted tools before retrying them.".to_string(),
+            images: Vec::new(),
+            user_text: None,
+        }
+    }
+
     /// The history item the model reads it as. Without images it is the plain text
     /// message every other user item is.
     fn item(&self) -> Value {
@@ -1188,6 +1198,7 @@ pub(crate) async fn run_configured(
                         Next::Compact
                     }
                     Control::Retry => Next::Retry,
+                    Control::Resume => Next::Turn(UserInput::continuation()),
                     Control::Forked(message) => Next::Forked(message),
                     // Nothing joins the history, so the compacted copy still stands for it.
                     Control::Btw(question) => {
@@ -1509,6 +1520,7 @@ pub(crate) async fn run_configured(
                         }
                         Control::AuthorizationRecovery(_)
                         | Control::Retry
+                        | Control::Resume
                         | Control::Forked(_)
                         | Control::Btw(_)
                         | Control::ForkSession => {
@@ -6658,6 +6670,48 @@ mod tests {
             .map(|item| item["content"][0]["text"].as_str().unwrap())
             .collect();
         assert_eq!(said, ["go", TURN_ABORTED, "again"]);
+    }
+
+    #[tokio::test]
+    async fn resume_continues_the_interrupted_history_without_new_user_authority() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![fake::step(fake::HANG), vec![say("ok")]]);
+        let (mut rx, user, control, cancel) = goal_session(&fake, Vec::new());
+        user.send("go".into()).await.unwrap();
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Text(_)) {
+                break;
+            }
+        }
+        cancel.stop_turn();
+        settle(&mut rx).await;
+        cancel.clear();
+        control.send(Control::Resume).await.unwrap();
+        settle(&mut rx).await;
+
+        let calls = parent_calls(&fake);
+        assert_eq!(calls.len(), 2);
+        let input: Value = serde_json::from_str(&calls[1]).unwrap();
+        let items: Vec<_> = input
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| !crate::environment::is_context(item))
+            .collect();
+        assert_eq!(items[0]["content"][0]["text"], "go");
+        assert_eq!(items[1]["content"][0]["text"], TURN_ABORTED);
+        let continuation = items.last().unwrap();
+        assert!(
+            continuation["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Continue the interrupted task")
+        );
+        let message = UserInput::continuation();
+        assert_eq!(continuation["content"][0]["text"], message.text);
+        assert!(message.user_text.is_none());
+        assert_eq!(message.item()["bhai_automatic"], true);
     }
 
     /// A turn run again on the history as it stands, as `Session::retry` asks for it.

@@ -743,7 +743,7 @@ async fn attach(
     let session = attached.session;
     let (model, effort) = session.model();
     let notices = vec![format!(
-        "attached to {base}. What you type runs there; ctrl+c detaches and leaves the session running, esc twice interrupts its turn. \
+        "attached to {base}. What you type runs there; ctrl+c detaches and leaves the session running, esc interrupts its turn and enter on an empty prompt resumes it. \
 !commands, @ files, pasted images and the commands that act on this machine are off."
     )];
     let (terminal, modes) = take_terminal();

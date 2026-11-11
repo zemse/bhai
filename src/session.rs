@@ -324,6 +324,8 @@ pub struct State {
     pub identity: String,
     pub mode: Mode,
     pub working: bool,
+    /// The interrupted parent can be continued from the empty prompt.
+    pub resumable: bool,
     /// Prompts waiting for the running turn, in the order they will run.
     pub queued: Vec<String>,
     pub input_tokens: u64,
@@ -571,6 +573,7 @@ pub enum Action {
     },
     Fast(bool),
     Retry,
+    Resume,
     Goal(String),
     Allow(String),
     /// `/trust` when true, `/untrust` when false.
@@ -651,6 +654,7 @@ pub const APPROVAL_SETTLE: Duration = Duration::from_millis(300);
 #[derive(Default)]
 struct Inner {
     working: bool,
+    resumable: bool,
     /// What was typed while a turn ran, oldest first.
     queue: VecDeque<Waiting>,
     total: Usage,
@@ -689,6 +693,7 @@ impl Inner {
     /// A turn runs from now.
     fn start(&mut self) {
         self.working = true;
+        self.resumable = false;
         self.started = Some(Instant::now());
         self.verb = Some(crate::entries::verb());
     }
@@ -821,6 +826,7 @@ impl Session {
             self.privacy.clear();
         }
         inner.working = state["working"].as_bool().unwrap_or_default();
+        inner.resumable = state["resumable"].as_bool().unwrap_or_default();
         inner.started = inner.working.then(Instant::now);
         let queued: Vec<String> = read(state, "queued").unwrap_or_default();
         inner.queue = queued
@@ -986,7 +992,10 @@ impl Session {
                     self.privacy.clear();
                 }
             }
-            Event::Cleared => inner.last_usage = None,
+            Event::Cleared => {
+                inner.last_usage = None;
+                inner.resumable = false;
+            }
             Event::Goal(goal) => {
                 if goal.is_some() || inner.goal.is_some() {
                     inner.plan = goal.as_ref().and_then(|g| g.plan.clone());
@@ -1007,8 +1016,9 @@ impl Session {
                 inner.started = None;
                 inner.working = !inner.queue.is_empty();
             }
-            Event::PromptEdited { .. }
-            | Event::Titled(_)
+            Event::Interrupted => inner.resumable = inner.working,
+            Event::PromptEdited { .. } => inner.resumable = false,
+            Event::Titled(_)
             | Event::Reasoning(_)
             | Event::Text(_)
             | Event::Commentary(_)
@@ -1031,7 +1041,6 @@ impl Session {
             | Event::Judging(_)
             | Event::Error(_)
             | Event::TurnFailed(_)
-            | Event::Interrupted
             | Event::Done { .. } => {}
         }
         // Under the lock, as `on_agent` publishes, so the state and the events agree.
@@ -1107,6 +1116,7 @@ impl Session {
             identity: self.identity.clone(),
             mode: self.policy.mode(),
             working: inner.working,
+            resumable: inner.resumable,
             queued: inner.queue.iter().map(Waiting::shown).collect(),
             input_tokens: inner.total.input,
             cached_tokens: inner.total.cached,
@@ -1597,6 +1607,7 @@ impl Session {
             return true;
         }
         self.cancel.stop_turn();
+        inner.resumable = true;
         let front = inner.pending.front().map(|(approval, _, _)| approval.id);
         let mut at = 0;
         while at < inner.pending.len() {
@@ -1642,6 +1653,10 @@ impl Session {
         }
         // Cancel first so the agent does not move on to the next call once rejected.
         self.cancel.stop();
+        {
+            let mut inner = self.lock();
+            inner.resumable = inner.working;
+        }
         // Every parked call, not just the one on screen: parallel steps park their own.
         while self.answer(Answer::Reject, None).is_some() {}
         self.publish(Event::Interrupted);
@@ -1951,6 +1966,37 @@ impl Session {
         Ok(())
     }
 
+    pub fn can_resume(&self) -> bool {
+        let inner = self.lock();
+        inner.resumable && !inner.working
+    }
+
+    /// Continue only an interrupted parent, without asking the user to retype a prompt.
+    pub fn resume_turn(&self) -> Result<(), SubmitError> {
+        if !self.privacy.ready() {
+            return Err(SubmitError::Private);
+        }
+        let mut inner = self.lock();
+        if inner.working {
+            return Err(SubmitError::Busy);
+        }
+        if !inner.resumable {
+            return Ok(());
+        }
+        if let Some(link) = self.link() {
+            link.send(Action::Resume);
+            inner.resumable = false;
+            return Ok(());
+        }
+        self.cancel.clear();
+        self.tx_control
+            .try_send(Control::Resume)
+            .map_err(|_| SubmitError::Closed)?;
+        inner.start();
+        self.publish(Event::Resumed("after interruption".to_string()));
+        Ok(())
+    }
+
     /// Run the last turn again, after it failed. Nothing is added to the history, so the
     /// call goes out as the failed one did, and the user retypes nothing.
     pub fn retry(&self) -> Result<(), SubmitError> {
@@ -2073,6 +2119,7 @@ impl Session {
         self.tx_control
             .try_send(Control::Clear)
             .map_err(|_| SubmitError::Closed)?;
+        inner.resumable = false;
         if self.privacy.active() {
             inner.start();
         }
@@ -2120,6 +2167,7 @@ impl Session {
                 let eligible =
                     matches!(entries.list.last(), Some(Entry::User(last)) if last == &text);
                 if eligible {
+                    inner.resumable = false;
                     inner.started = None;
                     let event = Event::PromptEdited { text, images };
                     entries.apply(&event);

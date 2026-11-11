@@ -170,7 +170,7 @@ pub(super) enum Command {
 
 const ATTACH_HELP: &str = "The server listens on 127.0.0.1 only. --ssh DEST runs the ssh tunnel to it and restarts it when it drops; without it, run your own.
 Against bhai serve, --session ID picks a session; without it the only one is used, or you choose from a list.
-Leaving (ctrl+c twice, ctrl+d, /quit) only detaches: the session keeps running. esc twice interrupts its turn.
+Leaving (ctrl+c twice, ctrl+d, /quit) only detaches: the session keeps running. esc interrupts its turn; enter on an empty prompt resumes it.
 To stop a session, DELETE /sessions/ID on bhai serve, or SIGTERM the bhai that serves it; bhai -r ID resumes it there.
 It opens on the session as it stands: transcript, subagent panes, plan, monitors, background list, schedules, totals and any approval waiting.
 A dropped or silent connection is retried every second and replays from the last event seen; the prompt's border says when it is down and why.
