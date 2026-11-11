@@ -1760,7 +1760,16 @@ fn child_row(child: &ChildRow, width: usize, spinner: usize, open: bool) -> Line
         ChildState::Failed => ("✗", Color::Red),
     };
     let head = format!(" {mark} {} ", child.id);
-    let quiet = quiet(child);
+    let mut timing = String::new();
+    if child.state == ChildState::Running {
+        let secs = child.started.elapsed().as_secs();
+        timing = match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+            (0, 0, s) => format!(" · running {s}s"),
+            (0, m, s) => format!(" · running {m}m{s}s"),
+            (h, m, s) => format!(" · running {h}h{m}m{s}s"),
+        };
+    }
+    timing.push_str(&quiet(child));
     let mut tail = format!(
         "{} · {} · {}",
         child.identity, child.model, child.description
@@ -1769,9 +1778,9 @@ fn child_row(child: &ChildRow, width: usize, spinner: usize, open: bool) -> Line
     // reads as a button and the whole row is what a click lands on.
     let close = if open { CLOSE } else { "" };
     let room =
-        width.saturating_sub(head.chars().count() + close.chars().count() + quiet.chars().count());
-    tail = clip(&tail, room) + &quiet;
-    let room = room + quiet.chars().count();
+        width.saturating_sub(head.chars().count() + close.chars().count() + timing.chars().count());
+    tail = clip(&tail, room) + &timing;
+    let room = room + timing.chars().count();
     let pad = room.saturating_sub(tail.chars().count());
     if open {
         // The open pane's row is the transcript's title, so it reads as selected.
@@ -2771,6 +2780,40 @@ mod tests {
         // A caller works its room out by subtraction, so it can reach zero.
         assert_eq!(clip("abc", 0), "\u{2026}");
         assert_eq!(clip("", 0), "");
+    }
+
+    #[test]
+    fn running_children_show_elapsed_time_even_when_the_description_is_clipped() {
+        let now = Instant::now();
+        let mut child = ChildRow {
+            id: "a1".into(),
+            identity: "worker".into(),
+            model: "gpt-5.5".into(),
+            description: "a long description that will not fit in the row".into(),
+            state: ChildState::Running,
+            steps: 0,
+            started: now,
+            last: now,
+        };
+        for (secs, expected) in [(7, "7s"), (125, "2m5s"), (3725, "1h2m5s")] {
+            child.started = now - Duration::from_secs(secs);
+            let shown = child_row(&child, 60, 0, false).to_string();
+            assert!(
+                shown.ends_with(&format!(" · running {expected}")),
+                "{shown}"
+            );
+            assert!(!shown.contains(&child.description), "{shown}");
+        }
+        child.last = now - Duration::from_secs(25);
+        let shown = child_row(&child, 80, 0, true).to_string();
+        assert!(shown.contains(" · running 1h2m5s · quiet 25s"), "{shown}");
+        assert!(shown.ends_with(CLOSE), "{shown}");
+        for state in [ChildState::Done, ChildState::Failed] {
+            child.state = state;
+            let shown = child_row(&child, 80, 0, false).to_string();
+            assert!(!shown.contains("running"), "{shown}");
+            assert!(!shown.contains("quiet"), "{shown}");
+        }
     }
 
     #[test]

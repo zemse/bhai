@@ -681,6 +681,7 @@ mod tests {
                 description: "build the circuits".to_string(),
                 state: ChildState::Done,
                 steps: 14,
+                started: std::time::Instant::now(),
                 last: std::time::Instant::now(),
             },
             entries: vec![

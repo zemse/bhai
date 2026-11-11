@@ -241,6 +241,9 @@ pub struct ChildRow {
     /// Events heard from this child. A coarse sign of progress, since a child that is
     /// working says something every few seconds and one that is wedged says nothing.
     pub steps: u32,
+    /// When this run began; continuing a child starts a new run.
+    #[serde(rename = "elapsed_secs", serialize_with = "idle_secs")]
+    pub started: Instant,
     /// When the last of them arrived. Reported as seconds, which is the form a reader
     /// wants: from outside, a child in a retry loop and one on a long build look the
     /// same until you can see how long it has been quiet.
@@ -2419,7 +2422,8 @@ impl Session {
                     pane.row.model = model.clone();
                     pane.row.description = description.clone();
                     pane.row.state = ChildState::Running;
-                    pane.row.last = Instant::now();
+                    pane.row.started = Instant::now();
+                    pane.row.last = pane.row.started;
                     pane.entries
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -2441,6 +2445,7 @@ impl Session {
                         description: description.clone(),
                         state: ChildState::Running,
                         steps: 0,
+                        started: Instant::now(),
                         last: Instant::now(),
                     },
                     entries,
@@ -3022,6 +3027,12 @@ mod tests {
     fn a_continued_child_carries_on_in_the_pane_it_had() {
         let (session, _rx) = session();
         child(&session, "a1", "review it");
+        let old = Instant::now() - Duration::from_secs(125);
+        session.panes()[0].row.started = old;
+        assert_eq!(
+            serde_json::to_value(&session.children()[0]).unwrap()["elapsed_secs"],
+            125
+        );
         session.on_agent(AgentEvent::ChildEnded {
             id: "a1".to_string(),
             ok: true,
@@ -3041,6 +3052,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, ChildState::Running);
         assert_eq!(rows[0].model, "ollama:qwen3");
+        assert!(rows[0].started > old);
+        assert_eq!(rows[0].started, rows[0].last);
         assert_eq!(
             serde_json::to_value(&rows[0]).unwrap()["model"],
             "ollama:qwen3"
