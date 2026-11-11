@@ -305,6 +305,7 @@ pub struct Conversation<'a> {
 
 pub struct Registry {
     tools: Vec<Box<dyn Tool>>,
+    goal: Option<crate::goal::Shared>,
     /// The hub calls to functions `tool_search` loaded are resolved against.
     native: Option<Arc<crate::mcp::Hub>>,
     /// A child's worktree, which its calls are moved into.
@@ -318,6 +319,7 @@ impl Registry {
             tools: Vec::new(),
             native: None,
             rooted: None,
+            goal: None,
         }
     }
 
@@ -339,6 +341,7 @@ impl Registry {
             tools,
             native: None,
             rooted: None,
+            goal: None,
         }
     }
 
@@ -384,8 +387,42 @@ impl Registry {
     /// `goal`, for the main agent. Added past the identity's narrowing, so every
     /// persistent objective can be completed or blocked.
     pub fn with_goal(mut self, goal: goal::Goal) -> Self {
+        self.goal = Some(Arc::clone(&goal.goal));
         self.tools.push(Box::new(goal));
         self
+    }
+
+    /// Implementation tools wait for a goal-owned plan; inspection stays available.
+    pub fn requires_plan(&self, name: &str, args: &Value) -> bool {
+        let missing = self.goal.as_ref().is_some_and(|shared| {
+            shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|goal| {
+                    goal.active() && goal.plan.as_ref().is_none_or(|p| p.steps.is_empty())
+                })
+        });
+        if !missing {
+            return false;
+        }
+        match name {
+            "write" | "edit" | "apply_patch" | "agent" => true,
+            "bash" => !args
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(crate::permissions::bash::parse)
+                .is_some_and(|commands| {
+                    commands.iter().all(|c| {
+                        c.writes.is_empty() && crate::permissions::bash::is_read_only(&c.words)
+                    })
+                }),
+            "write_stdin" => args
+                .get("chars")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty() && s != "\u{3}"),
+            _ => false,
+        }
     }
 
     /// `update_plan`, for the main agent, past the identity's narrowing like `goal`: it

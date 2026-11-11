@@ -1293,7 +1293,7 @@ mod tests {
         let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
         let mut goal = crate::goal::Goal::new("ship");
         goal.plan = crate::plan::Plan::parse(&json!({"plan": [
-            {"step": "inspect", "status": "completed"},
+            {"step": "inspect", "status": "completed", "reason": "offline inspection: expected inputs found"},
             {"step": "verify", "status": "skipped", "reason": "superseded by integration checks"}
         ]}))
         .unwrap();
@@ -1302,6 +1302,14 @@ mod tests {
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.goal, Some(goal.clone()));
         assert_eq!(loaded.plan, goal.plan);
+        assert_eq!(
+            loaded.plan.as_ref().unwrap().steps[0].reason,
+            "offline inspection: expected inputs found"
+        );
+        drop(writer);
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        assert_eq!(writer.goal, loaded.goal);
+        assert_eq!(writer.plan, loaded.plan);
         let records = std::fs::read_to_string(&path).unwrap();
         assert!(
             !records.contains(r#""type":"plan""#),
@@ -1330,6 +1338,41 @@ mod tests {
         let cleared = load(&path).unwrap();
         assert!(cleared.goal.is_none() && cleared.plan.is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_completed_steps_load_and_fork_without_backfilling_reasons() {
+        let dir = temp_dir();
+        let path = write(&dir, "s1", &items());
+        let mut writer = Writer::resume(&dir, &load(&path).unwrap()).unwrap();
+        writer
+            .write(json!({"type": "goal", "goal": {
+                "objective": "legacy", "state": "paused", "plan": {"steps": [
+                    {"step": "old work", "status": "completed"}
+                ]}
+            }}))
+            .unwrap();
+        let loaded = load(&path).unwrap();
+        assert!(loaded.plan.as_ref().unwrap().steps[0].reason.is_empty());
+        drop(writer);
+        let writer = Writer::resume(&dir, &loaded).unwrap();
+        let fork = writer.fork(&loaded.items, loaded.plan.as_ref()).unwrap();
+        assert_eq!(load(&super::path(&dir, &fork)).unwrap().goal, loaded.goal);
+        drop(writer);
+        let mut writer = Writer::resume(&dir, &loaded).unwrap();
+        let shared =
+            crate::plan::Shared::new(std::sync::Arc::new(std::sync::Mutex::new(loaded.goal)));
+        shared
+            .update_with(
+                &json!({"append": [{"step": "new work", "status": "pending"}]}),
+                |goal, _| writer.goal(goal).map_err(|e| e.to_string()),
+            )
+            .unwrap();
+        let reloaded = load(&path).unwrap();
+        assert!(reloaded.plan.as_ref().unwrap().steps[0].reason.is_empty());
+        assert_eq!(reloaded.plan.unwrap().steps.len(), 2);
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

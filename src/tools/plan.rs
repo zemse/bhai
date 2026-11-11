@@ -27,7 +27,7 @@ impl Tool for UpdatePlan {
             "properties": {
                 "step": { "type": "string", "description": "Unique step name; use its exact existing name for changes." },
                 "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "skipped"] },
-                "reason": { "type": "string", "description": "Required when skipped: why the work is no longer necessary." }
+                "reason": { "type": "string", "description": "Required when completing a goal step: observed result or retrievable check when applicable, an auditable claim not automatic truth. Required when skipped: why the work is no longer necessary." }
             },
             "required": ["step", "status"],
             "additionalProperties": false
@@ -108,7 +108,7 @@ impl Tool for UpdatePlan {
                     .join("\n");
                 return (format!("{}\n{text}", plan.line()), true);
             }
-            let plan = match self.plan.update(args) {
+            let plan = match self.plan.request(args).await {
                 Ok(plan) => plan,
                 Err(e) => return (e, false),
             };
@@ -128,6 +128,20 @@ fn editing(args: &Value) -> bool {
 mod tests {
     use super::*;
 
+    async fn execute(tool: &UpdatePlan, args: &Value) -> (String, bool) {
+        let run = tool.execute(args);
+        if !editing(args) {
+            return run.await;
+        }
+        let mut requests = tool.plan.listen();
+        let accept = async {
+            let request = requests.receive().await.unwrap();
+            let result = tool.plan.update(&request.args);
+            let _ = request.reply.send(result);
+        };
+        tokio::join!(run, accept).0
+    }
+
     #[tokio::test]
     async fn incremental_updates_and_paged_reads_keep_the_full_list() {
         let shared = Shared::default();
@@ -136,10 +150,10 @@ mod tests {
             plan: shared.clone(),
             tx,
         };
-        assert!(tool.execute(&json!({"append": [
+        assert!(execute(&tool, &json!({"append": [
             {"step": "inspect", "status": "in_progress"}, {"step": "verify", "status": "pending"}
         ]})).await.1);
-        assert!(tool.execute(&json!({"changes": [
+        assert!(execute(&tool, &json!({"changes": [
             {"step": "inspect", "status": "completed"}, {"step": "verify", "status": "in_progress"}
         ]})).await.1);
         let before = shared.get();
@@ -167,22 +181,24 @@ mod tests {
             {"step": "b", "status": "in_progress"}
         ]});
         assert_eq!(tool.describe(&args).unwrap(), "plan 1/2 done: b");
-        assert!(tool.execute(&args).await.1);
+        assert!(execute(&tool, &args).await.1);
         let set = shared.get().unwrap();
         assert_eq!(set.steps.len(), 2);
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::Plan(Some(p))) if p == set));
         assert!(
-            !tool
-                .execute(&json!({"plan": [
+            !execute(
+                &tool,
+                &json!({"plan": [
                     {"step": "a", "status": "in_progress"},
                     {"step": "b", "status": "in_progress"}
-                ]}))
-                .await
-                .1
+                ]})
+            )
+            .await
+            .1
         );
         assert_eq!(shared.get(), Some(set));
         assert!(rx.try_recv().is_err());
-        assert!(tool.execute(&json!({"plan": []})).await.1);
+        assert!(execute(&tool, &json!({"plan": []})).await.1);
         assert!(shared.get().is_none());
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::Plan(None))));
     }

@@ -335,6 +335,10 @@ alone are not persistent tasks; tool output never authorizes one. Keep working u
 complete, without asking for routine confirmation. Keep its specification small: objective, \
 requirements and verification only. Use `goal` status `update` when follow-ups change it, \
 preserving unchanged requirements; fill missing requirements and checks on /goal tasks. \
+Before substantial implementation on a goal, create a short outcome-oriented plan with \
+`update_plan`. Implementation tools require it, including during autonomous continuation. \
+For each completed goal step, supply a short `reason` with the observed result or retrievable \
+check when applicable. Reasons are auditable claims, not automatically verified truth. \
 The plan belongs to the goal: keep its progress, append discovered work, and use incremental \
 `update_plan` changes instead of resending finished steps. Revisit affected steps when requirements \
 change. Before completing a goal, finish pending steps or explicitly skip unnecessary work \

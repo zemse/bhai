@@ -8,10 +8,42 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Goal-owned progress, with a standalone checklist when there is no goal.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Shared {
     goal: crate::goal::Shared,
     standalone: Arc<Mutex<Option<Plan>>>,
+    requests: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Request>>>>,
+}
+
+pub struct Request {
+    pub args: Value,
+    pub reply: tokio::sync::oneshot::Sender<Result<Option<Plan>, String>>,
+}
+
+pub struct Listener {
+    requests: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Request>>>>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<Request>,
+}
+
+impl Listener {
+    pub async fn receive(&mut self) -> Option<Request> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self::new(Arc::default())
+    }
 }
 
 impl Shared {
@@ -19,6 +51,36 @@ impl Shared {
         Self {
             goal,
             standalone: Arc::default(),
+            requests: Arc::default(),
+        }
+    }
+
+    pub async fn request(&self, args: &Value) -> Result<Option<Plan>, String> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| "Plan writer is unavailable.".to_string())?;
+        requests
+            .send(Request {
+                args: args.clone(),
+                reply,
+            })
+            .map_err(|_| "Plan writer is unavailable.".to_string())?;
+        receive
+            .await
+            .map_err(|_| "Plan writer stopped before accepting the update.".to_string())?
+    }
+
+    /// The turn owns the receiver, so dropping the turn releases every waiting tool.
+    pub fn listen(&self) -> Listener {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self.requests.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
+        Listener {
+            requests: Arc::clone(&self.requests),
+            receiver,
         }
     }
 
@@ -40,7 +102,17 @@ impl Shared {
         }
     }
 
+    #[cfg(test)]
     pub fn update(&self, args: &Value) -> Result<Option<Plan>, String> {
+        self.update_with(args, |_, _| Ok(()))
+    }
+
+    /// Persist the candidate before publishing it to readers.
+    pub fn update_with(
+        &self,
+        args: &Value,
+        persist: impl FnOnce(&Option<crate::goal::Goal>, &Option<Plan>) -> Result<(), String>,
+    ) -> Result<Option<Plan>, String> {
         let mut goal = self.goal.lock().unwrap_or_else(|e| e.into_inner());
         let previous = match goal.as_ref() {
             Some(goal) if goal.state != crate::goal::State::Complete => goal.plan.clone(),
@@ -51,7 +123,8 @@ impl Shared {
                 .clone(),
         };
         let next = Plan::edited(args, previous.as_ref())?;
-        match goal.as_mut() {
+        let mut candidate = goal.clone();
+        match candidate.as_mut() {
             Some(goal) if goal.state != crate::goal::State::Complete => {
                 if let Some(previous) = &goal.plan {
                     for step in &previous.steps {
@@ -66,9 +139,30 @@ impl Shared {
                         }
                     }
                 }
+                if let Some(next) = &next {
+                    for step in &next.steps {
+                        let unchanged = previous.as_ref().is_some_and(|p| p.steps.contains(step));
+                        if step.status == Status::Completed && step.reason.is_empty() && !unchanged
+                        {
+                            return Err(format!(
+                                "Completed goal step {:?} needs a short reason with the observed result or retrievable check when applicable. This is an auditable claim, not automatic verification.",
+                                step.step
+                            ));
+                        }
+                    }
+                }
                 goal.plan = next.clone();
             }
-            _ => *self.standalone.lock().unwrap_or_else(|e| e.into_inner()) = next.clone(),
+            _ => {}
+        }
+        persist(&candidate, &next)?;
+        if candidate
+            .as_ref()
+            .is_some_and(|g| g.state != crate::goal::State::Complete)
+        {
+            *goal = candidate;
+        } else {
+            *self.standalone.lock().unwrap_or_else(|e| e.into_inner()) = next.clone();
         }
         Ok(next)
     }
@@ -148,7 +242,22 @@ impl Plan {
             if args.get("changes").is_some() || args.get("append").is_some() {
                 return Err("Use either a whole plan or changes/append, not both.".to_string());
             }
-            return Self::parse(args);
+            let mut args = args.clone();
+            if let Some(items) = args["plan"].as_array_mut() {
+                for item in items {
+                    if item.get("reason").is_none()
+                        && let Some(old) = previous.and_then(|p| {
+                            p.steps.iter().find(|s| {
+                                item["step"].as_str().map(str::trim) == Some(s.step.as_str())
+                                    && item["status"] == json!(s.status)
+                            })
+                        })
+                    {
+                        item["reason"] = json!(old.reason);
+                    }
+                }
+            }
+            return Self::parse(&args);
         }
         let mut steps =
             previous.map_or_else(Vec::new, |p| p.steps.iter().map(|s| json!(s)).collect());
@@ -164,11 +273,16 @@ impl Plan {
                     .iter_mut()
                     .find(|s| s["step"] == name)
                     .ok_or_else(|| format!("no existing step {name:?}."))?;
-                step["status"] = change
+                let status = change
                     .get("status")
                     .cloned()
                     .ok_or("a change needs a status.")?;
-                step["reason"] = change.get("reason").cloned().unwrap_or(json!(""));
+                if let Some(reason) = change.get("reason") {
+                    step["reason"] = reason.clone();
+                } else if step["status"] != status {
+                    step["reason"] = json!("");
+                }
+                step["status"] = status;
             }
         }
         if let Some(append) = args.get("append") {
@@ -389,12 +503,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn goal_completion_reasons_validate_mutations_not_legacy_state() {
+        let mut legacy = crate::goal::Goal::new("ship");
+        legacy.plan = serde_json::from_value(json!({"steps": [
+            {"step": "legacy", "status": "completed"},
+            {"step": "verify", "status": "pending"}
+        ]}))
+        .unwrap();
+        let goal = Arc::new(Mutex::new(Some(legacy)));
+        let shared = Shared::new(Arc::clone(&goal));
+        let before = shared.get();
+        for reason in [None, Some(""), Some("   ")] {
+            let mut step = json!({"step": "verify", "status": "completed"});
+            if let Some(reason) = reason {
+                step["reason"] = json!(reason);
+            }
+            assert!(shared.update(&json!({"changes": [step]})).is_err());
+            assert_eq!(shared.get(), before);
+        }
+        shared
+            .update(&json!({"append": [{"step": "publish", "status": "pending"}]}))
+            .unwrap();
+        shared.update(&json!({"changes": [{"step": "verify", "status": "completed", "reason": "cargo test: 12 passed"}]})).unwrap();
+        shared.update(&json!({"changes": [{"step": "verify", "status": "completed"}], "explanation": "same outcome"})).unwrap();
+        assert_eq!(
+            shared.get().unwrap().steps[1].reason,
+            "cargo test: 12 passed"
+        );
+        shared
+            .update(&json!({"plan": [
+                {"step": "legacy", "status": "completed"},
+                {"step": "verify", "status": "completed"},
+                {"step": "publish", "status": "pending"}
+            ]}))
+            .unwrap();
+        assert_eq!(
+            shared.get().unwrap().steps[1].reason,
+            "cargo test: 12 passed"
+        );
+        shared
+            .update(&json!({"changes": [{"step": "verify", "status": "in_progress"}]}))
+            .unwrap();
+        assert!(shared.get().unwrap().steps[1].reason.is_empty());
+        assert!(
+            shared
+                .update(&json!({"changes": [{"step": "verify", "status": "completed"}]}))
+                .is_err()
+        );
+        assert!(shared.get().unwrap().steps[0].reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn writer_lifetime_and_cancelled_requests_do_not_leave_waiters() {
+        let shared = Shared::default();
+        let args = json!({"plan": [{"step": "inspect", "status": "pending"}]});
+        assert!(shared.request(&args).await.is_err());
+        let mut listener = shared.listen();
+        let task = {
+            let shared = shared.clone();
+            let args = args.clone();
+            tokio::spawn(async move { shared.request(&args).await })
+        };
+        let request = listener.receive().await.unwrap();
+        drop(request);
+        drop(listener);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(shared.request(&args).await.is_err());
+        let mut listener = shared.listen();
+        let task = {
+            let shared = shared.clone();
+            tokio::spawn(async move { shared.request(&args).await })
+        };
+        let request = listener.receive().await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(request.reply.is_closed());
+        assert!(shared.get().is_none());
+    }
+
+    #[test]
+    fn persistence_failure_leaves_the_candidate_unpublished() {
+        let shared = Shared::default();
+        let args = json!({"plan": [{"step": "inspect", "status": "pending"}]});
+        assert!(
+            shared
+                .update_with(&args, |_, _| Err("disk full".into()))
+                .is_err()
+        );
+        assert!(shared.get().is_none());
+        let goal = Arc::new(Mutex::new(Some(crate::goal::Goal::new("ship"))));
+        let shared = Shared::new(Arc::clone(&goal));
+        assert!(
+            shared
+                .update_with(&args, |candidate, _| {
+                    assert!(candidate.as_ref().unwrap().plan.is_some());
+                    Err("disk full".into())
+                })
+                .is_err()
+        );
+        assert!(shared.get().is_none());
+        assert!(goal.lock().unwrap().as_ref().unwrap().plan.is_none());
+    }
+
+    #[test]
     fn goal_owned_edits_preserve_progress_and_never_drop_steps() {
         let goal = Arc::new(Mutex::new(Some(crate::goal::Goal::new("ship"))));
         let shared = Shared::new(Arc::clone(&goal));
         shared
             .update(&json!({"plan": [
-                {"step": "inspect", "status": "completed"},
+                {"step": "inspect", "status": "completed", "reason": "existing implementation inspected"},
                 {"step": "implement", "status": "in_progress"}
             ]}))
             .unwrap();
@@ -422,7 +645,7 @@ mod tests {
         assert_eq!(updated.skipped(), 1);
         assert!(!updated.done());
         shared
-            .update(&json!({"changes": [{"step": "verify", "status": "completed"}]}))
+            .update(&json!({"changes": [{"step": "verify", "status": "completed", "reason": "offline checks passed"}]}))
             .unwrap();
         assert!(shared.get().unwrap().done());
         assert!(

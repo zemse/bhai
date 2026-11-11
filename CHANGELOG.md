@@ -6,6 +6,8 @@ carries the shape of what is there.
 
 ## 2026-11-11
 
+- Goal implementation tools wait for a short outcome-oriented plan; completion requires a nonempty resolved plan. Completed goal steps require a short result or check in `reason`, an auditable claim rather than automatic verification. Existing reasonless progress still loads, unrelated edits preserve reasons, and reopening clears them.
+- Plan updates are saved before tool success or panel updates; failed saves leave progress unchanged. Private conversations keep updates in memory, and saved sessions, forks and both compaction paths preserve completion reasons.
 - Scroll over the plan panel to browse long checklists without moving the transcript. The footer shows the visible step range; collapsing and reopening the panel returns to the active step.
 - `/private` keeps the current conversation in memory until `/clear`, erases its saved transcript, owned artifacts and prompt-history entries, and blocks prompts if erasure fails. The top banner and magenta input border show privacy, including on attach. Activation requires idle turns and background work; private sessions refuse forks, children, workflows, memory writes, schedules, monitors, generated images, browser rendering, exports, dictation and external editing, and skip hooks and notification commands. Tool writes, provider retention, independent copies and filesystem backups are outside this boundary.
 

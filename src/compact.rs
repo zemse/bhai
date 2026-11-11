@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn both_compaction_paths_keep_the_latest_focused_progress() {
         let mut plan = crate::plan::Plan::parse(&json!({"plan": [
-            {"step": "inspect", "status": "completed"}, {"step": "verify", "status": "pending"}
+            {"step": "inspect", "status": "completed", "reason": "retrievable check: offline inspection passed"}, {"step": "verify", "status": "pending"}
         ]}))
         .unwrap()
         .unwrap();
@@ -512,6 +512,11 @@ mod tests {
         plan.steps[1].status = crate::plan::Status::InProgress;
         history.extend(crate::plan::context(&history, Some(&plan)));
         let expected = crate::plan::restated_context(&history).unwrap();
+        assert!(
+            expected
+                .to_string()
+                .contains("retrievable check: offline inspection passed")
+        );
         let folded = fold(&history, "summary").unwrap();
         let installed = install(
             &history,

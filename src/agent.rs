@@ -2234,8 +2234,11 @@ async fn turn(
                     (run, rx)
                 })
                 .unzip();
-            let (outcomes, ()) =
-                tokio::join!(futures_util::future::join_all(runs), in_turn(events, tx));
+            let requests = goal_context.map(|c| c.plan.listen());
+            let (outcomes, ()) = tokio::join!(
+                futures_util::future::join_all(runs),
+                in_turn(events, tx, goal_context.map(|c| c.plan), requests, sink)
+            );
             for (result, ok) in outcomes {
                 all_failed &= !ok;
                 results.push(result);
@@ -2311,10 +2314,43 @@ fn batches(registry: &Registry, calls: &[&Value]) -> Vec<std::ops::Range<usize>>
 async fn in_turn(
     events: Vec<mpsc::UnboundedReceiver<AgentEvent>>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
+    plan: Option<&crate::plan::Shared>,
+    mut requests: Option<crate::plan::Listener>,
+    sink: &mut Sink<'_>,
 ) {
     for mut rx in events {
-        while let Some(event) = rx.recv().await {
-            let _ = tx.send(event);
+        loop {
+            tokio::select! {
+                event = rx.recv() => match event {
+                    Some(event) => { let _ = tx.send(event); }
+                    None => break,
+                },
+                Some(request) = async {
+                    match requests.as_mut() {
+                        Some(requests) => requests.receive().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if request.reply.is_closed() {
+                        continue;
+                    }
+                    let result = plan.ok_or_else(|| "Plan writer is unavailable.".to_string()).and_then(|plan| {
+                        plan.update_with(&request.args, |goal, next| {
+                            if let Sink::Session(writer) = sink {
+                                // Goal-owned plans are one record with their specification.
+                                let saved = if goal.as_ref().is_some_and(|g| g.state != goal::State::Complete) {
+                                    writer.goal(goal)
+                                } else {
+                                    writer.plan(next)
+                                };
+                                saved.map_err(|e| format!("Could not save plan: {e:#}"))?;
+                            }
+                            Ok(())
+                        })
+                    });
+                    let _ = request.reply.send(result);
+                }
+            }
         }
     }
 }
@@ -3417,6 +3453,9 @@ async fn execute(
     }
     if let Some(updated) = before.updated_input {
         args = registry.rooted(name, updated);
+    }
+    if registry.requires_plan(name, &args) {
+        return ("Create a short outcome-oriented goal plan with update_plan before implementation. Planning and read-only inspection remain available.".to_string(), false);
     }
     let summary = match tool.describe(&args) {
         Ok(summary) => summary,
@@ -5925,6 +5964,15 @@ mod tests {
         Control::Goal(goal::Command::Set(objective.to_string()))
     }
 
+    fn completed_plan_call() -> Value {
+        fake::call(
+            "update_plan",
+            json!({"plan": [
+                {"step": "check scripted outcome", "status": "completed", "reason": "offline scripted check passed"}
+            ]}),
+        )
+    }
+
     fn parent_calls(fake: &fake::Fake) -> Vec<String> {
         fake.bodies
             .lock()
@@ -5943,10 +5991,10 @@ mod tests {
             vec![call("read", json!({"path": "/etc/hosts"}))],
             // The turn ends without the goal ending, so another opens on it.
             vec![say("not yet")],
-            vec![call(
-                "goal",
-                json!({"status": "complete", "reason": "read it"}),
-            )],
+            vec![
+                completed_plan_call(),
+                call("goal", json!({"status": "complete", "reason": "read it"})),
+            ],
             vec![say("done")],
             vec![say("should not run")],
         ]);
@@ -5985,10 +6033,10 @@ mod tests {
             vec![call("compact", json!({}))],
             vec![say("the summary")],
             vec![say("still working")],
-            vec![call(
-                "goal",
-                json!({"status": "complete", "reason": "verified"}),
-            )],
+            vec![
+                completed_plan_call(),
+                call("goal", json!({"status": "complete", "reason": "verified"})),
+            ],
             vec![say("done")],
             vec![say("next message answered")],
         ]);
@@ -6128,10 +6176,10 @@ mod tests {
             let fake = Fake::new(vec![
                 vec![say("still working")],
                 vec![call("read", json!({"path": "/etc/hosts"}))],
-                vec![call(
-                    "goal",
-                    json!({"status": "complete", "reason": "verified"}),
-                )],
+                vec![
+                    completed_plan_call(),
+                    call("goal", json!({"status": "complete", "reason": "verified"})),
+                ],
                 vec![say("done")],
             ])
             .with_usage(usage);
@@ -6175,10 +6223,10 @@ mod tests {
             )],
             vec![call("read", json!({"path": "/etc/hosts"}))],
             vec![say("smaller work checked; continuing")],
-            vec![call(
-                "goal",
-                json!({"status": "complete", "reason": "verified"}),
-            )],
+            vec![
+                completed_plan_call(),
+                call("goal", json!({"status": "complete", "reason": "verified"})),
+            ],
             vec![say("done")],
         ]);
         let (mut rx, _user, _control, _cancel) =
@@ -6230,10 +6278,10 @@ mod tests {
                 json!({"status": "resume", "reason": "key supplied"}),
             )],
             vec![say("checking")],
-            vec![call(
-                "goal",
-                json!({"status": "complete", "reason": "verified"}),
-            )],
+            vec![
+                completed_plan_call(),
+                call("goal", json!({"status": "complete", "reason": "verified"})),
+            ],
             vec![say("done")],
         ]);
         let (mut rx, user, _control, _cancel) = goal_session(&fake, Vec::new());
@@ -6282,10 +6330,10 @@ mod tests {
                 json!({"status": "update", "reason": "capture output comparison", "spec": updated}),
             )],
             vec![call("read", json!({"path": "/etc/hosts"}))],
-            vec![call(
-                "goal",
-                json!({"status": "complete", "reason": "verified"}),
-            )],
+            vec![
+                completed_plan_call(),
+                call("goal", json!({"status": "complete", "reason": "verified"})),
+            ],
             vec![say("done")],
         ]);
         let (mut rx, user, _control, _cancel) = goal_session(&fake, Vec::new());
@@ -6363,7 +6411,7 @@ mod tests {
         let plan = crate::plan::Shared::new(Arc::clone(&goal));
         let (tx, _rx) = mpsc::unbounded_channel();
         steer_goal(&goal, &plan, goal::Command::Set("ship".to_string()), &tx);
-        plan.update(&json!({"append": [{"step": "inspect", "status": "completed"}]}))
+        plan.update(&json!({"append": [{"step": "inspect", "status": "completed", "reason": "offline inspection passed"}]}))
             .unwrap();
         let progress = plan.get();
         steer_goal(&goal, &plan, goal::Command::Pause, &tx);
@@ -6380,6 +6428,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_goal_plan_blocks_implementation_but_not_inspection_or_planning() {
+        use fake::{Fake, call, say};
+        let dir = tools::temp_dir();
+        let file = dir.join("not-written");
+        let fake = Fake::new(vec![
+            vec![call("write", json!({"path": file, "content": "no"}))],
+            vec![call("bash", json!({"command": "printf no > not-written"}))],
+            vec![call("read", json!({"path": "/etc/hosts"}))],
+            vec![call(
+                "update_plan",
+                json!({"plan": [{"step": "verify output", "status": "pending"}]}),
+            )],
+            vec![say("planned")],
+        ]);
+        let (mut rx, _user, _control, cancel) = goal_session(&fake, vec![set_goal("implement")]);
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), settle(&mut rx))
+            .await
+            .unwrap();
+        cancel.stop();
+        assert!(!file.exists());
+        let bodies = fake.bodies.lock().unwrap();
+        let input = bodies.last().unwrap().1["input"].as_array().unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "function_call_output"
+                    && item["output"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("Create a short outcome-oriented goal plan")))
+                .count(),
+            2
+        );
+        drop(bodies);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Plan(Some(_))))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Approval { .. }))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    async fn check_plan_acceptance(fail: bool, private: bool) {
+        use fake::{Fake, call, say};
+        let dir = tools::temp_dir();
+        let store = dir.join("sessions");
+        if fail {
+            std::fs::write(&store, "not a directory").unwrap();
+        }
+        let path = sessions::path(&store, "sess");
+        let shared: goal::Shared = Arc::new(Mutex::new(Some(Goal::new("verify"))));
+        let plan = crate::plan::Shared::new(Arc::clone(&shared));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let registry = Registry::new(Vec::new())
+            .with_goal(tools::goal::Goal {
+                goal: Arc::clone(&shared),
+                plan: plan.clone(),
+                requested: Arc::default(),
+            })
+            .with_plan(tools::plan::UpdatePlan {
+                plan: plan.clone(),
+                tx: tx.clone(),
+            });
+        let check_path = path.clone();
+        let fake = Fake::new(vec![
+            vec![call("update_plan", json!({"plan": [{"step": "verify", "status": "completed", "reason": "offline fixture: 12 checks passed"}]}))],
+            vec![say("done")],
+        ]).during(move |n| {
+            if n == 1 {
+                if fail || private {
+                    assert!(!check_path.exists());
+                } else {
+                    let loaded = sessions::load(&check_path).unwrap();
+                    assert_eq!(loaded.goal.unwrap().plan.unwrap().steps[0].reason, "offline fixture: 12 checks passed");
+                }
+            }
+        });
+        let requested = Arc::default();
+        let context_usage = Arc::default();
+        let quota = Arc::default();
+        let context = GoalContext {
+            goal: &shared,
+            plan: &plan,
+            compact_requested: &requested,
+            context_usage: &context_usage,
+            quota: &quota,
+        };
+        let mut writer = Writer::create(
+            &store,
+            sessions::Header::new("sess", "general", "fake", "medium", &dir),
+        );
+        let mut history = Vec::new();
+        let policy = Policy::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let schemas = registry.schemas();
+        let mut calls = Vec::new();
+        let mut monitor = CacheMonitor::default();
+        let mut sink = Sink::Session(&mut writer);
+        let run = turn(
+            &fake,
+            &registry,
+            &policy,
+            None,
+            &schemas,
+            "",
+            &mut history,
+            &tx,
+            &cancel,
+            &mut calls,
+            &mut monitor,
+            None,
+            &mut sink,
+            None,
+            None,
+            None,
+            Some(&context),
+            None,
+        );
+        let (finished, mut completion) = oneshot::channel();
+        let run = async {
+            let outcome = run.await;
+            let _ = finished.send(());
+            outcome
+        };
+        let observe = async {
+            let mut accepted = false;
+            let mut check = |event| {
+                if let AgentEvent::Plan(Some(shown)) = event {
+                    accepted = true;
+                    if private {
+                        assert!(!path.exists());
+                    } else {
+                        let loaded = sessions::load(&path).unwrap();
+                        assert_eq!(loaded.goal.unwrap().plan.as_ref(), Some(&shown));
+                    }
+                }
+            };
+            loop {
+                tokio::select! {
+                    event = rx.recv() => {
+                        if let Some(event) = event { check(event); } else { break; }
+                    }
+                    _ = &mut completion => {
+                        while let Ok(event) = rx.try_recv() { check(event); }
+                        break;
+                    }
+                }
+            }
+            assert_eq!(accepted, !fail);
+        };
+        let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(run, observe)
+        })
+        .await
+        .unwrap();
+        assert!(outcome.result.is_ok());
+        assert_eq!(
+            history
+                .iter()
+                .any(|item| item["type"] == "function_call_output"
+                    && item["output"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("Could not save plan"))),
+            fail
+        );
+        assert_eq!(plan.get().is_some(), !fail);
+        assert_eq!(
+            shared.lock().unwrap().as_ref().unwrap().plan.is_some(),
+            !fail
+        );
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn plan_acceptance_is_saved_before_announcement_and_the_next_model_call() {
+        check_plan_acceptance(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_plan_save_has_no_success_event_or_accepted_mutation() {
+        check_plan_acceptance(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn private_plan_acceptance_stays_in_memory() {
+        let privacy = Arc::new(crate::privacy::Privacy::default());
+        privacy.begin();
+        privacy.finish(true);
+        crate::privacy::CURRENT
+            .scope(
+                std::cell::RefCell::new(privacy),
+                check_plan_acceptance(false, true),
+            )
+            .await;
+    }
+
+    #[tokio::test]
     async fn an_unfinished_owned_plan_prevents_premature_goal_completion() {
         use fake::{Fake, call, say};
         let fake = Fake::new(vec![
@@ -6393,7 +6643,7 @@ mod tests {
             )],
             vec![call(
                 "update_plan",
-                json!({"changes": [{"step": "verify", "status": "completed"}]}),
+                json!({"changes": [{"step": "verify", "status": "completed", "reason": "offline checks passed"}]}),
             )],
             vec![call(
                 "goal",
@@ -8980,10 +9230,10 @@ mod tests {
             step(OVERFLOW),
             vec![say("the summary")],
             vec![say("retried")],
-            vec![call(
-                "goal",
-                json!({"status": "complete", "reason": "retried"}),
-            )],
+            vec![
+                completed_plan_call(),
+                call("goal", json!({"status": "complete", "reason": "retried"})),
+            ],
             vec![say("done")],
         ]);
         let (mut rx, user, control, _cancel) = goal_session(&fake, Vec::new());

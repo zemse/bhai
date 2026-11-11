@@ -232,6 +232,11 @@ impl Tool for Goal {
             }
             match shared.as_mut() {
                 Some(goal) if goal.active() => {
+                    if status == "complete"
+                        && goal.plan.as_ref().is_none_or(|plan| plan.steps.is_empty())
+                    {
+                        return ("The goal needs a short outcome-oriented plan before completion. Record the work and its checks with update_plan.".to_string(), false);
+                    }
                     if status == "complete" && goal.plan.as_ref().is_some_and(|plan| !plan.done()) {
                         return ("The goal's plan has unfinished steps. Finish them or mark unnecessary steps skipped with reasons, then verify the requirements before completing.".to_string(), false);
                     }
@@ -448,6 +453,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_requires_a_nonempty_owned_plan_not_a_helper_checklist() {
+        let tool = tool(Some(goal::Goal::new("ship")), true);
+        tool.plan.restore_standalone(
+            crate::plan::Plan::parse(&json!({"plan": [
+                {"step": "helper", "status": "completed"}
+            ]}))
+            .unwrap(),
+        );
+        for plan in [
+            None,
+            Some(crate::plan::Plan {
+                explanation: String::new(),
+                steps: Vec::new(),
+            }),
+        ] {
+            tool.goal.lock().unwrap().as_mut().unwrap().plan = plan;
+            let (out, ok) = tool
+                .execute(&json!({"status": "complete", "reason": "claimed done"}))
+                .await;
+            assert!(!ok && out.contains("plan"), "{out}");
+            assert!(tool.goal.lock().unwrap().as_ref().unwrap().active());
+        }
+    }
+
+    #[tokio::test]
     async fn completion_requires_reconciling_owned_progress_and_new_tasks_reset_it() {
         let tool = tool(Some(goal::Goal::new("ship")), true);
         tool.plan
@@ -459,7 +489,7 @@ mod tests {
         assert!(!ok && out.contains("unfinished"), "{out}");
         assert!(tool.goal.lock().unwrap().as_ref().unwrap().active());
         tool.plan
-            .update(&json!({"changes": [{"step": "verify", "status": "completed"}]}))
+            .update(&json!({"changes": [{"step": "verify", "status": "completed", "reason": "offline checks passed"}]}))
             .unwrap();
         assert!(
             tool.execute(&json!({"status": "complete", "reason": "tests passed"}))
@@ -476,6 +506,7 @@ mod tests {
     async fn terminal_status_returns_only_the_goal_status() {
         for (status, state) in [("complete", State::Complete), ("blocked", State::Blocked)] {
             let tool = tool(Some(goal::Goal::new("ship")), false);
+            tool.plan.update(&json!({"plan": [{"step": "verify", "status": "completed", "reason": "offline checks passed"}]})).unwrap();
             let args = if status == "blocked" {
                 blocked("verified outcome")
             } else {
@@ -498,6 +529,7 @@ mod tests {
     #[tokio::test]
     async fn completion_requires_a_reason_and_a_new_task_can_follow_it() {
         let tool = tool(Some(goal::Goal::new("old")), true);
+        tool.plan.update(&json!({"plan": [{"step": "verify", "status": "completed", "reason": "offline checks passed"}]})).unwrap();
         assert!(
             !tool
                 .execute(&json!({"status": "complete", "reason": " "}))
