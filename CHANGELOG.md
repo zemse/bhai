@@ -6,6 +6,8 @@ carries the shape of what is there.
 
 ## 2026-11-12
 
+- `stream_timing` is an authenticated Codex SSE example that logs timestamped events, deltas and characters, text boundaries, gaps and final usage as JSONL.
+- Running subagent rows show live elapsed time separately from quiet time, including attached sessions; continuing a child restarts its timer.
 - Wrapped links in user messages keep their complete destination when a wide character leaves background padding at a row break; that padding stays out of transcript text.
 - Subagents and workflow children have no model-step limit; the 40-step cutoff and forced wrap-up prompt are gone. Step counts remain in reports, and explicit cancellation, permission checks and failure-loop guards still apply.
 

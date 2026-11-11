@@ -324,6 +324,11 @@ fn child(value: &Value, entry: impl Fn(&Value) -> Option<Entry>) -> Option<Child
         description: text("description"),
         state: serde_json::from_value(row["state"].clone()).ok()?,
         steps: u32::try_from(row["steps"].as_u64().unwrap_or_default()).unwrap_or(u32::MAX),
+        started: Instant::now()
+            .checked_sub(Duration::from_secs(
+                row["elapsed_secs"].as_u64().unwrap_or_default(),
+            ))
+            .unwrap_or_else(Instant::now),
         last: Instant::now()
             .checked_sub(idle)
             .unwrap_or_else(Instant::now),
@@ -988,6 +993,29 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(5);
     const TOKEN: &str = "attach-test-token-0123";
+
+    #[test]
+    fn child_snapshots_keep_elapsed_and_idle_time_separate() {
+        let mut value = serde_json::json!({
+            "child": {
+                "id": "a1",
+                "state": "running",
+                "elapsed_secs": 125,
+                "idle_secs": 3
+            },
+            "entries": []
+        });
+        let log = child(&value, |_| None).unwrap();
+        assert_eq!(log.row.started.elapsed().as_secs(), 125);
+        assert_eq!(log.row.idle().as_secs(), 3);
+        assert_eq!(serde_json::to_value(&log.row).unwrap()["elapsed_secs"], 125);
+        value["child"]
+            .as_object_mut()
+            .unwrap()
+            .remove("elapsed_secs");
+        let older = child(&value, |_| None).unwrap();
+        assert_eq!(older.row.started.elapsed().as_secs(), 0);
+    }
 
     #[test]
     fn a_session_is_picked_by_prefix_or_by_being_the_only_one() {
@@ -1908,6 +1936,7 @@ mod tests {
                 description: String::new(),
                 state,
                 steps,
+                started: Instant::now(),
                 last: Instant::now(),
             },
             entries: Vec::new(),
