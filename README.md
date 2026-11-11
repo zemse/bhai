@@ -85,6 +85,20 @@ SIGTERM or SIGHUP (from `kill`, a closed ssh session or a killed tmux pane) inte
 
 `--resume` keeps the same UUID and directories. project configuration, remembered permission rules, project memory and explicitly enabled workflow caches remain shared; session search and worktree coordination still work across sessions.
 
+### project defaults
+
+`/model-default-global` picks the model for new sessions in `~/.config/bhai/config.toml`. `/model-default-project` saves it in the working directory's `.bhai/config.toml` instead. both accept `<model> [effort]` to skip the picker and leave the current session unchanged. `/effort-default <level>` still changes the global effort.
+
+the project file overrides only the keys it sets. it can set `model`, `effort`, `reasoning_context`, `verbosity` and `private`; environment model overrides, identities, resume state and explicit flags still apply as before. backend addresses and permission grants remain global-only.
+
+```toml
+model = "gpt-5.5"
+effort = "high"
+private = true
+```
+
+`private = true` starts new sessions in private mode before accepting prompts. it does not erase a conversation opened with `--resume` or `--pick`; use `/private` explicitly for those. `/clear` still starts a persistent conversation. restarting bhai applies the configured default again.
+
 ### private conversations
 
 `/private` keeps the current conversation in memory and erases its saved transcript, session artifacts and matching prompt-history entries. the top of the transcript says `PRIVATE MODE` and the input border changes colour. finish or interrupt the running turn and stop background activity before enabling it. if erasure fails, new prompts stay blocked; retry `/private` after fixing the error.

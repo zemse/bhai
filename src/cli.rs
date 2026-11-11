@@ -239,10 +239,15 @@ pub async fn entry() -> Result<()> {
         limits,
         judge,
         title: titled,
+        private,
         choice,
         statusline,
         sudo,
     } = load(args.flags, &name, Some(&session_id)).await?;
+    let private = private && resume.is_none();
+    if private {
+        crate::privacy::raw_logging_disabled(std::env::var_os("BHAI_DEBUG_SSE").as_deref())?;
+    }
     // `--workflow` and `exec` answer every approval but the workflow's own with no, so a
     // call the rules leave at `Ask` is refused for good. The agent is told that rather
     // than told to ask someone who is not there. `exec --serve` has the server to ask.
@@ -436,7 +441,7 @@ allow it.",
         judge.model.clone(),
     ));
     // Only a run that stays up fires schedules, so only there may the model set one.
-    let schedules = (args.workflow.is_none() && args.exec.is_none())
+    let schedules = (!private && args.workflow.is_none() && args.exec.is_none())
         .then(|| session_schedules(&cwd, &session_id))
         .flatten()
         .map(Arc::new);
@@ -457,6 +462,9 @@ allow it.",
         saved,
         limits,
     );
+    if private {
+        start_private(&session).await?;
+    }
     startup::end("start");
     // `--workflow` is a run of its own: no TUI, no turn, just the steps and their report.
     if let Some((name, input)) = args.workflow.clone() {
@@ -986,6 +994,8 @@ struct Setup {
     judge: judge::Settings,
     /// `title`: whether the session is named for the terminal's title.
     title: bool,
+    /// `private`: new conversations start without recording.
+    private: bool,
     /// The model the config asks for, before the identity and the flags have their say.
     choice: client::Choice,
     /// `statusline`: the status bar's template, which may not parse.
@@ -1059,6 +1069,7 @@ async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> 
     let limits = config.limits;
     let judge = config.judge.clone();
     let titled = config.title;
+    let private = config.private;
     let choice = config.choice.clone();
     let statusline = config.statusline.clone();
     let sudo = config.sudo;
@@ -1073,6 +1084,7 @@ async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> 
         limits,
         judge,
         title: titled,
+        private,
         choice,
         statusline,
         sudo,
@@ -1196,6 +1208,23 @@ fn env_mode(value: Option<&str>) -> Result<Option<permissions::Mode>> {
         bail!("BHAI_MODE cannot be bypass, pass --mode bypass instead");
     }
     Ok(Some(mode))
+}
+
+/// Wait for the persistence boundary before accepting any startup prompt.
+async fn start_private(session: &Session) -> Result<()> {
+    crate::privacy::raw_logging_disabled(std::env::var_os("BHAI_DEBUG_SSE").as_deref())?;
+    let mut events = session.subscribe();
+    session.enable_private().map_err(anyhow::Error::msg)?;
+    loop {
+        match events.recv().await? {
+            session::Event::Private {
+                active: true,
+                ready: true,
+            } => return Ok(()),
+            session::Event::Error(error) => bail!("could not start private conversation: {error}"),
+            _ => {}
+        }
+    }
 }
 
 /// Spawn the agent behind a session. The returned receiver is subscribed before the
@@ -1959,6 +1988,9 @@ async fn run(
     // One that does not parse was already reported with the notices.
     app.statusline = statusline.and_then(|t| statusline::Template::parse(&t).ok());
     app.config_path = std::env::var_os("HOME").map(|home| config::global_path(home.as_ref()));
+    app.project_config_path = std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join(".bhai/config.toml"));
     app.defaults = defaults;
     app.designer = designer;
     {
@@ -2128,6 +2160,61 @@ fn attention(event: &session::Event, root: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::prompt;
+
+    #[tokio::test]
+    async fn private_startup_waits_for_the_persistence_boundary() {
+        let (user, _users) = mpsc::channel(1);
+        let (control, mut controls) = mpsc::channel(1);
+        let session = Session::new(
+            "m".into(),
+            "medium".into(),
+            "general".into(),
+            user,
+            control,
+            Arc::new(agent::Cancel::default()),
+            Arc::new(Policy::default()),
+            None,
+        );
+        let starting = start_private(&session);
+        tokio::pin!(starting);
+        tokio::select! {
+            result = &mut starting => panic!("private startup returned early: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert!(session.privacy.active());
+        assert!(!session.privacy.ready());
+        let Some(Control::Private(privacy)) = controls.recv().await else {
+            panic!("private startup did not reach the persistence boundary");
+        };
+        privacy.finish(true);
+        session.on_agent(AgentEvent::Private {
+            active: true,
+            ready: true,
+        });
+        starting.await.unwrap();
+        assert!(session.privacy.ready());
+
+        session.privacy.begin();
+        let retry = start_private(&session);
+        tokio::pin!(retry);
+        tokio::select! {
+            result = &mut retry => panic!("private startup returned early: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        let Some(Control::Private(privacy)) = controls.recv().await else {
+            panic!("private retry did not reach the persistence boundary");
+        };
+        privacy.finish(false);
+        session.on_agent(AgentEvent::Error("erasure failed".into()));
+        assert!(
+            retry
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("erasure failed")
+        );
+        assert!(!session.privacy.ready());
+    }
 
     /// The draw loop applies a whole batch and then draws once, so `apply` says whether
     /// the view changed and the batch takes the union.

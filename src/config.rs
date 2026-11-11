@@ -54,6 +54,8 @@ pub struct Config {
     pub judge: crate::judge::Settings,
     /// `title`: name the session for the terminal's title, which is one small call.
     pub title: bool,
+    /// `private`: new conversations start in private mode.
+    pub private: bool,
     /// `web_search`: offer the `web_search` tool, which runs on the Codex backend only.
     pub web_search: bool,
     /// `image_gen`: offer the `image_gen` tool, which runs on the Codex backend only.
@@ -106,6 +108,7 @@ impl Default for Config {
             auto_project_commands: true,
             judge: crate::judge::Settings::default(),
             title: true,
+            private: false,
             web_search: false,
             image_gen: false,
             code_theme: None,
@@ -196,6 +199,7 @@ struct Layer {
     judge_timeout_ms: Option<u64>,
     judge_max_per_turn: Option<usize>,
     title: Option<bool>,
+    private: Option<bool>,
     web_search: Option<bool>,
     image_gen: Option<bool>,
     code_theme: Option<String>,
@@ -284,6 +288,21 @@ impl Config {
         let mut config = Self::load_global(home)?;
         config.apply_file(&cwd.join(".bhai/config.toml"), false)?;
         Ok(config)
+    }
+
+    /// Read the files a scoped defaults command writes, without environment overrides.
+    pub(crate) fn model_defaults(
+        global: Option<&Path>,
+        project: Option<&Path>,
+    ) -> Result<(String, String)> {
+        let mut config = Self::default();
+        if let Some(path) = global {
+            config.apply_file(path, true)?;
+        }
+        if let Some(path) = project {
+            config.apply_file(path, false)?;
+        }
+        Ok(crate::client::configured_model_settings(&config.choice))
     }
 
     /// Read only the host's global file, before choosing a guest working directory.
@@ -396,7 +415,20 @@ impl Config {
         if trusted && let Some(McpLayer::Table { servers, .. }) = &layer.mcp {
             self.mcp_servers.extend(servers.clone());
         }
-        // Where inference runs is the user's call, never a cloned repo's.
+        if let Some(private) = layer.private {
+            self.private = private;
+        }
+        for (field, value) in [
+            (&mut self.choice.model, &layer.model),
+            (&mut self.choice.effort, &layer.effort),
+            (&mut self.choice.reasoning_context, &layer.reasoning_context),
+            (&mut self.choice.verbosity, &layer.verbosity),
+        ] {
+            if value.is_some() {
+                *field = value.clone();
+            }
+        }
+        // Backend addresses remain global even when a project picks the model.
         if trusted {
             // What a child may see of the environment is the user's call, never a cloned repo's.
             self.pass_env.extend(layer.bash.pass_env.iter().cloned());
@@ -438,16 +470,8 @@ impl Config {
             if layer.statusline.is_some() {
                 self.statusline = layer.statusline.clone();
             }
-            for (field, value) in [
-                (&mut self.choice.model, &layer.model),
-                (&mut self.choice.effort, &layer.effort),
-                (&mut self.choice.ollama_url, &layer.ollama_url),
-                (&mut self.choice.reasoning_context, &layer.reasoning_context),
-                (&mut self.choice.verbosity, &layer.verbosity),
-            ] {
-                if value.is_some() {
-                    *field = value.clone();
-                }
+            if layer.ollama_url.is_some() {
+                self.choice.ollama_url = layer.ollama_url.clone();
             }
             if let Some(websocket) = layer.websocket {
                 self.choice.websocket = websocket;
@@ -710,6 +734,42 @@ mod tests {
     }
 
     #[test]
+    fn project_defaults_override_only_the_keys_they_set() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        let global = global_path(&home);
+        let project = cwd.join(".bhai/config.toml");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().private);
+        write(
+            &global,
+            "model = \"gpt-5.5\"\neffort = \"high\"\nprivate = false\n",
+        );
+        write(&project, "private = true\n");
+        save(&project, &[("model", Some("ollama:gemma4:e2b"))]).unwrap();
+        let config = Config::load(Some(&home), &cwd).unwrap();
+        assert!(config.private);
+        assert_eq!(config.choice.model.as_deref(), Some("ollama:gemma4:e2b"));
+        assert_eq!(config.choice.effort.as_deref(), Some("high"));
+        assert_eq!(
+            Config::model_defaults(Some(&global), None).unwrap(),
+            ("gpt-5.5".into(), "high".into())
+        );
+        assert_eq!(
+            Config::model_defaults(Some(&global), Some(&project)).unwrap(),
+            ("ollama:gemma4:e2b".into(), "high".into())
+        );
+        assert!(
+            std::fs::read_to_string(&project)
+                .unwrap()
+                .contains("private = true")
+        );
+        write(&global, "private = true\n");
+        write(&project, "private = false\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().private);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn statusline_is_the_global_files_alone() {
         let dir = temp_dir();
         let (home, cwd) = (dir.join("home"), dir.join("cwd"));
@@ -915,14 +975,14 @@ mod tests {
     }
 
     #[test]
-    fn only_the_global_file_picks_the_model() {
+    fn projects_pick_models_but_not_backend_addresses() {
         let dir = temp_dir();
         let (home, cwd) = (dir.join("home"), dir.join("cwd"));
         write(
             &home.join(".config/bhai/config.toml"),
             "model = \"ollama:gemma4:e2b\"\neffort = \"low\"\nollama_url = \"http://box:11434\"\nwebsocket = true\n",
         );
-        // A cloned repo must not redirect inference, least of all to a URL of its own.
+        // Project model names do not let a clone supply a backend address.
         write(
             &cwd.join(".bhai/config.toml"),
             "model = \"gpt-5.5\"\nollama_url = \"http://elsewhere\"\nwebsocket = false\n",
@@ -931,7 +991,7 @@ mod tests {
         assert_eq!(
             config.choice,
             crate::client::Choice {
-                model: Some("ollama:gemma4:e2b".to_string()),
+                model: Some("gpt-5.5".to_string()),
                 effort: Some("low".to_string()),
                 ollama_url: Some("http://box:11434".to_string()),
                 websocket: true,
@@ -1222,7 +1282,7 @@ compact_at = 0.9
     }
 
     #[test]
-    fn request_controls_come_from_the_global_file_only() {
+    fn projects_override_request_controls() {
         let dir = temp_dir();
         let (home, cwd) = (dir.join("home"), dir.join("cwd"));
         assert_eq!(Config::load(None, &cwd).unwrap().choice.verbosity, None);
@@ -1236,7 +1296,7 @@ compact_at = 0.9
             config.choice.reasoning_context.as_deref(),
             Some("all_turns")
         );
-        assert_eq!(config.choice.verbosity.as_deref(), Some("low"));
+        assert_eq!(config.choice.verbosity.as_deref(), Some("high"));
         write(&cwd.join(".bhai/config.toml"), "verbosity = \"terse\"\n");
         let err = format!("{:#}", Config::load(Some(&home), &cwd).unwrap_err());
         assert!(err.contains("terse") && err.contains("medium"), "{err}");

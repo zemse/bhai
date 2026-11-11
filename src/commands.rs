@@ -172,9 +172,14 @@ pub const COMMANDS: &[Command] = &[
     },
     // No args hint, for the same reason as `/model`.
     Command {
-        name: "model-default",
+        name: "model-default-global",
         args: "",
-        help: "pick the model new sessions start on",
+        help: "pick the model new sessions start on globally",
+    },
+    Command {
+        name: "model-default-project",
+        args: "",
+        help: "pick the model new sessions start on in this project",
     },
     Command {
         name: "effort-default",

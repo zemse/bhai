@@ -6,6 +6,8 @@ carries the shape of what is there.
 
 ## 2026-11-11
 
+- `/model-default-global` and `/model-default-project` replace `/model-default`, saving model and effort in the global or project config without switching the current session. Project config can override model request settings and start new conversations with `private = true`; backend addresses and permission grants stay global-only.
+
 - `$<command>` runs a direct shell command like `!<command>`; either prefix gives the input a yellow shell label, border and prompt marker. Private mode keeps its magenta border, and attached sessions refuse both prefixes.
 - Goal implementation tools wait for a short outcome-oriented plan; completion requires a nonempty resolved plan. Completed goal steps require a short result or check in `reason`, an auditable claim rather than automatic verification. Existing reasonless progress still loads, unrelated edits preserve reasons, and reopening clears them.
 - Plan updates are saved before tool success or panel updates; failed saves leave progress unchanged. Private conversations keep updates in memory, and saved sessions, forks and both compaction paths preserve completion reasons.

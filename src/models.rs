@@ -427,8 +427,10 @@ pub struct Picker {
     pub selected: usize,
     /// The model and effort the session is on, marked in the lists.
     current: (String, String),
-    /// Picking the default new sessions start on, for `/model-default`.
+    /// Picking the default new sessions start on.
     pub default: bool,
+    /// Save the default in the project config rather than the global file.
+    pub project: bool,
     /// Said above the backends' notes once the list arrives.
     pub note: Option<String>,
     /// Where the backends' answer lands, filled in by the task that asks them.
@@ -444,6 +446,7 @@ impl Picker {
             selected: 0,
             current: (model.to_string(), effort.to_string()),
             default: false,
+            project: false,
             note: None,
             incoming: Arc::new(Mutex::new(None)),
         }
@@ -599,7 +602,10 @@ impl Picker {
     fn title(&self) -> String {
         let what = if self.default { "the default" } else { "an" };
         match self.stage {
-            Stage::Models if self.default => " pick the default model ".to_string(),
+            Stage::Models if self.default => format!(
+                " pick the {} default model ",
+                if self.project { "project" } else { "global" }
+            ),
             Stage::Models => " pick a model ".to_string(),
             Stage::Efforts(at) => match self.models().get(at) {
                 Some(model) => format!(" {} · pick {what} effort ", model.label),

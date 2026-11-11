@@ -1636,9 +1636,17 @@ fn api_error_message(body: &str) -> Option<String> {
 /// whatever `~/.codex/config.toml` has at top level. The last of those is deliberately
 /// a line scan rather than a TOML dependency.
 fn model_settings(choice: &Choice) -> (String, String) {
-    let mut model = env("BHAI_MODEL").or_else(|| choice.model.clone());
-    let mut effort = env("BHAI_EFFORT").or_else(|| choice.effort.clone());
+    configured_model_settings(&Choice {
+        model: env("BHAI_MODEL").or_else(|| choice.model.clone()),
+        effort: env("BHAI_EFFORT").or_else(|| choice.effort.clone()),
+        ..choice.clone()
+    })
+}
 
+/// Config defaults, including the Codex fallback but not environment overrides.
+pub(crate) fn configured_model_settings(choice: &Choice) -> (String, String) {
+    let mut model = choice.model.clone();
+    let mut effort = choice.effort.clone();
     if model.is_none() || effort.is_none() {
         let config = auth::codex_home()
             .ok()

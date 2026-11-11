@@ -346,6 +346,8 @@ pub struct App {
     pub statusline: Option<statusline::Template>,
     /// The global config file, which `/statusline` and the `-default` commands save to.
     pub config_path: Option<PathBuf>,
+    /// The project's `.bhai/config.toml`.
+    pub project_config_path: Option<PathBuf>,
     /// The model and effort a new session starts on, before identity, resume and flags.
     pub defaults: (String, String),
     /// The model call behind `/statusline <request>`.
@@ -526,6 +528,7 @@ impl App {
             session_id: String::new(),
             statusline: None,
             config_path: None,
+            project_config_path: None,
             defaults: (session.state().model, session.state().effort),
             designer: None,
             designing: None,
@@ -635,6 +638,7 @@ impl App {
             && !(ctrl && key.code == KeyCode::Char('c'))
         {
             let default = picker.default;
+            let project = picker.project;
             match picker.on_key(key.code) {
                 Choice::Waiting => {}
                 Choice::Closed => self.picker = None,
@@ -645,7 +649,7 @@ impl App {
                 } => {
                     self.picker = None;
                     match default {
-                        true => self.save_default(&model, Some(&effort)),
+                        true => self.save_default(&model, Some(&effort), project),
                         false => self.switch_model(model, effort, window),
                     }
                 }
@@ -2196,12 +2200,17 @@ impl App {
             self.fast_command(rest.trim());
             return;
         }
-        if let Some(rest) = message.strip_prefix("/model-default")
-            && (rest.is_empty() || rest.starts_with(' '))
-        {
-            self.follow = true;
-            self.model_default_command(rest.trim());
-            return;
+        for (command, project) in [
+            ("/model-default-global", false),
+            ("/model-default-project", true),
+        ] {
+            if let Some(rest) = message.strip_prefix(command)
+                && (rest.is_empty() || rest.starts_with(' '))
+            {
+                self.follow = true;
+                self.model_default_command(rest.trim(), project);
+                return;
+            }
         }
         if let Some(rest) = message.strip_prefix("/effort-default")
             && (rest.is_empty() || rest.starts_with(' '))
@@ -2534,23 +2543,40 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         }
     }
 
-    /// `/model-default`: the picker again, but what it picks is saved for new sessions
-    /// rather than switched to. `/model-default <name> [effort]` saves without asking.
-    fn model_default_command(&mut self, rest: &str) {
+    /// The scoped default commands save for new sessions without switching this one.
+    fn model_default_command(&mut self, rest: &str, project: bool) {
         if rest.is_empty() {
-            let picker = Picker::for_default(&self.defaults.0, &self.defaults.1);
+            let defaults = match crate::config::Config::model_defaults(
+                self.config_path.as_deref(),
+                self.project_config_path.as_deref().filter(|_| project),
+            ) {
+                Ok(defaults) => defaults,
+                Err(e) => {
+                    self.note(Entry::Error(format!("could not read the default: {e:#}")));
+                    return;
+                }
+            };
+            let mut picker = Picker::for_default(&defaults.0, &defaults.1);
+            picker.project = project;
             picker.ask(&self.ollama_url);
             self.picker = Some(picker);
             return;
         }
         let (name, effort) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         let effort = Some(effort.trim()).filter(|e| !e.is_empty());
-        self.save_default(name, effort);
+        self.save_default(name, effort, project);
     }
 
     /// `/effort-default <level>`: the effort new sessions start at. On its own it says
     /// which that is.
     fn effort_default_command(&mut self, rest: &str) {
+        match crate::config::Config::model_defaults(self.config_path.as_deref(), None) {
+            Ok(defaults) => self.defaults = defaults,
+            Err(e) => {
+                self.note(Entry::Error(format!("could not read the default: {e:#}")));
+                return;
+            }
+        }
         if rest.is_empty() {
             self.note(Entry::Info(format!(
                 "default effort: {}. Usage: /effort-default <low|medium|high|xhigh>",
@@ -2573,15 +2599,19 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             return;
         }
         let (model, effort) = (self.defaults.0.clone(), rest.to_string());
-        self.save_default(&model, Some(&effort));
+        self.save_default(&model, Some(&effort), false);
     }
 
-    /// Write `model`, and `effort` where given, to the global config for new sessions.
-    /// This session stays on what it runs.
-    fn save_default(&mut self, model: &str, effort: Option<&str>) {
-        let Some(path) = self.config_path.clone() else {
+    /// Write `model`, and `effort` where given, without switching this session.
+    fn save_default(&mut self, model: &str, effort: Option<&str>, project: bool) {
+        let path = if project {
+            &self.project_config_path
+        } else {
+            &self.config_path
+        };
+        let Some(path) = path.clone() else {
             self.note(Entry::Error(
-                "no home directory to save the default in".to_string(),
+                "no config path to save the default in".to_string(),
             ));
             return;
         };
@@ -2603,10 +2633,18 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             self.note(Entry::Error(format!("could not save the default: {e:#}")));
             return;
         }
-        self.defaults.0 = model.to_string();
-        if let Some(effort) = effort {
-            self.defaults.1 = effort.to_string();
-        }
+        self.defaults = match crate::config::Config::model_defaults(
+            self.config_path.as_deref(),
+            self.project_config_path.as_deref().filter(|_| project),
+        ) {
+            Ok(defaults) => defaults,
+            Err(e) => {
+                self.note(Entry::Error(format!(
+                    "default saved, but could not read it back: {e:#}"
+                )));
+                return;
+            }
+        };
         let shown = match codex {
             true => format!("{} ({})", self.defaults.0, self.defaults.1),
             false => self.defaults.0.clone(),
@@ -2616,6 +2654,14 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
             path.display(),
             self.model
         );
+        if !project
+            && self
+                .project_config_path
+                .as_ref()
+                .is_some_and(|path| path.exists())
+        {
+            notice.push_str(" Project config overrides global defaults where set.");
+        }
         let set = |key: &str| std::env::var(key).is_ok_and(|v| !v.trim().is_empty());
         for key in ["BHAI_MODEL", "BHAI_EFFORT"].into_iter().filter(|k| set(k)) {
             notice.push_str(&format!(" {key} is set, and wins over the config."));
@@ -3472,7 +3518,7 @@ mod tests {
             ("/clear", "/clear"),
             ("/queue clear", "/queue"),
             ("/permissions recover", "/permissions"),
-            ("/model-default x", "/model-default"),
+            ("/model-default-global x", "/model-default-global"),
             ("/some-skill go", "/some-skill"),
         ] {
             assert_eq!(
@@ -4286,7 +4332,7 @@ mod tests {
         let session = app.session.state();
 
         // The picker opens on the default, and enter saves rather than switches.
-        app.input.set("/model-default".to_string());
+        app.input.set("/model-default-global".to_string());
         app.submit();
         let picker = app.picker.as_mut().expect("the picker is up");
         assert!(picker.default);
@@ -4313,7 +4359,8 @@ mod tests {
         app.submit();
         assert!(last(&mut app).contains("on Ollama, which takes no effort"));
 
-        app.input.set("/model-default gpt-5.5 xhigh".to_string());
+        app.input
+            .set("/model-default-global gpt-5.5 xhigh".to_string());
         app.submit();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -4331,6 +4378,48 @@ mod tests {
         app.input.set("/effort-default".to_string());
         app.submit();
         assert!(last(&mut app).starts_with("default effort: low."));
+
+        let project = dir.join("project/.bhai/config.toml");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, "private = true\n").unwrap();
+        app.project_config_path = Some(project.clone());
+        app.input.set("/model-default-project gpt-5.5 high".into());
+        app.submit();
+        assert_eq!(
+            std::fs::read_to_string(&project).unwrap(),
+            "private = true\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "model = \"gpt-5.5\"\neffort = \"low\"\n"
+        );
+        app.input.set("/model-default-project".into());
+        app.submit();
+        let picker = app.picker.as_mut().unwrap();
+        assert!(picker.project);
+        picker.fill(crate::models::Catalogue {
+            models: vec![crate::models::Model {
+                id: "ollama:gemma4:e2b".into(),
+                label: "gemma4:e2b".into(),
+                detail: String::new(),
+                efforts: Vec::new(),
+                default_effort: None,
+                window: None,
+            }],
+            notes: Vec::new(),
+        });
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            std::fs::read_to_string(&project)
+                .unwrap()
+                .contains("model = \"ollama:gemma4:e2b\"")
+        );
+        app.input.set("/effort-default medium".into());
+        app.submit();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "model = \"gpt-5.5\"\neffort = \"medium\"\n"
+        );
 
         let now = app.session.state();
         assert_eq!((now.model, now.effort), (session.model, session.effort));
