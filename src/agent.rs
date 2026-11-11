@@ -58,6 +58,8 @@ pub enum AgentEvent {
     Commentary(String),
     /// The agent wants to run a tool call; `reply` carries the user's decision back.
     Approval {
+        /// Forwarded from a child rather than the session's own turn.
+        child: bool,
         tool: String,
         /// The command, or a one-line summary of the call.
         command: String,
@@ -626,9 +628,14 @@ impl Cancel {
         self.turn.load(Ordering::Relaxed)
     }
 
+    /// Stop only the session's turn, leaving existing children running.
+    pub fn stop_turn(&self) {
+        self.turn.store(true, Ordering::Relaxed);
+    }
+
     /// Stop the turn and every child still running under it.
     pub fn stop(&self) {
-        self.turn.store(true, Ordering::Relaxed);
+        self.stop_turn();
         for (_, child) in self.lock().iter() {
             child.store(true, Ordering::Relaxed);
         }
@@ -637,7 +644,7 @@ impl Cancel {
     /// Stop an unanswered turn and request its prompt back for editing.
     pub fn edit_prompt(&self, text: String) {
         *self.edit.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
-        self.stop();
+        self.stop_turn();
     }
 
     /// Stop child `id` alone, leaving the turn and its siblings running. False when no
@@ -3199,12 +3206,14 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 // An approval is modal, so it is answered where every other one is,
                 // with the tag saying which child is asking.
                 AgentEvent::Approval {
+                    child: _,
                     tool,
                     command,
                     preview,
                     offers,
                     reply,
                 } => AgentEvent::Approval {
+                    child: true,
                     tool,
                     command: format!("{tag} {command}"),
                     preview,
@@ -3763,6 +3772,7 @@ async fn ask(
     let (reply, wait) = oneshot::channel();
     if tx
         .send(AgentEvent::Approval {
+            child: false,
             tool: name.to_string(),
             command: summary.to_string(),
             preview,

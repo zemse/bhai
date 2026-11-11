@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-11
 
+- ESC in the main view stops only the parent turn, including prompt editing and attached sessions; running subagents and their pending approvals stay alive. With only subagents running, ESC does not interrupt them. Local Ctrl+C and shutdown still stop all work.
 - `/model-default-global` and `/model-default-project` replace `/model-default`, saving model and effort in the global or project config without switching the current session. Project config can override model request settings and start new conversations with `private = true`; backend addresses and permission grants stay global-only.
 
 - `$<command>` runs a direct shell command like `!<command>`; either prefix gives the input a yellow shell label, border and prompt marker. Private mode keeps its magenta border, and attached sessions refuse both prefixes.

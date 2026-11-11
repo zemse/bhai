@@ -555,6 +555,7 @@ pub enum Action {
         answer: Answer,
     },
     Interrupt,
+    InterruptTurn,
     InterruptChild(String),
     Steer {
         id: String,
@@ -673,8 +674,8 @@ struct Inner {
     plan: Option<crate::plan::Plan>,
     next_id: u64,
     /// Calls waiting on the user, oldest first. Parallel workflow steps each park one,
-    /// so there can be several; only the front is on screen.
-    pending: VecDeque<(Approval, oneshot::Sender<Answer>)>,
+    /// so there can be several; only the front is on screen. The bool marks a child's.
+    pending: VecDeque<(Approval, oneshot::Sender<Answer>, bool)>,
     /// When the front of `pending` was published.
     shown: Option<Instant>,
     /// The Codex credentials failed, so the queue and the schedules wait for the user.
@@ -825,7 +826,9 @@ impl Session {
             .collect();
         inner.pending.clear();
         if let Some(approval) = read(state, "pending") {
-            inner.pending.push_back((approval, oneshot::channel().0));
+            inner
+                .pending
+                .push_back((approval, oneshot::channel().0, false));
             inner.shown = Some(Instant::now());
         }
         inner.rate_limits = read(state, "rate_limits");
@@ -945,11 +948,13 @@ impl Session {
                     preview: preview.clone(),
                     offers: offers.clone(),
                 };
-                inner.pending.retain(|(a, _)| a.id != *id);
-                inner.pending.push_front((approval, oneshot::channel().0));
+                inner.pending.retain(|(a, _, _)| a.id != *id);
+                inner
+                    .pending
+                    .push_front((approval, oneshot::channel().0, false));
                 inner.shown = Some(Instant::now());
             }
-            Event::Resolved { id, .. } => inner.pending.retain(|(a, _)| a.id != *id),
+            Event::Resolved { id, .. } => inner.pending.retain(|(a, _, _)| a.id != *id),
             Event::Usage(usage) => {
                 inner.total += *usage;
                 inner.last_usage = Some(*usage);
@@ -1117,7 +1122,10 @@ impl Session {
             quota: self.quota.snapshot(chrono::Utc::now().timestamp()),
             goal: inner.goal.clone(),
             plan: inner.plan.clone(),
-            pending: inner.pending.front().map(|(approval, _)| approval.clone()),
+            pending: inner
+                .pending
+                .front()
+                .map(|(approval, _, _)| approval.clone()),
             entries: self.entries().attributed(),
             seq,
         }
@@ -1523,7 +1531,7 @@ impl Session {
     /// (or something else) to answer.
     pub fn answer(&self, answer: Answer, id: Option<u64>) -> Option<u64> {
         let mut inner = self.lock();
-        let (approval, _) = inner.pending.front()?;
+        let (approval, _, _) = inner.pending.front()?;
         if id.is_some_and(|id| approval.id != id)
             || answer
                 .remember()
@@ -1537,7 +1545,7 @@ impl Session {
             link.send(Action::Answer { id, answer });
             return Some(id);
         }
-        let (approval, reply) = inner.pending.pop_front()?;
+        let (approval, reply, _) = inner.pending.pop_front()?;
         let _ = reply.send(answer);
         self.publish(Event::Resolved {
             id: approval.id,
@@ -1546,7 +1554,7 @@ impl Session {
         });
         // Whatever was parked behind it takes its place on screen.
         inner.shown = Some(Instant::now());
-        if let Some((next, _)) = inner.pending.front() {
+        if let Some((next, _, _)) = inner.pending.front() {
             self.publish(Event::Approval {
                 id: next.id,
                 tool: next.tool.clone(),
@@ -1572,6 +1580,48 @@ impl Session {
             return false;
         };
         self.cancel.edit_prompt(text.clone());
+        true
+    }
+
+    /// Stop only the parent turn, keeping children and their approvals alive.
+    pub fn interrupt_turn(&self) -> bool {
+        let mut inner = self.lock();
+        if !inner.working {
+            return false;
+        }
+        if let Some(link) = self.link() {
+            link.send(Action::InterruptTurn);
+            return true;
+        }
+        self.cancel.stop_turn();
+        let front = inner.pending.front().map(|(approval, _, _)| approval.id);
+        let mut at = 0;
+        while at < inner.pending.len() {
+            if inner.pending[at].2 {
+                at += 1;
+                continue;
+            }
+            let (approval, reply, _) = inner.pending.remove(at).unwrap();
+            let _ = reply.send(Answer::Reject);
+            self.publish(Event::Resolved {
+                id: approval.id,
+                accepted: false,
+                remember: None,
+            });
+        }
+        if front != inner.pending.front().map(|(approval, _, _)| approval.id) {
+            inner.shown = Some(Instant::now());
+            if let Some((next, _, _)) = inner.pending.front() {
+                self.publish(Event::Approval {
+                    id: next.id,
+                    tool: next.tool.clone(),
+                    command: next.command.clone(),
+                    preview: next.preview.clone(),
+                    offers: next.offers.clone(),
+                });
+            }
+        }
+        self.publish(Event::Interrupted);
         true
     }
 
@@ -2080,12 +2130,17 @@ impl Session {
             AgentEvent::Text(s) => Event::Text(s),
             AgentEvent::Commentary(s) => Event::Commentary(s),
             AgentEvent::Approval {
+                child,
                 tool,
                 command,
                 preview,
                 offers,
                 reply,
             } => {
+                if !child && self.cancel.stopped() {
+                    let _ = reply.send(Answer::Reject);
+                    return;
+                }
                 inner.next_id += 1;
                 let id = inner.next_id;
                 inner.pending.push_back((
@@ -2097,6 +2152,7 @@ impl Session {
                         offers: offers.clone(),
                     },
                     reply,
+                    child,
                 ));
                 // One prompt at a time: a call parked behind another is published when
                 // that one is answered, rather than replacing it on screen unseen.
@@ -2875,6 +2931,7 @@ mod tests {
     fn approval(session: &Session) -> oneshot::Receiver<Answer> {
         let (reply, wait) = oneshot::channel();
         session.on_agent(AgentEvent::Approval {
+            child: false,
             tool: "bash".to_string(),
             command: "ls".to_string(),
             preview: None,
@@ -3092,6 +3149,60 @@ mod tests {
             ok: false,
         });
         assert!(!session.interrupt());
+    }
+
+    #[test]
+    fn parent_interrupt_keeps_children_and_their_approvals() {
+        for child_first in [false, true] {
+            let (session, _rx) = session();
+            session.submit("go".to_string()).unwrap();
+            child(&session, "a1", "read the docs");
+            let flag = session.cancel.child("a1");
+            let (reply, mut child_wait) = oneshot::channel();
+            if !child_first {
+                let _ = approval(&session);
+            }
+            session.on_agent(AgentEvent::Approval {
+                child: true,
+                tool: "bash".into(),
+                command: "ls".into(),
+                preview: None,
+                offers: Offers::default(),
+                reply,
+            });
+            let mut parent_wait = approval(&session);
+            assert!(session.interrupt_turn());
+            assert!(session.cancel.stopped());
+            assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+            assert_eq!(parent_wait.try_recv(), Ok(Answer::Reject));
+            assert!(matches!(
+                child_wait.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(session.state().pending.unwrap().command, "ls");
+            assert!(session.answer(Answer::Accept(None), None).is_some());
+            assert_eq!(child_wait.try_recv(), Ok(Answer::Accept(None)));
+            let mut late = approval(&session);
+            assert_eq!(late.try_recv(), Ok(Answer::Reject));
+            session.on_agent(AgentEvent::TurnEnd);
+            session.cancel.clear();
+            assert!(!session.interrupt_turn());
+            assert!(!session.cancel.stopped());
+            assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(session.interrupt());
+            assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn editing_a_parent_prompt_keeps_existing_children_running() {
+        let (session, _rx) = session();
+        child(&session, "a1", "read the docs");
+        let flag = session.cancel.child("a1");
+        session.submit("edit me".to_string()).unwrap();
+        assert!(session.edit_prompt());
+        assert!(session.cancel.stopped());
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

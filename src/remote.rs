@@ -876,7 +876,10 @@ async fn act<T>(
 /// Queue `action` to be sent, saying so when the link is down.
 fn take(session: &Session, held: &mut std::collections::VecDeque<Held>, action: Action, up: bool) {
     if !up {
-        if matches!(action, Action::Interrupt | Action::InterruptChild(_)) {
+        if matches!(
+            action,
+            Action::Interrupt | Action::InterruptTurn | Action::InterruptChild(_)
+        ) {
             session.publish(session::Event::Error(format!(
                 "not connected, so the {} was not sent; try again once reconnected",
                 described_action(&action)
@@ -920,6 +923,7 @@ fn described_action(action: &Action) -> String {
         Action::Prompt(_) => "the prompt".into(),
         Action::Answer { .. } => "the answer to the approval".into(),
         Action::Interrupt => "interrupt".into(),
+        Action::InterruptTurn => "parent interrupt".into(),
         Action::InterruptChild(id) => format!("interrupt of {id}"),
         Action::Steer { id, .. } => format!("message to {id}"),
         Action::Mode(mode) => format!("mode change to {}", mode.as_str()),
@@ -951,6 +955,7 @@ fn route(action: &Action) -> (String, Value) {
             answer: Answer::Reject,
         } => ("/reject".into(), json!({ "id": id })),
         Action::Interrupt => ("/interrupt".into(), Value::Null),
+        Action::InterruptTurn => ("/interrupt/turn".into(), Value::Null),
         Action::InterruptChild(id) => (format!("/children/{id}/interrupt"), Value::Null),
         Action::Steer { id, text } => ("/steer".into(), json!({ "id": id, "text": text })),
         Action::Mode(mode) => ("/mode".into(), json!({ "mode": mode })),
@@ -1165,6 +1170,7 @@ mod tests {
         served
             .agent
             .send(AgentEvent::Approval {
+                child: false,
                 tool: "bash".into(),
                 command: "touch x".into(),
                 preview: None,
@@ -1429,6 +1435,7 @@ mod tests {
         served
             .agent
             .send(AgentEvent::Approval {
+                child: false,
                 tool: "bash".into(),
                 command: "touch x".into(),
                 preview: None,
@@ -1438,6 +1445,46 @@ mod tests {
             .unwrap();
         until("the approval shows here", || here.state().pending.is_some()).await;
         (here.state().pending.unwrap().id, decided)
+    }
+
+    #[tokio::test]
+    async fn attached_parent_interrupt_keeps_child_approvals() {
+        let mut served = served().await;
+        let attached = connect(attach_to(served.port)).await.unwrap();
+        let here = attached.session;
+        let (_, parent) = parked(&mut served, &here).await;
+        let (reply, mut child) = oneshot::channel();
+        served
+            .agent
+            .send(AgentEvent::Approval {
+                child: true,
+                tool: "bash".into(),
+                command: "child command".into(),
+                preview: None,
+                offers: Offers::default(),
+                reply,
+            })
+            .unwrap();
+        assert!(here.interrupt_turn());
+        assert_eq!(
+            timeout(WAIT, parent).await.unwrap().unwrap(),
+            Answer::Reject
+        );
+        until("the child approval stays", || {
+            here.state()
+                .pending
+                .is_some_and(|a| a.command == "child command")
+        })
+        .await;
+        assert!(matches!(
+            child.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(here.answer(Answer::Accept(None), None).is_some());
+        assert_eq!(
+            timeout(WAIT, child).await.unwrap().unwrap(),
+            Answer::Accept(None)
+        );
     }
 
     /// While the link is down, prompts and an answer to the approval on screen are held,

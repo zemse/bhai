@@ -158,6 +158,7 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/approve", post(approve))
         .route("/reject", post(reject))
         .route("/interrupt", post(interrupt))
+        .route("/interrupt/turn", post(interrupt_turn))
         .route("/retry", post(retry))
         .route("/goal", post(goal))
         .route("/mode", post(mode))
@@ -643,6 +644,14 @@ async fn interrupt(State(session): State<Arc<Session>>) -> Response {
         ok()
     } else {
         error(StatusCode::CONFLICT, "no turn is running")
+    }
+}
+
+async fn interrupt_turn(State(session): State<Arc<Session>>) -> Response {
+    if session.interrupt_turn() {
+        ok()
+    } else {
+        error(StatusCode::CONFLICT, "no parent turn is running")
     }
 }
 
@@ -1241,6 +1250,7 @@ mod tests {
             let _ = tx_agent.send(AgentEvent::Text("hi".to_string()));
             let (reply, wait) = oneshot::channel();
             let _ = tx_agent.send(AgentEvent::Approval {
+                child: false,
                 tool: "bash".to_string(),
                 command: "ls".to_string(),
                 preview: Some("@@ -1 +1 @@\n-a\n+b".to_string()),

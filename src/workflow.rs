@@ -1209,6 +1209,7 @@ async fn confirm(policy: &Policy, tx: &mpsc::UnboundedSender<AgentEvent>, plan: 
     }
     let (reply, wait) = oneshot::channel();
     let sent = tx.send(AgentEvent::Approval {
+        child: false,
         tool: TOOL.to_string(),
         command: plan,
         preview: None,

@@ -761,7 +761,7 @@ impl App {
                 self.note(Entry::Info("dictation dropped".to_string()));
             }
             KeyCode::Esc if self.inside.is_some() => self.leave_child(),
-            KeyCode::Esc if self.busy() => self.confirm_interrupt(),
+            KeyCode::Esc if self.working => self.confirm_interrupt(),
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
             KeyCode::Char('s') if ctrl => self.toggle_bg(),
@@ -3280,7 +3280,9 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
         }
         let now = Instant::now();
         match self.esc_armed.take() {
-            Some(at) if now.duration_since(at) <= QUIT_WINDOW => self.interrupt(),
+            Some(at) if now.duration_since(at) <= QUIT_WINDOW => {
+                self.session.interrupt_turn();
+            }
             _ => {
                 self.esc_armed = Some(now);
                 self.follow = true;
@@ -3478,7 +3480,10 @@ mod tests {
         app.quit = false;
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(actions.try_recv(), Ok(crate::session::Action::Interrupt));
+        assert_eq!(
+            actions.try_recv(),
+            Ok(crate::session::Action::InterruptTurn)
+        );
     }
 
     #[test]
@@ -4708,6 +4713,7 @@ mod tests {
         let mut app = App::detached();
         let (reply, mut answered) = tokio::sync::oneshot::channel();
         app.session().on_agent(crate::agent::AgentEvent::Approval {
+            child: false,
             tool: "bash".to_string(),
             command: "ls".to_string(),
             preview: None,
@@ -5510,6 +5516,50 @@ mod tests {
                 .iter()
                 .any(|entry| matches!(entry, Entry::User(_)))
         );
+    }
+
+    #[test]
+    fn esc_stops_only_the_parent_and_does_nothing_when_only_children_run() {
+        let (tx_user, _user) = tokio::sync::mpsc::channel(4);
+        let (tx_control, _control) = tokio::sync::mpsc::channel(4);
+        let cancel = Arc::new(crate::agent::Cancel::default());
+        let session = Session::new(
+            "gpt-5.5".into(),
+            "medium".into(),
+            "general".into(),
+            tx_user,
+            tx_control,
+            Arc::clone(&cancel),
+            Arc::default(),
+            None,
+        );
+        let mut app = App::new(Arc::clone(&session));
+        session.publish(Event::ChildStarted {
+            id: "a1".into(),
+            identity: "worker".into(),
+            model: "gpt-5.5".into(),
+            description: "read the docs".into(),
+            task: "go".into(),
+        });
+        let flag = cancel.child("a1");
+        session.submit("go".to_string()).unwrap();
+        app.on_event(Event::User("go".into()));
+        app.input.set("draft".into());
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        app.on_key(esc);
+        assert!(!cancel.stopped());
+        app.on_key(esc);
+        assert!(cancel.stopped());
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        session.on_agent(crate::agent::AgentEvent::TurnEnd);
+        app.on_event(Event::TurnEnd);
+        cancel.clear();
+        app.on_key(esc);
+        app.on_key(esc);
+        assert!(!cancel.stopped());
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        app.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]
