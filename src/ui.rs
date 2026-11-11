@@ -1831,13 +1831,24 @@ fn menu_row(item: &Item, width: usize, selected: bool) -> Line<'static> {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
+    let shell = app.inside.is_none()
+        && app.attached().is_none()
+        && crate::input::shell_command(app.input.value()).is_some();
     let mut block = Block::bordered()
         .border_style(Style::new().fg(if app.session().privacy.active() {
             Color::Magenta
+        } else if shell {
+            Color::Yellow
         } else {
             Color::DarkGray
         }))
         .title_bottom(mode_chip(app.mode));
+    if shell {
+        block = block.title(Line::styled(
+            " shell · not sent to model ",
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     // Inside a pane the prompt goes to that child, so it says so where the eye lands.
     if let Some(inside) = &app.inside {
         block = block.title(Line::styled(
@@ -1894,7 +1905,10 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
     let [marker_area, text_area] =
         Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
     frame.render_widget(
-        Paragraph::new(Span::styled("› ", Style::new().fg(Color::Cyan))),
+        Paragraph::new(Span::styled(
+            if shell { "$ " } else { "› " },
+            Style::new().fg(if shell { Color::Yellow } else { Color::Cyan }),
+        )),
         marker_area,
     );
 
@@ -4127,6 +4141,41 @@ mod tests {
                 } else {
                     Color::DarkGray
                 }
+            );
+        }
+    }
+
+    #[test]
+    fn shell_prefixes_change_the_input_and_removing_them_restores_it() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        for (text, shell) in [
+            ("!", true),
+            ("!ls", true),
+            ("$", true),
+            ("  $ echo hi", true),
+            ("echo hi", false),
+            ("", false),
+        ] {
+            app.input.set(text.to_string());
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(
+                screen(&terminal).contains("shell · not sent to model"),
+                shell
+            );
+            let (area, ..) = app.input_area.unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(
+                buffer[(area.x, area.y - 1)].fg,
+                if shell {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }
+            );
+            assert_eq!(
+                buffer[(area.x - 2, area.y)].symbol(),
+                if shell { "$" } else { "›" }
             );
         }
     }

@@ -9,6 +9,11 @@ use ratatui::text::Line;
 use serde::{Deserialize, Serialize};
 use tui_input::{Input, InputRequest};
 
+/// The direct shell command after its prompt prefix, including an empty command.
+pub fn shell_command(text: &str) -> Option<&str> {
+    text.trim_start().strip_prefix(['!', '$'])
+}
+
 /// Prompts kept from the history file.
 const MAX_HISTORY: usize = 1000;
 
@@ -593,6 +598,21 @@ fn rewrite(path: &Path, entries: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_prefixes_share_the_same_command_detection() {
+        for prefix in ['!', '$'] {
+            assert_eq!(shell_command(&format!("{prefix}ls")), Some("ls"));
+            assert_eq!(
+                shell_command(&format!("  {prefix} echo hi")),
+                Some(" echo hi")
+            );
+            assert_eq!(shell_command(&prefix.to_string()), Some(""));
+        }
+        for prompt in ["", "run $HOME", "hello!", "/help"] {
+            assert_eq!(shell_command(prompt), None);
+        }
+    }
 
     /// A width no test line reaches, so wrapping stays out of the way.
     const WIDE: usize = 200;

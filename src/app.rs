@@ -26,7 +26,7 @@ use crate::debug;
 use crate::diff::DiffView;
 use crate::entries::Entries;
 pub use crate::entries::Entry;
-use crate::input::{Attachments, Editor, History, kept_out};
+use crate::input::{Attachments, Editor, History, kept_out, shell_command};
 use crate::limits::{self, RateLimits};
 use crate::markdown::{self, Origin};
 use crate::models::{Choice, Picker};
@@ -418,8 +418,8 @@ fn remote_context(profile: &serde_json::Value) -> String {
 /// What of `message` cannot be done while attached, by name: `!` commands run here, as
 /// do most slash commands and every skill, which this machine's list would name.
 fn refused_attached(message: &str) -> Option<String> {
-    if message.starts_with('!') {
-        return Some("!".to_string());
+    if shell_command(message).is_some() {
+        return Some(message.trim_start()[..1].to_string());
     }
     let (name, rest) = command(message)?;
     let allowed = ATTACHED.contains(&name)
@@ -2000,10 +2000,12 @@ impl App {
             )));
             return;
         }
-        if let Some(command) = message.strip_prefix('!') {
+        if let Some(command) = shell_command(&message) {
             self.follow = true;
             match command.trim() {
-                "" => self.note(Entry::Error("!<command>: run a shell command".to_string())),
+                "" => self.note(Entry::Error(
+                    "!<command> or $<command>: run a shell command".to_string(),
+                )),
                 command => self.session.shell(command),
             }
             return;
@@ -3434,6 +3436,23 @@ mod tests {
     }
 
     #[test]
+    fn shell_prefixes_route_to_shell_without_sending_a_model_prompt() {
+        let (mut app, mut user, _) = connected();
+        app.session.privacy.begin();
+        app.session.privacy.finish(true);
+        let mut events = app.session.subscribe();
+        for prefix in ['!', '$'] {
+            app.input.set(format!("{prefix}echo hi"));
+            app.submit();
+            assert!(matches!(
+                events.try_recv().unwrap(),
+                crate::session::Event::Error(text) if text.contains("unavailable in private mode")
+            ));
+            assert!(user.try_recv().is_err());
+        }
+    }
+
+    #[test]
     fn attached_only_the_commands_that_reach_the_session_are_taken() {
         for allowed in [
             "hi",
@@ -3448,6 +3467,7 @@ mod tests {
         }
         for (refused, name) in [
             ("!ls", "!"),
+            ("$ls", "$"),
             ("/diff", "/diff"),
             ("/clear", "/clear"),
             ("/queue clear", "/queue"),

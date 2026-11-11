@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-11
 
+- `$<command>` runs a direct shell command like `!<command>`; either prefix gives the input a yellow shell label, border and prompt marker. Private mode keeps its magenta border, and attached sessions refuse both prefixes.
 - Goal implementation tools wait for a short outcome-oriented plan; completion requires a nonempty resolved plan. Completed goal steps require a short result or check in `reason`, an auditable claim rather than automatic verification. Existing reasonless progress still loads, unrelated edits preserve reasons, and reopening clears them.
 - Plan updates are saved before tool success or panel updates; failed saves leave progress unchanged. Private conversations keep updates in memory, and saved sessions, forks and both compaction paths preserve completion reasons.
 - Scroll over the plan panel to browse long checklists without moving the transcript. The footer shows the visible step range; collapsing and reopening the panel returns to the active step.
