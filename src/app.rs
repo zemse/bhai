@@ -327,6 +327,8 @@ pub struct App {
     pub plan_area: Option<Rect>,
     pub monitor_area: Option<Rect>,
     pub plan_collapsed: bool,
+    /// The first visible plan step, or automatic following when unset.
+    pub plan_scroll: Option<usize>,
     pub monitors_collapsed: bool,
     /// The directory and branch hit area on the built-in status bar.
     pub repo_area: Option<Rect>,
@@ -514,6 +516,7 @@ impl App {
             plan_area: None,
             monitor_area: None,
             plan_collapsed: false,
+            plan_scroll: None,
             monitors_collapsed: false,
             repo_area: None,
             bg: None,
@@ -989,6 +992,7 @@ impl App {
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             if self.plan_area.is_some_and(|area| area.contains(at)) {
                 self.plan_collapsed = !self.plan_collapsed;
+                self.plan_scroll = None;
                 return true;
             }
             if self.monitor_area.is_some_and(|area| area.contains(at)) {
@@ -1016,6 +1020,25 @@ impl App {
         // With an approval up, clicks still reach its buttons.
         if let Some(diff) = self.diff.as_mut().filter(|_| self.pending.is_none()) {
             return diff_mouse(diff, mouse);
+        }
+        if let Some(area) = self.plan_area.filter(|area| area.contains(at))
+            && matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            if !self.plan_collapsed
+                && let Some(plan) = self.plan()
+            {
+                let rows = area.height.saturating_sub(2) as usize;
+                let top = self.plan_top(&plan, rows);
+                let max = plan.steps.len().saturating_sub(rows);
+                self.plan_scroll = Some(match mouse.kind {
+                    MouseEventKind::ScrollUp => top.saturating_sub(WHEEL_LINES),
+                    _ => top.saturating_add(WHEEL_LINES).min(max),
+                });
+            }
+            return true;
         }
         if self.children_area.is_some_and(|area| area.contains(at)) {
             let max = self.children().len().saturating_sub(self.child_rows.len());
@@ -2615,6 +2638,16 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     /// The checklist `update_plan` set, for its panel.
     pub fn plan(&self) -> Option<crate::plan::Plan> {
         self.session.plan()
+    }
+
+    pub fn plan_top(&self, plan: &crate::plan::Plan, rows: usize) -> usize {
+        let focus = plan
+            .current()
+            .or_else(|| plan.steps.iter().position(|s| !s.status.resolved()))
+            .unwrap_or(plan.steps.len().saturating_sub(1));
+        self.plan_scroll
+            .unwrap_or_else(|| focus.saturating_sub(1))
+            .min(plan.steps.len().saturating_sub(rows))
     }
 
     /// What the session is working on, as last said.

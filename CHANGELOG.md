@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-11
 
+- Scroll over the plan panel to browse long checklists without moving the transcript. The footer shows the visible step range; collapsing and reopening the panel returns to the active step.
 - `/private` keeps the current conversation in memory until `/clear`, erases its saved transcript, owned artifacts and prompt-history entries, and blocks prompts if erasure fails. The top banner and magenta input border show privacy, including on attach. Activation requires idle turns and background work; private sessions refuse forks, children, workflows, memory writes, schedules, monitors, generated images, browser rendering, exports, dictation and external editing, and skip hooks and notification commands. Tool writes, provider retention, independent copies and filesystem backups are outside this boundary.
 
 ## 2026-11-06

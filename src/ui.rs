@@ -309,6 +309,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let plan = app.plan().filter(|plan| {
         app.goal().is_some_and(|g| g.plan.as_ref() == Some(plan)) || app.working || !plan.done()
     });
+    if plan.is_none() {
+        app.plan_scroll = None;
+    }
     let plan_height = plan.as_ref().map_or(0, |plan| {
         if app.plan_collapsed {
             1
@@ -364,7 +367,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         app.scrollbar = None;
         app.input_area = None;
         // The pane covered those rows, so they go back on top.
-        render_plan(frame, plan_area, plan.as_ref(), app.plan_collapsed);
+        render_plan(frame, plan_area, plan.as_ref(), app);
         crate::monitorview::render(frame, monitor_area, &monitors, app.monitors_collapsed);
         render_children(frame, children_area, app, &children);
         render_queued(frame, queued_area, app);
@@ -385,7 +388,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         }
         None => render_transcript(frame, transcript_area, app),
     }
-    render_plan(frame, plan_area, plan.as_ref(), app.plan_collapsed);
+    render_plan(frame, plan_area, plan.as_ref(), app);
     crate::monitorview::render(frame, monitor_area, &monitors, app.monitors_collapsed);
     render_children(frame, children_area, app, &children);
     render_queued(frame, queued_area, app);
@@ -402,10 +405,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// The checklist the model keeps with `update_plan`, with the step in progress kept in
-/// view when there are more steps than rows.
-fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>, collapsed: bool) {
+/// The checklist the model keeps with `update_plan`, following the active step until
+/// the user scrolls.
+fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>, app: &App) {
     use crate::plan::Status;
+    let collapsed = app.plan_collapsed;
     let Some(plan) = plan.filter(|_| area.height > 0) else {
         return;
     };
@@ -430,19 +434,22 @@ fn render_plan(frame: &mut Frame, area: Rect, plan: Option<&crate::plan::Plan>, 
         return;
     }
     let inner = block.inner(area);
-    frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
-
     let rows = inner.height as usize;
     let width = inner.width as usize;
-    // The step to keep in view: the one in progress, else the first still to do.
-    let focus = plan
-        .current()
-        .or_else(|| plan.steps.iter().position(|s| !s.status.resolved()))
-        .unwrap_or(plan.steps.len().saturating_sub(1));
-    let top = focus
-        .saturating_sub(1)
-        .min(plan.steps.len().saturating_sub(rows));
+    let top = app.plan_top(plan, rows);
+    if plan.steps.len() > rows && rows > 0 {
+        block = block.title_bottom(Line::styled(
+            format!(
+                " steps {}-{}/{} · scroll ",
+                top + 1,
+                top + rows,
+                plan.steps.len()
+            ),
+            dim,
+        ));
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
     let lines: Vec<Line> = plan
         .steps
         .iter()
@@ -4670,6 +4677,79 @@ mod tests {
         };
         assert!(app.on_mouse(event(MouseEventKind::Down(MouseButton::Left))));
         app.on_mouse(event(MouseEventKind::Up(MouseButton::Left)));
+    }
+
+    #[test]
+    fn the_plan_panel_scrolls_all_eighteen_steps_without_scrolling_the_transcript() {
+        let mut app = App::detached();
+        let session = std::sync::Arc::clone(app.session());
+        let steps: Vec<_> = (0..18)
+            .map(|i| {
+                serde_json::json!({
+                    "step": format!("step {i}"),
+                    "status": if i == 8 { "in_progress" } else { "pending" }
+                })
+            })
+            .collect();
+        let plan = crate::plan::Plan::parse(&serde_json::json!({"plan": steps})).unwrap();
+        session.on_agent(crate::agent::AgentEvent::Plan(plan));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("▸ step 8"));
+        assert!(screen(&terminal).contains("steps 8-13/18 · scroll"));
+        let area = app.plan_area.unwrap();
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: area.x + 1,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let transcript_scroll = app.scroll;
+        for _ in 0..10 {
+            app.on_mouse(wheel(MouseEventKind::ScrollUp));
+        }
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.plan_scroll, Some(0));
+        assert!(screen(&terminal).contains("○ step 0"));
+        assert!(screen(&terminal).contains("steps 1-6/18 · scroll"));
+        let mut seen = [false; 18];
+        for _ in 0..10 {
+            let top = app.plan_scroll.unwrap();
+            seen[top..top + 6].fill(true);
+            app.on_mouse(wheel(MouseEventKind::ScrollDown));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        }
+        assert!(seen.into_iter().all(|visible| visible));
+        assert_eq!(app.plan_scroll, Some(12));
+        assert!(screen(&terminal).contains("○ step 17"));
+        assert!(screen(&terminal).contains("steps 13-18/18 · scroll"));
+        assert_eq!(app.scroll, transcript_scroll);
+
+        panel_click(&mut app, area);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.on_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.plan_scroll, None);
+        assert_eq!(app.scroll, transcript_scroll);
+        let area = app.plan_area.unwrap();
+        panel_click(&mut app, area);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("▸ step 8"));
+        assert!(screen(&terminal).contains("steps 8-13/18 · scroll"));
+
+        app.plan_scroll = Some(usize::MAX);
+        let steps = serde_json::json!([
+            {"step": "short first", "status": "in_progress"},
+            {"step": "short last", "status": "pending"}
+        ]);
+        session.on_agent(crate::agent::AgentEvent::Plan(
+            crate::plan::Plan::parse(&serde_json::json!({"plan": steps})).unwrap(),
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("short first"));
+        assert!(screen(&terminal).contains("short last"));
+        session.on_agent(crate::agent::AgentEvent::Plan(None));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.plan_scroll, None);
     }
 
     #[test]
