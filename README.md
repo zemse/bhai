@@ -85,6 +85,10 @@ SIGTERM or SIGHUP (from `kill`, a closed ssh session or a killed tmux pane) inte
 
 `--resume` keeps the same UUID and directories. project configuration, remembered permission rules, project memory and explicitly enabled workflow caches remain shared; session search and worktree coordination still work across sessions.
 
+### subagents
+
+subagents have no model-step limit, including workflow steps. they run until they finish, fail or are explicitly stopped. permission checks, subscription limits and failure-loop guards still apply. ESC in the main view stops only the parent; ctrl+x inside a subagent pane stops that child.
+
 ### project defaults
 
 `/model-default-global` picks the model for new sessions in `~/.config/bhai/config.toml`. `/model-default-project` saves it in the working directory's `.bhai/config.toml` instead. both accept `<model> [effort]` to skip the picker and leave the current session unchanged. `/effort-default <level>` still changes the global effort.

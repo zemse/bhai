@@ -1461,8 +1461,6 @@ pub(crate) async fn run_configured(
                 &mut sink,
                 inbox.as_ref().map(Steer::Inbox),
                 Some(&mut rx_results),
-                // The user is watching this one and can interrupt it.
-                None,
                 Some(&goal_context),
                 Some(limits),
             )
@@ -1824,24 +1822,19 @@ fn prompt_tokens(model: &str, instructions: &str, tools: &[Value], items: &[Valu
         + compact::estimate(&tools::timed_input(items), counter)
 }
 
-/// How one turn ended: the model calls it made, whether its step budget was spent, and
-/// the failure if there was one.
+/// How one turn ended: the model calls it made and the failure if there was one.
 struct Turn {
     steps: usize,
-    /// The budget message went in, so the answer is what the agent had at that point
-    /// rather than what it would have finished with.
-    truncated: bool,
     /// Tool activity survives history compaction within the turn.
     acted: bool,
     result: anyhow::Result<()>,
 }
 
 impl Turn {
-    /// A turn that ran to an answer, however much of its budget that took.
-    fn ended(steps: usize, truncated: bool, acted: bool) -> Self {
+    /// A turn that ran to an answer.
+    fn ended(steps: usize, acted: bool) -> Self {
         Self {
             steps,
-            truncated,
             acted,
             result: Ok(()),
         }
@@ -1867,8 +1860,6 @@ async fn turn(
     mut steer: Option<Steer<'_>>,
     // Reports of children detached earlier; they join the history between steps.
     mut results: Option<&mut mpsc::UnboundedReceiver<ChildResult>>,
-    // Steps this turn may take, for one nobody is watching; `None` for no bound.
-    limit: Option<usize>,
     // The goal and progress whose context stays current between calls.
     goal_context: Option<&GoalContext<'_>>,
     // When old tool outputs are evicted between steps; `None` for never.
@@ -1876,7 +1867,6 @@ async fn turn(
 ) -> Turn {
     model.begin_turn();
     let mut error_rounds = 0usize;
-    let mut truncated = false;
     let mut acted = false;
     let mut continued = 0usize;
     let mut quota_warned = false;
@@ -1887,31 +1877,6 @@ async fn turn(
     loop {
         step += 1;
         Span::current().record("steps", step);
-        // The last step is spent answering, not calling: a bound that cuts the turn off
-        // mid-tool throws away everything it found, so it is told to finish first.
-        if let Some(limit) = limit {
-            if step > limit {
-                return Turn {
-                    steps: step - 1,
-                    truncated,
-                    acted,
-                    result: Err(anyhow!("kept calling tools past its {limit}-step budget")),
-                };
-            }
-            if step == limit {
-                truncated = true;
-                let from = history.len();
-                history.push(json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": budget_note(limit),
-                    }],
-                }));
-                record(sink, &history[from..], tx);
-            }
-        }
         // Whatever was typed into this agent's pane, or queued for it, joins the history
         // before the call, so the next answer has it.
         if let Some(from) = steered(steer.as_mut(), history, tx, judge) {
@@ -1920,7 +1885,6 @@ async fn turn(
         if let Err(error) = refresh_authorization(judge, policy, sink, tx, cancel).await {
             return Turn {
                 steps: step - 1,
-                truncated,
                 acted,
                 result: Err(error),
             };
@@ -1943,7 +1907,7 @@ async fn turn(
                     .await
                     .is_some()
                 {
-                    return Turn::ended(step - 1, truncated, acted);
+                    return Turn::ended(step - 1, acted);
                 }
             } else {
                 let _ = tx.send(AgentEvent::CacheStalled(cache::MAX_MISSES));
@@ -2090,7 +2054,7 @@ async fn turn(
         let items = match answer {
             Ok(items) => items,
             // An interrupt is the user's decision, not an error worth reporting.
-            Err(_) if cancel.load(Ordering::Relaxed) => return Turn::ended(step, truncated, acted),
+            Err(_) if cancel.load(Ordering::Relaxed) => return Turn::ended(step, acted),
             // Left in the history, a refused image would fail every call after this one.
             Err(e)
                 if images::refused(&e)
@@ -2101,7 +2065,6 @@ async fn turn(
             Err(e) => {
                 return Turn {
                     steps: step,
-                    truncated,
                     acted,
                     result: Err(e),
                 };
@@ -2160,14 +2123,14 @@ async fn turn(
             // A preamble on `end_turn: false` is the model narrating before it carries on;
             // ending there leaves the work undone.
             if !continues {
-                return Turn::ended(step, truncated, acted);
+                return Turn::ended(step, acted);
             }
             continued += 1;
             if continued > MAX_CONTINUES {
                 let _ = tx.send(AgentEvent::Info(format!(
                     "stopped: the model asked to carry on {MAX_CONTINUES} times without acting"
                 )));
-                return Turn::ended(step, truncated, acted);
+                return Turn::ended(step, acted);
             }
             continue;
         }
@@ -2265,7 +2228,7 @@ async fn turn(
                 .take()
         });
         if cancel.load(Ordering::Relaxed) {
-            return Turn::ended(step, truncated, acted);
+            return Turn::ended(step, acted);
         }
         if let Some(asked) = requested {
             let pass = Compaction {
@@ -2295,7 +2258,7 @@ async fn turn(
             let _ = tx.send(AgentEvent::Error(
                 "stopped: the last few tool calls all failed".to_string(),
             ));
-            return Turn::ended(step, truncated, acted);
+            return Turn::ended(step, acted);
         }
     }
 }
@@ -2434,14 +2397,6 @@ fn repair_images(
         "the backend refused an image, so {removed} image(s) left the history and the call goes again"
     )));
     true
-}
-
-/// What a bounded turn is told on its last step.
-fn budget_note(limit: usize) -> String {
-    format!(
-        "You have reached your budget of {limit} steps. Stop calling tools and answer now \
-with what you have found, saying what you did not get to."
-    )
 }
 
 /// Put a finished child's report into the history, where it reads as the tool result
@@ -3029,12 +2984,6 @@ fn append_jsonl(path: &Path, items: &[Value]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Steps a child may take before it is told to answer with what it has. A child runs
-/// unattended: the user is watching the parent's turn and can interrupt that, but a
-/// child that has lost the thread reads and re-reads until the model gives up on its
-/// own. Set well past a real delegated task, so it bounds a loop rather than the work.
-pub const CHILD_STEPS: usize = 40;
-
 /// A child agent to run: who it is and what it was asked.
 pub struct Child<'a> {
     pub id: &'a str,
@@ -3065,9 +3014,6 @@ pub struct Child<'a> {
 #[derive(Debug)]
 pub struct Finished {
     pub steps: usize,
-    /// The child spent its whole step budget, so its result is what it had when it was
-    /// told to stop rather than what it set out to produce.
-    pub truncated: bool,
     pub usage: Usage,
     /// The final assistant text, or why there is none.
     pub result: anyhow::Result<String>,
@@ -3141,7 +3087,6 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             steer.as_mut().map(Steer::Mailbox),
             // A child has no `agent` tool, so it has no children to hear back from.
             None,
-            Some(CHILD_STEPS),
             None,
             None,
         )
@@ -3274,12 +3219,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     };
     let ((result, history), (usage, failure)) = tokio::join!(work, forward);
 
-    let Turn {
-        steps,
-        truncated,
-        result,
-        ..
-    } = result;
+    let Turn { steps, result, .. } = result;
     let result = match result {
         Ok(()) if child.cancel.load(Ordering::Relaxed) => Err(anyhow!("interrupted by the user")),
         // An accepted result is the answer however the turn went on after it; without
@@ -3302,7 +3242,6 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     });
     Finished {
         steps,
-        truncated,
         usage,
         result,
     }
@@ -3344,16 +3283,9 @@ fn submitted(history: &[Value], accepted: &[Value]) -> Result<String, &'static s
     let (Some(last), Some(value)) = (last, accepted.last()) else {
         return Err(UNSUBMITTED);
     };
-    // The note on a child's last step is the harness's, not a change of plan.
-    let note = budget_note(CHILD_STEPS);
-    let steered = history[last..].iter().any(|item| {
-        let said = item
-            .get("content")
-            .and_then(Value::as_array)
-            .and_then(|parts| parts.first())
-            .map(|part| text(part, "text"));
-        text(item, "role") == "user" && said.as_deref() != Some(note.as_str())
-    });
+    let steered = history[last..]
+        .iter()
+        .any(|item| text(item, "role") == "user");
     if steered {
         return Err("was sent a message after its result was accepted and submitted none after it");
     }
@@ -4400,7 +4332,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .await;
         assert!(result.is_ok());
@@ -4571,7 +4502,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .await;
         let mut events = Vec::new();
@@ -4643,7 +4573,6 @@ mod tests {
                 &mut CacheMonitor::default(),
                 None,
                 &mut Sink::Discard,
-                None,
                 None,
                 None,
                 Some(&context),
@@ -4773,7 +4702,6 @@ mod tests {
             &mut CacheMonitor::default(),
             None,
             &mut Sink::Discard,
-            None,
             None,
             None,
             None,
@@ -4936,7 +4864,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .await;
         assert!(result.is_ok());
@@ -5002,7 +4929,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Some(limits),
         )
         .await;
@@ -5064,7 +4990,6 @@ mod tests {
             &mut Sink::Discard,
             None,
             Some(&mut results),
-            None,
             None,
             None,
         )
@@ -6554,7 +6479,6 @@ mod tests {
             &mut monitor,
             None,
             &mut sink,
-            None,
             None,
             None,
             Some(&context),

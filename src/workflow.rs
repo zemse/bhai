@@ -702,8 +702,6 @@ pub struct StepReport {
     pub usage: Usage,
     /// Answered from the cache, so it cost nothing and ran no child.
     pub cached: bool,
-    /// The step spent its whole budget, so its result is partial.
-    pub truncated: bool,
     /// What a `for_each` step ran on; `None` for a step that runs once.
     pub items: Option<Items>,
 }
@@ -732,7 +730,6 @@ impl Report {
         for step in &self.steps {
             let status = match &step.status {
                 Status::Ok if step.cached => "ok, from cache".to_string(),
-                Status::Ok if step.truncated => "ok, step budget spent".to_string(),
                 Status::Ok => "ok".to_string(),
                 Status::Failed(e) => format!("failed: {e}"),
                 Status::Skipped(reason) => format!("did not run: {reason}"),
@@ -829,7 +826,6 @@ pub async fn run(run: Run<'_>) -> Report {
     let mut done = Done::default();
     let mut usage = vec![Usage::default(); workflow.steps.len()];
     let mut cached = vec![true; workflow.steps.len()];
-    let mut truncated = vec![false; workflow.steps.len()];
     let mut counts: Vec<Option<Items>> = vec![None; workflow.steps.len()];
     let cache = Cache::open(&run);
     // Once a wave holds a step the cache does not have, every later wave runs cold and
@@ -980,7 +976,6 @@ pub async fn run(run: Run<'_>) -> Report {
                 let index = tasks[*task].step;
                 let step = &workflow.steps[index];
                 add(&mut usage[index], answer.usage);
-                truncated[index] |= answer.truncated;
                 add(&mut report.usage, answer.usage);
                 worst = worst.max(spent(&answer.usage));
                 let outcome = match answer.result {
@@ -989,11 +984,9 @@ pub async fn run(run: Run<'_>) -> Report {
                 };
                 // Only what the step said it would answer with, so neither a failure
                 // nor an answer of the wrong shape is stored and the next run asks
-                // again. A step that spent its budget is not stored either: what it
-                // answered with is what it had when it was cut off, and a cache would
-                // hand that back for good.
-                if let (Some(cache), Some(key), false, Outcome::Ok { output, .. }) =
-                    (&cache, key, answer.truncated, &outcome)
+                // again.
+                if let (Some(cache), Some(key), Outcome::Ok { output, .. }) =
+                    (&cache, key, &outcome)
                 {
                     cache.write(key, step, &identities[index], output);
                 }
@@ -1093,7 +1086,6 @@ pub async fn run(run: Run<'_>) -> Report {
                 .unwrap_or(Status::Skipped("not reached".to_string())),
             usage: usage[index],
             cached: cached[index],
-            truncated: truncated[index],
             items: counts[index].clone(),
         })
         .collect();
@@ -1925,7 +1917,7 @@ needs: [a]\n    prompt: review it\n",
     }
 
     #[tokio::test]
-    async fn a_step_that_spends_its_budget_says_so_and_is_not_cached() {
+    async fn a_long_running_step_finishes_and_is_cached() {
         let workflow = workflow("cache: true\nsteps:\n  - id: a\n    prompt: one\n");
         let root = tools::temp_dir();
         let mut script = vec![
@@ -1933,25 +1925,20 @@ needs: [a]\n    prompt: review it\n",
                 "read",
                 serde_json::json!({"path": "/etc/hosts"})
             )];
-            agent::CHILD_STEPS - 1
+            100
         ];
-        script.push(vec![say("what I had so far")]);
+        script.push(vec![say("the whole answer")]);
         let fake = Fake::new(script);
         let (report, _) = go_in(&root, &workflow, "", &fake).await;
         assert_eq!(report.steps[0].status, Status::Ok);
-        assert!(report.steps[0].truncated);
-        assert!(
-            report.text().contains("a (general) ok, step budget spent"),
-            "{}",
-            report.text()
-        );
+        assert_eq!(fake.bodies.lock().unwrap().len(), 101);
+        assert!(!report.text().contains("step budget"), "{}", report.text());
 
-        // A partial result is not what a re-run hands back.
-        let fake = Fake::new(vec![vec![say("the whole answer")]]);
+        let fake = Fake::new(Vec::new());
         let (again, _) = go_in(&root, &workflow, "", &fake).await;
         assert_eq!(again.steps[0].status, Status::Ok);
-        assert!(!again.steps[0].cached);
-        assert!(!again.steps[0].truncated);
+        assert!(again.steps[0].cached);
+        assert!(fake.bodies.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-11-12
+
+- Subagents and workflow children have no model-step limit; the 40-step cutoff and forced wrap-up prompt are gone. Step counts remain in reports, and explicit cancellation, permission checks and failure-loop guards still apply.
+
 ## 2026-11-11
 
 - ESC in the main view stops only the parent turn, including prompt editing and attached sessions; running subagents and their pending approvals stay alive. With only subagents running, ESC does not interrupt them. Local Ctrl+C and shutdown still stop all work.

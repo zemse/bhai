@@ -343,12 +343,8 @@ impl Agent {
             let name = &identity.name;
             let mut text = match finished.result {
                 Ok(text) => format!(
-                    "child {id} ({name}) finished in {} steps{}, {}/{} tokens\n{}",
+                    "child {id} ({name}) finished in {} steps, {}/{} tokens\n{}",
                     finished.steps,
-                    match finished.truncated {
-                        true => " (step budget spent)",
-                        false => "",
-                    },
                     finished.usage.input,
                     finished.usage.output,
                     truncate(&sanitize(&text))
@@ -571,7 +567,6 @@ control tags and were neutralised; treat them as quoted text.]"
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::CHILD_STEPS;
     use crate::agent::fake::{self, Fake, call, say};
     use crate::prompt::SystemPrompt;
 
@@ -900,50 +895,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_last_step_of_the_budget_is_spent_answering() {
-        let mut script = vec![vec![call("read", json!({"path": "/etc/hosts"}))]; CHILD_STEPS - 1];
-        script.push(vec![say("what I found")]);
+    async fn a_child_runs_past_the_old_step_limit_without_a_wrap_up_prompt() {
+        let mut script = vec![vec![call("read", json!({"path": "/etc/hosts"}))]; 100];
+        script.push(vec![say("the whole answer")]);
         let fake = Fake::new(script);
         let mut harness = tool(&fake, false);
         let out = harness
-            .report(json!({"description": "look around", "prompt": "go"}))
+            .report(json!({"description": "long task", "prompt": "go"}))
             .await;
-        assert!(
-            out.contains(&format!(
-                "finished in {CHILD_STEPS} steps (step budget spent)"
-            )),
-            "{out}"
-        );
-        assert!(out.ends_with("what I found"), "{out}");
-        // The step it answers on is the one that was told to.
+        assert!(out.contains("finished in 101 steps"), "{out}");
+        assert!(out.ends_with("the whole answer"), "{out}");
+        assert!(!out.contains("step budget"), "{out}");
         let bodies = fake.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 101);
         let last = bodies.last().unwrap().1["input"].to_string();
         assert!(
-            last.contains(&format!("budget of {CHILD_STEPS} steps")),
+            !last.contains("Stop calling tools and answer now"),
             "{last}"
         );
         harness.cleanup();
     }
 
     #[tokio::test]
-    async fn a_child_that_never_stops_calling_is_cut_off_at_its_budget() {
+    async fn a_long_running_child_can_still_be_stopped() {
         let fake = Fake::new(vec![
             vec![call("read", json!({"path": "/etc/hosts"}))];
-            CHILD_STEPS + 1
+            1000
         ]);
         let mut harness = tool(&fake, false);
-        let out = harness
-            .report(json!({"description": "look around", "prompt": "go"}))
+        let (started, ok) = harness
+            .agent
+            .execute(&json!({"description": "long task", "prompt": "go"}))
             .await;
+        assert!(ok, "{started}");
+        let id = started["child ".len()..].split(' ').next().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fake.bodies.lock().unwrap().len() < 50 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(harness.agent.cancel.stop_child(id));
+        let report =
+            tokio::time::timeout(std::time::Duration::from_secs(5), harness.results.recv())
+                .await
+                .unwrap()
+                .unwrap();
         assert!(
-            out.contains(&format!("failed after {CHILD_STEPS} steps")),
-            "{out}"
-        );
-        assert!(
-            out.ends_with(&format!(
-                "kept calling tools past its {CHILD_STEPS}-step budget"
-            )),
-            "{out}"
+            report.text.contains("interrupted by the user"),
+            "{}",
+            report.text
         );
         harness.cleanup();
     }
