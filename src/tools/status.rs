@@ -30,41 +30,8 @@ impl Quota {
         let mut value = serde_json::to_value(limits).ok()?;
         value["observed_at"] = json!(observed_at);
         value["age_seconds"] = json!((now - observed_at).max(0));
-        value["checkpoint_recommended"] = json!(checkpoint(&limits, now).is_some());
         Some(value)
     }
-
-    pub fn warning(&self) -> Option<String> {
-        let value = self.snapshot(chrono::Utc::now().timestamp())?;
-        (value["checkpoint_recommended"] == true).then(|| {
-            format!(
-                "For this turn, subscription weekly usage is at least 98% with no reported positive or unlimited credits. Checkpoint now; a later \
-user request may resume work. Do not start new \
-experiments, delegate more work or spend quota on model-based compaction. Preserve modified \
-files and write a concise on-disk handoff with verified results, uncommitted work, running \
-commands, child IDs and exact next steps. Ask active children to checkpoint; do not discard \
-their work or kill useful commands. Finish only bounded essential verification/landing if \
-feasible, then pause and tell the user the reset time if known. Do not auto-switch models, \
-weaken permissions or mark an unfinished goal complete or blocked solely because quota is \
-low. Latest reported quota (not a reservation or guarantee of remaining calls): {value}"
-            )
-        })
-    }
-}
-
-/// The unreset weekly window at least 98% used, without reported credits to spend.
-pub fn checkpoint(limits: &crate::limits::RateLimits, now: i64) -> Option<crate::limits::Window> {
-    if limits
-        .credits
-        .is_some_and(|c| c.unlimited || c.remaining.is_some_and(|remaining| remaining > 0.0))
-    {
-        return None;
-    }
-    limits.windows().find(|w| {
-        w.window_minutes == Some(7 * 24 * 60)
-            && w.used_percent >= 98.0
-            && w.resets_at.is_none_or(|reset| reset > now)
-    })
 }
 
 pub fn context(input: u64, window: u64, estimated: bool) -> Value {
@@ -95,7 +62,6 @@ impl Tool for Status {
             "name": NAME,
             "description": "Read context usage (input_tokens, window_tokens, percent, estimated) and a succinct JSON snapshot of background work. Context reflects the latest model call; estimated is true when backend usage is unavailable. \
         rate_limits, when available, reports subscription window used_percent, window_minutes, resets_at (Unix seconds), credits, observed_at and age_seconds from this agent's latest quota report, not a live fetch. \
-        checkpoint_recommended means a reported weekly window is at least 98% used, has not reached its known reset time and has no reported positive or unlimited credits. Continue work when positive or unlimited credits are reported. Other sessions and children share quota, so headroom is not guaranteed. \
         Commands include running sessions and exited ones with next: collect (use write_stdin with that id). \
         Children include only active tasks. Monitors include state and a short summary. \
         Empty sections are omitted. Reads do not wait, collect results or change anything; push updates arrive separately.",
@@ -259,82 +225,12 @@ mod tests {
         assert_eq!(value["rate_limits"]["primary"]["used_percent"], 98.5);
         assert_eq!(value["rate_limits"]["primary"]["resets_at"], i64::MAX);
         assert_eq!(value["rate_limits"]["credits"]["remaining"], 12.0);
-        assert_eq!(value["rate_limits"]["checkpoint_recommended"], false);
+        assert!(value["rate_limits"].get("checkpoint_recommended").is_none());
         let observed_at = value["rate_limits"]["observed_at"].as_i64().unwrap();
         assert_eq!(
             status.quota.snapshot(observed_at + 60).unwrap()["age_seconds"],
             60
         );
-        assert!(status.quota.warning().is_none());
-    }
-
-    #[test]
-    fn checkpoint_threshold_uses_window_duration_and_known_reset() {
-        use crate::limits::{RateLimits, Window};
-
-        let quota = Quota::default();
-        assert!(quota.snapshot(0).is_none());
-        assert!(quota.warning().is_none());
-        for (used, minutes, reset, expected) in [
-            (97.99, Some(10080), Some(200), false),
-            (98.0, Some(10080), Some(200), true),
-            (100.0, Some(10080), None, true),
-            (100.0, Some(10080), Some(100), false),
-            (100.0, Some(10080), Some(99), false),
-            (99.0, Some(300), Some(200), false),
-            (99.0, None, Some(200), false),
-        ] {
-            let window = Some(Window {
-                used_percent: used,
-                window_minutes: minutes,
-                resets_at: reset,
-            });
-            for secondary in [false, true] {
-                quota.observe(RateLimits {
-                    primary: if secondary { None } else { window },
-                    secondary: if secondary { window } else { None },
-                    credits: None,
-                });
-                assert_eq!(
-                    quota.snapshot(100).unwrap()["checkpoint_recommended"],
-                    expected
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn checkpoint_allows_positive_or_unlimited_credits() {
-        use crate::limits::{Credits, RateLimits, Window};
-
-        for (unlimited, remaining, expected) in [
-            (false, None, true),
-            (false, Some(0.0), true),
-            (false, Some(-1.0), true),
-            (false, Some(0.01), false),
-            (true, None, false),
-            (true, Some(0.0), false),
-        ] {
-            let quota = Quota::default();
-            quota.observe(RateLimits {
-                primary: Some(Window {
-                    used_percent: 100.0,
-                    window_minutes: Some(10080),
-                    resets_at: None,
-                }),
-                credits: Some(Credits {
-                    unlimited,
-                    remaining,
-                    ..Credits::default()
-                }),
-                ..RateLimits::default()
-            });
-            assert_eq!(
-                quota.snapshot(0).unwrap()["checkpoint_recommended"],
-                expected
-            );
-            assert_eq!(quota.warning().is_some(), expected);
-        }
     }
 
     #[test]
@@ -357,12 +253,10 @@ mod tests {
             }),
             ..RateLimits::default()
         });
-        assert!(quota.warning().is_none());
         quota.observe(RateLimits {
             primary: window(100.0),
             ..RateLimits::default()
         });
-        assert!(quota.warning().is_none());
         quota.observe(RateLimits {
             primary: window(1.0),
             ..RateLimits::default()
@@ -370,7 +264,6 @@ mod tests {
         let value = quota.snapshot(chrono::Utc::now().timestamp()).unwrap();
         assert_eq!(value["primary"]["used_percent"], 1.0);
         assert_eq!(value["credits"]["remaining"], 12.0);
-        assert!(quota.warning().is_none());
         quota.observe(RateLimits {
             primary: window(100.0),
             credits: Some(Credits {
@@ -379,7 +272,7 @@ mod tests {
             }),
             ..RateLimits::default()
         });
-        assert!(quota.warning().unwrap().contains("Checkpoint now"));
+        assert_eq!(quota.snapshot(0).unwrap()["credits"]["remaining"], 0.0);
         quota.clear();
         assert!(quota.snapshot(0).is_none());
     }

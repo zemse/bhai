@@ -282,7 +282,7 @@ pub fn watch(
 struct Seen {
     /// A login failed, so the end of that turn is not reported as done as well.
     failed: bool,
-    /// The weekly window is past the checkpoint line without reported credits to spend.
+    /// The weekly window is nearly spent.
     low: bool,
 }
 
@@ -304,7 +304,11 @@ fn about(event: &session::Event, seen: &mut Seen, now: i64) -> Option<(Kind, Str
                 .windows()
                 .any(|w| w.window_minutes == Some(7 * 24 * 60)) =>
         {
-            let window = crate::tools::status::checkpoint(limits, now);
+            let window = limits.windows().find(|w| {
+                w.window_minutes == Some(7 * 24 * 60)
+                    && w.used_percent >= 98.0
+                    && w.resets_at.is_none_or(|reset| reset > now)
+            });
             if std::mem::replace(&mut seen.low, window.is_some()) {
                 return None;
             }

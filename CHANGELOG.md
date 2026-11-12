@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-12
 
+- Quota reports no longer inject checkpoint instructions, pause goals or suppress automatic compaction. Usage reporting and quota notifications remain informational.
 - The weekly quota checkpoint guard allows continued work when positive or unlimited credits are reported, including after subscription quota is exhausted.
 - `list_sessions` discovers active local sessions across projects with IDs, names, titles and working paths. Permission-checked `send_message` delivers agent-framed messages with the sender's ID for replies, waking idle receivers or queueing for busy ones. Private sessions stay out of discovery and delivery; the authenticated local transport does not need `--serve`.
 - `/name <name>` and `/rename <name>` keep a user-set session name separately from model titles, persist it across resume and show it at the input's top right, including attached sessions.

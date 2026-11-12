@@ -1189,10 +1189,9 @@ mod tests {
         assert_eq!(since("9").send().await.unwrap().status().as_u16(), 409);
     }
 
-    /// `/state` carries the quota the way `status` shows it to the model, so a client
-    /// knows the week is nearly spent without parsing the windows itself.
+    /// `/state` carries the quota the way `status` shows it to the model.
     #[tokio::test]
-    async fn state_reports_the_quota_and_the_checkpoint() {
+    async fn state_reports_the_quota() {
         use crate::limits::{RateLimits, Window};
 
         let (base, session) = quiet().await;
@@ -1211,11 +1210,12 @@ mod tests {
         session.on_agent(week(40.0));
         let quota = get_json(&http, format!("{base}/state")).await["quota"].clone();
         assert_eq!(quota["secondary"]["used_percent"], 40.0);
-        assert_eq!(quota["checkpoint_recommended"], false);
+        assert!(quota.get("checkpoint_recommended").is_none());
         assert!(quota["observed_at"].is_i64() && quota["age_seconds"].is_i64());
         session.on_agent(week(98.0));
         let quota = get_json(&http, format!("{base}/state")).await["quota"].clone();
-        assert_eq!(quota["checkpoint_recommended"], true);
+        assert_eq!(quota["secondary"]["used_percent"], 98.0);
+        assert!(quota.get("checkpoint_recommended").is_none());
     }
 
     /// Start a server on an ephemeral port in front of a fake agent that says hi, asks

@@ -1593,8 +1593,6 @@ pub(crate) async fn run_configured(
                     g.pause("the turn failed");
                 } else if cancel.load(Ordering::Relaxed) {
                     g.pause("interrupted");
-                } else if quota.warning().is_some() {
-                    g.pause("weekly quota is at least 98%; checkpoint before resuming");
                 } else if on_goal.is_some() {
                     g.progress(result.acted);
                 }
@@ -1693,7 +1691,7 @@ pub(crate) async fn run_configured(
             || compact_next
             || size.is_some_and(|input| limits.over(model.name(), input));
         let mut compacted = false;
-        if over && !cancel.load(Ordering::Relaxed) && (compact_next || quota.warning().is_none()) {
+        if over && !cancel.load(Ordering::Relaxed) {
             let pass = Compaction {
                 model: model.as_ref(),
                 tools: &tools,
@@ -1920,7 +1918,6 @@ async fn turn(
     let mut error_rounds = 0usize;
     let mut acted = false;
     let mut continued = 0usize;
-    let mut quota_warned = false;
     let local_quota = tools::status::Quota::default();
     let quota = goal_context.map_or(&local_quota, |context| context.quota);
 
@@ -1964,19 +1961,6 @@ async fn turn(
                 let _ = tx.send(AgentEvent::CacheStalled(cache::MAX_MISSES));
             }
             monitor.resume();
-        }
-        if !quota_warned && let Some(warning) = quota.warning() {
-            let from = history.len();
-            history.push(json!({
-                "type": "message",
-                "role": "developer",
-                "content": [{"type": "input_text", "text": warning}],
-            }));
-            record(sink, &history[from..], tx);
-            let _ = tx.send(AgentEvent::Info(
-                "weekly quota is at least 98%; checkpointing".into(),
-            ));
-            quota_warned = true;
         }
         if let Some(context) = goal_context {
             let now = lock_goal(context.goal).clone();
@@ -6115,7 +6099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turns_without_a_goal_context_also_receive_quota_guidance() {
+    async fn turns_without_a_goal_context_do_not_receive_quota_guidance() {
         use fake::{Fake, say};
 
         let fake = Fake::new(vec![
@@ -6131,9 +6115,9 @@ mod tests {
         let dir = tools::temp_dir();
         let (_, result, events) = run_turn(&fake, &dir).await;
         assert!(result.result.is_ok());
-        assert!(info(&events).iter().any(|s| s.contains("checkpointing")));
+        assert!(!info(&events).iter().any(|s| s.contains("checkpointing")));
         assert!(
-            fake.bodies.lock().unwrap()[1].1["input"]
+            !fake.bodies.lock().unwrap()[1].1["input"]
                 .to_string()
                 .contains("Checkpoint now")
         );
@@ -6141,7 +6125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn weekly_quota_warns_once_and_pauses_goal_without_compaction() {
+    async fn weekly_quota_does_not_pause_goal_or_inject_guidance() {
         use fake::{Fake, call, say};
 
         for weekly_primary in [false, true] {
@@ -6160,34 +6144,38 @@ mod tests {
             let fake = Fake::new(vec![
                 vec![quota, call("status", json!({}))],
                 vec![call("status", json!({}))],
-                vec![say("checkpoint saved; resume after reset")],
-            ])
-            .with_usage(Usage {
-                input: 1_000_000,
-                ..Usage::default()
-            });
+                vec![say("still working")],
+                vec![
+                    completed_plan_call(),
+                    call("goal", json!({"status": "complete", "reason": "verified"})),
+                ],
+                vec![say("done")],
+            ]);
             let (mut rx, _user, _control, _cancel) = goal_session(&fake, vec![set_goal("work")]);
-            let events = settle(&mut rx).await;
+            let mut events = settle(&mut rx).await;
+            events.extend(settle(&mut rx).await);
             assert!(
                 !events
                     .iter()
                     .any(|e| matches!(e, AgentEvent::Compacted { .. } | AgentEvent::Error(_))),
                 "{events:?}"
             );
-            assert!(events.iter().any(|e| matches!(e, AgentEvent::Goal(Some(g)) if g.state == goal::State::Paused && g.note.contains("weekly quota"))));
+            assert!(events.iter().any(
+                |e| matches!(e, AgentEvent::Goal(Some(g)) if g.state == goal::State::Complete)
+            ));
             assert_eq!(
                 info(&events)
                     .iter()
                     .filter(|s| s.contains("checkpointing"))
                     .count(),
-                1
+                0
             );
             let bodies = fake.bodies.lock().unwrap();
-            assert_eq!(bodies.len(), 3);
+            assert_eq!(bodies.len(), 5);
             for (_, body) in bodies.iter().skip(1) {
                 let input = body["input"].to_string();
-                assert_eq!(input.matches("Checkpoint now").count(), 1);
-                assert!(input.contains("checkpoint_recommended"));
+                assert!(!input.contains("Checkpoint now"));
+                assert!(!input.contains("checkpoint_recommended"));
             }
         }
     }
@@ -9416,11 +9404,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_goal_turn_that_overflows_keeps_the_goal_through_the_retry() {
+    async fn a_goal_turn_that_overflows_keeps_the_goal_through_the_retry_at_high_quota() {
         use fake::{Fake, OVERFLOW, call, say, step};
 
         let fake = Fake::new(vec![
-            vec![say("one")],
+            vec![
+                json!({"type": "codex.rate_limits", "primary": {
+                    "used_percent": 100.0, "window_minutes": 10080,
+                    "resets_at": i64::MAX,
+                }}),
+                say("one"),
+            ],
             step(OVERFLOW),
             vec![say("the summary")],
             vec![say("retried")],
