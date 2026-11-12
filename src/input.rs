@@ -52,6 +52,13 @@ impl Editor {
         self.input.value()
     }
 
+    /// Chars hidden when the direct shell prefix is drawn as a separate marker.
+    pub fn shell_prefix_len(&self) -> usize {
+        shell_command(self.value()).map_or(0, |command| {
+            self.value().chars().count() - command.chars().count()
+        })
+    }
+
     /// The cursor as a char index into the value.
     pub fn cursor(&self) -> usize {
         self.input.cursor()
@@ -178,25 +185,35 @@ impl Editor {
     /// Move the cursor `delta` rows, keeping its column where the row allows.
     /// False when there is no row that way.
     pub fn move_line(&mut self, delta: isize, width: usize) -> bool {
-        let (row, column) = self.cursor_position(width);
+        self.move_line_from(delta, width, 0)
+    }
+
+    /// Move between wrapped rows with the first `start` chars hidden.
+    pub fn move_line_from(&mut self, delta: isize, width: usize, start: usize) -> bool {
+        let (row, column) = self.cursor_position_from(width, start);
         let target = row as isize + delta;
-        if target < 0 || target as usize >= self.rows(width).len() {
+        if target < 0 || target as usize >= self.rows_from(width, start).len() {
             return false;
         }
-        self.place(target as usize, column, width);
+        self.place_from(target as usize, column, width, start);
         true
     }
 
     /// The text as it is drawn: each logical line wrapped to `width`, with the char
     /// index it starts at. A row break at a space leaves that space on the row before.
     pub fn rows(&self, width: usize) -> Vec<Row> {
+        self.rows_from(width, 0)
+    }
+
+    /// Wrap after hiding `start` chars. Row starts remain indexes into the full value.
+    pub fn rows_from(&self, width: usize, start: usize) -> Vec<Row> {
         let width = width.max(1);
         let chars: Vec<char> = self.value().chars().collect();
         let mut rows = Vec::new();
-        let mut start = 0;
+        let mut start = start.min(chars.len());
         let mut column = 0;
         let mut space = None;
-        for (i, &c) in chars.iter().enumerate() {
+        for (i, &c) in chars.iter().enumerate().skip(start) {
             if c == '\n' {
                 rows.push(Row::new(&chars, start, i));
                 (start, column, space) = (i + 1, 0, None);
@@ -228,20 +245,30 @@ impl Editor {
 
     /// The cursor's row and display column once the text is wrapped to `width`.
     pub fn cursor_position(&self, width: usize) -> (usize, usize) {
+        self.cursor_position_from(width, 0)
+    }
+
+    /// The projected cursor position; a cursor in the hidden prefix draws at (0, 0).
+    pub fn cursor_position_from(&self, width: usize, start: usize) -> (usize, usize) {
         let cursor = self.cursor();
-        let rows = self.rows(width);
+        let rows = self.rows_from(width, start);
         let row = rows.iter().rposition(|r| r.start <= cursor).unwrap_or(0);
         let column = self
             .value()
             .chars()
             .skip(rows[row].start)
-            .take(cursor - rows[row].start);
+            .take(cursor.saturating_sub(rows[row].start));
         (row, column.map(char_width).sum())
     }
 
     /// Put the cursor on `row` at display column `column`, or the nearest place to it.
     pub fn place(&mut self, row: usize, column: usize, width: usize) {
-        let rows = self.rows(width);
+        self.place_from(row, column, width, 0);
+    }
+
+    /// Hit test projected rows, placing the cursor at a char index in the full value.
+    pub fn place_from(&mut self, row: usize, column: usize, width: usize, start: usize) {
+        let rows = self.rows_from(width, start);
         let Some(row) = rows.get(row.min(rows.len().saturating_sub(1))) else {
             return;
         };
@@ -259,8 +286,13 @@ impl Editor {
 
     /// The first of `height` visible rows, moved only as far as keeps the cursor in view.
     pub fn top(&mut self, height: usize, width: usize) -> usize {
-        let row = self.cursor_position(width).0;
-        let rows = self.rows(width).len();
+        self.top_from(height, width, 0)
+    }
+
+    /// Scroll projected rows just far enough to keep the cursor visible.
+    pub fn top_from(&mut self, height: usize, width: usize, start: usize) -> usize {
+        let row = self.cursor_position_from(width, start).0;
+        let rows = self.rows_from(width, start).len();
         let top = self.top.min(row).max((row + 1).saturating_sub(height));
         self.top = top.min(rows.saturating_sub(height));
         self.top
@@ -611,6 +643,142 @@ mod tests {
         }
         for prompt in ["", "run $HOME", "hello!", "/help"] {
             assert_eq!(shell_command(prompt), None);
+        }
+    }
+
+    #[test]
+    fn shell_projection_hides_only_the_leading_whitespace_and_one_prefix() {
+        for prefix in ['!', '$'] {
+            for whitespace in ["", "  ", "\t\n\u{3000}"] {
+                for command in ["", " echo hi", "!$HOME", "é界\nnext"] {
+                    let text = format!("{whitespace}{prefix}{command}");
+                    let mut editor = editor(&text);
+                    let start = editor.shell_prefix_len();
+                    assert_eq!(start, whitespace.chars().count() + 1);
+                    let rows = editor.rows_from(WIDE, start);
+                    assert_eq!(rows[0].start, start);
+                    assert_eq!(
+                        rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                        command.split('\n').collect::<Vec<_>>()
+                    );
+                    assert_eq!(editor.take(), text);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_only_projection_has_an_empty_row_and_a_cursor() {
+        for text in ["!", "$", "  !", "\n\u{3000}$"] {
+            let mut editor = editor(text);
+            let start = editor.shell_prefix_len();
+            assert_eq!(
+                editor.rows_from(0, start),
+                [Row {
+                    start,
+                    text: String::new()
+                }]
+            );
+            assert_eq!(editor.cursor_position_from(0, start), (0, 0));
+            assert_eq!(editor.top_from(1, 0, start), 0);
+            assert!(!editor.move_line_from(-1, 0, start));
+            assert!(!editor.move_line_from(1, 0, start));
+            editor.handle(InputRequest::SetCursor(0), false);
+            assert_eq!(editor.cursor_position_from(0, start), (0, 0));
+            editor.place_from(99, 99, 0, start);
+            assert_eq!(editor.cursor(), start);
+        }
+    }
+
+    #[test]
+    fn projected_wrapping_and_cursor_positions_use_the_command_width() {
+        let command = "é界 abcdef\n\nnext line\n";
+        for prefix in ['!', '$'] {
+            let mut editor = editor(&format!("\u{3000}{prefix}{command}"));
+            let mut plain = super::Editor::default();
+            plain.set(command.to_string());
+            let start = editor.shell_prefix_len();
+            for width in [0, 1, 3, 6, WIDE] {
+                let rows = editor.rows_from(width, start);
+                let expected = plain.rows(width);
+                assert_eq!(rows.len(), expected.len());
+                for (row, expected) in rows.iter().zip(expected) {
+                    assert_eq!(row.start, start + expected.start);
+                    assert_eq!(row.text, expected.text);
+                }
+                for cursor in 0..=command.chars().count() {
+                    editor.handle(InputRequest::SetCursor(start + cursor), false);
+                    plain.handle(InputRequest::SetCursor(cursor), false);
+                    assert_eq!(
+                        editor.cursor_position_from(width, start),
+                        plain.cursor_position(width)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn projected_navigation_hit_testing_and_selection_keep_full_char_indexes() {
+        for prefix in ['!', '$'] {
+            let mut editor = editor(&format!("  {prefix}é界 abc\nnext"));
+            let start = editor.shell_prefix_len();
+            editor.place_from(0, 1, 4, start);
+            assert_eq!(editor.cursor(), start + 1);
+            editor.selecting(true);
+            assert!(editor.move_line_from(1, 4, start));
+            assert_eq!(editor.cursor(), start + 4);
+            assert_eq!(editor.selection(), Some(start + 1..start + 4));
+            assert_eq!(editor.selected().as_deref(), Some("界 a"));
+            assert_eq!(editor.cursor_position_from(4, start), (1, 1));
+            assert_eq!(editor.top_from(1, 4, start), 1);
+            editor.handle(InputRequest::DeletePrevChar, false);
+            assert_eq!(editor.value(), format!("  {prefix}ébc\nnext"));
+            assert_eq!(editor.cursor(), start + 1);
+            editor.place_from(0, 0, WIDE, start);
+            editor.handle(InputRequest::DeletePrevChar, false);
+            assert_eq!(editor.value(), "  ébc\nnext");
+            assert_eq!(editor.shell_prefix_len(), 0);
+        }
+    }
+
+    #[test]
+    fn a_cursor_in_the_hidden_prefix_can_still_edit_it() {
+        for prefix in ['!', '$'] {
+            let mut editor = editor(&format!("\u{3000}{prefix}é"));
+            let start = editor.shell_prefix_len();
+            for cursor in 0..start {
+                editor.handle(InputRequest::SetCursor(cursor), false);
+                assert_eq!(editor.cursor_position_from(1, start), (0, 0));
+                assert_eq!(editor.cursor(), cursor);
+            }
+            editor.handle(InputRequest::GoToNextChar, true);
+            assert_eq!(
+                editor.selected().as_deref(),
+                Some(prefix.to_string().as_str())
+            );
+            editor.handle(InputRequest::DeletePrevChar, false);
+            assert_eq!(editor.value(), "\u{3000}é");
+            assert_eq!(editor.shell_prefix_len(), 0);
+        }
+    }
+
+    #[test]
+    fn non_shell_projection_keeps_the_normal_layout() {
+        for text in ["", "  hi é界\nthere", "hello!", "run $HOME"] {
+            let mut editor = editor(text);
+            let start = editor.shell_prefix_len();
+            assert_eq!(start, 0);
+            assert_eq!(editor.rows_from(4, start), editor.rows(4));
+            assert_eq!(
+                editor.cursor_position_from(4, start),
+                editor.cursor_position(4)
+            );
+            assert_eq!(editor.top_from(1, 4, start), editor.top(1, 4));
+            editor.place_from(0, 2, 4, start);
+            let cursor = editor.cursor();
+            editor.place(0, 2, 4);
+            assert_eq!(editor.cursor(), cursor);
         }
     }
 
