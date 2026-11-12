@@ -228,9 +228,13 @@ pub struct Choice {
     pub websocket: bool,
 }
 
+pub use crate::speed::Output;
+
 /// What the UI is told while a turn streams.
 #[derive(Debug, Clone)]
 pub enum Delta {
+    /// Output timing on the backend's clock, independent of display delivery.
+    Output(Output),
     Reasoning(String),
     Text(String),
     /// Text of a message in the `commentary` phase: a preamble the model writes before
@@ -860,6 +864,24 @@ impl Client {
         on_delta: &mut impl FnMut(Delta),
         cancel: &Arc<AtomicBool>,
     ) -> std::result::Result<Vec<Value>, Error> {
+        on_delta(Delta::Output(Output::Waiting));
+        let result = self
+            .attempt_inner(provider, body, routed, on_delta, cancel)
+            .await;
+        if result.is_err() {
+            on_delta(Delta::Output(Output::Stopped));
+        }
+        result
+    }
+
+    async fn attempt_inner(
+        &self,
+        provider: Provider,
+        body: &Value,
+        routed: bool,
+        on_delta: &mut impl FnMut(Delta),
+        cancel: &Arc<AtomicBool>,
+    ) -> std::result::Result<Vec<Value>, Error> {
         if provider == Provider::Ollama {
             return ollama::attempt(&self.http, &self.ollama_url, body, on_delta, cancel).await;
         }
@@ -923,7 +945,7 @@ impl Client {
         let usage_fetch = self.usage_fetch(&auth);
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let mut call = Call::new();
+        let mut call = Call::new(body["model"].as_str().unwrap_or(self.model()));
 
         loop {
             let chunk = match watched(stream.next(), cancel, "stream idle for too long").await? {
@@ -931,6 +953,7 @@ impl Client {
                 Some(Err(e)) => return Err(Error::Retryable(anyhow!("stream error: {e}"))),
                 Some(Ok(chunk)) => chunk,
             };
+            let received = std::time::Instant::now();
             buf.extend_from_slice(&chunk);
 
             while let Some(line) = take_line(&mut buf) {
@@ -941,7 +964,7 @@ impl Client {
                 let Some(event) = parse_event(data) else {
                     continue;
                 };
-                self.take(&mut call, &event, routed, on_delta)?;
+                self.take(&mut call, &event, received, routed, on_delta)?;
             }
             // The rest of the batch is drained above, so nothing sharing the terminal
             // event's chunk is lost by leaving here rather than waiting for the close.
@@ -1083,13 +1106,14 @@ impl Client {
             Ok(Ok(())) => {}
         }
         let usage_fetch = self.usage_fetch(auth);
-        let mut call = Call::new();
+        let mut call = Call::new(body["model"].as_str().unwrap_or(self.model()));
         let mut events = 0;
         loop {
             let message = match watched(conn.ws.next(), cancel, "stream idle for too long").await {
                 Err(e) => return Streamed::Failed(e),
                 Ok(message) => message,
             };
+            let received = std::time::Instant::now();
             let text = match message {
                 Some(Ok(Message::Text(text))) => text,
                 Some(Ok(Message::Close(_)) | Err(_)) | None => {
@@ -1110,7 +1134,7 @@ impl Client {
             if websocket::stale(&event) {
                 return Streamed::Stale;
             }
-            if let Err(e) = self.take(&mut call, &event, true, on_delta) {
+            if let Err(e) = self.take(&mut call, &event, received, true, on_delta) {
                 return Streamed::Failed(e);
             }
             if call.completed {
@@ -1149,10 +1173,40 @@ impl Client {
         &self,
         call: &mut Call,
         event: &Value,
+        received: std::time::Instant,
         routed: bool,
         on_delta: &mut impl FnMut(Delta),
     ) -> std::result::Result<(), Error> {
-        call.gaps.event(std::time::Instant::now());
+        call.gaps.event(received);
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+        if matches!(
+            kind,
+            "response.output_text.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.function_call_arguments.delta"
+                | "response.custom_tool_call_input.delta"
+        ) && let Some(text) = event.get("delta").and_then(Value::as_str)
+        {
+            let key = format!(
+                "{kind}:{}:{}:{}",
+                event["item_id"], event["content_index"], event["summary_index"]
+            );
+            if let Some(sample) = call.output.push(received, &call.model, key, text) {
+                on_delta(Delta::Output(sample));
+            }
+        }
+        if matches!(
+            kind,
+            "response.completed" | "response.incomplete" | "response.failed" | "error"
+        ) {
+            on_delta(Delta::Output(call.output.finish(&call.model).unwrap_or(
+                Output::Sample {
+                    elapsed: Duration::ZERO,
+                    tokens: 0,
+                    finished: true,
+                },
+            )));
+        }
         match event.get("type").and_then(Value::as_str).unwrap_or("") {
             "response.created" => {
                 if let Some(id) = event.pointer("/response/id").and_then(Value::as_str) {
@@ -1300,6 +1354,8 @@ type UsageFetch = tokio::task::JoinHandle<Result<Value>>;
 
 /// One call's stream, assembled event by event.
 struct Call {
+    output: crate::speed::Meter,
+    model: String,
     /// The ChatGPT backend leaves `response.completed.response.output` empty, so the
     /// output is assembled from the per-item `done` events instead.
     items: Vec<Value>,
@@ -1319,8 +1375,10 @@ struct Call {
 }
 
 impl Call {
-    fn new() -> Self {
+    fn new(model: &str) -> Self {
         Self {
+            output: crate::speed::Meter::default(),
+            model: model.to_string(),
             items: Vec::new(),
             completed: false,
             continues: false,
@@ -1685,6 +1743,135 @@ fn toml_string(line: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_samples_use_arrival_time_and_end_before_call_bookkeeping() {
+        let client = Client::new(&Choice::default()).unwrap();
+        let mut call = Call::new("gpt-6-luna");
+        let start = std::time::Instant::now();
+        let mut samples = Vec::new();
+        let mut receive = |delta| {
+            if let Delta::Output(sample) = delta {
+                samples.push(sample);
+            }
+        };
+        for (ms, event) in [
+            (0, json!({"type":"response.created"})),
+            (
+                100,
+                json!({"type":"response.output_text.delta", "delta":""}),
+            ),
+            (100, json!({"type":"response.reasoning_summary_part.added"})),
+            (
+                1000,
+                json!({"type":"response.output_text.delta", "item_id":"text", "delta":"hel"}),
+            ),
+            (
+                1000,
+                json!({"type":"response.output_text.delta", "item_id":"text", "delta":"lo"}),
+            ),
+            (
+                1500,
+                json!({"type":"response.function_call_arguments.delta", "item_id":"tool", "delta":"{"}),
+            ),
+            (
+                1600,
+                json!({"type":"response.function_call_arguments.delta", "item_id":"tool", "delta":"}"}),
+            ),
+            (
+                1700,
+                json!({"type":"response.custom_tool_call_input.delta", "item_id":"custom", "delta":"test"}),
+            ),
+            (
+                3000,
+                json!({"type":"response.completed", "response":{"usage":{"output_tokens":999,"output_tokens_details":{"reasoning_tokens":990}}}}),
+            ),
+        ] {
+            assert!(
+                client
+                    .take(
+                        &mut call,
+                        &event,
+                        start + Duration::from_millis(ms),
+                        false,
+                        &mut receive,
+                    )
+                    .is_ok()
+            );
+        }
+        assert_eq!(
+            samples.first(),
+            Some(&Output::Sample {
+                elapsed: Duration::ZERO,
+                tokens: 1,
+                finished: false
+            })
+        );
+        assert_eq!(
+            samples.last(),
+            Some(&Output::Sample {
+                elapsed: Duration::from_millis(700),
+                tokens: 3,
+                finished: true
+            })
+        );
+        assert!(call.completed);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_attempt_stops_output_before_returning() {
+        let client = Client::new(&Choice::default()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut samples = Vec::new();
+        let result = client
+            .attempt(
+                Provider::Ollama,
+                &json!({}),
+                false,
+                &mut |delta| {
+                    if let Delta::Output(sample) = delta {
+                        samples.push(sample);
+                    }
+                },
+                &cancel,
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Interrupted)));
+        assert_eq!(samples, [Output::Waiting, Output::Stopped]);
+    }
+
+    #[test]
+    fn an_output_free_terminal_event_clears_the_wait_without_inventing_tokens() {
+        let client = Client::new(&Choice::default()).unwrap();
+        for kind in [
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+            "error",
+        ] {
+            let mut call = Call::new("gpt-6-luna");
+            let mut samples = Vec::new();
+            let _ = client.take(
+                &mut call,
+                &json!({"type":kind}),
+                std::time::Instant::now(),
+                false,
+                &mut |delta| {
+                    if let Delta::Output(sample) = delta {
+                        samples.push(sample);
+                    }
+                },
+            );
+            assert_eq!(
+                samples,
+                [Output::Sample {
+                    elapsed: Duration::ZERO,
+                    tokens: 0,
+                    finished: true
+                }]
+            );
+        }
+    }
 
     #[test]
     fn gaps_count_the_silences_after_the_first_event() {

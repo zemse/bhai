@@ -197,6 +197,8 @@ pub async fn attempt(
     // one call's usage twice.
     let mut counted = None;
     let mut gaps = client::Gaps::new(std::time::Instant::now());
+    let mut output = crate::speed::Meter::default();
+    let model = body["model"].as_str().unwrap_or("");
 
     loop {
         let chunk = match client::watched(stream.next(), cancel, "stream idle for too long").await?
@@ -205,6 +207,7 @@ pub async fn attempt(
             Some(Err(e)) => return Err(Error::Retryable(anyhow!("stream error: {e}"))),
             Some(Ok(chunk)) => chunk,
         };
+        let received = std::time::Instant::now();
         buf.extend_from_slice(&chunk);
 
         while let Some(line) = client::take_line(&mut buf) {
@@ -222,22 +225,48 @@ pub async fn attempt(
             if let Some(part) = event.pointer("/message/thinking").and_then(Value::as_str)
                 && !part.is_empty()
             {
+                if let Some(sample) = output.push(received, model, "thinking".into(), part) {
+                    on_delta(Delta::Output(sample));
+                }
                 on_delta(Delta::Reasoning(part.to_string()));
             }
             if let Some(part) = event.pointer("/message/content").and_then(Value::as_str)
                 && !part.is_empty()
             {
                 text.push_str(part);
+                if let Some(sample) = output.push(received, model, "content".into(), part) {
+                    on_delta(Delta::Output(sample));
+                }
                 on_delta(Delta::Text(part.to_string()));
             }
             if let Some(found) = event
                 .pointer("/message/tool_calls")
                 .and_then(Value::as_array)
             {
-                calls.extend(found.iter().map(call_item));
+                for call in found {
+                    let function = &call["function"];
+                    let text = format!(
+                        "{}{}",
+                        function["name"].as_str().unwrap_or(""),
+                        function["arguments"]
+                    );
+                    if let Some(sample) =
+                        output.push(received, model, format!("tool:{}", calls.len()), &text)
+                    {
+                        on_delta(Delta::Output(sample));
+                    }
+                    calls.push(call_item(call));
+                }
             }
             if event.get("done").and_then(Value::as_bool) == Some(true) {
                 done = true;
+                on_delta(Delta::Output(output.finish(model).unwrap_or(
+                    client::Output::Sample {
+                        elapsed: std::time::Duration::ZERO,
+                        tokens: 0,
+                        finished: true,
+                    },
+                )));
                 // `stop` and a missing reason are a finished answer; `length` means the
                 // model was cut off at `num_predict` or the context window.
                 if event.get("done_reason").and_then(Value::as_str) == Some("length") {
@@ -409,6 +438,44 @@ mod tests {
             std::future::pending::<()>().await;
         });
         url
+    }
+
+    #[tokio::test]
+    async fn output_in_the_done_chunk_is_counted_before_the_stream_stops() {
+        let body = concat!(
+            "{\"message\":{\"thinking\":\"think\",\"content\":\"hi\"},\"done\":false}\n",
+            "{\"message\":{\"content\":\"!\",\"tool_calls\":[{\"function\":{\"name\":\"test\",\"arguments\":{}}}]},\"done\":true,\"eval_count\":999}\n",
+        );
+        let url = serve_chunks(vec![body.as_bytes().to_vec()]).await;
+        let mut samples = Vec::new();
+        let http = reqwest::Client::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let read = attempt(
+            &http,
+            &url,
+            &json!({"model":"gpt-test"}),
+            &mut |delta| {
+                if let Delta::Output(sample) = delta {
+                    samples.push(sample);
+                }
+            },
+            &cancel,
+        )
+        .await;
+        assert!(read.is_ok());
+        let tokenizer = crate::tokens::for_model("gpt-test");
+        let tokens = ["think", "hi!", "test{}"]
+            .iter()
+            .map(|text| tokenizer.count(text) as u64)
+            .sum();
+        assert_eq!(
+            samples.last(),
+            Some(&client::Output::Sample {
+                elapsed: std::time::Duration::ZERO,
+                tokens,
+                finished: true
+            })
+        );
     }
 
     #[tokio::test]

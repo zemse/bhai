@@ -1658,6 +1658,7 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             | AgentEvent::Item(_)
             | AgentEvent::Judging(None)
             | AgentEvent::Streaming(_)
+            | AgentEvent::Output(_)
             | AgentEvent::ToolProgress(_) => {}
             AgentEvent::CacheHit(hit) => {
                 if let (Some(expected), Some(ratio)) = (hit.expected_cached, hit.hit_ratio) {

@@ -160,6 +160,7 @@ pub enum AgentEvent {
     /// wait before the first token is spent reading.
     Sending(u64),
     Streaming(bool),
+    Output(crate::client::Output),
     Error(String),
     /// The turn ended on a failure rather than a reply: the model call did not get
     /// through, or a tool broke the loop. The history still stands, so the same turn can
@@ -1988,6 +1989,7 @@ async fn turn(
         let mut stalls = None;
         let mut on_delta = |delta: Delta| {
             let _ = tx.send(match delta {
+                Delta::Output(sample) => AgentEvent::Output(sample),
                 Delta::Reasoning(s) => AgentEvent::Reasoning(s),
                 Delta::Text(s) => AgentEvent::Text(s),
                 Delta::Commentary(s) => AgentEvent::Commentary(s),
@@ -2914,6 +2916,9 @@ async fn btw(
     let mut input = history.to_vec();
     input.push(btw_request(question));
     let mut on_delta = |delta: Delta| match delta {
+        Delta::Output(sample) => {
+            let _ = tx.send(AgentEvent::Output(sample));
+        }
         Delta::Reasoning(s) => {
             let _ = tx.send(AgentEvent::Reasoning(s));
         }
@@ -3163,6 +3168,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 AgentEvent::Private { .. }
                 | AgentEvent::Sending(_)
                 | AgentEvent::Streaming(_)
+                | AgentEvent::Output(_)
                 | AgentEvent::TurnEnd
                 // A child has no children, so it never resumes on one's report.
                 | AgentEvent::Resumed(_)

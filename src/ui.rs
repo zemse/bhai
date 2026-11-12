@@ -822,7 +822,11 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
             ));
         }
         if let Some(rate) = app.speed.rate(now) {
-            spans.push(Span::styled(format!(" · {rate:.0} tok/s"), dim));
+            let last = if app.speed.finished() { "last " } else { "" };
+            spans.push(Span::styled(format!(" · {last}~{rate:.0} tok/s"), dim));
+        }
+        if app.speed.quiet(now) {
+            spans.push(Span::styled(" · output quiet", dim));
         }
     }
     if !app.queued.is_empty() {
@@ -3109,15 +3113,40 @@ mod tests {
         // A reading of writing, twenty-five tokens in it, and one that closes it.
         let began = Instant::now() - crate::speed::PERIOD;
         app.speed.start(began);
-        app.speed.streamed(began, 25);
-        app.speed.streamed(Instant::now(), 1);
+        app.speed.observe(
+            began,
+            crate::client::Output::Sample {
+                elapsed: Duration::ZERO,
+                tokens: 1,
+                finished: false,
+            },
+        );
+        app.speed.observe(
+            Instant::now(),
+            crate::client::Output::Sample {
+                elapsed: crate::speed::PERIOD,
+                tokens: 26,
+                finished: false,
+            },
+        );
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
         let rate = 25.0 / crate::speed::PERIOD.as_secs_f64();
         assert!(
-            shown.contains(&format!("working... · {rate:.0} tok/s")),
+            shown.contains(&format!("working... · ~{rate:.0} tok/s")),
             "{shown}"
         );
+
+        app.speed.observe(
+            Instant::now(),
+            crate::client::Output::Sample {
+                elapsed: crate::speed::PERIOD,
+                tokens: 26,
+                finished: true,
+            },
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("last ~104 tok/s"));
 
         // It is a working-row reading, so it goes with the row.
         app.on_event(Event::TurnEnd);
@@ -3142,7 +3171,14 @@ mod tests {
         assert!(shown.contains("reading 8.7k in · 4s"), "{shown}");
 
         // The first token ends the wait, and the wait becomes a rate of its own.
-        app.speed.streamed(Instant::now(), 10);
+        app.speed.observe(
+            Instant::now(),
+            crate::client::Output::Sample {
+                elapsed: Duration::ZERO,
+                tokens: 10,
+                finished: false,
+            },
+        );
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
         assert!(!shown.contains("reading"), "{shown}");

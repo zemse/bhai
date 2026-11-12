@@ -1837,10 +1837,7 @@ impl App {
                 true => self.speed.start(Instant::now()),
                 false => self.speed.end(Instant::now()),
             },
-            Event::Reasoning(ref text) | Event::Text(ref text) | Event::Commentary(ref text) => {
-                let tokens = crate::tokens::for_model(&self.model).count(text);
-                self.speed.streamed(Instant::now(), tokens as u64);
-            }
+            Event::Output(sample) => self.speed.observe(Instant::now(), sample),
             // Children count towards the status bar total, not the cache rate.
             Event::ChildUsage(usage) => match self.attached() {
                 Some(_) => (self.tokens_in, self.tokens_out) = self.session.totals(),
@@ -1892,6 +1889,10 @@ impl App {
         self.last_usage = state.last_usage;
         self.rate_limits = state.rate_limits;
         self.working = state.working;
+        self.speed = Speed::default();
+        if self.working {
+            self.speed.start(Instant::now());
+        }
         self.queued = state.queued;
         self.pending = state.pending;
         self.reset_approval_view();
@@ -5785,6 +5786,20 @@ mod tests {
     }
 
     #[test]
+    fn resync_accepts_source_samples_without_replaying_a_request_start() {
+        let mut app = App::detached();
+        app.session.mirror(Event::Streaming(true));
+        app.resync();
+        app.on_event(Event::Output(crate::client::Output::Sample {
+            elapsed: Duration::from_secs(2),
+            tokens: 100,
+            finished: false,
+        }));
+        assert_eq!(app.speed.counted(), 100);
+        assert_eq!(app.speed.rate(Instant::now()), Some(50.0));
+    }
+
+    #[test]
     fn the_speed_counts_only_what_the_model_streams() {
         let mut app = App::detached();
         app.on_event(Event::Text("not while idle".to_string()));
@@ -5795,8 +5810,18 @@ mod tests {
         app.on_event(Event::Text("hello world".to_string()));
         assert_eq!(
             app.speed.counted(),
+            0,
+            "display delivery is not source timing"
+        );
+        let now = Instant::now();
+        let mut meter = crate::speed::Meter::default();
+        meter.push(now, &app.model, "reasoning".into(), "thinking");
+        meter.push(now, &app.model, "text".into(), "hello world");
+        app.on_event(Event::Output(meter.finish(&app.model).unwrap()));
+        assert_eq!(
+            app.speed.counted(),
             5,
-            "bytes/4 for a model with no tokenizer"
+            "bytes/4 across each complete stream"
         );
 
         // A model with a tokenizer of its own is counted with it, not by its bytes.
@@ -5804,6 +5829,9 @@ mod tests {
         gpt.model = "gpt-5.6-sol".to_string();
         gpt.on_event(Event::Streaming(true));
         gpt.on_event(Event::Text("hello world".to_string()));
+        let mut meter = crate::speed::Meter::default();
+        meter.push(now, &gpt.model, "text".into(), "hello world");
+        gpt.on_event(Event::Output(meter.finish(&gpt.model).unwrap()));
         assert_eq!(
             gpt.speed.counted(),
             2,
