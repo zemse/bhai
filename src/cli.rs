@@ -514,6 +514,22 @@ allow it.",
         }
         return Ok(());
     }
+    // Only a run that stays up receives messages from other local sessions.
+    let _peer = if !private {
+        if let Some(dir) = crate::peers::directory() {
+            match crate::peers::register(&dir, &session_id, &cwd, &session).await {
+                Ok(peer) => Some(peer),
+                Err(error) => {
+                    eprintln!("bhai: session messaging unavailable: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // Only a run that stays up has a list to show it in.
     session.watch_background(crate::background::sources(hub.clone()));
     notify::watch(session.subscribe(), Arc::clone(&session.privacy));

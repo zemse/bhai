@@ -1243,14 +1243,17 @@ impl Session {
         if let Some(link) = self.link() {
             return Ok(self.forward(link, &prompt, prompt.text.clone()));
         }
-        let mut inner = self.lock();
+        self.submit_local(&mut self.lock(), prompt)
+    }
+
+    fn submit_local(&self, inner: &mut Inner, prompt: Prompt) -> Result<Submitted, SubmitError> {
         if !self.privacy.ready() {
             return Err(SubmitError::Private);
         }
         self.privacy.track(&prompt.shown);
         inner.held = false;
         if inner.working {
-            return Ok(self.enqueue(&mut inner, Waiting::Prompt(prompt)));
+            return Ok(self.enqueue(inner, Waiting::Prompt(prompt)));
         }
         // Cleared here, not when the agent picks the message up, so an interrupt that
         // lands in between still stops the turn.
@@ -1261,6 +1264,21 @@ impl Session {
         inner.start();
         self.publish(prompt.event());
         Ok(Submitted::Started)
+    }
+
+    /// Admit peer data under the same lock that begins a private conversation.
+    pub(crate) fn submit_peer(&self, prompt: Prompt) -> Result<Submitted, SubmitError> {
+        if self.link().is_some() {
+            return Err(SubmitError::Attached);
+        }
+        let mut inner = self.lock();
+        if self.privacy.active() {
+            return Err(SubmitError::Private);
+        }
+        if inner.held {
+            return Ok(self.enqueue(&mut inner, Waiting::Prompt(prompt)));
+        }
+        self.submit_local(&mut inner, prompt)
     }
 
     /// Send `text` for `prompt` down `link`. Images stay here: the other end takes text.
@@ -3055,6 +3073,45 @@ mod tests {
         );
         assert!(session.name_command("/rename unsaved").unwrap().is_err());
         assert_eq!(session.name().as_deref(), Some("original"));
+    }
+
+    #[test]
+    fn peer_admission_does_not_take_the_privacy_io_lock() {
+        let (session, mut rx) = session();
+        let io = session.privacy.io.lock().unwrap();
+        let (done, wait) = std::sync::mpsc::channel();
+        let peer = Arc::clone(&session);
+        let task = std::thread::spawn(move || {
+            done.send(peer.submit_peer(Prompt::automatic("message".into(), "message".into())))
+                .unwrap();
+        });
+        assert_eq!(
+            wait.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(Submitted::Started)
+        );
+        drop(io);
+        task.join().unwrap();
+        assert!(rx.try_recv().unwrap().user_text.is_none());
+    }
+
+    #[test]
+    fn peer_admission_rechecks_privacy_after_waiting_for_the_session_lock() {
+        let (session, mut rx) = session();
+        let inner = session.lock();
+        let (done, wait) = std::sync::mpsc::channel();
+        let peer = Arc::clone(&session);
+        let task = std::thread::spawn(move || {
+            done.send(peer.submit_peer(Prompt::automatic("message".into(), "message".into())))
+                .unwrap();
+        });
+        session.privacy.begin();
+        drop(inner);
+        assert_eq!(
+            wait.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(SubmitError::Private)
+        );
+        task.join().unwrap();
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

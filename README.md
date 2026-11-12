@@ -87,6 +87,14 @@ SIGTERM or SIGHUP (from `kill`, a closed ssh session or a killed tmux pane) inte
 
 `--resume` keeps the same UUID and directories. project configuration, remembered permission rules, project memory and explicitly enabled workflow caches remain shared; session search and worktree coordination still work across sessions.
 
+### session messages
+
+`/name <name>` and `/rename <name>` set a session name, shown at the input's top right and kept on resume. the name is separate from the model's changing topic title.
+
+the agent's `list_sessions` tool lists active local sessions across projects, including their full IDs, names, titles, working directories and busy state. `send_message` takes a receiver's `session_id` and a `message`; the harness attaches the sender's ID so the receiver can reply with the same tool. sending requires permission. idle sessions wake for delivery; busy sessions queue messages. an acceptance means delivered or queued, not that the receiver has acted.
+
+messages are other agents' data, not new user authorization. discovery uses private records in `~/.config/bhai/active/` and authenticated loopback listeners, independently of `--serve`. stopped sessions disappear; crash leftovers are ignored unless they answer as the expected session. private sessions neither appear nor receive messages, and sending is disabled in private mode. only persistent TUI and headless sessions receive messages, not one-shot `exec` runs, workflow runs or attached mirrors. sessions on another machine or VM are not discovered.
+
 ### subagents
 
 subagents have no model-step limit, including workflow steps. they run until they finish, fail or are explicitly stopped. permission checks, subscription limits and failure-loop guards still apply. ESC in the main view stops only the parent; ctrl+x inside a subagent pane stops that child.

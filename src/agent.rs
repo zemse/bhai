@@ -867,6 +867,20 @@ pub(crate) async fn run_configured(
         {
             registry = registry.with_history(delegation.sessions.clone(), own.clone());
         }
+        if let Some(dir) = crate::peers::directory() {
+            if prompt.identity.allows_tool(tools::peers::LIST) {
+                registry = registry.with_tool(Box::new(tools::peers::List {
+                    dir: dir.clone(),
+                    current: own.clone(),
+                }));
+            }
+            if prompt.identity.allows_tool(tools::peers::SEND) {
+                registry = registry.with_tool(Box::new(tools::peers::Send {
+                    dir,
+                    current: own.clone(),
+                }));
+            }
+        }
         if let Some(delegation) = &delegation
             && prompt.identity.allows_tool(tools::memory::NAME)
         {

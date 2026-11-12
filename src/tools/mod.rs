@@ -25,6 +25,7 @@ pub mod memory;
 pub mod models;
 pub mod monitor;
 pub mod patch;
+pub mod peers;
 pub mod plan;
 pub mod read;
 pub mod schedule;
@@ -39,7 +40,7 @@ pub mod web;
 pub mod write;
 
 /// Every tool name, as identities refer to them.
-pub const NAMES: [&str; 18] = [
+pub const NAMES: [&str; 20] = [
     compact::NAME,
     aws_instance::NAME,
     bash::NAME,
@@ -51,6 +52,8 @@ pub const NAMES: [&str; 18] = [
     models::NAME,
     history::FIND,
     history::READ,
+    peers::LIST,
+    peers::SEND,
     memory::NAME,
     web::NAME,
     fetch::NAME,

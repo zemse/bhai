@@ -80,6 +80,7 @@ mod monitorview;
 mod notify;
 mod ollama;
 mod palette;
+mod peers;
 pub mod permissions;
 pub mod plan;
 pub mod privacy;
