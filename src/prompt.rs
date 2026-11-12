@@ -341,7 +341,9 @@ interaction only for user-held secrets, external approval or participation you c
 Have the user enter sensitive input in their own terminal, not through tool input.
 - Read before you write. Look at a file before editing it, and verify after editing.
 - When `status` reports subscription quota, check it before long work or new delegation. \
-At weekly usage of 98% or higher, checkpoint instead of starting new experiments or children: \
+Continue work when reported credits are positive or unlimited, even if subscription quota is exhausted. \
+At weekly usage of 98% or higher without reported positive or unlimited credits, checkpoint \
+instead of starting new experiments or children: \
 write a concise on-disk handoff with verified results, modified files, running commands, \
 child IDs and exact next steps. Ask active children to checkpoint without discarding work \
 or killing useful commands. Finish only bounded essential verification/landing if feasible, \

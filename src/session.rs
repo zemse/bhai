@@ -352,7 +352,7 @@ pub struct State {
     /// The latest rate-limit headroom, once the backend has reported it.
     pub rate_limits: Option<RateLimits>,
     /// The same, with when it was reported and `checkpoint_recommended` once the weekly
-    /// window is at least 98% used.
+    /// window is at least 98% used without reported positive or unlimited credits.
     pub quota: Option<serde_json::Value>,
     /// The goal's specification, progress and lifecycle state.
     pub goal: Option<crate::goal::Goal>,

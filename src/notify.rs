@@ -282,8 +282,7 @@ pub fn watch(
 struct Seen {
     /// A login failed, so the end of that turn is not reported as done as well.
     failed: bool,
-    /// The weekly window is past the checkpoint line. Usage only climbs within a window,
-    /// so it is under the line again only once the window has reset.
+    /// The weekly window is past the checkpoint line without reported credits to spend.
     low: bool,
 }
 
