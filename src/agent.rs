@@ -787,7 +787,7 @@ pub(crate) async fn run_with(
 pub(crate) async fn run_configured(
     mut model: Arc<dyn Model>,
     session_id: String,
-    prompt: SystemPrompt,
+    mut prompt: SystemPrompt,
     policy: Arc<Policy>,
     judge: Option<Arc<Judge>>,
     mut namer: Option<Arc<dyn Name>>,
@@ -837,12 +837,12 @@ pub(crate) async fn run_configured(
         .map_or_else(|| session_id.clone(), |s| s.writer.header.session.clone());
     // Built again when `/model` switches, so a child starts on the model its parent is
     // on. What tools there are does not depend on the model, so the schemas hold.
-    let build = |model: &Arc<dyn Model>| {
+    let build = |prompt: &SystemPrompt, model: &Arc<dyn Model>| {
         if let Some(factory) = &registry_factory {
-            return factory(&prompt, model);
+            return factory(prompt, model);
         }
         let mut registry =
-            Registry::for_prompt(&prompt).with_aws_policy(Arc::clone(&policy), judge.clone());
+            Registry::for_prompt(prompt).with_aws_policy(Arc::clone(&policy), judge.clone());
         if let Some(delegation) = delegation.clone()
             && prompt.identity.allows_tool(tools::agent::NAME)
         {
@@ -911,13 +911,13 @@ pub(crate) async fn run_configured(
                 tx: tx.clone(),
             }))
     };
-    let mut registry = build(&model);
+    let mut registry = build(&prompt, &model);
     let tools = registry.schemas();
     // Both follow the model, so a switch takes them with it. A window the config asked
     // for still wins over the one the new model's backend reports.
     let mut tokenizer = tokens::for_model(model.name());
-    let report = |history: &[Value], calls: &[Call], tokenizer| {
-        let mut profile = profile::build(&prompt, &tools, history, calls, tokenizer);
+    let report = |prompt: &SystemPrompt, history: &[Value], calls: &[Call], tokenizer| {
+        let mut profile = profile::build(prompt, &tools, history, calls, tokenizer);
         profile.children = children.lock().unwrap_or_else(|e| e.into_inner()).clone();
         profile.judge = judge.as_ref().map_or_else(Usage::default, |j| j.total());
         profile
@@ -1017,7 +1017,7 @@ pub(crate) async fn run_configured(
             Some(control) = rx_control.recv() => {
                 match control {
                     Control::Context(reply) => {
-                        let _ = reply.send(report(&history, &calls, tokenizer));
+                        let _ = reply.send(report(&prompt, &history, &calls, tokenizer));
                         continue;
                     }
                     Control::Fast(on) => {
@@ -1077,6 +1077,26 @@ pub(crate) async fn run_configured(
                         persist_plan(&plan, writer.as_mut(), &tx);
                         (calls, monitor) = (Vec::new(), CacheMonitor::default());
                         model.reset("cleared");
+                        let mut refreshed = prompt.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            refreshed.refresh_skills();
+                            refreshed
+                        }).await {
+                            Ok(refreshed) => {
+                                prompt = refreshed;
+                                registry = build(&prompt, &model);
+                                if let Some(writer) = &mut writer {
+                                    let prefix = sessions::prefix(model.name(), &prompt.text, &tools);
+                                    if writer.header.prefix != prefix {
+                                        let effort = writer.header.effort.clone();
+                                        if let Err(error) = writer.model(model.name(), &effort, &prefix) {
+                                            let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{error:#}")));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => { let _ = tx.send(AgentEvent::Error(format!("could not refresh skills: {error}"))); }
+                        }
                         if let Some(writer) = &mut writer
                             && let Err(e) = writer.compact("clear", before, 0, &history)
                         {
@@ -1142,7 +1162,7 @@ pub(crate) async fn run_configured(
                                 drop_fork(&mut fork, &tx);
                                 model = switched;
                                 // Children run at the effort in force.
-                                registry = build(&model);
+                                registry = build(&prompt, &model);
                                 if updates {
                                     continue;
                                 }
@@ -1482,7 +1502,7 @@ pub(crate) async fn run_configured(
                     result = &mut turn => break result,
                     Some(control) = rx_control.recv() => match control {
                         Control::Context(reply) => {
-                            let _ = reply.send(report(&before, &calls_before, tokenizer));
+                            let _ = reply.send(report(&prompt, &before, &calls_before, tokenizer));
                         }
                         Control::Fast(on) => set_fast(model.as_ref(), on, &tx),
                         // Never while a tool call may be pending: once the turn is over.
@@ -1617,7 +1637,7 @@ pub(crate) async fn run_configured(
                     .to_string();
                 if let Some(switched) = model.switch(&name, &back) {
                     model = switched;
-                    registry = build(&model);
+                    registry = build(&prompt, &model);
                 }
                 // Earlier calls index the history the removal shifted, and the guard holds
                 // the refused request, which the next one no longer extends.
@@ -10063,6 +10083,100 @@ mod tests {
         assert!(crate::environment::is_context(&sent[0]));
         assert_eq!(sent[1], crate::client::effort_update("high"));
         assert_eq!(sent[2]["content"][0]["text"], "second");
+    }
+
+    #[tokio::test]
+    async fn new_skills_load_without_changing_the_prefix_until_clear() {
+        use crate::instructions::{Reload, Roots};
+        use fake::{Fake, call, say};
+
+        let dir = tools::temp_dir().canonicalize().unwrap();
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        let reload = Reload::new(
+            crate::config::Config::default(),
+            Roots {
+                home: None,
+                codex_home: None,
+                cwd: dir.clone(),
+            },
+        );
+        let mut prompt = crate::prompt::system_prompt(&[], Vec::new()).with_session(&dir, "sess");
+        prompt.reload = Some(reload);
+        let original = prompt.text.clone();
+        let fake = Fake::new(vec![
+            vec![say("one")],
+            vec![say("two")],
+            vec![call("register_skills", json!({"name": "just-added"}))],
+            vec![say("loaded")],
+            vec![say("fresh")],
+        ]);
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".into(),
+            prompt,
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            None,
+            Limits::default(),
+        ));
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        let skill = dir.join(".claude/skills/just-added");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: just-added\ndescription: A new skill.\n---\nUnique skill body.",
+        )
+        .unwrap();
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        drive(&tx_user, &mut rx, &cancel, "load just-added", &[]).await;
+        tx_control.send(Control::Clear).await.unwrap();
+        while !matches!(rx.recv().await.unwrap(), AgentEvent::Cleared) {}
+        while !matches!(rx.recv().await.unwrap(), AgentEvent::TurnEnd) {}
+        drive(&tx_user, &mut rx, &cancel, "after clear", &[]).await;
+
+        let bodies = fake.bodies.lock().unwrap();
+        for (_, body) in &bodies[..4] {
+            assert_eq!(body["instructions"], original);
+        }
+        let loaded = bodies[3].1["input"].as_array().unwrap();
+        assert!(loaded.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["output"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Unique skill body."))
+        }));
+        let fresh = &bodies[4].1;
+        assert!(
+            fresh["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("- just-added: A new skill.")
+        );
+        assert!(
+            fresh["instructions"]
+                .as_str()
+                .unwrap()
+                .ends_with(original.split("# Session").nth(1).unwrap())
+        );
+        let first = bodies[0].1["input"].as_array().unwrap();
+        let second = bodies[1].1["input"].as_array().unwrap();
+        assert_eq!(&second[..first.len()], first);
+        assert_eq!(second.len(), first.len() + 2);
+        assert_eq!(fresh["tools"], bodies[0].1["tools"]);
+        assert!(fake.breaks.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

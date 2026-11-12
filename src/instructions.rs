@@ -294,6 +294,18 @@ impl Reload {
         Self { config, roots }
     }
 
+    /// The enabled skills as they are on disk now, narrowed to the session's identity.
+    pub fn skills(&self, identity: &crate::identity::Identity) -> Vec<crate::skills::Skill> {
+        if !self.config.skills || !identity.allows_tool(crate::tools::skill::NAME) {
+            return Vec::new();
+        }
+        crate::skills::discover(&self.roots, &self.config.skill_sources)
+            .skills
+            .into_iter()
+            .filter(|skill| identity.allows_skill(&skill.name))
+            .collect()
+    }
+
     /// The files as they are on disk now.
     pub fn files(&self) -> Vec<File> {
         load(&self.config, &self.roots).files

@@ -336,7 +336,10 @@ impl Registry {
             Box::new(stdin::WriteStdin),
             Box::new(fetch::Fetch::default()),
         ];
-        tools.push(Box::new(skill::Skill { skills }));
+        tools.push(Box::new(skill::Skill {
+            skills,
+            reload: None,
+        }));
         Self {
             tools,
             native: None,
@@ -483,6 +486,17 @@ impl Registry {
     /// narrowed the MCP tools.
     pub fn for_prompt(prompt: &crate::prompt::SystemPrompt) -> Self {
         let mut registry = Self::new(prompt.skills.clone()).with_mcp(prompt.mcp.clone());
+        if let Some(reload) = &prompt.reload
+            && let Some(tool) = registry
+                .tools
+                .iter_mut()
+                .find(|tool| tool.name() == skill::NAME)
+        {
+            *tool = Box::new(skill::Skill {
+                skills: prompt.skills.clone(),
+                reload: Some((reload.clone(), prompt.identity.clone())),
+            });
+        }
         if prompt.web_search {
             registry.tools.push(Box::new(web::WebSearch::codex()));
         }

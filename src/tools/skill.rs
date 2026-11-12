@@ -9,6 +9,7 @@ pub const NAME: &str = "register_skills";
 
 pub struct Skill {
     pub skills: Vec<skills::Skill>,
+    pub reload: Option<(crate::instructions::Reload, crate::identity::Identity)>,
 }
 
 impl Tool for Skill {
@@ -54,6 +55,17 @@ impl Tool for Skill {
                 None => format!("discover skills in {repo}"),
             });
         }
+        if let Some((reload, identity)) = &self.reload
+            && self.find(args).is_err()
+        {
+            let tool = Skill {
+                skills: reload.skills(identity),
+                reload: None,
+            };
+            return tool
+                .find(args)
+                .map(|skill| format!("register_skills {}", skill.name));
+        }
         self.find(args)
             .map(|skill| format!("register_skills {}", skill.name))
     }
@@ -62,8 +74,13 @@ impl Tool for Skill {
         Box::pin(async move {
             let args = args.clone();
             let skills = self.skills.clone();
+            let reload = self.reload.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let tool = Skill { skills };
+                let skills = reload.map_or(skills, |(reload, identity)| reload.skills(&identity));
+                let tool = Skill {
+                    skills,
+                    reload: None,
+                };
                 match repo_arg(&args)? {
                     Some(repo) => repo_skill(repo, name_arg(&args)?),
                     // Not truncated: instructions with a hole in the middle are worse than long ones.
@@ -182,9 +199,49 @@ mod tests {
         (
             Skill {
                 skills: vec![skill],
+                reload: None,
             },
             dir,
         )
+    }
+
+    #[tokio::test]
+    async fn live_loading_keeps_identity_filters_and_rejects_removed_skills() {
+        let dir = super::super::temp_dir();
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        let path = dir.join(".claude/skills/new");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("SKILL.md"),
+            "---\nname: new\ndescription: New.\n---\nBody.",
+        )
+        .unwrap();
+        let reload = crate::instructions::Reload::new(
+            crate::config::Config::default(),
+            crate::instructions::Roots {
+                home: None,
+                codex_home: None,
+                cwd: dir.clone(),
+            },
+        );
+        let identity = crate::identity::Identity {
+            skills: vec!["!new".into()],
+            ..Default::default()
+        };
+        let mut tool = Skill {
+            skills: Vec::new(),
+            reload: Some((reload.clone(), identity)),
+        };
+        let args = json!({"name": "new"});
+        assert!(tool.describe(&args).is_err());
+        assert!(!tool.execute(&args).await.1);
+        tool.reload = Some((reload.clone(), crate::identity::Identity::default()));
+        assert!(tool.describe(&args).is_ok());
+        assert!(tool.execute(&args).await.1);
+        tool.skills = reload.skills(&crate::identity::Identity::default());
+        std::fs::remove_dir_all(path).unwrap();
+        assert!(!tool.execute(&args).await.1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

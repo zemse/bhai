@@ -22,6 +22,8 @@ pub struct SystemPrompt {
     pub skills: Vec<Skill>,
     /// Bytes the skills listing adds to the prompt.
     pub skills_bytes: usize,
+    /// Where the skills section starts, before any session-specific suffixes.
+    pub skills_start: usize,
     /// The MCP servers, which `mcp_search` and `mcp_call` reach.
     pub mcp: Option<Arc<Hub>>,
     /// Bytes the MCP server lines add to the prompt.
@@ -53,6 +55,19 @@ pub struct Source {
 }
 
 impl SystemPrompt {
+    /// Refresh only the skill section when the conversation is cleared.
+    pub fn refresh_skills(&mut self) {
+        let Some(reload) = &self.reload else { return };
+        let skills = reload.skills(&self.identity);
+        let section = skill_section(&skills);
+        self.text.replace_range(
+            self.skills_start..self.skills_start + self.skills_bytes,
+            &section,
+        );
+        self.skills_bytes = section.len();
+        self.skills = skills;
+    }
+
     /// The startup lines: `loaded: ~/.claude/CLAUDE.md (~0.8k tok), skills (~52 tok)`,
     /// then one per skipped import.
     pub fn notices(&self) -> Vec<String> {
@@ -204,17 +219,10 @@ pub fn system_prompt_for(tools: &[&str], files: &[File], skills: Vec<Skill>) -> 
         });
     }
     let start = text.len();
-    if !skills.is_empty() {
-        text.push_str(
-            "\n\n# Skills\n\nSkills are task-specific instructions. Before using one, call the \
-`register_skills` tool with its name to load its full instructions.\n",
-        );
-        for skill in &skills {
-            let _ = write!(text, "\n{}", skill.entry());
-        }
-    }
+    text.push_str(&skill_section(&skills));
     SystemPrompt {
         skills_bytes: text.len() - start,
+        skills_start: start,
         text,
         sources,
         skills,
@@ -229,6 +237,20 @@ pub fn system_prompt_for(tools: &[&str], files: &[File], skills: Vec<Skill>) -> 
         web_search: false,
         image_gen: false,
     }
+}
+
+fn skill_section(skills: &[Skill]) -> String {
+    let mut text = String::new();
+    if !skills.is_empty() {
+        text.push_str(
+            "\n\n# Skills\n\nSkills are task-specific instructions. Before using one, call the \
+`register_skills` tool with its name to load its full instructions.\n",
+        );
+        for skill in skills {
+            let _ = write!(text, "\n{}", skill.entry());
+        }
+    }
+    text
 }
 
 /// What the static text says about the file and shell tools present, names sorted.
@@ -459,6 +481,67 @@ mod tests {
                 prompt.skills_bytes.div_ceil(4)
             )
         );
+    }
+
+    #[test]
+    fn refreshing_skills_preserves_the_surrounding_prompt_and_filters() {
+        use crate::config::{Config, Source};
+        use crate::instructions::Roots;
+
+        let dir = crate::tools::temp_dir();
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        let roots = Roots {
+            home: None,
+            codex_home: None,
+            cwd: dir.clone(),
+        };
+        let config = Config {
+            skill_sources: vec![Source::Project],
+            ..Config::default()
+        };
+        let mut prompt = system_prompt(&[file("./CLAUDE.md", "be terse")], Vec::new())
+            .with_agents(&[Identity::default()])
+            .with_session(&dir, "sess");
+        prompt.reload = Some(Reload::new(config.clone(), roots.clone()));
+        prompt.identity.skills = vec!["allowed*".into()];
+        let before = prompt.text.clone();
+        let start = prompt.skills_start;
+        for name in ["allowed-new", "excluded"] {
+            let path = dir.join(".claude/skills").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Fresh.\n---\nBody."),
+            )
+            .unwrap();
+        }
+        prompt.refresh_skills();
+        assert_eq!(prompt.skills.len(), 1);
+        assert_eq!(prompt.skills[0].name, "allowed-new");
+        assert_eq!(&prompt.text[..start], &before[..start]);
+        assert_eq!(
+            &prompt.text[start + prompt.skills_bytes..],
+            &before[start..]
+        );
+        std::fs::remove_dir_all(dir.join(".claude/skills/allowed-new")).unwrap();
+        prompt.refresh_skills();
+        assert_eq!(prompt.text, before);
+        assert!(prompt.skills.is_empty());
+        prompt.identity.skills.clear();
+        prompt.identity.tools = Some(vec!["read".into()]);
+        prompt.refresh_skills();
+        assert!(prompt.skills.is_empty());
+        prompt.identity.tools = None;
+        prompt.reload = Some(Reload::new(
+            Config {
+                skills: false,
+                ..config
+            },
+            roots,
+        ));
+        prompt.refresh_skills();
+        assert_eq!(prompt.text, before);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

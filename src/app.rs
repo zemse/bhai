@@ -305,7 +305,7 @@ pub struct App {
     pub branch: Branch,
     /// When history is compacted, which is what the bar's context fill is read against.
     pub limits: Limits,
-    /// The skills in the system prompt, for `/skills`.
+    /// The current skills, for slash suggestions and `/skills`.
     pub skills: Vec<Skill>,
     /// The session's MCP servers, for `/mcp`.
     pub mcp: Option<Arc<crate::mcp::Hub>>,
@@ -944,6 +944,12 @@ impl App {
             .and_then(|row| items.get(row))
             .map(|item| item.completion(self.input.before()))
             .unwrap_or_default()
+    }
+
+    /// Update slash suggestions without changing the conversation.
+    pub fn set_skills(&mut self, skills: Vec<Skill>) {
+        self.skills = skills;
+        self.refresh_menu();
     }
 
     /// Open the menu on anything that matches, keeping the highlighted row in range.

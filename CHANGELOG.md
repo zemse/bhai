@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-12
 
+- TUI slash suggestions refresh installed skills while a session is open. Discovery leaves the active prompt and history untouched; `/clear` rebuilds the skill listing, and explicitly selected new skills load without a restart.
 - One Esc interrupts the parent turn. After interruption, Enter on an empty prompt continues with the existing context; the prompt shows an enter-to-resume hint, including attached sessions. Subagents keep running, and empty Enter after normal completion does nothing.
 - `stream_timing` is an authenticated Codex SSE example that logs timestamped events, deltas and characters, text boundaries, gaps and final usage as JSONL.
 - Running subagent rows show live elapsed time separately from quiet time, including attached sessions; continuing a child restarts its timer.

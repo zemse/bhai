@@ -56,6 +56,7 @@ enum Event {
     /// sudo in a bash call wants a password.
     Askpass(askpass::Request),
     Tick,
+    Skills(Vec<skills::Skill>),
 }
 
 /// Run the existing command-line frontend. May exit the process on CLI errors.
@@ -409,6 +410,10 @@ allow it.",
         );
     }
     let skills = prompt.skills.clone();
+    let skill_reload = prompt
+        .reload
+        .clone()
+        .map(|reload| (reload, prompt.identity.clone()));
     let workflows = workflow::discover(&instructions::Roots::from_env(cwd.clone()));
     notices.extend(workflows.errors.iter().cloned());
     startup::mark("session");
@@ -577,6 +582,7 @@ allow it.",
         listener,
         notices,
         skills,
+        skill_reload,
         hub.clone(),
         &history,
         prompts,
@@ -767,6 +773,7 @@ async fn attach(
         None,
         notices,
         Vec::new(),
+        None,
         None,
         &[],
         prompts,
@@ -1877,6 +1884,7 @@ async fn run(
     listener: Option<(TcpListener, server::Token)>,
     notices: Vec<String>,
     skills: Vec<skills::Skill>,
+    skill_reload: Option<(instructions::Reload, identity::Identity)>,
     hub: Option<Arc<mcp::Hub>>,
     history: &[serde_json::Value],
     prompts: input::History,
@@ -1966,6 +1974,15 @@ async fn run(
             }
         }
     });
+
+    if let Some((reload, identity)) = skill_reload {
+        tokio::spawn(watch_skills(
+            reload,
+            identity,
+            skills.clone(),
+            tx_event.clone(),
+        ));
+    }
 
     let mouse = modes.mouse;
     let mut app = App::new(Arc::clone(&session));
@@ -2122,6 +2139,35 @@ fn apply(
             true
         }
         Event::Tick => app.tick(),
+        Event::Skills(skills) => {
+            app.set_skills(skills);
+            true
+        }
+    }
+}
+
+async fn watch_skills(
+    reload: instructions::Reload,
+    identity: identity::Identity,
+    mut previous: Vec<skills::Skill>,
+    tx: mpsc::UnboundedSender<Event>,
+) {
+    while !tx.is_closed() {
+        let reload = reload.clone();
+        let identity = identity.clone();
+        let Ok(found) = tokio::task::spawn_blocking(move || reload.skills(&identity)).await else {
+            break;
+        };
+        if found != previous {
+            previous = found.clone();
+            if tx.send(Event::Skills(found)).is_err() {
+                break;
+            }
+        }
+        tokio::select! {
+            _ = tx.closed() => break,
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
     }
 }
 
@@ -2160,6 +2206,70 @@ fn attention(event: &session::Event, root: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::prompt;
+
+    #[tokio::test]
+    async fn new_skills_reach_tui_suggestions_without_conversation_events() {
+        let dir = tools::temp_dir();
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        let reload = instructions::Reload::new(
+            config::Config::default(),
+            instructions::Roots {
+                home: None,
+                codex_home: None,
+                cwd: dir.clone(),
+            },
+        );
+        let old = dir.join(".claude/skills/old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(
+            old.join("SKILL.md"),
+            "---\nname: old\ndescription: Old.\n---\nBody.",
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let watch = tokio::spawn(watch_skills(
+            reload,
+            identity::Identity::default(),
+            Vec::new(),
+            tx,
+        ));
+        assert!(matches!(rx.recv().await.unwrap(), Event::Skills(skills) if skills.len() == 1));
+        let new = dir.join(".claude/skills/just-added");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(
+            new.join("SKILL.md"),
+            "---\nname: just-added\ndescription: New.\n---\nBody.",
+        )
+        .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&event, Event::Skills(skills) if skills.len() == 2));
+        let mut app = App::detached();
+        app.input.set("/just-".into());
+        let entries = app.entries().list.len();
+        let mut notifier = notify::Notifier::from_env();
+        let mut tab = title::Tab::new(PathBuf::new());
+        assert!(apply(&mut app, &mut notifier, event, &mut tab));
+        assert_eq!(app.suggestion(), "added");
+        assert_eq!(app.entries().list.len(), entries);
+        std::fs::remove_dir_all(new).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&event, Event::Skills(skills) if skills.len() == 1));
+        apply(&mut app, &mut notifier, event, &mut tab);
+        assert!(app.suggestion().is_empty());
+        assert_eq!(app.entries().list.len(), entries);
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), watch)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn private_startup_waits_for_the_persistence_boundary() {
