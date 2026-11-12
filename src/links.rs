@@ -36,19 +36,54 @@ impl Shown {
             .iter()
             .any(|(y, xs)| *y == at.y && xs.contains(&at.x))
     }
+
+    pub fn occlude(&mut self, areas: &[Rect]) {
+        if areas.is_empty() {
+            return;
+        }
+        let mut spans: Vec<(u16, Range<u16>)> = Vec::new();
+        for (y, xs) in std::mem::take(&mut self.spans) {
+            for x in xs {
+                if areas.iter().any(|area| area.contains(Position::new(x, y))) {
+                    continue;
+                }
+                match spans.last_mut() {
+                    Some((row, xs)) if *row == y && xs.end == x => xs.end = x + 1,
+                    _ => spans.push((y, x..x + 1)),
+                }
+            }
+        }
+        self.spans = spans;
+    }
 }
 
-/// Whether a click may open `target`: only a web page, so text in the transcript can
-/// never have a click run a `file:` URL or another scheme's handler.
+/// A local Markdown destination, never passed to an external scheme handler.
+pub fn markdown_path(target: &str) -> Option<std::path::PathBuf> {
+    let url = url::Url::parse(target).ok()?;
+    if url.scheme() != "file" || url.host_str().is_some_and(|host| host != "localhost") {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
+    let ext = path.extension()?.to_str()?;
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "md" | "markdown" | "mdown" | "mkd"
+    )
+    .then_some(path)
+}
+
+/// Only web pages and local Markdown files can take a click.
 pub fn openable(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
-    (lower.starts_with("https://") || lower.starts_with("http://"))
-        && !target.chars().any(char::is_control)
+    !target.chars().any(char::is_control)
+        && (lower.starts_with("https://")
+            || lower.starts_with("http://")
+            || markdown_path(target).is_some())
 }
 
 /// Open `target` with `launch`, refusing anything [`openable`] does not pass.
 pub fn open(target: &str, launch: fn(&str) -> std::io::Result<()>) -> Result<(), String> {
-    if !openable(target) {
+    if !openable(target) || markdown_path(target).is_some() {
         return Err(format!(
             "not opening {target}: only http and https links open"
         ));
@@ -232,6 +267,87 @@ fn file_url(path: &Path) -> String {
 /// over several rows, light up together.
 fn wrapped(id: &str, target: &str, symbol: &str) -> String {
     format!("\x1b]8;id={id};{target}\x1b\\{symbol}\x1b]8;;\x1b\\")
+}
+
+/// Hit regions for Markdown labels. A URL inside a label keeps the explicit
+/// destination for both native terminal links and bhai's mouse handler.
+pub fn stamp_named(
+    buf: &mut Buffer,
+    area: Rect,
+    view: Range<usize>,
+    lines: &[String],
+    links: &[(usize, Range<usize>, String)],
+    places: &Places,
+) -> Vec<Shown> {
+    let mut shown: Vec<Shown> = Vec::new();
+    for (row, chars, destination) in links {
+        if !view.contains(row) || destination.chars().any(char::is_control) {
+            continue;
+        }
+        let target = if openable(destination) && markdown_path(destination).is_none() {
+            Some(destination.clone())
+        } else if places.files {
+            let name = destination.split('#').next().unwrap_or(destination);
+            let (base, name) = match name.strip_prefix("~/") {
+                Some(rest) => (places.home, rest),
+                None => (Some(places.root), name),
+            };
+            let resolved = base
+                .and_then(|base| url::Url::from_directory_path(base).ok())
+                .and_then(|base| base.join(name).ok())
+                .filter(|url| url.scheme() == "file")
+                .and_then(|url| url.to_file_path().ok())
+                .and_then(|path| std::fs::canonicalize(path).ok());
+            resolved.map(|path| file_url(&path))
+        } else {
+            None
+        };
+        let Some(target) = target.filter(|target| !target.chars().any(char::is_control)) else {
+            continue;
+        };
+        let Some(text) = lines.get(*row) else {
+            continue;
+        };
+        let y = area.y + (*row - view.start) as u16;
+        let mut spans: Vec<(u16, Range<u16>)> = Vec::new();
+        let mut column = 0u16;
+        for (index, c) in text.chars().enumerate() {
+            let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
+            let x = area.x.saturating_add(column);
+            if chars.contains(&index) && width > 0 && x < area.right() && y < area.bottom() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    let mut own = [0; 4];
+                    let plain = c.encode_utf8(&mut own);
+                    let native = cell.symbol().starts_with("\x1b]8;id=bhai-")
+                        && cell.symbol().split_once("\x1b\\").is_some_and(|(_, body)| {
+                            body.strip_suffix("\x1b]8;;\x1b\\") == Some(plain)
+                        });
+                    if cell.symbol() == plain || native {
+                        if native {
+                            cell.set_symbol(&wrapped(
+                                &format!("bhai-named-{row}-{}", chars.start),
+                                &target,
+                                plain,
+                            ));
+                        }
+                        let end = x.saturating_add(width).min(area.right());
+                        match spans.last_mut() {
+                            Some((_, xs)) if xs.end == x => xs.end = end,
+                            _ => spans.push((y, x..end)),
+                        }
+                    }
+                }
+            }
+            column = column.saturating_add(width);
+        }
+        if !spans.is_empty() {
+            match shown.last_mut() {
+                Some(link) if link.target == target => link.spans.extend(spans),
+                _ => shown.push(Shown { target, spans }),
+            }
+        }
+    }
+    shown
 }
 
 /// Turn the links in the transcript rows `view` into OSC 8 links in `buf`, where `area`
@@ -469,6 +585,68 @@ mod tests {
 
     fn launched(_: &str) -> std::io::Result<()> {
         Ok(())
+    }
+
+    #[test]
+    fn markdown_files_are_internal_and_never_sent_to_the_browser() {
+        assert_eq!(
+            markdown_path("file:///tmp/a%20b.MD#heading"),
+            Some(Path::new("/tmp/a b.MD").to_path_buf())
+        );
+        assert!(openable("file:///tmp/a.md"));
+        assert!(open("file:///tmp/a.md", launched).is_err());
+        for target in [
+            "file:///tmp/a.rs",
+            "file://other-host/tmp/a.md",
+            "https://example.com/a.md",
+            "javascript:a.md",
+        ] {
+            assert!(markdown_path(target).is_none(), "{target}");
+        }
+    }
+
+    #[test]
+    fn named_paths_decode_spaces_and_never_stamp_unsafe_schemes_or_overlays() {
+        let root = std::env::temp_dir().join(format!("bhai-named-links-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a b.md"), "# title").unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let places = Places {
+            root: &root,
+            home: None,
+            files: true,
+        };
+        let area = Rect::new(0, 0, 20, 1);
+        let lines = vec!["read the notes".to_owned()];
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, &lines[0], ratatui::style::Style::new());
+        buf[(7, 0)].set_symbol("#");
+        let named = [(0, 5..14, "a%20b.md#title".into())];
+        let shown = stamp_named(&mut buf, area, 0..1, &lines, &named, &places);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].target, file_url(&root.join("a b.md")));
+        assert!(!shown[0].contains(Position::new(7, 0)));
+        for destination in [
+            "javascript:alert(1)",
+            "file://other-host/tmp/a.md",
+            "https://example.com/\u{7}",
+        ] {
+            let mut buf = Buffer::empty(area);
+            buf.set_string(0, 0, &lines[0], ratatui::style::Style::new());
+            assert!(
+                stamp_named(
+                    &mut buf,
+                    area,
+                    0..1,
+                    &lines,
+                    &[(0, 0..14, destination.into())],
+                    &places
+                )
+                .is_empty(),
+                "{destination}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

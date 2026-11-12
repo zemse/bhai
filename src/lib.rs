@@ -85,6 +85,7 @@ pub mod plan;
 pub mod privacy;
 pub mod profile;
 pub mod prompt;
+mod reader;
 mod redact;
 pub mod remote;
 mod runtime;

@@ -60,8 +60,13 @@ const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const MESSAGE_MARK: &str = "⏺ ";
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    if let Some(reader) = app.reader.as_mut() {
+        reader.draw(frame);
+        return;
+    }
     app.plan_area = None;
     app.monitor_area = None;
+    app.link_occlusions.clear();
     draw(frame, app);
     // Last, so it sits over whatever the drag was made on.
     render_copied(frame, app);
@@ -74,6 +79,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn render_links(frame: &mut Frame, app: &mut App) {
     let Some(area) = app.transcript_area else {
         app.links.clear();
+        app.label_links.clear();
         return;
     };
     let view = app.scroll..(app.scroll + area.height as usize).min(app.lines.len());
@@ -82,17 +88,53 @@ fn render_links(frame: &mut Frame, app: &mut App) {
     let places = crate::links::Places {
         root: &root,
         home: home.as_deref(),
-        files: !crate::clipboard::over_ssh(|name| std::env::var_os(name)),
+        files: app.attached().is_none()
+            && !crate::clipboard::over_ssh(|name| std::env::var_os(name)),
     };
+    let mut covered = HashMap::new();
+    for area in &app.link_occlusions {
+        for y in area.y..area.bottom() {
+            // A wide glyph cannot survive an overlay over its trailing cell.
+            if area.x > 0 {
+                if let Some(cell) = frame.buffer_mut().cell_mut((area.x - 1, y)) {
+                    if unicode_width::UnicodeWidthStr::width(cell.symbol()) > 1 {
+                        cell.set_symbol(" ");
+                    }
+                }
+            }
+            for x in area.x..area.right() {
+                if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                    covered.entry((x, y)).or_insert_with(|| cell.clone());
+                    cell.set_symbol("");
+                }
+            }
+        }
+    }
     app.links = crate::links::stamp(
         frame.buffer_mut(),
         area,
-        view,
+        view.clone(),
         &app.lines,
         &app.joins,
         &app.margins,
         &places,
     );
+    app.label_links = crate::links::stamp_named(
+        frame.buffer_mut(),
+        area,
+        view,
+        &app.lines,
+        &app.named_links,
+        &places,
+    );
+    for link in app.links.iter_mut().chain(&mut app.label_links) {
+        link.occlude(&app.link_occlusions);
+    }
+    app.links.retain(|link| !link.spans.is_empty());
+    app.label_links.retain(|link| !link.spans.is_empty());
+    for (at, cell) in covered {
+        frame.buffer_mut()[at] = cell;
+    }
     if let Some(link) = app.hovered_link() {
         let buf = frame.buffer_mut();
         for (y, xs) in &link.spans {
@@ -107,7 +149,7 @@ fn render_links(frame: &mut Frame, app: &mut App) {
 
 /// What a drag's copy leaves behind, beside where the drag ended so the eye is already
 /// there, on a background so it reads as a note over the transcript and not a row of it.
-fn render_copied(frame: &mut Frame, app: &App) {
+fn render_copied(frame: &mut Frame, app: &mut App) {
     let Some(copied) = app.copied.filter(|c| c.at.elapsed() < COPIED_FOR) else {
         return;
     };
@@ -133,6 +175,7 @@ fn render_copied(frame: &mut Frame, app: &App) {
         )),
         area,
     );
+    app.link_occlusions.push(area);
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
@@ -962,6 +1005,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut margins: Vec<usize> = Vec::new();
     let mut sources: Vec<Option<Source>> = Vec::new();
     let mut copies = Vec::new();
+    let mut named_links = Vec::new();
     let mut diagrams = Vec::new();
     let mut folds = HashMap::new();
     // Each drawn entry and how many of its cached rows it shows.
@@ -1006,6 +1050,11 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
                 .iter()
                 .map(|(row, chars, code)| (start + row, chars.clone(), code.clone())),
         );
+        named_links.extend(
+            rows.links
+                .iter()
+                .map(|(row, chars, target)| (start + row, chars.clone(), target.clone())),
+        );
         diagrams.extend(rows.diagrams.iter().cloned().map(|mut toggle| {
             toggle.row += start;
             (index, toggle)
@@ -1037,6 +1086,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     app.margins = margins;
     app.sources = sources;
     app.copies = copies;
+    app.named_links = named_links;
     app.diagrams = diagrams;
     app.rehover();
 
@@ -1145,7 +1195,8 @@ fn row_map(spans: &[(Range<usize>, usize)], scroll: usize, area: Rect) -> Vec<(R
 
 /// Badges of hovered, pinned or (with ctrl+t) all entries, right-aligned on the blank
 /// row under each entry, or on its last visible row when that blank is not in view.
-fn render_badges(frame: &mut Frame, area: Rect, app: &App) {
+fn render_badges(frame: &mut Frame, area: Rect, app: &mut App) {
+    let mut covered = Vec::new();
     let entries = app.entries();
     for (rows, entry) in &app.rows {
         let shown = app.all_badges || app.hover == Some(*entry) || app.pinned.contains(entry);
@@ -1173,7 +1224,10 @@ fn render_badges(frame: &mut Frame, area: Rect, app: &App) {
         );
         frame.render_widget(Clear, spot);
         frame.render_widget(Paragraph::new(line), spot);
+        covered.push(spot);
     }
+    drop(entries);
+    app.link_occlusions.extend(covered);
 }
 
 /// Is the screen row empty text? The separator between two entries is; a row the bottom
@@ -1386,6 +1440,7 @@ struct Rows {
     margins: Vec<usize>,
     origins: Vec<Option<Vec<Option<Origin>>>>,
     copies: Vec<(usize, Range<usize>, String)>,
+    links: Vec<(usize, Range<usize>, String)>,
     diagrams: Vec<markdown::DiagramToggle>,
     folded: bool,
 }
@@ -1428,6 +1483,11 @@ fn entry_lines(
                 toggle
             })
             .collect();
+        let links = rendered
+            .links
+            .into_iter()
+            .map(|(row, chars, target)| (row, chars.start + lead..chars.end + lead, target))
+            .collect();
         let copies = rendered
             .copies
             .into_iter()
@@ -1467,6 +1527,7 @@ fn entry_lines(
             margins,
             origins,
             copies,
+            links,
             diagrams,
             folded: false,
         };
@@ -1617,6 +1678,7 @@ fn entry_lines(
         joins,
         margins,
         copies: Vec::new(),
+        links: Vec::new(),
         diagrams: Vec::new(),
         folded: hidden > 0 || printed > 0,
     }
@@ -1694,6 +1756,7 @@ fn diff_entry(text: &str, width: usize, expanded: bool) -> Rows {
         joins,
         margins,
         copies: Vec::new(),
+        links: Vec::new(),
         diagrams: Vec::new(),
         folded: true,
     }
@@ -2270,6 +2333,7 @@ mod tests {
     use ratatui::crossterm::event::{
         KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
+    use ratatui::layout::Position;
     use ratatui::style::Modifier;
     use std::time::{Duration, Instant};
 
@@ -4100,8 +4164,8 @@ mod tests {
     }
 
     #[test]
-    fn code_clicks_use_char_positions_and_take_priority_over_links() {
-        let (mut app, _) = drawn("界 [`cargo test`](https://example.com)", 40);
+    fn code_clicks_use_char_positions_when_not_a_link() {
+        let (mut app, _) = drawn("界 `cargo test`", 40);
         let (line, column) = find(&app, "cargo test");
         let area = app.transcript_area.unwrap();
         let x = area.x
@@ -5408,6 +5472,119 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn named_link_labels_are_clickable_across_wrapped_wide_characters() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Assistant(
+            "see [the 界 documentation](https://example.com/docs)".into(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(24, 18)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (row, column) = find(&app, "the 界");
+        let area = app.transcript_area.unwrap();
+        let at = Position::new(area.x + column as u16, area.y + (row - app.scroll) as u16);
+        let link = app
+            .label_links
+            .iter()
+            .find(|link| link.contains(at))
+            .unwrap_or_else(|| {
+                panic!(
+                    "at {at:?}, links {:?}, named {:?}, lines {:?}",
+                    app.links, app.named_links, app.lines
+                )
+            });
+        assert_eq!(link.target, "https://example.com/docs");
+        assert!(link.spans.len() > 1);
+        assert_eq!(terminal.backend().buffer()[(at.x, at.y)].symbol(), "t");
+    }
+
+    #[test]
+    fn an_opaque_overlay_is_not_a_link_even_when_its_letters_match() {
+        for (label, offset) in [("same letters", 0), ("界same letters", 1)] {
+            let (mut app, mut terminal) = drawn(&format!("[{label}](https://example.com)"), 60);
+            let (y, xs) = app.label_links[0].spans[0].clone();
+            let at = Position::new(xs.start + offset, y);
+            terminal
+                .draw(|frame| {
+                    app.link_occlusions.clear();
+                    draw(frame, &mut app);
+                    let cover = Rect::new(at.x, at.y, 4, 1);
+                    frame.render_widget(Clear, cover);
+                    frame.render_widget(Paragraph::new("same"), cover);
+                    app.link_occlusions.push(cover);
+                    render_links(frame, &mut app);
+                })
+                .unwrap();
+            for x in at.x..at.x + 4 {
+                assert!(
+                    !app.label_links
+                        .iter()
+                        .chain(&app.links)
+                        .any(|link| link.contains(Position::new(x, at.y))),
+                    "{label}: {x}"
+                );
+            }
+            assert_eq!(terminal.backend().buffer()[(at.x, at.y)].symbol(), "s");
+        }
+    }
+
+    #[test]
+    fn a_url_used_as_a_label_keeps_the_explicit_destination() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Assistant(
+            "[https://shown.example](https://actual.example)".into(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.label_links.len(), 1);
+        assert_eq!(app.label_links[0].target, "https://actual.example");
+        for cell in terminal.backend().buffer().content() {
+            if cell.symbol().contains("\x1b]8;id=") {
+                assert!(cell.symbol().contains(";https://actual.example\x1b\\"));
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_a_markdown_label_opens_hackmd_and_escape_restores_bhai() {
+        let mut app = App::detached();
+        app.entries().push(Entry::Assistant(
+            "see [`release notes`](CHANGELOG.md)".into(),
+        ));
+        app.input.set("unfinished prompt".into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let scroll = app.scroll;
+        let (row, column) = find(&app, "release notes");
+        let area = app.transcript_area.unwrap();
+        let x = area.x + column as u16;
+        let y = area.y + (row - app.scroll) as u16;
+        assert!(app.label_links.iter().any(
+            |link| link.contains(Position::new(x, y)) && link.target.ends_with("/CHANGELOG.md")
+        ));
+        let copied = crate::clipboard::last_copied();
+        app.on_mouse(down(x, y));
+        app.on_mouse(up(x, y));
+        assert!(app.reader.is_some());
+        assert_eq!(crate::clipboard::last_copied(), copied);
+        for i in 0..30 {
+            app.entries()
+                .push(Entry::Assistant(format!("new output {i}")));
+        }
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("Esc back to bhai"));
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        app.on_paste("not part of the prompt");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.reader.is_none());
+        assert_eq!(app.input.value(), "unfinished prompt");
+        assert_eq!(app.scroll, scroll);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.scroll, scroll);
+        assert!(app.max_scroll > scroll);
+        assert!(screen(&terminal).contains("unfinished prompt"));
     }
 
     #[test]

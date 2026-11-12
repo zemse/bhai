@@ -14,7 +14,7 @@ use crate::wrap::Join;
 
 /// One styled character and where it came from; lines are built from these so wrapping
 /// keeps both.
-type Cell = (char, Style, Option<Origin>, Option<usize>);
+type Cell = (char, Style, Option<Origin>, Option<usize>, Option<usize>);
 
 /// The bytes of the source a drawn char came from. Every char of an inline element
 /// (`**bold**`, a link, `code`) has the whole element, so a copy keeps its delimiters.
@@ -45,6 +45,8 @@ pub struct Rendered {
     pub origins: Vec<Vec<Option<Origin>>>,
     /// Clickable code: its row, its chars and the code it copies.
     pub copies: Vec<(usize, Range<usize>, String)>,
+    /// Link labels and destinations, preserved through wrapping.
+    pub links: Vec<(usize, Range<usize>, String)>,
     /// Clickable Mermaid view controls.
     pub diagrams: Vec<DiagramToggle>,
 }
@@ -122,8 +124,9 @@ struct Renderer {
     containers: Vec<Container>,
     /// Next number of each open list, `None` for bullets.
     lists: Vec<Option<u64>>,
-    /// Destination and start in `inline` of each open link or image.
+    /// Destination and payload index of each open link or image.
     links: Vec<(String, usize)>,
+    link_targets: Vec<String>,
     /// The open code block.
     code: Option<Code>,
     /// Rows of the open table, each a row of cells, each cell its styled chars.
@@ -167,7 +170,7 @@ impl Renderer {
                 let rule = "─".repeat(self.width.saturating_sub(self.prefix_width()).min(40));
                 let origin = Some(range.into());
                 self.emit(
-                    rule.chars().map(|c| (c, DIM, origin, None)).collect(),
+                    rule.chars().map(|c| (c, DIM, origin, None, None)).collect(),
                     Join::Newline,
                 );
                 self.gap = true;
@@ -194,7 +197,9 @@ impl Renderer {
             }
             Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
                 self.styles.push(Style::new().underlined());
-                self.links.push((dest_url.to_string(), self.inline.len()));
+                let id = self.link_targets.len();
+                self.link_targets.push(dest_url.to_string());
+                self.links.push((dest_url.to_string(), id));
                 self.elements.push(range.into());
             }
             Tag::Heading { level, .. } => {
@@ -267,12 +272,18 @@ impl Renderer {
             }
             TagEnd::Link | TagEnd::Image => {
                 self.styles.pop();
-                if let Some((url, start)) = self.links.pop() {
-                    let label: String = self.inline[start..].iter().map(|(c, ..)| c).collect();
+                if let Some((url, id)) = self.links.last().cloned() {
+                    let label: String = self
+                        .inline
+                        .iter()
+                        .filter(|cell| cell.4 == Some(id))
+                        .map(|cell| cell.0)
+                        .collect();
                     if !url.is_empty() && label != url {
                         self.push(&format!(" ({url})"), DIM, range);
                     }
                 }
+                self.links.pop();
                 self.elements.pop();
             }
             TagEnd::Heading(_) => {
@@ -324,15 +335,16 @@ impl Renderer {
 
     /// Text that came from `range` of the source, or from the inline element it sits in.
     fn push(&mut self, text: &str, style: Style, range: Range<usize>) {
+        let link = self.links.last().map(|(_, id)| *id);
         match self.elements.first() {
             Some(&element) => {
-                let cells = text.chars().map(|c| (c, style, Some(element), None));
+                let cells = text.chars().map(|c| (c, style, Some(element), None, link));
                 self.inline.extend(cells);
             }
             None => {
                 let cells = text.chars().zip(origins(text, range));
                 self.inline
-                    .extend(cells.map(|(c, origin)| (c, style, origin, None)));
+                    .extend(cells.map(|(c, origin)| (c, style, origin, None, link)));
             }
         }
     }
@@ -440,7 +452,7 @@ impl Renderer {
         let painted: Vec<Cell> = syntax::highlight(code, &lang)
             .into_iter()
             .zip(origins)
-            .map(|((c, style), origin)| (c, style, origin, None))
+            .map(|((c, style), origin)| (c, style, origin, None, None))
             .collect();
         for line in split_lines(&painted) {
             let cells: Vec<Cell> = line.to_vec();
@@ -453,7 +465,7 @@ impl Renderer {
             for (index, chunk) in chunks.into_iter().enumerate() {
                 let mut row: Vec<Cell> = CODE_INDENT
                     .chars()
-                    .map(|c| (c, PLAIN, None, None))
+                    .map(|c| (c, PLAIN, None, None, None))
                     .collect();
                 row.extend_from_slice(chunk);
                 // The line was split to fit, not reflowed, so nothing stands between.
@@ -486,7 +498,7 @@ impl Renderer {
             false => wrap(
                 &lang
                     .chars()
-                    .map(|c| (c, DIM, None, None))
+                    .map(|c| (c, DIM, None, None, None))
                     .collect::<Vec<_>>(),
                 width,
             ),
@@ -494,7 +506,7 @@ impl Renderer {
         let label = COPY_LABEL.chars().count();
         let last = rows.last().map_or(0, |(row, _)| cells_width(row));
         match rows.last_mut() {
-            Some((row, _)) if last + 1 + label <= width => row.push((' ', DIM, None, None)),
+            Some((row, _)) if last + 1 + label <= width => row.push((' ', DIM, None, None, None)),
             _ if label <= width => rows.push((Vec::new(), Join::Newline)),
             _ => {}
         }
@@ -502,7 +514,7 @@ impl Renderer {
         if let (Some(at), Some((row, _))) = (at, rows.last_mut())
             && label <= width
         {
-            row.extend(COPY_LABEL.chars().map(|c| (c, DIM, None, None)));
+            row.extend(COPY_LABEL.chars().map(|c| (c, DIM, None, None, None)));
             let start = self.prefix_width() + at;
             let line = self.out.lines.len() + rows.len() - 1;
             self.out
@@ -522,7 +534,7 @@ impl Renderer {
         for line in lines {
             let mut row: Vec<Cell> = CODE_INDENT
                 .chars()
-                .map(|c| (c, PLAIN, None, None))
+                .map(|c| (c, PLAIN, None, None, None))
                 .collect();
             let mut used = 0;
             row.extend(
@@ -531,7 +543,7 @@ impl Renderer {
                         used += unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0);
                         used <= width
                     })
-                    .map(|c| (c, PLAIN, Some(block), None)),
+                    .map(|c| (c, PLAIN, Some(block), None, None)),
             );
             self.emit_code(row, Join::Newline);
         }
@@ -572,15 +584,21 @@ impl Renderer {
                 let mut text: Vec<Cell> = Vec::new();
                 for (i, w) in widths.iter().enumerate() {
                     if i > 0 {
-                        text.extend([(' ', Style::new(), None, None); 2]);
+                        text.extend([(' ', Style::new(), None, None, None); 2]);
                     }
                     let part = cells[i].get(line).map_or(&[][..], Vec::as_slice);
-                    text.extend(part.iter().map(|&(c, style, origin, click)| match head {
-                        true => (c, style.bold(), origin, click),
-                        false => (c, style, origin, click),
-                    }));
+                    text.extend(
+                        part.iter()
+                            .map(|&(c, style, origin, click, link)| match head {
+                                true => (c, style.bold(), origin, click, link),
+                                false => (c, style, origin, click, link),
+                            }),
+                    );
                     let pad = w.saturating_sub(cells_width(part));
-                    text.extend(std::iter::repeat_n((' ', Style::new(), None, None), pad));
+                    text.extend(std::iter::repeat_n(
+                        (' ', Style::new(), None, None, None),
+                        pad,
+                    ));
                 }
                 while text.last().is_some_and(|(c, ..)| *c == ' ') {
                     text.pop();
@@ -602,7 +620,7 @@ impl Renderer {
             if head {
                 let rule = "─".repeat((widths.iter().sum::<usize>() + gaps).min(width));
                 self.emit(
-                    rule.chars().map(|c| (c, DIM, None, None)).collect(),
+                    rule.chars().map(|c| (c, DIM, None, None, None)).collect(),
                     Join::Newline,
                 );
             }
@@ -634,8 +652,19 @@ impl Renderer {
         let mut run = String::new();
         let mut style = None;
         let mut click_run: Option<(usize, usize)> = None;
-        for (c, s, origin, click) in cells {
+        let mut link_run: Option<(usize, usize)> = None;
+        for (c, s, origin, click, link) in cells {
             let column = origins.len();
+            if link_run.map(|(_, id)| id) != link {
+                if let Some((start, id)) = link_run.take() {
+                    self.out.links.push((
+                        self.out.lines.len(),
+                        start..column,
+                        self.link_targets[id].clone(),
+                    ));
+                }
+                link_run = link.map(|id| (column, id));
+            }
             if click_run.map(|(_, code)| code) != click {
                 if let Some((start, code)) = click_run.take() {
                     self.out.copies.push((
@@ -652,6 +681,13 @@ impl Renderer {
             }
             style = Some(s);
             run.push(c);
+        }
+        if let Some((start, id)) = link_run {
+            self.out.links.push((
+                self.out.lines.len(),
+                start..origins.len(),
+                self.link_targets[id].clone(),
+            ));
         }
         if let Some((start, code)) = click_run {
             self.out.copies.push((
@@ -1137,6 +1173,39 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::CROSSED_OUT)
         );
+    }
+
+    #[test]
+    fn named_links_keep_their_target_through_styles_wrapping_and_tables() {
+        for source in [
+            "[a **wide 界 label**](https://x.io) tail",
+            "**[a wide 界 label](https://x.io)** tail",
+            "| docs |\n| --- |\n| [a wide 界 label](https://x.io) |",
+            "[a wide 界 label][docs]\n\n[docs]: https://x.io",
+        ] {
+            let rendered = render(source, 14, &[]);
+            let mut linked = String::new();
+            for (row, chars, target) in &rendered.links {
+                assert_eq!(target, "https://x.io");
+                let text: String = rendered.lines[*row]
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                linked.extend(text.chars().skip(chars.start).take(chars.len()));
+            }
+            assert!(linked.contains("wide"), "{source}: {linked}");
+            assert!(!linked.contains("tail"), "{source}: {linked}");
+            assert!(rendered.links.len() > 1, "{source}");
+        }
+    }
+
+    #[test]
+    fn named_links_survive_a_hard_break_without_linking_following_text() {
+        let rendered = render("prefix [one  \ntwo](https://x.io) tail", 80, &[]);
+        assert_eq!(rendered.links.len(), 2);
+        assert_eq!(rendered.links[0], (0, 7..10, "https://x.io".into()));
+        assert_eq!(rendered.links[1], (1, 0..18, "https://x.io".into()));
     }
 
     #[test]

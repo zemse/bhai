@@ -220,6 +220,10 @@ pub struct App {
     pub transcript_area: Option<Rect>,
     /// The links the last frame drew over the transcript, filled in by the renderer.
     pub links: Vec<crate::links::Shown>,
+    pub named_links: Vec<(usize, Range<usize>, String)>,
+    pub label_links: Vec<crate::links::Shown>,
+    pub link_occlusions: Vec<Rect>,
+    pub reader: Option<crate::reader::Reader>,
     /// The pointer and the scroll it was last seen at: a scroll since moves the text
     /// out from under it, so the link it was on is no longer hovered.
     pointer: Option<(Position, usize)>,
@@ -457,6 +461,10 @@ impl App {
             diagrams: Vec::new(),
             transcript_area: None,
             links: Vec::new(),
+            named_links: Vec::new(),
+            label_links: Vec::new(),
+            link_occlusions: Vec::new(),
+            reader: None,
             pointer: None,
             opener: crate::links::launch,
             selection: None,
@@ -548,6 +556,14 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if let Some(reader) = self.reader.as_mut() {
+            if key.code == KeyCode::Esc {
+                self.reader = None;
+            } else {
+                reader.key(key);
+            }
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -836,6 +852,9 @@ impl App {
 
     /// Bracketed paste: the text goes into the input as typed, newlines and all.
     pub fn on_paste(&mut self, text: &str) {
+        if self.reader.is_some() {
+            return;
+        }
         if !self.passwords.is_empty() {
             let line = text.lines().next().unwrap_or_default();
             return line.chars().for_each(|c| self.typed.push(c));
@@ -1000,6 +1019,9 @@ impl App {
 
     /// Returns whether the screen needs a redraw.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if let Some(reader) = self.reader.as_mut() {
+            return reader.mouse(mouse);
+        }
         let at = Position::new(mouse.column, mouse.row);
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             if self.plan_area.is_some_and(|area| area.contains(at)) {
@@ -1102,6 +1124,11 @@ impl App {
                 }
                 return clicked
                     && (self.click_diagram(mouse.column, mouse.row)
+                        || (self
+                            .label_links
+                            .iter()
+                            .any(|link| link.contains(Position::new(mouse.column, mouse.row)))
+                            && self.click_link(mouse.column, mouse.row))
                         || self.click_copy(mouse.column, mouse.row)
                         || self.click_link(mouse.column, mouse.row)
                         || self.click_entry(mouse.row));
@@ -1173,13 +1200,15 @@ impl App {
     /// The web link under the pointer, unless the transcript has scrolled since it moved.
     fn hovered_index(&self) -> Option<usize> {
         let (at, _) = self.pointer.filter(|(_, scroll)| *scroll == self.scroll)?;
-        self.links
+        self.label_links
             .iter()
+            .chain(&self.links)
             .position(|link| link.contains(at) && crate::links::openable(&link.target))
     }
 
     pub fn hovered_link(&self) -> Option<&crate::links::Shown> {
-        self.hovered_index().map(|index| &self.links[index])
+        self.hovered_index()
+            .and_then(|index| self.label_links.iter().chain(&self.links).nth(index))
     }
 
     /// Whether the pointer was last seen in `area`, however the transcript has scrolled.
@@ -1272,13 +1301,22 @@ impl App {
         }
         let at = Position::new(x, y);
         let Some(link) = self
-            .links
+            .label_links
             .iter()
+            .chain(&self.links)
             .find(|link| link.contains(at) && crate::links::openable(&link.target))
         else {
             return false;
         };
-        if let Err(err) = crate::links::open(&link.target, self.opener) {
+        if let Some(path) = crate::links::markdown_path(&link.target) {
+            match crate::reader::Reader::open(&path) {
+                Ok(reader) => {
+                    self.follow = false;
+                    self.reader = Some(reader);
+                }
+                Err(err) => self.note(Entry::Error(format!("opening {}: {err}", path.display()))),
+            }
+        } else if let Err(err) = crate::links::open(&link.target, self.opener) {
             self.note(Entry::Error(err));
         }
         true
@@ -5575,6 +5613,32 @@ mod tests {
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
         app.on_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn escape_from_the_markdown_reader_does_not_interrupt_the_parent() {
+        let (tx_user, _user) = tokio::sync::mpsc::channel(4);
+        let (tx_control, _control) = tokio::sync::mpsc::channel(4);
+        let cancel = Arc::new(crate::agent::Cancel::default());
+        let session = Session::new(
+            "gpt-5.5".into(),
+            "medium".into(),
+            "general".into(),
+            tx_user,
+            tx_control,
+            Arc::clone(&cancel),
+            Arc::default(),
+            None,
+        );
+        let mut app = App::new(Arc::clone(&session));
+        session.submit("go".to_string()).unwrap();
+        app.on_event(Event::User("go".into()));
+        app.reader =
+            Some(crate::reader::Reader::open(std::path::Path::new("CHANGELOG.md")).unwrap());
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.reader.is_none());
+        assert!(app.working);
+        assert!(!cancel.stopped());
     }
 
     #[test]
