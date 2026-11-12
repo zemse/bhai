@@ -157,6 +157,9 @@ impl Speed {
             return (elapsed >= PERIOD).then(|| tokens as f64 / elapsed.as_secs_f64());
         }
         let age = now.saturating_duration_since(self.received?);
+        if self.quiet(now) {
+            return Some(0.0);
+        }
         let (span, tokens) = self.recent?;
         let span = span + age.saturating_sub(PERIOD);
         Some(tokens as f64 / span.as_secs_f64())
@@ -236,7 +239,7 @@ mod tests {
         speed.observe(now, sample(0, 1, false));
         speed.observe(now + PERIOD, sample(250, 15, false));
         let quiet = now + Duration::from_secs(2);
-        assert!(speed.rate(quiet).unwrap() < 56.0);
+        assert_eq!(speed.rate(quiet), Some(0.0));
         assert!(speed.quiet(quiet));
         assert!(!speed.finished());
         speed.observe(quiet, sample(2000, 16, false));
