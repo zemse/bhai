@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-12
 
+- Direct `!` and `$` commands show their prompt marker once, stream redacted output to private per-session files, and give the agent bounded file references rather than the output body. A live tail offers Ctrl+B after 10 seconds to keep the command in the existing background list; Esc stops foreground commands, and the 120-second cutoff is gone.
 - TUI slash suggestions refresh installed skills while a session is open. Discovery leaves the active prompt and history untouched; `/clear` rebuilds the skill listing, and explicitly selected new skills load without a restart.
 - One Esc interrupts the parent turn. After interruption, Enter on an empty prompt continues with the existing context; the prompt shows an enter-to-resume hint, including attached sessions. Subagents keep running, and empty Enter after normal completion does nothing.
 - `stream_timing` is an authenticated Codex SSE example that logs timestamped events, deltas and characters, text boundaries, gaps and final usage as JSONL.

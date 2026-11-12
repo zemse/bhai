@@ -32,6 +32,8 @@ $ bhai
 
 <img src="https://raw.githubusercontent.com/zemse/bhai/main/assets/banner.png" alt="bhai running a task in the terminal" width="100%">
 
+in the terminal UI, `!command` or `$command` runs a direct shell command without starting a model turn. the input draws the shell marker once. output streams to a private file under the session's scratch directory, with known secrets redacted; the agent gets a small file reference on its next call and can read selected lines or search it using the usual tool permissions. the foreground shows a live tail and offers `ctrl+b` after 10s to keep it in the background; `esc` stops foreground commands. background commands use the same `/bg`, `ctrl+s` and `write_stdin` controls as model-started processes. direct commands are unavailable in private mode and while attached.
+
 ## command line
 
 `bhai` starts the terminal UI. `bhai --help`, `bhai exec --help` and `bhai --version` work without starting a session or calling a model.

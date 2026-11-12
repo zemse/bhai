@@ -18,7 +18,7 @@ use crate::sandbox::Sandbox;
 
 pub const NAME: &str = "bash";
 
-/// How long a command typed after `!` may run, since nobody can poll it.
+/// The timeout represented by legacy results and the one-shot test runner.
 const TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a call waits before handing back a session, unless it says otherwise.
 const YIELD: Duration = Duration::from_secs(10);
@@ -272,16 +272,67 @@ fn parse_tty(args: &Value) -> Result<bool, String> {
     }
 }
 
-/// Run a command the user typed after `!`: to the end, or until [`TIMEOUT`] kills it,
-/// since there is nobody to poll a session.
-pub async fn typed(command: &str) -> String {
-    static NEVER: AtomicBool = AtomicBool::new(false);
-    let live = Live {
-        progress: &|_| {},
-        cancel: &NEVER,
-        conversation: None,
-    };
-    run_in(command, None, crate::sandbox::active(), live).await
+/// A direct command uses the same process table as a model's bash call.
+pub struct Typed {
+    pub id: u32,
+    proc: Arc<tokio::sync::Mutex<Proc>>,
+}
+
+impl Typed {
+    pub fn start(command: &str, session: &str, output: &std::path::Path) -> Result<Self, String> {
+        let capture =
+            Capture::open(output).map_err(|e| format!("could not save shell output: {e}"))?;
+        let proc = Proc::spawn_captured(command, session, capture)?;
+        let id = keep(command, proc);
+        let proc = sessions()
+            .live
+            .get(&id)
+            .map(|s| Arc::clone(&s.proc))
+            .ok_or_else(|| "shell session was evicted before it could start".to_string())?;
+        Ok(Self { id, proc })
+    }
+
+    /// A background request releases the waiter, not the process or its output readers.
+    pub async fn wait(self, mut background: tokio::sync::oneshot::Receiver<()>) -> String {
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        let live = Live {
+            progress: &|_| {},
+            cancel: &NEVER,
+            conversation: None,
+        };
+        let mut proc = self.proc.lock().await;
+        let started = proc.started;
+        let waited = loop {
+            tokio::select! {
+                result = proc.wait(tokio::time::Instant::now() + YIELD_MAX, live) => {
+                    if matches!(result, Ok(None)) {
+                        continue;
+                    }
+                    break result;
+                }
+                request = &mut background => {
+                    if request.is_ok() {
+                        break Ok(None);
+                    }
+                    // A dropped owner stops a foreground command rather than orphaning it.
+                    kill_group(proc.group);
+                    break proc.child.wait().await.map(Some);
+                }
+            }
+        };
+        let (stdout, stderr) = proc.take();
+        match waited {
+            Ok(None) => running(self.id, &stdout, &stderr, started.elapsed()),
+            result => {
+                sessions().live.remove(&self.id);
+                match result {
+                    Ok(Some(status)) => format_output(&stdout, &stderr, status, started.elapsed()),
+                    Err(e) => format!("Could not wait for shell command: {e}"),
+                    Ok(None) => unreachable!(),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +341,7 @@ async fn run(command: &str, workdir: Option<&str>, live: Live<'_>) -> String {
 }
 
 /// Run `command` until it exits or the clock runs out, and kill it in the latter case.
+#[cfg(test)]
 async fn run_in(
     command: &str,
     workdir: Option<&str>,
@@ -509,6 +561,7 @@ struct Proc {
     status: Option<ExitStatus>,
     drained_by: Option<tokio::time::Instant>,
     started: Instant,
+    captured: bool,
     /// Held while the command lives: its sudo can ask only while it is registered.
     _asking: Option<crate::askpass::Call>,
 }
@@ -525,6 +578,30 @@ impl Drop for Proc {
 }
 
 type Pipe = Box<dyn AsyncRead + Unpin + Send>;
+
+#[derive(Clone)]
+struct Capture(Arc<tokio::sync::Mutex<tokio::fs::File>>);
+
+impl Capture {
+    fn open(path: &std::path::Path) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        crate::privacy::writable()?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        Ok(Self(Arc::new(tokio::sync::Mutex::new(
+            tokio::fs::File::from_std(file),
+        ))))
+    }
+
+    async fn write(&self, text: &str) -> io::Result<()> {
+        let mut file = self.0.lock().await;
+        file.write_all(text.as_bytes()).await?;
+        file.flush().await
+    }
+}
 
 impl Proc {
     /// Start `bash -lc command`, in its own process group, with stdin empty or, for a
@@ -543,10 +620,28 @@ impl Proc {
             .transpose()
             .map_err(|e| format!("{UNSTARTED} in the sandbox: {e}"))?;
         let asking = crate::askpass::register(command);
-        Self::spawn_in(command, workdir, shell, asking, tty, session)
+        Self::spawn_in(command, workdir, shell, asking, tty, session, None)
             .map_err(|e| format!("{UNSTARTED}: {e}"))
     }
 
+    fn spawn_captured(command: &str, session: &str, capture: Capture) -> Result<Self, String> {
+        let shell = crate::sandbox::active()
+            .map(Sandbox::bash)
+            .transpose()
+            .map_err(|e| format!("{UNSTARTED} in the sandbox: {e}"))?;
+        Self::spawn_in(
+            command,
+            None,
+            shell,
+            crate::askpass::register(command),
+            false,
+            Some(session),
+            Some(capture),
+        )
+        .map_err(|e| format!("{UNSTARTED}: {e}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn spawn_in(
         command: &str,
         workdir: Option<&str>,
@@ -554,6 +649,7 @@ impl Proc {
         asking: Option<crate::askpass::Call>,
         tty: bool,
         session: Option<&str>,
+        capture: Option<Capture>,
     ) -> io::Result<Self> {
         let mut plain = Command::new("bash");
         let bash = match &mut shell {
@@ -623,9 +719,19 @@ impl Proc {
             stopping: false,
         }));
         let closed = Arc::new(Notify::new());
+        let group = child.id();
         let readers = pipes
             .into_iter()
-            .map(|(pipe, err)| read_into(pipe, err, Arc::clone(&shared), Arc::clone(&closed)))
+            .map(|(pipe, err)| {
+                read_into(
+                    pipe,
+                    err,
+                    Arc::clone(&shared),
+                    Arc::clone(&closed),
+                    capture.clone(),
+                    group,
+                )
+            })
             .collect();
         Ok(Self {
             group: child.id(),
@@ -638,6 +744,7 @@ impl Proc {
             status: None,
             drained_by: None,
             started: Instant::now(),
+            captured: capture.is_some(),
             _asking: asking,
         })
     }
@@ -650,6 +757,7 @@ impl Proc {
     /// `until`, when `None` says it is still running. An interrupt kills the process
     /// group. Once the command itself has exited its output is only drained for `DRAIN`,
     /// since a backgrounded grandchild inherits the pipes and never closes them.
+    /// Captured direct commands keep draining until EOF or the next yield.
     async fn wait(
         &mut self,
         until: tokio::time::Instant,
@@ -666,12 +774,13 @@ impl Proc {
             }
             let now = tokio::time::Instant::now();
             if let Some(status) = self.status
-                && (self.lock().open == 0 || self.drained_by.is_some_and(|at| now >= at))
+                && (self.lock().open == 0
+                    || (!self.captured && self.drained_by.is_some_and(|at| now >= at)))
             {
                 self.flush(live.progress);
                 return Ok(Some(status));
             }
-            if self.status.is_none() && now >= until {
+            if now >= until {
                 self.flush(live.progress);
                 return Ok(None);
             }
@@ -683,9 +792,11 @@ impl Proc {
                 _ = self.closed.notified() => {}
                 _ = tokio::time::sleep_until(until), if self.status.is_none() => {}
                 _ = tick.tick() => {
-                    if live.cancel.load(Ordering::Relaxed) && self.status.is_none() {
+                    if live.cancel.load(Ordering::Relaxed) {
                         kill_group(self.group);
-                        self.status = Some(self.child.wait().await?);
+                        if self.status.is_none() {
+                            self.status = Some(self.child.wait().await?);
+                        }
                         self.flush(live.progress);
                         return Ok(self.status);
                     }
@@ -718,24 +829,47 @@ fn read_into(
     stderr: bool,
     shared: Arc<Mutex<Shared>>,
     closed: Arc<Notify>,
+    capture: Option<Capture>,
+    group: Option<u32>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = [0u8; 8192];
+        let mut redactor = crate::redact::Stream::default();
+        let capturing = capture.is_some();
+        let mut capture = capture;
         loop {
             let n = pipe.read(&mut buf).await.unwrap_or(0);
+            let text = capturing.then(|| {
+                if n == 0 {
+                    redactor.finish()
+                } else {
+                    redactor.push(&buf[..n])
+                }
+            });
+            let bytes = text.as_deref().map(str::as_bytes).unwrap_or(&buf[..n]);
+            if let Some(file) = &capture {
+                if let Err(error) = file.write(text.as_deref().unwrap_or_default()).await {
+                    let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    state
+                        .stderr
+                        .push(format!("\nOutput file write failed: {error}\n").as_bytes());
+                    kill_group(group);
+                    capture = None;
+                }
+            }
             let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+            match stderr {
+                true => shared.stderr.push(bytes),
+                false => shared.stdout.push(bytes),
+            }
+            queue(&mut shared.pending, bytes);
+            shared.recent.extend(bytes);
             if n == 0 {
                 shared.open -= 1;
                 drop(shared);
                 closed.notify_one();
                 return;
             }
-            match stderr {
-                true => shared.stderr.push(&buf[..n]),
-                false => shared.stdout.push(&buf[..n]),
-            }
-            queue(&mut shared.pending, &buf[..n]);
-            shared.recent.extend(&buf[..n]);
             if shared.recent.len() > RECENT {
                 let over = shared.recent.len() - RECENT;
                 shared.recent.drain(..over);
@@ -961,6 +1095,9 @@ fn exited(proc: &tokio::sync::Mutex<Proc>) -> bool {
     let Ok(proc) = proc.try_lock() else {
         return false;
     };
+    if proc.captured && proc.lock().open > 0 {
+        return false;
+    }
     proc.status.is_some() || proc.child.id().is_some_and(zombie)
 }
 
@@ -1112,6 +1249,9 @@ pub fn stop(id: u32) -> bool {
     tokio::spawn(async move {
         let mut proc = session.proc.lock().await;
         if proc.status.is_some() {
+            if proc.captured && proc.lock().open > 0 {
+                kill_group(proc.group);
+            }
             return;
         }
         // On a terminal, ctrl-c goes to whatever job has the foreground.
@@ -1293,6 +1433,76 @@ mod tests {
             cancel: &NOT_CANCELLED,
             conversation: None,
         }
+    }
+
+    #[tokio::test]
+    async fn typed_output_is_saved_in_full_with_a_bounded_result() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = super::super::temp_dir().join("output.log");
+        let session = uuid::Uuid::new_v4().to_string();
+        let typed = Typed::start("seq 1 50000", &session, &path).unwrap();
+        let (background, request) = tokio::sync::oneshot::channel();
+        let result = typed.wait(request).await;
+        drop(background);
+        assert!(result.starts_with("exit code: 0"), "{result}");
+        assert!(result.len() < super::super::MAX_OUTPUT + 1024);
+        let output = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(output.lines().count(), 50000);
+        assert!(output.contains("\n25000\n"));
+        assert!(output.ends_with("50000\n"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_output_redacts_split_secrets_in_both_streams() {
+        let path = super::super::temp_dir().join("output.log");
+        crate::redact::register("typed-output-test-credential");
+        let session = uuid::Uuid::new_v4().to_string();
+        let typed = Typed::start("printf typed-output-test-; sleep 0.05; printf credential; printf typed-output-test-credential >&2", &session, &path).unwrap();
+        let (background, request) = tokio::sync::oneshot::channel();
+        let result = typed.wait(request).await;
+        drop(background);
+        let output = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(output, "[REDACTED][REDACTED]");
+        assert!(!result.contains("typed-output-test-credential"));
+    }
+
+    #[tokio::test]
+    async fn typed_output_keeps_draining_after_the_shell_itself_exits() {
+        let path = super::super::temp_dir().join("output.log");
+        let session = uuid::Uuid::new_v4().to_string();
+        let typed = Typed::start(
+            "printf before; (sleep 0.3; printf after) &",
+            &session,
+            &path,
+        )
+        .unwrap();
+        let (background, request) = tokio::sync::oneshot::channel();
+        let result = typed.wait(request).await;
+        drop(background);
+        assert!(result.starts_with("exit code: 0"), "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "beforeafter");
+    }
+
+    #[tokio::test]
+    async fn typed_backgrounding_keeps_the_output_file_live() {
+        let path = super::super::temp_dir().join("output.log");
+        let session = uuid::Uuid::new_v4().to_string();
+        let typed =
+            Typed::start("printf before; sleep 0.3; printf after", &session, &path).unwrap();
+        let id = typed.id;
+        let (background, request) = tokio::sync::oneshot::channel();
+        background.send(()).unwrap();
+        let result = typed.wait(request).await;
+        assert_eq!(session_id(&result), id);
+        assert!(kept().iter().any(|s| s.id == id));
+        let result = write(id, "", Duration::from_secs(5), quiet()).await;
+        assert!(result.starts_with("exit code: 0"), "{result}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "beforeafter");
+        assert!(super::session(id).is_none());
     }
 
     #[tokio::test]

@@ -758,8 +758,12 @@ impl App {
                 self.note(Entry::Info("dictation dropped".to_string()));
             }
             KeyCode::Esc if self.inside.is_some() => self.leave_child(),
+            KeyCode::Esc if self.session.shell_running() => {
+                self.session.stop_shells();
+            }
             KeyCode::Esc if self.working => self.interrupt_turn(),
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
+            KeyCode::Char('b') if ctrl && self.session.background_shell() => {}
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
             KeyCode::Char('s') if ctrl => self.toggle_bg(),
             KeyCode::Char('l') if ctrl => self.toggle_folds(),
@@ -816,7 +820,8 @@ impl App {
             KeyCode::Up | KeyCode::Down => {
                 let delta = if key.code == KeyCode::Up { -1 } else { 1 };
                 self.input.selecting(shift);
-                if !self.input.move_line(delta, self.input_width()) && !shift {
+                let start = self.input_start();
+                if !self.input.move_line_from(delta, self.input_width(), start) && !shift {
                     return self.recall(delta);
                 }
             }
@@ -1137,7 +1142,8 @@ impl App {
             }
             self.input.selecting(false);
             let row = top + (y - area.y) as usize;
-            self.input.place(row, (x - area.x) as usize, width);
+            self.input
+                .place_from(row, (x - area.x) as usize, width, self.input_start());
             self.selecting = true;
             return true;
         }
@@ -1572,8 +1578,12 @@ impl App {
         };
         self.input.selecting(true);
         let row = top + y.saturating_sub(area.y) as usize;
-        self.input
-            .place(row, x.saturating_sub(area.x) as usize, width);
+        self.input.place_from(
+            row,
+            x.saturating_sub(area.x) as usize,
+            width,
+            self.input_start(),
+        );
         true
     }
 
@@ -1705,10 +1715,20 @@ impl App {
         self.input_area.map_or(80, |(.., width)| width)
     }
 
+    pub fn input_start(&self) -> usize {
+        if self.inside.is_none() && self.attached().is_none() {
+            self.input.shell_prefix_len()
+        } else {
+            0
+        }
+    }
+
     /// Rows the input draws on at that width.
     #[cfg(test)]
     fn input_rows(&self) -> usize {
-        self.input.rows(self.input_width()).len()
+        self.input
+            .rows_from(self.input_width(), self.input_start())
+            .len()
     }
 
     pub fn entry_at(&self, y: u16) -> Option<usize> {
@@ -2018,7 +2038,7 @@ impl App {
                 "" => self.note(Entry::Error(
                     "!<command> or $<command>: run a shell command".to_string(),
                 )),
-                command => self.session.shell(command),
+                command => self.session.shell(command, &self.session_id),
             }
             return;
         }
@@ -3294,7 +3314,7 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     }
 
     fn busy(&self) -> bool {
-        self.working || self.session.child_running()
+        self.working || self.session.child_running() || self.session.shell_running()
     }
 
     fn scroll_by(&mut self, delta: isize) {

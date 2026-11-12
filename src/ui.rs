@@ -264,7 +264,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .unwrap_or_else(|| {
             // The input's own rows, wrapped to the width it will be drawn at.
             let width = input_width(frame.area().width.saturating_sub(4));
-            app.input.rows(width).len().min(MAX_INPUT_LINES) as u16 + 2
+            app.input
+                .rows_from(width, app.input_start())
+                .len()
+                .min(MAX_INPUT_LINES) as u16
+                + 2
         });
 
     // The `/` menu stands between the transcript and the prompt, and only while the
@@ -281,6 +285,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     // The spinner sits just above the prompt, where the eye already is. An approval is
     // the agent waiting on the user, so nothing spins there.
     let working_height = u16::from(app.working && app.pending.is_none());
+    let shell = app.session().shell_status();
+    let shell_height = if shell.is_some() { 2 } else { 0 };
 
     // The turn's subagents sit above all of that, so the panel does not move as the
     // menu opens or the spinner comes and goes. Once the turn is over and every child
@@ -334,6 +340,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         children_area,
         queued_area,
         menu_area,
+        shell_area,
         working_area,
         bottom_area,
         status_area,
@@ -344,6 +351,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(children_height),
         Constraint::Length(queued_height),
         Constraint::Length(menu_height),
+        Constraint::Length(shell_height),
         Constraint::Length(working_height),
         Constraint::Length(approval_height),
         Constraint::Length(1),
@@ -371,6 +379,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         crate::monitorview::render(frame, monitor_area, &monitors, app.monitors_collapsed);
         render_children(frame, children_area, app, &children);
         render_queued(frame, queued_area, app);
+        render_shell(frame, shell_area, shell.as_ref());
         render_working(frame, working_area, app);
         if app.pending.is_some() {
             render_approval(frame, bottom_area, app);
@@ -395,6 +404,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if menu_height > 0 {
         render_menu(frame, menu_area, &items, app.menu.unwrap_or(0));
     }
+    render_shell(frame, shell_area, shell.as_ref());
     render_working(frame, working_area, app);
     if app.pending.is_some() {
         app.input_area = None;
@@ -737,6 +747,36 @@ fn render_chip(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
     };
     frame.render_widget(Paragraph::new(Span::styled(text, style)), chip);
     rest
+}
+
+fn render_shell(frame: &mut Frame, area: Rect, shell: Option<&crate::session::ShellRow>) {
+    let Some(shell) = shell.filter(|_| area.height > 0) else {
+        return;
+    };
+    let controls = if shell.background_ready {
+        " · ctrl+b background · esc stop"
+    } else {
+        " · esc stop"
+    };
+    let timing = format!(" · {}s{controls}", shell.seconds);
+    let room = usize::from(area.width).saturating_sub(timing.chars().count() + 3);
+    let header = format!(" $ {}{timing}", clip(&shell.command, room));
+    let tail = shell
+        .tail
+        .lines()
+        .rev()
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(header, Style::new().fg(Color::Yellow)),
+            Line::styled(
+                format!(" {}", clip(tail, usize::from(area.width).saturating_sub(1))),
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]),
+        area,
+    );
 }
 
 /// The spinner row above the prompt, drawn only while a turn is actually running.
@@ -1865,7 +1905,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
         .title_bottom(mode_chip(app.mode));
     if shell {
         block = block.title(Line::styled(
-            " shell · not sent to model ",
+            " shell · output saved for agent ",
             Style::new().fg(Color::Yellow),
         ));
     }
@@ -1941,13 +1981,16 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
     // The text wraps to the width, less one column so the cursor at the end of a full
     // row is never off-screen. The widget scrolls only when it has more rows than fit.
     let width = input_width(text_area.width);
-    let top = app.input.top(text_area.height.max(1) as usize, width);
-    let (row, column) = app.input.cursor_position(width);
+    let start = app.input_start();
+    let top = app
+        .input
+        .top_from(text_area.height.max(1) as usize, width, start);
+    let (row, column) = app.input.cursor_position_from(width, start);
     app.input_area = Some((text_area, top, width));
     let selection = app.input.selection();
     let mut rows: Vec<Line> = app
         .input
-        .rows(width)
+        .rows_from(width, start)
         .into_iter()
         .map(|r| input_row(r, selection.as_ref()))
         .collect();
@@ -4240,7 +4283,7 @@ mod tests {
             app.input.set(text.to_string());
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             assert_eq!(
-                screen(&terminal).contains("shell · not sent to model"),
+                screen(&terminal).contains("shell · output saved for agent"),
                 shell
             );
             let (area, ..) = app.input_area.unwrap();
@@ -4258,6 +4301,55 @@ mod tests {
                 if shell { "$" } else { "›" }
             );
         }
+    }
+
+    #[test]
+    fn shell_prefix_is_drawn_once_and_mouse_positions_use_the_command() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        for prefix in ['!', '$'] {
+            app.input.set(format!("{prefix}héllo world"));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let (area, ..) = app.input_area.unwrap();
+            assert!(screen(&terminal).contains("$ héllo world"));
+            assert!(!screen(&terminal).contains(&format!("$ {prefix}héllo")));
+            assert_eq!(terminal.get_cursor_position().unwrap().x, area.x + 11);
+            assert!(app.on_mouse(down(area.x + 3, area.y)));
+            assert_eq!(app.input.cursor(), 4);
+            assert!(app.on_mouse(down(area.x, area.y)));
+            assert_eq!(app.input.cursor(), 1);
+            key(&mut app, KeyCode::Backspace);
+            assert_eq!(app.input.value(), "héllo world");
+        }
+    }
+
+    #[test]
+    fn direct_shell_status_offers_backgrounding_only_after_the_delay() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+        let mut shell = crate::session::ShellRow {
+            command: "sleep 30".into(),
+            seconds: 9,
+            background_ready: false,
+            tail: "still working\n".into(),
+        };
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_shell(frame, area, Some(&shell));
+            })
+            .unwrap();
+        assert!(screen(&terminal).contains("esc stop"));
+        assert!(!screen(&terminal).contains("ctrl+b background"));
+        shell.seconds = 10;
+        shell.background_ready = true;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_shell(frame, area, Some(&shell));
+            })
+            .unwrap();
+        assert!(screen(&terminal).contains("ctrl+b background"));
+        assert!(screen(&terminal).contains("still working"));
     }
 
     #[test]

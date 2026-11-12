@@ -184,6 +184,7 @@ impl Editor {
 
     /// Move the cursor `delta` rows, keeping its column where the row allows.
     /// False when there is no row that way.
+    #[cfg(test)]
     pub fn move_line(&mut self, delta: isize, width: usize) -> bool {
         self.move_line_from(delta, width, 0)
     }
@@ -201,6 +202,7 @@ impl Editor {
 
     /// The text as it is drawn: each logical line wrapped to `width`, with the char
     /// index it starts at. A row break at a space leaves that space on the row before.
+    #[cfg(test)]
     pub fn rows(&self, width: usize) -> Vec<Row> {
         self.rows_from(width, 0)
     }
@@ -244,6 +246,7 @@ impl Editor {
     }
 
     /// The cursor's row and display column once the text is wrapped to `width`.
+    #[cfg(test)]
     pub fn cursor_position(&self, width: usize) -> (usize, usize) {
         self.cursor_position_from(width, 0)
     }
@@ -262,6 +265,7 @@ impl Editor {
     }
 
     /// Put the cursor on `row` at display column `column`, or the nearest place to it.
+    #[cfg(test)]
     pub fn place(&mut self, row: usize, column: usize, width: usize) {
         self.place_from(row, column, width, 0);
     }
@@ -285,6 +289,7 @@ impl Editor {
     }
 
     /// The first of `height` visible rows, moved only as far as keeps the cursor in view.
+    #[cfg(test)]
     pub fn top(&mut self, height: usize, width: usize) -> usize {
         self.top_from(height, width, 0)
     }

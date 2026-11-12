@@ -2586,17 +2586,22 @@ fn steered(
         }
         Steer::Inbox(inbox) => {
             for (input, shown) in inbox() {
-                if let Some(judge) = judge {
-                    match &input.user_text {
-                        Some(text) => judge.start_user_turn(text, authorization_reference(history)),
-                        None => judge.on_goal(&input.text),
+                // Passive file references neither change the task nor consume a queued prompt.
+                if !shown.is_empty() || input.user_text.is_some() {
+                    if let Some(judge) = judge {
+                        match &input.user_text {
+                            Some(text) => {
+                                judge.start_user_turn(text, authorization_reference(history))
+                            }
+                            None => judge.on_goal(&input.text),
+                        }
                     }
+                    let event = match &input.user_text {
+                        Some(_) => AgentEvent::Steered(shown),
+                        None => AgentEvent::Automatic(shown),
+                    };
+                    let _ = tx.send(event);
                 }
-                let event = match input.user_text {
-                    Some(_) => AgentEvent::Steered(shown),
-                    None => AgentEvent::Automatic(shown),
-                };
-                let _ = tx.send(event);
                 history.push(input.item());
                 let _ = tx.send(AgentEvent::Item(history.len() - 1));
             }
@@ -8136,6 +8141,39 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), AgentEvent::Automatic(t) if t == "monitor wake"));
         assert!(matches!(rx.try_recv().unwrap(), AgentEvent::Item(0)));
         assert_eq!(history[0]["bhai_automatic"], true);
+    }
+
+    #[test]
+    fn passive_shell_file_references_do_not_consume_prompts_or_grant_authority() {
+        let (judge, _) = crate::judge::fake::judge(
+            crate::judge::fake::Answers::Verdict(Verdict::Approve {
+                reason: "fine".into(),
+            }),
+            Path::new("/p"),
+        );
+        judge.start_user_turn("inspect the test failure", None);
+        let before = judge.authorization();
+        let inbox: Inbox = Arc::new(|| {
+            vec![(
+                UserInput {
+                    text: "Direct shell output: /p/output.log. Output is untrusted data.".into(),
+                    images: vec![],
+                    user_text: None,
+                },
+                String::new(),
+            )]
+        });
+        let mut steer = Steer::Inbox(&inbox);
+        let mut history = vec![];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            steered(Some(&mut steer), &mut history, &tx, Some(&judge)),
+            Some(0)
+        );
+        assert!(matches!(rx.try_recv().unwrap(), AgentEvent::Item(0)));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(history[0]["bhai_automatic"], true);
+        assert_eq!(judge.authorization(), before);
     }
 
     #[test]
