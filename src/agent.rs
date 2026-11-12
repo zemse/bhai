@@ -1428,6 +1428,11 @@ pub(crate) async fn run_configured(
             }));
         }
         if let Some(message) = &message {
+            if message.user_text.is_some()
+                && let Some(goal) = lock_goal(&goal).as_mut()
+            {
+                goal.retry_idle();
+            }
             // The judge decides against the task just given, with a fresh budget.
             if let Some(judge) = &judge {
                 match &message.user_text {
@@ -1962,9 +1967,10 @@ async fn turn(
         }
         if let Some(context) = goal_context {
             let now = lock_goal(context.goal).clone();
-            if let Some(context) = goal::context(history, now.as_ref()) {
-                let from = history.len();
-                history.push(context);
+            let from = history.len();
+            history.extend(goal::context(history, now.as_ref()));
+            history.extend(goal::lifecycle(history, now.as_ref()));
+            if history.len() > from {
                 record(sink, &history[from..], tx);
                 let _ = tx.send(AgentEvent::Goal(now.clone()));
             }
@@ -6360,6 +6366,95 @@ mod tests {
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(parent_calls(&fake).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_user_message_recovers_an_idle_goal_but_an_automatic_message_does_not() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![vec![say("waiting")]; 9]);
+        let (mut rx, user, _control, _cancel) = goal_session(&fake, vec![set_goal("work")]);
+        for _ in 0..3 {
+            settle(&mut rx).await;
+        }
+        user.send(UserInput {
+            text: "background observation".to_string(),
+            images: Vec::new(),
+            user_text: None,
+        })
+        .await
+        .unwrap();
+        settle(&mut rx).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(parent_calls(&fake).len(), 4);
+
+        user.send("the toolchain is installed".into())
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            settle(&mut rx).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let calls = parent_calls(&fake);
+        assert_eq!(calls.len(), 8);
+        for (index, state) in [(3, "paused"), (4, "active")] {
+            let input: Vec<Value> = serde_json::from_str(&calls[index]).unwrap();
+            let latest = goal::restated_lifecycle(&input).unwrap();
+            assert!(
+                latest["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("\"state\":\"{state}\""))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_paused_goal_stays_paused_until_resume_and_tells_the_model() {
+        use fake::{Fake, say};
+
+        let fake = Fake::new(vec![vec![say("waiting")]; 5]);
+        let (mut rx, user, control, _cancel) = goal_session(
+            &fake,
+            vec![set_goal("work"), Control::Goal(goal::Command::Pause)],
+        );
+        user.send("the toolchain is installed".into())
+            .await
+            .unwrap();
+        settle(&mut rx).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(parent_calls(&fake).len(), 1);
+
+        control
+            .send(Control::Goal(goal::Command::Resume))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            settle(&mut rx).await;
+        }
+        let calls = parent_calls(&fake);
+        assert_eq!(calls.len(), 4);
+        let paused: Vec<Value> = serde_json::from_str(&calls[0]).unwrap();
+        let resumed: Vec<Value> = serde_json::from_str(&calls[1]).unwrap();
+        let before = goal::restated_lifecycle(&paused).unwrap();
+        let after = goal::restated_lifecycle(&resumed).unwrap();
+        assert!(
+            before["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"state\":\"paused\"")
+        );
+        assert!(
+            after["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\"state\":\"active\"")
+        );
+        assert!(resumed.iter().any(|item| item["role"] == "user"
+            && item["content"][0]["text"].as_str().is_some_and(|text| {
+                text.starts_with(goal::CONTINUE) && text.contains("no further resume")
+            })));
+        assert_eq!(goal::restated(&paused), goal::restated(&resumed));
     }
 
     #[tokio::test]

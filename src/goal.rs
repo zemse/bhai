@@ -21,6 +21,8 @@ pub const MAX_OBJECTIVE: usize = 240;
 pub const MAX_ITEMS: usize = 5;
 pub const MAX_ITEM: usize = 160;
 const CONTEXT: &str = "<goal_context>";
+const LIFECYCLE: &str = "<goal_status>";
+const IDLE_PAUSE: &str = "three consecutive turns without work tool calls";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,6 +108,43 @@ pub fn restated(history: &[Value]) -> Option<Value> {
     history.iter().rev().find(|item| is_context(item)).cloned()
 }
 
+/// Lifecycle changes append independently of the specification.
+pub fn lifecycle(history: &[Value], goal: Option<&Goal>) -> Option<Value> {
+    let latest = restated_lifecycle(history);
+    if latest.is_none() && goal.is_none() {
+        return None;
+    }
+    let status = goal.map(|g| json!({"state": g.state, "reason": g.note}));
+    let item = json!({
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": format!(
+            "{LIFECYCLE}\n{}\nThe harness's current goal state overrides earlier lifecycle claims. \
+    An active goal needs no further resume; continue authorized work. \
+    Only the user can resume an explicit pause or interruption with /goal resume. \
+    For a blocked goal, use goal resume when the user's reply resolves its blocker.\n</goal_status>",
+            json!(status)
+        )}],
+    });
+    (latest.as_ref() != Some(&item)).then_some(item)
+}
+
+pub fn is_lifecycle(item: &Value) -> bool {
+    item["role"] == "developer"
+        && item
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.starts_with(LIFECYCLE))
+}
+
+pub fn restated_lifecycle(history: &[Value]) -> Option<Value> {
+    history
+        .iter()
+        .rev()
+        .find(|item| is_lifecycle(item))
+        .cloned()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
@@ -175,7 +214,7 @@ impl Goal {
 
     /// Stop it until the user resumes it, saying why.
     pub fn pause(&mut self, why: &str) {
-        if self.active() {
+        if self.active() || (self.state == State::Paused && self.note == IDLE_PAUSE) {
             self.state = State::Paused;
             self.note = why.to_string();
         }
@@ -190,15 +229,25 @@ impl Goal {
                 self.idle_turns.saturating_add(1)
             };
             if self.idle_turns >= 3 {
-                self.pause("three consecutive turns without work tool calls");
+                self.pause(IDLE_PAUSE);
             }
+        }
+    }
+
+    /// A fresh user message retries an idle loop, but never overrides a deliberate stop.
+    pub fn retry_idle(&mut self) {
+        if self.state == State::Paused && self.note == IDLE_PAUSE {
+            self.state = State::Active;
+            self.idle_turns = 0;
+            self.note.clear();
         }
     }
 
     /// What the model is told when a turn opens on it.
     pub fn prompt(&self) -> String {
         format!(
-            "{CONTINUE} Use the latest <goal_context> specification and recent results. \
+            "{CONTINUE} The goal is active; no further resume is needed. \
+Use the latest <goal_context> specification and recent results. \
 Verify its requirements with the listed checks before completing; finish unblocked work \
 before asking for essential input."
         )
@@ -212,6 +261,9 @@ before asking for essential input."
         }
         match self.state {
             State::Active | State::Complete => {}
+            State::Paused if self.note == IDLE_PAUSE => {
+                line.push_str("; reply to retry or /goal resume")
+            }
             State::Paused => line.push_str("; /goal resume to carry on"),
             State::Blocked => line.push_str("; reply with the missing input or /goal resume"),
         }
@@ -251,10 +303,13 @@ pub fn apply(goal: &mut Option<Goal>, command: Command) -> Result<(), String> {
         (Command::Set(objective), _) => *goal = Some(Goal::new(&objective)),
         (Command::Clear, _) => *goal = None,
         (_, None) => return Err(format!("there is no goal. {USAGE}")),
-        (Command::Pause, Some(goal)) => match goal.active() {
-            true => goal.pause("paused by you"),
-            false => return Err(format!("the goal is already {}", goal.state.label())),
-        },
+        (Command::Pause, Some(goal)) => {
+            if goal.active() || (goal.state == State::Paused && goal.note == IDLE_PAUSE) {
+                goal.pause("paused by you");
+            } else {
+                return Err(format!("the goal is already {}", goal.state.label()));
+            }
+        }
         (Command::Resume, Some(goal)) => {
             if goal.active() {
                 return Err("the goal is already active".to_string());
@@ -338,6 +393,91 @@ mod tests {
         history.push(clear);
         assert!(context(&history, None).is_none());
         assert!(context(&[], None).is_none());
+    }
+
+    #[test]
+    fn lifecycle_tracks_pause_resume_block_and_clear_without_repeating_the_spec() {
+        let mut shared = Some(Goal::new("build"));
+        let mut history = vec![context(&[], shared.as_ref()).unwrap()];
+        assert!(lifecycle(&[], None).is_none());
+        for (state, reason) in [
+            (State::Active, ""),
+            (State::Paused, "interrupted"),
+            (State::Blocked, "needs Zig"),
+            (State::Active, ""),
+            (State::Complete, "tests passed"),
+        ] {
+            let goal = shared.as_mut().unwrap();
+            goal.state = state;
+            goal.note = reason.to_string();
+            assert!(context(&history, Some(goal)).is_none());
+            let update = lifecycle(&history, Some(goal)).unwrap();
+            let text = update["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(&format!("\"state\":\"{}\"", state.label())));
+            assert!(text.contains(reason));
+            history.push(update);
+            assert!(lifecycle(&history, Some(goal)).is_none());
+        }
+        let clear = lifecycle(&history, None).unwrap();
+        assert!(
+            clear["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("\nnull\n")
+        );
+        history.push(clear);
+        assert!(lifecycle(&history, None).is_none());
+    }
+
+    #[test]
+    fn only_idle_pauses_recover_on_a_user_message() {
+        for (state, reason, resumes) in [
+            (State::Paused, IDLE_PAUSE, true),
+            (State::Paused, "paused by you", false),
+            (State::Paused, "interrupted", false),
+            (State::Paused, "the last few tool calls all failed", false),
+            (State::Blocked, "needs Zig", false),
+            (State::Complete, "verified", false),
+        ] {
+            let mut goal = Goal::new("build");
+            goal.state = state;
+            goal.note = reason.to_string();
+            goal.idle_turns = 3;
+            goal.retry_idle();
+            if resumes {
+                assert!(goal.active());
+                assert!(goal.note.is_empty());
+                goal.progress(false);
+                assert!(goal.active(), "idle streak must reset");
+            } else {
+                assert_eq!(goal.state, state);
+                assert_eq!(goal.note, reason);
+            }
+        }
+    }
+
+    #[test]
+    fn a_deliberate_stop_overrides_an_idle_pause() {
+        for command in [false, true] {
+            let mut shared = Some(Goal::new("work"));
+            shared.as_mut().unwrap().pause(IDLE_PAUSE);
+            if command {
+                apply(&mut shared, Command::Pause).unwrap();
+            } else {
+                shared.as_mut().unwrap().pause("interrupted");
+            }
+            let goal = shared.as_mut().unwrap();
+            goal.retry_idle();
+            assert_eq!(goal.state, State::Paused);
+            assert_eq!(
+                goal.note,
+                if command {
+                    "paused by you"
+                } else {
+                    "interrupted"
+                }
+            );
+        }
     }
 
     #[test]

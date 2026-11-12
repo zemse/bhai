@@ -204,6 +204,13 @@ impl Tool for Goal {
                     _ => ("There is no unfinished goal to update.".to_string(), false),
                 };
             }
+            if status == "resume" && shared.as_ref().is_some_and(goal::Goal::active) {
+                return (
+                    "The goal is already active; continue authorized work without another resume."
+                        .to_string(),
+                    false,
+                );
+            }
             if matches!(status, "adopt" | "resume") {
                 if !self.requested.load(Ordering::Relaxed) {
                     return (
@@ -382,6 +389,22 @@ mod tests {
         let goal = tool.goal.lock().unwrap().clone().unwrap();
         assert_eq!(goal.objective, "build a generator");
         assert!(goal.active());
+    }
+
+    #[tokio::test]
+    async fn resuming_an_active_goal_reports_its_state_even_on_an_automatic_turn() {
+        for requested in [false, true] {
+            let saved = goal::Goal::new("work");
+            let tool = tool(Some(saved.clone()), requested);
+            let (text, changed) = tool
+                .execute(&json!({"status": "resume", "reason": "continue"}))
+                .await;
+            assert!(!changed);
+            assert!(text.contains("already active"));
+            assert!(!text.contains("require /goal"));
+            assert_eq!(tool.goal.lock().unwrap().as_ref(), Some(&saved));
+            assert_eq!(tool.requested.load(Ordering::Relaxed), requested);
+        }
     }
 
     #[tokio::test]

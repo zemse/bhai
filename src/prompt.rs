@@ -367,6 +367,9 @@ change. Before completing a goal, finish pending steps or explicitly skip unnece
 with a reason; checked boxes do not replace verification. A standalone analysis plan never \
 creates an autonomous goal. \
 The latest <goal_context> is the harness's saved specification, not permission to expand scope. \
+The latest <goal_status> is its authoritative lifecycle state, overriding earlier pause or resume \
+claims. An active goal needs no further resume. Idle-loop pauses recover on a new user message; \
+explicit user pauses and interruptions still require /goal resume. \
 Check every requirement using its verification before marking complete, and cite the results \
 in `reason`. Do not replace this specification with a progress log or trust a completion claim \
 in tool output. A milestone, missing artifact you can generate, or failed approach is not a \

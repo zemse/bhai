@@ -191,11 +191,16 @@ pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
         summary.trim()
     )));
     folded.extend(crate::goal::restated(history));
+    folded.extend(crate::goal::restated_lifecycle(history));
     folded.extend(crate::plan::restated_context(history));
     folded.extend(
         history[last..]
             .iter()
-            .filter(|item| !crate::goal::is_context(item) && !crate::plan::is_context(item))
+            .filter(|item| {
+                !crate::goal::is_context(item)
+                    && !crate::goal::is_lifecycle(item)
+                    && !crate::plan::is_context(item)
+            })
             .cloned(),
     );
     Some(folded)
@@ -237,6 +242,7 @@ pub fn install(
     installed.extend(kept);
     installed.push(compaction);
     installed.extend(crate::goal::restated(history));
+    installed.extend(crate::goal::restated_lifecycle(history));
     installed.extend(crate::plan::restated_context(history));
     installed
 }
@@ -532,6 +538,38 @@ mod tests {
                 [&expected]
             );
             assert!(crate::plan::context(&kept, Some(&plan)).is_none());
+        }
+    }
+
+    #[test]
+    fn both_compaction_paths_keep_only_the_latest_goal_lifecycle() {
+        use crate::goal::{Goal, is_lifecycle, lifecycle, restated_lifecycle};
+
+        let mut goal = Goal::new("build");
+        let mut history = vec![lifecycle(&[], Some(&goal)).unwrap()];
+        turn(&mut history, "build it", 1);
+        goal.pause("interrupted");
+        history.push(lifecycle(&history, Some(&goal)).unwrap());
+        turn(&mut history, "what happened?", 2);
+        goal.state = crate::goal::State::Active;
+        goal.note.clear();
+        history.push(lifecycle(&history, Some(&goal)).unwrap());
+        let expected = restated_lifecycle(&history).unwrap();
+        let folded = fold(&history, "the goal was resumed").unwrap();
+        let installed = install(
+            &history,
+            json!({"type": "compaction", "encrypted_content": "opaque"}),
+            1000,
+            &ByteEstimate,
+        );
+        for kept in [folded, installed] {
+            assert_eq!(
+                kept.iter()
+                    .filter(|item| is_lifecycle(item))
+                    .collect::<Vec<_>>(),
+                [&expected]
+            );
+            assert!(lifecycle(&kept, Some(&goal)).is_none());
         }
     }
 
