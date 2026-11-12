@@ -843,21 +843,18 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
     let now = Instant::now();
-    // Before the first token there is the prompt being read. No backend says how far
-    // through one it is, so what is shown is the size of it and how long it has been:
-    // enough to tell a big prompt from a stalled call, which is what the wait is for.
+    // Waiting includes queueing, network time and hidden reasoning, not just prefill.
     if let Some((prompt, waited)) = app.speed.reading_prompt(now) {
         spans.push(Span::styled(
             format!(
-                " · reading {} in · {:.0}s",
+                " · ~{} in · waiting {:.0}s",
                 compact(prompt),
                 waited.as_secs_f64()
             ),
             dim,
         ));
     } else {
-        // Once the first token is back that wait has a rate of its own, and it stays up
-        // beside the answer's: the two halves of a call are read together.
+        // Input speed needs the backend's evaluation duration, not time to first output.
         if let Some(prompt) = app.speed.prompt_rate() {
             spans.push(Span::styled(
                 format!(" · {} in/s", compact(prompt as u64)),
@@ -3219,7 +3216,7 @@ mod tests {
     }
 
     #[test]
-    fn the_working_row_shows_the_prompt_being_read() {
+    fn the_working_row_separates_waiting_from_measured_prompt_evaluation() {
         let mut app = App::detached();
         app.working = true;
         let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
@@ -3232,9 +3229,10 @@ mod tests {
         app.speed.start(sent);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
-        assert!(shown.contains("reading 8.7k in · 4s"), "{shown}");
+        assert!(shown.contains("~8.7k in · waiting 4s"), "{shown}");
+        assert!(!shown.contains("in/s"), "{shown}");
 
-        // The first token ends the wait, and the wait becomes a rate of its own.
+        // First output ends the wait, but does not measure prompt evaluation.
         app.speed.observe(
             Instant::now(),
             crate::client::Output::Sample {
@@ -3245,8 +3243,22 @@ mod tests {
         );
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let shown = screen(&terminal);
-        assert!(!shown.contains("reading"), "{shown}");
-        assert!(shown.contains("2.2k in/s"), "{shown}");
+        assert!(!shown.contains("waiting"), "{shown}");
+        assert!(!shown.contains("in/s"), "{shown}");
+
+        app.on_event(Event::Input(crate::client::Input {
+            tokens: 400,
+            elapsed: Duration::from_millis(200),
+        }));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("2.0k in/s"), "{shown}");
+
+        app.on_event(Event::Output(crate::client::Output::Waiting));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let shown = screen(&terminal);
+        assert!(shown.contains("waiting"), "{shown}");
+        assert!(!shown.contains("in/s"), "{shown}");
     }
 
     #[test]

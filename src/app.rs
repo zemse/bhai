@@ -1876,6 +1876,7 @@ impl App {
                 false => self.speed.end(Instant::now()),
             },
             Event::Output(sample) => self.speed.observe(Instant::now(), sample),
+            Event::Input(sample) => self.speed.evaluated(sample),
             // Children count towards the status bar total, not the cache rate.
             Event::ChildUsage(usage) => match self.attached() {
                 Some(_) => (self.tokens_in, self.tokens_out) = self.session.totals(),
@@ -5861,6 +5862,20 @@ mod tests {
         }));
         assert_eq!(app.speed.counted(), 100);
         assert_eq!(app.speed.rate(Instant::now()), Some(50.0));
+    }
+
+    #[test]
+    fn resync_accepts_backend_input_timing_without_a_local_request_start() {
+        let mut app = App::detached();
+        app.session.mirror(Event::Streaming(true));
+        app.resync();
+        app.on_event(Event::Input(crate::client::Input {
+            tokens: 200,
+            elapsed: Duration::from_millis(100),
+        }));
+        assert_eq!(app.speed.prompt_rate(), Some(2000.0));
+        app.on_event(Event::Sending(100_000));
+        assert_eq!(app.speed.prompt_rate(), None);
     }
 
     #[test]

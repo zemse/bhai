@@ -147,13 +147,14 @@ pub enum Event {
     CacheStalled(usize),
     /// The latest rate-limit headroom.
     RateLimits(RateLimits),
-    /// A model call went out with this many tokens of prompt behind it; the wait for
-    /// its first token is the backend reading them.
+    /// A call is about to be sent with this estimated prompt size.
     Sending(u64),
     /// A model call is on the wire, or is over.
     Streaming(bool),
     /// Output throughput sampled on the backend's clock.
     Output(crate::client::Output),
+    /// Prompt evaluation measured by the backend.
+    Input(crate::client::Input),
     /// A schedule fell due and its prompt goes to the session now: a turn of its own, or
     /// `queued` behind the running one. `missed` is a slot that passed while no bhai ran.
     Scheduled {
@@ -1056,6 +1057,7 @@ impl Session {
             | Event::Sending(_)
             | Event::Streaming(_)
             | Event::Output(_)
+            | Event::Input(_)
             | Event::Scheduled { .. }
             | Event::Background(_)
             | Event::Info(_)
@@ -2493,6 +2495,7 @@ A background session can be polled with write_stdin.",
             }
             AgentEvent::Sending(tokens) => Event::Sending(tokens),
             AgentEvent::Output(sample) => Event::Output(sample),
+            AgentEvent::Input(sample) => Event::Input(sample),
             AgentEvent::Streaming(on) => {
                 if on {
                     inner.sending = Some(Instant::now());
@@ -3528,6 +3531,23 @@ mod tests {
         assert_eq!(event, Event::Output(sample));
         let encoded = serde_json::to_value(&event).unwrap();
         assert_eq!(encoded["type"], "output");
+        let decoded: Event = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn input_measurements_keep_backend_time_through_session_serialization() {
+        let (session, _user) = session();
+        let mut events = session.subscribe();
+        let sample = crate::client::Input {
+            tokens: 200,
+            elapsed: Duration::from_millis(100),
+        };
+        session.on_agent(AgentEvent::Input(sample));
+        let event = events.try_recv().unwrap();
+        assert_eq!(event, Event::Input(sample));
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["type"], "input");
         let decoded: Event = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, event);
     }

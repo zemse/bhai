@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-12
 
+- Input tok/s uses backend-reported prompt evaluation counts and duration, excluding explicit cache hits. Ollama supplies these measurements; backends without evaluation timing show no invented input rate. The pre-output row labels estimated input size and waiting time without calling the wait prompt processing, and retries clear old measurements.
 - The TUI draws a command's start before draining later events and bounds streaming batches, so a busy output queue cannot postpone its first frame until completion.
 - Goal lifecycle updates tell the model the current state and reason independently of the specification, surviving both compaction paths. Autonomous turns explicitly say the goal is active; a fresh user message retries narration-only idle pauses, while deliberate pauses and interruptions still require `/goal resume`.
 - Markdown link labels are clickable, including wrapped, styled and code-formatted labels. Local Markdown links open a read-only hackmd view with keyboard and mouse scrolling; Esc returns to the same transcript position and draft without interrupting the turn. Web links still open in the browser, and inline code outside links still copies.

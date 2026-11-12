@@ -24,6 +24,13 @@ pub enum Output {
     },
 }
 
+/// Backend-reported prompt evaluation, excluding cached tokens and request overhead.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Input {
+    pub tokens: u64,
+    pub elapsed: Duration,
+}
+
 /// One attempt's text, sampled no more than four times a second.
 #[derive(Debug, Default)]
 pub(crate) struct Meter {
@@ -85,13 +92,14 @@ pub struct Speed {
     previous: (Duration, u64),
     recent: Option<(Duration, u64)>,
     sent: Option<(Instant, u64)>,
-    read: Option<(u64, Duration)>,
+    input: Option<Input>,
     prompt: u64,
 }
 
 impl Speed {
     pub fn sending(&mut self, now: Instant, tokens: u64) {
         self.prompt = tokens;
+        self.input = None;
         self.sent = Some((now, tokens));
         self.clear_output();
     }
@@ -117,7 +125,8 @@ impl Speed {
         match output {
             Output::Waiting => {
                 self.clear_output();
-                self.sent.get_or_insert((now, self.prompt));
+                self.input = None;
+                self.sent = Some((now, self.prompt));
             }
             Output::Stopped => {
                 self.sent = None;
@@ -130,12 +139,7 @@ impl Speed {
                 tokens,
                 finished,
             } => {
-                if tokens == 0 && finished {
-                    self.sent = None;
-                }
-                if let Some((sent, prompt)) = self.sent.take() {
-                    self.read = Some((prompt, now.saturating_duration_since(sent)));
-                }
+                self.sent = None;
                 if elapsed > self.previous.0 {
                     self.recent = Some((
                         elapsed - self.previous.0,
@@ -181,10 +185,16 @@ impl Speed {
         Some((tokens, now.saturating_duration_since(at)))
     }
 
-    /// This includes queueing, reasoning and network time, not just prompt evaluation.
+    pub fn evaluated(&mut self, input: Input) {
+        if self.accepting {
+            self.input = Some(input);
+        }
+    }
+
+    /// Only the backend can separate prompt evaluation from queueing and reasoning.
     pub fn prompt_rate(&self) -> Option<f64> {
-        let (tokens, took) = self.read?;
-        (took > Duration::ZERO).then(|| tokens as f64 / took.as_secs_f64())
+        let Input { tokens, elapsed } = self.input?;
+        (tokens > 0 && elapsed > Duration::ZERO).then(|| tokens as f64 / elapsed.as_secs_f64())
     }
 
     fn clear_output(&mut self) {
@@ -210,6 +220,65 @@ mod tests {
             tokens,
             finished,
         }
+    }
+
+    #[test]
+    fn waiting_for_output_is_not_prompt_evaluation() {
+        let now = Instant::now();
+        let mut speed = Speed::default();
+        speed.sending(now, 100_000);
+        speed.start(now);
+        speed.observe(now, Output::Waiting);
+        assert_eq!(speed.prompt_rate(), None);
+        speed.observe(now + Duration::from_secs(20), sample(0, 1, false));
+        assert_eq!(speed.reading_prompt(now), None);
+        assert_eq!(speed.prompt_rate(), None);
+        speed.end(now + Duration::from_secs(25));
+        assert_eq!(speed.prompt_rate(), None);
+    }
+
+    #[test]
+    fn input_uses_backend_time_and_resets_between_attempts() {
+        let now = Instant::now();
+        let mut speed = Speed::default();
+        speed.start(now);
+        speed.evaluated(Input {
+            tokens: 200,
+            elapsed: Duration::from_millis(100),
+        });
+        assert_eq!(speed.prompt_rate(), Some(2000.0));
+        speed.end(now + Duration::from_secs(20));
+        assert_eq!(speed.prompt_rate(), Some(2000.0));
+        speed.sending(now + Duration::from_secs(30), 100_000);
+        assert_eq!(speed.prompt_rate(), None);
+        speed.start(now + Duration::from_secs(30));
+        speed.evaluated(Input {
+            tokens: 100,
+            elapsed: Duration::from_secs(1),
+        });
+        speed.observe(now + Duration::from_secs(35), Output::Waiting);
+        assert_eq!(speed.prompt_rate(), None);
+        assert_eq!(
+            speed.reading_prompt(now + Duration::from_secs(36)),
+            Some((100_000, Duration::from_secs(1)))
+        );
+    }
+
+    #[test]
+    fn missing_input_work_or_duration_has_no_rate() {
+        let now = Instant::now();
+        let mut speed = Speed::default();
+        speed.start(now);
+        for (tokens, elapsed) in [(0, Duration::from_secs(1)), (1, Duration::ZERO)] {
+            speed.evaluated(Input { tokens, elapsed });
+            assert_eq!(speed.prompt_rate(), None);
+        }
+        speed.end(now);
+        speed.evaluated(Input {
+            tokens: 200,
+            elapsed: Duration::from_millis(100),
+        });
+        assert_eq!(speed.prompt_rate(), None);
     }
 
     #[test]

@@ -154,13 +154,12 @@ pub enum AgentEvent {
     CacheStalled(usize),
     /// The latest rate-limit headroom; one account, so a child's counts too.
     RateLimits(RateLimits),
-    /// A model call is on the wire, or is over; the UI times these to say how fast the
-    /// model is answering, leaving out the time tools and approvals take.
-    /// A call went out with this many tokens of prompt behind it, which is what the
-    /// wait before the first token is spent reading.
+    /// A call is about to be sent with this estimated prompt size.
     Sending(u64),
+    /// A model call is on the wire, or is over.
     Streaming(bool),
     Output(crate::client::Output),
+    Input(crate::client::Input),
     Error(String),
     /// The turn ended on a failure rather than a reply: the model call did not get
     /// through, or a tool broke the loop. The history still stands, so the same turn can
@@ -1996,6 +1995,7 @@ async fn turn(
         let mut on_delta = |delta: Delta| {
             let _ = tx.send(match delta {
                 Delta::Output(sample) => AgentEvent::Output(sample),
+                Delta::Input(sample) => AgentEvent::Input(sample),
                 Delta::Reasoning(s) => AgentEvent::Reasoning(s),
                 Delta::Text(s) => AgentEvent::Text(s),
                 Delta::Commentary(s) => AgentEvent::Commentary(s),
@@ -2925,6 +2925,9 @@ async fn btw(
         Delta::Output(sample) => {
             let _ = tx.send(AgentEvent::Output(sample));
         }
+        Delta::Input(sample) => {
+            let _ = tx.send(AgentEvent::Input(sample));
+        }
         Delta::Reasoning(s) => {
             let _ = tx.send(AgentEvent::Reasoning(s));
         }
@@ -3175,6 +3178,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                 | AgentEvent::Sending(_)
                 | AgentEvent::Streaming(_)
                 | AgentEvent::Output(_)
+                | AgentEvent::Input(_)
                 | AgentEvent::TurnEnd
                 // A child has no children, so it never resumes on one's report.
                 | AgentEvent::Resumed(_)

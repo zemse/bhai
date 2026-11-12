@@ -272,6 +272,9 @@ pub async fn attempt(
                 if event.get("done_reason").and_then(Value::as_str) == Some("length") {
                     on_delta(Delta::Truncated);
                 }
+                if let Some(input) = input(&event) {
+                    on_delta(Delta::Input(input));
+                }
                 counted = Some(usage(&event));
             }
         }
@@ -326,13 +329,27 @@ fn items(text: String, calls: Vec<Value>) -> Vec<Value> {
     items
 }
 
-/// Token counts from the final chunk. Ollama serves a cached prefix without saying how
-/// much of one it reused, so `cached` stays zero.
+/// Older runners report evaluated tokens only; newer ones include an explicit cache count.
+fn input(event: &Value) -> Option<client::Input> {
+    let total = event.get("prompt_eval_count")?.as_u64()?;
+    let cached = match event.get("prompt_eval_cached_count") {
+        None | Some(Value::Null) => 0,
+        Some(value) => value.as_u64()?,
+    };
+    let tokens = total.checked_sub(cached)?;
+    let nanos = event.get("prompt_eval_duration")?.as_u64()?;
+    (tokens > 0 && nanos > 0).then_some(client::Input {
+        tokens,
+        elapsed: std::time::Duration::from_nanos(nanos),
+    })
+}
+
+/// Token counts from the final chunk, including cache reuse where reported.
 fn usage(event: &Value) -> Usage {
     let count = |key: &str| event.get(key).and_then(Value::as_u64).unwrap_or(0);
     Usage {
         input: count("prompt_eval_count"),
-        cached: 0,
+        cached: count("prompt_eval_cached_count").min(count("prompt_eval_count")),
         cache_write: 0,
         output: count("eval_count"),
         reasoning: 0,
@@ -438,6 +455,80 @@ mod tests {
             std::future::pending::<()>().await;
         });
         url
+    }
+
+    #[test]
+    fn prompt_evaluation_excludes_cache_and_requires_valid_measurements() {
+        let mut event = json!({
+            "prompt_eval_count": 1000,
+            "prompt_eval_cached_count": 800,
+            "prompt_eval_duration": 100_000_000
+        });
+        assert_eq!(
+            input(&event),
+            Some(client::Input {
+                tokens: 200,
+                elapsed: std::time::Duration::from_millis(100),
+            })
+        );
+        assert_eq!(usage(&event).cached, 800);
+        event
+            .as_object_mut()
+            .unwrap()
+            .remove("prompt_eval_cached_count");
+        assert_eq!(input(&event).unwrap().tokens, 1000);
+        for patch in [
+            json!({"prompt_eval_duration": 0}),
+            json!({"prompt_eval_duration": null}),
+            json!({"prompt_eval_duration": -1}),
+            json!({"prompt_eval_count": 0}),
+            json!({"prompt_eval_count": null}),
+            json!({"prompt_eval_cached_count": 1000}),
+            json!({"prompt_eval_cached_count": 1001}),
+            json!({"prompt_eval_cached_count": -1}),
+        ] {
+            let mut invalid = event.clone();
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            assert_eq!(input(&invalid), None, "{invalid}");
+        }
+        assert_eq!(input(&json!({"done": true})), None);
+    }
+
+    #[tokio::test]
+    async fn prompt_evaluation_is_reported_on_the_backend_clock() {
+        let body = concat!(
+            "{\"message\":{\"content\":\"hi\"},\"done\":true,",
+            "\"prompt_eval_count\":1000,\"prompt_eval_cached_count\":800,",
+            "\"prompt_eval_duration\":100000000,\"eval_count\":1}\n",
+        );
+        let url = serve_chunks(vec![body.as_bytes().to_vec()]).await;
+        let mut inputs = Vec::new();
+        let mut usages = Vec::new();
+        let read = attempt(
+            &reqwest::Client::new(),
+            &url,
+            &json!({"model": "test"}),
+            &mut |delta| match delta {
+                Delta::Input(input) => inputs.push(input),
+                Delta::Usage(usage) => usages.push(usage),
+                _ => {}
+            },
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert!(read.is_ok());
+        assert_eq!(
+            inputs,
+            [client::Input {
+                tokens: 200,
+                elapsed: std::time::Duration::from_millis(100),
+            }]
+        );
+        assert_eq!(usages[0].input, 1000);
+        assert_eq!(usages[0].cached, 800);
     }
 
     #[tokio::test]

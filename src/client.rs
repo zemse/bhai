@@ -228,13 +228,15 @@ pub struct Choice {
     pub websocket: bool,
 }
 
-pub use crate::speed::Output;
+pub use crate::speed::{Input, Output};
 
 /// What the UI is told while a turn streams.
 #[derive(Debug, Clone)]
 pub enum Delta {
     /// Output timing on the backend's clock, independent of display delivery.
     Output(Output),
+    /// Prompt evaluation measured by the backend, where available.
+    Input(Input),
     Reasoning(String),
     Text(String),
     /// Text of a message in the `commentary` phase: a preamble the model writes before
