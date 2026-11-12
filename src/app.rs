@@ -2082,6 +2082,13 @@ impl App {
             }
             return;
         }
+        if let Some(result) = self.session.name_command(&message) {
+            self.follow = true;
+            if let Err(error) = result {
+                self.note(Entry::Error(error));
+            }
+            return;
+        }
         if message == "/help" {
             self.follow = true;
             self.note(Entry::Info(commands::help()));
@@ -3513,6 +3520,18 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_commands_update_the_session_without_starting_a_turn() {
+        let mut app = App::detached();
+        for command in ["/name review", "/rename release candidate", "/name"] {
+            app.input.set(command.to_string());
+            app.submit();
+            assert!(app.input.is_empty());
+            assert!(!app.session.state().working);
+        }
+        assert_eq!(app.session.name().as_deref(), Some("release candidate"));
+    }
 
     /// Attached, ctrl+c twice detaches mid-turn and never sends the interrupt, while esc
     /// stops the turn there with one press.

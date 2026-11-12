@@ -69,6 +69,8 @@ pub enum Event {
     /// What this session is working on, in a few words. The TUI puts it in the
     /// terminal's title; nothing else has a use for it.
     Titled(String),
+    /// The persistent name chosen by the user, independent of the terminal title.
+    Named(String),
     /// A user message typed while a turn ran; it waits at `position` in the queue.
     Queued {
         position: usize,
@@ -317,6 +319,7 @@ pub struct Approval {
 /// A snapshot of the session, as `GET /state` reports it.
 #[derive(Debug, Clone, Serialize)]
 pub struct State {
+    pub name: Option<String>,
     pub private: bool,
     pub privacy_ready: bool,
     pub model: String,
@@ -735,6 +738,8 @@ pub struct Session {
     gate: Mutex<()>,
     /// What the last [`Event::Titled`] said.
     title: Mutex<Option<String>>,
+    name: Mutex<Option<String>>,
+    name_path: std::sync::OnceLock<std::path::PathBuf>,
     inner: Mutex<Inner>,
     entries: Mutex<Entries>,
     /// The child agents of the running turn, oldest first.
@@ -795,6 +800,8 @@ impl Session {
             latest: watch::Sender::new(0),
             gate: Mutex::default(),
             title: Mutex::default(),
+            name: Mutex::default(),
+            name_path: std::sync::OnceLock::new(),
             inner: Mutex::default(),
             entries: Mutex::default(),
             children: Mutex::default(),
@@ -884,6 +891,7 @@ impl Session {
         inner.goal = read(state, "goal");
         inner.plan = read(state, "plan");
         inner.last_cache_break = read(state, "last_cache_break");
+        *self.name.lock().unwrap_or_else(|e| e.into_inner()) = read(state, "name");
         if title.is_some() {
             *self.title.lock().unwrap_or_else(|e| e.into_inner()) = title;
         }
@@ -945,6 +953,62 @@ impl Session {
     /// What the session is working on, as the last [`Event::Titled`] said.
     pub fn title(&self) -> Option<String> {
         self.title.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The persistent name chosen by the user, not the model-generated title.
+    pub fn name(&self) -> Option<String> {
+        self.name.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Load the name and configure its persistence before accepting user input.
+    pub fn configure_name(&self, path: std::path::PathBuf) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.name_path.set(path.clone()).is_ok(),
+            "name storage already configured"
+        );
+        let name = crate::sessions::read_name(&path)?;
+        *self.name.lock().unwrap_or_else(|e| e.into_inner()) = name;
+        Ok(())
+    }
+
+    /// Handle `/name` and `/rename` without sending them to the model.
+    pub fn name_command(&self, text: &str) -> Option<Result<(), String>> {
+        let text = text.trim();
+        let end = text.find(char::is_whitespace).unwrap_or(text.len());
+        if !matches!(&text[..end], "/name" | "/rename") {
+            return None;
+        }
+        let name = text[end..].trim();
+        if let Some(link) = self.link() {
+            link.send(Action::Prompt(text.to_string()));
+            return Some(Ok(()));
+        }
+        if name.is_empty() {
+            self.publish(Event::Info(self.name().map_or_else(
+                || "no session name; use /name <name>".to_string(),
+                |name| format!("session name: {name}"),
+            )));
+            return Some(Ok(()));
+        }
+        Some(self.set_name(name).map_err(|error| error.to_string()))
+    }
+
+    fn set_name(&self, name: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            name.chars().count() <= 80 && !name.chars().any(char::is_control),
+            "session name must be one line of at most 80 characters"
+        );
+        self.privacy.public(|| {
+            let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(path) = self.name_path.get() {
+                crate::sessions::write_name(path, name)?;
+            }
+            *self.name.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
+            let event = Event::Named(name.to_string());
+            self.record(&event);
+            let _ = self.events.send(event);
+            Ok(())
+        })
     }
 
     /// Show `event`, which the session this one is attached to published: keep what the
@@ -1041,6 +1105,7 @@ impl Session {
             Event::Interrupted => inner.resumable = inner.working,
             Event::PromptEdited { .. } => inner.resumable = false,
             Event::Titled(_)
+            | Event::Named(_)
             | Event::Reasoning(_)
             | Event::Text(_)
             | Event::Commentary(_)
@@ -1132,6 +1197,7 @@ impl Session {
     fn state_of(&self, inner: &Inner, seq: u64) -> State {
         let (model, effort) = self.model();
         State {
+            name: self.name(),
             private: self.privacy.active(),
             privacy_ready: self.privacy.ready(),
             model,
@@ -2612,6 +2678,9 @@ A background session can be polled with write_stdin.",
         if let Event::Titled(title) = &event {
             *self.title.lock().unwrap_or_else(|e| e.into_inner()) = Some(title.clone());
         }
+        if let Event::Named(name) = &event {
+            *self.name.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.clone());
+        }
         self.route(&event);
         self.entries().apply(&event);
         self.record(&event);
@@ -2929,6 +2998,63 @@ mod tests {
             ),
             rx_user,
         )
+    }
+
+    #[test]
+    fn user_name_persists_and_is_independent_of_model_titles() {
+        let dir = crate::tools::temp_dir();
+        let path = crate::sessions::state_dir(&dir, "named").join("name.json");
+        let (session, mut prompts) = session();
+        session.configure_name(path.clone()).unwrap();
+        assert_eq!(session.name(), None);
+        assert!(session.name_command("/names nope").is_none());
+        session
+            .name_command("/name  release work  ")
+            .unwrap()
+            .unwrap();
+        session.publish(Event::Titled("model title".into()));
+        assert_eq!(session.name().as_deref(), Some("release work"));
+        assert_eq!(session.title().as_deref(), Some("model title"));
+        session.name_command("/rename ship it").unwrap().unwrap();
+        session.name_command("/name").unwrap().unwrap();
+        assert!(prompts.try_recv().is_err());
+        assert!(!session.state().working);
+        assert_eq!(session.state().name.as_deref(), Some("ship it"));
+        let (resumed, _) = self::session();
+        resumed.configure_name(path).unwrap();
+        assert_eq!(resumed.name().as_deref(), Some("ship it"));
+    }
+
+    #[test]
+    fn invalid_private_and_failed_names_leave_the_old_name_intact() {
+        let (session, _) = session();
+        session.name_command("/name original").unwrap().unwrap();
+        for name in [
+            "x".repeat(81),
+            "two\nlines".into(),
+            "escape\u{1b}sequence".into(),
+        ] {
+            assert!(
+                session
+                    .name_command(&format!("/rename {name}"))
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(session.name().as_deref(), Some("original"));
+        }
+        session.privacy.begin();
+        assert!(session.name_command("/name private").unwrap().is_err());
+        assert_eq!(session.name().as_deref(), Some("original"));
+        session.privacy.clear();
+        let dir = crate::tools::temp_dir();
+        std::fs::write(dir.join("blocked"), "file").unwrap();
+        assert!(
+            session
+                .configure_name(dir.join("blocked/name.json"))
+                .is_err()
+        );
+        assert!(session.name_command("/rename unsaved").unwrap().is_err());
+        assert_eq!(session.name().as_deref(), Some("original"));
     }
 
     #[test]

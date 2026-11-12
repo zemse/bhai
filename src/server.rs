@@ -519,6 +519,11 @@ async fn prompt(
 
 /// Submit `text`, answering `{"ok": true}` or, when it joined the queue, the position too.
 fn admit(session: &Session, text: &str) -> Result<Value, (StatusCode, String)> {
+    if let Some(result) = session.name_command(text) {
+        return result
+            .map(|()| json!({"ok": true}))
+            .map_err(|error| (StatusCode::BAD_REQUEST, error));
+    }
     if text == "/private" {
         return session
             .enable_private()

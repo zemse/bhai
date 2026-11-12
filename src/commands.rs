@@ -22,6 +22,16 @@ pub const COMMANDS: &[Command] = &[
         help: "the commands and the keys",
     },
     Command {
+        name: "name",
+        args: " [name]",
+        help: "show or set this session's persistent name",
+    },
+    Command {
+        name: "rename",
+        args: " [name]",
+        help: "show or set this session's persistent name",
+    },
+    Command {
         name: "diff",
         args: "",
         help: "what has changed in the working tree",

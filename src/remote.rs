@@ -1674,6 +1674,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn attached_names_seed_forward_and_mirror_without_model_prompts() {
+        let mut served = served().await;
+        served
+            .session
+            .name_command("/name initial")
+            .unwrap()
+            .unwrap();
+        let attached = connect(attach_to(served.port)).await.unwrap();
+        let here = attached.session;
+        assert_eq!(here.name().as_deref(), Some("initial"));
+        here.name_command("/rename remote release")
+            .unwrap()
+            .unwrap();
+        until("the renamed session is mirrored", || {
+            here.name().as_deref() == Some("remote release")
+        })
+        .await;
+        assert_eq!(served.session.name().as_deref(), Some("remote release"));
+        assert!(served.prompts.try_recv().is_err());
+        served.session.publish(Event::Titled("model title".into()));
+        until("the model title is mirrored", || {
+            here.title().as_deref() == Some("model title")
+        })
+        .await;
+        assert_eq!(here.name().as_deref(), Some("remote release"));
+    }
+
     /// The served session mid-turn, with a child running and one finished, a plan, a
     /// schedule, a monitor sampled at least once, usage and a title, all before anyone
     /// attaches. Returns the schedule's id.

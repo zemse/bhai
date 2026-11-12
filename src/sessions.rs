@@ -19,6 +19,26 @@ pub fn state_dir(cwd: &Path, session: &str) -> PathBuf {
     cwd.join(DIR).join(session)
 }
 
+/// Read the user-set name independently of the conversation history.
+pub fn read_name(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Replace the user-set name without leaving a partial value on disk.
+pub fn write_name(path: &Path, name: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        private_dir(parent)?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    private_write(&temporary, &serde_json::to_string(name)?)?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
 /// Diagnostics owned by one session, including its children.
 pub fn debug_dir(cwd: &Path, session: &str) -> PathBuf {
     state_dir(cwd, session).join("debug")
@@ -1033,6 +1053,23 @@ fn truncate(text: String) -> String {
 mod tests {
     use super::*;
     use crate::tools::temp_dir;
+
+    #[test]
+    fn user_name_storage_round_trips_and_reports_corruption() {
+        let dir = temp_dir();
+        let path = state_dir(&dir, "named").join("name.json");
+        assert_eq!(read_name(&path).unwrap(), None);
+        write_name(&path, "release \"候補\"").unwrap();
+        assert_eq!(
+            read_name(&path).unwrap().as_deref(),
+            Some("release \"候補\"")
+        );
+        write_name(&path, "short").unwrap();
+        assert_eq!(read_name(&path).unwrap().as_deref(), Some("short"));
+        assert!(!path.with_extension("json.tmp").exists());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_name(&path).is_err());
+    }
 
     #[test]
     fn automatic_prompts_are_not_legacy_user_evidence() {

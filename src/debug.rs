@@ -441,6 +441,7 @@ mod tests {
             terminal: Some((120, 40)),
             backend: "codex".to_string(),
             state: State {
+                name: None,
                 private: false,
                 privacy_ready: true,
                 model: "gpt-5.5".to_string(),

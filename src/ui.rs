@@ -1986,8 +1986,26 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::new().fg(Color::Cyan),
         ));
     }
+    if app.attached().is_none()
+        && let Some(name) = app.session().name()
+    {
+        block = block.title_top(
+            Line::styled(
+                format!(
+                    " {} ",
+                    clip(&name, usize::from(area.width.saturating_sub(6)) / 2)
+                ),
+                Style::new().fg(Color::Cyan),
+            )
+            .right_aligned(),
+        );
+    }
     // Attached, the prompt goes to another machine, and ctrl+c leaves it running there.
     if let Some(link) = app.attached() {
+        let name = app
+            .session()
+            .name()
+            .map_or_else(String::new, |name| format!("{} · ", clip(&name, 24)));
         let host = link.url.trim_start_matches("http://");
         let held = match link.held() {
             0 => String::new(),
@@ -1996,12 +2014,12 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
         block = block.title(
             match link.connected() {
                 true => Line::styled(
-                    format!(" attached to {host} · ctrl+c detaches {held}"),
+                    format!(" {name}attached to {host} · ctrl+c detaches {held}"),
                     Style::new().fg(Color::Green),
                 ),
                 false => Line::styled(
                     format!(
-                        " disconnected from {host} · {} · reconnecting {held}",
+                        " {name}disconnected from {host} · {} · reconnecting {held}",
                         clip(&link.down(), 60)
                     ),
                     Style::new().fg(Color::Red).bold(),
@@ -2341,6 +2359,29 @@ mod tests {
             cache_write: 0,
             output,
             reasoning,
+        }
+    }
+
+    #[test]
+    fn the_user_name_is_on_the_input_top_right_not_the_model_title() {
+        let mut app = App::detached();
+        app.session()
+            .name_command("/name release work")
+            .unwrap()
+            .unwrap();
+        app.session().publish(Event::Titled("model title".into()));
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        terminal
+            .draw(|frame| render_input(frame, Rect::new(0, 0, 80, 5), &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let top: String = (0..80).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(top.ends_with(" release work ┐"), "{top}");
+        assert!(!top.contains("model title"));
+        for width in [1, 8, 24] {
+            terminal
+                .draw(|frame| render_input(frame, Rect::new(0, 0, width, 5), &mut app))
+                .unwrap();
         }
     }
 

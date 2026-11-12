@@ -1282,6 +1282,16 @@ fn start(
         judge.clone(),
     );
     let events = session.subscribe();
+    if let Err(error) = session.configure_name(
+        saved
+            .writer
+            .authorization_path()
+            .with_file_name("name.json"),
+    ) {
+        session.publish(session::Event::Error(format!(
+            "could not load session name: {error}"
+        )));
+    }
     // The session hands out the mailboxes, so a message typed into a child's pane
     // reaches the child the agent is running.
     let delegation = Delegation {
