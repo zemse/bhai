@@ -2058,15 +2058,13 @@ async fn run(
         let Some(event) = event else {
             break;
         };
-        dirty = apply(&mut app, &mut notifier, event, &mut tab);
-        // Whatever else is already waiting is applied before the next draw. A streaming
-        // turn sends an event per delta, and a frame per delta is a frame wasted:
-        // rendering the transcript costs the same however little of it changed.
-        while !app.quit {
-            let Ok(event) = rx_event.try_recv() else {
-                break;
-            };
+        dirty = false;
+        // Coalesce streaming deltas, but draw a command's start before draining more.
+        for event in frame_events(event, &mut rx_event) {
             dirty |= apply(&mut app, &mut notifier, event, &mut tab);
+            if app.quit {
+                break;
+            }
         }
         // `/mouse` hands the pointer back to the terminal, and takes it again.
         if app.mouse != captured {
@@ -2090,6 +2088,26 @@ async fn run(
         set_capture(mouse);
     }
     Ok(signalled)
+}
+
+/// Bound each frame's batch even when producers keep the queue nonempty.
+fn frame_events(
+    first: Event,
+    rx: &mut mpsc::UnboundedReceiver<Event>,
+) -> impl Iterator<Item = Event> + '_ {
+    let mut first = Some(first);
+    let mut remaining = 64;
+    std::iter::from_fn(move || {
+        if remaining == 0 {
+            return None;
+        }
+        let event = first.take().or_else(|| rx.try_recv().ok())?;
+        remaining -= 1;
+        if matches!(event, Event::Session(session::Event::ToolStart { .. })) {
+            remaining = 0;
+        }
+        Some(event)
+    })
 }
 
 /// Apply one event to the view; returns whether it has to be drawn again.
@@ -2207,6 +2225,39 @@ fn attention(event: &session::Event, root: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::prompt;
+
+    #[test]
+    fn a_command_start_ends_the_frame_batch() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Event::Session(session::Event::ToolStart {
+            tool: "bash".into(),
+            summary: "sleep 1; echo done".into(),
+            preview: None,
+        }))
+        .unwrap();
+        tx.send(Event::Session(session::Event::ToolOutput("done".into())))
+            .unwrap();
+        let events: Vec<_> = frame_events(Event::Tick, &mut rx).collect();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.last(),
+            Some(Event::Session(session::Event::ToolStart { .. }))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Event::Session(session::Event::ToolOutput(_)))
+        ));
+    }
+
+    #[test]
+    fn a_busy_event_queue_still_leaves_time_to_draw() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..100 {
+            tx.send(Event::Tick).unwrap();
+        }
+        assert_eq!(frame_events(Event::Tick, &mut rx).count(), 64);
+        assert_eq!(rx.len(), 37);
+    }
 
     #[tokio::test]
     async fn new_skills_reach_tui_suggestions_without_conversation_events() {

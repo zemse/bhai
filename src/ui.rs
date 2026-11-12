@@ -3565,6 +3565,28 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_command_is_visible_before_its_first_output() {
+        let mut app = App::detached();
+        app.entries().apply(&Event::ToolStart {
+            tool: "bash".into(),
+            summary: "sleep 1; echo done".into(),
+            preview: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("$ sleep 1; echo done"), "{text}");
+        assert!(!text.contains("succeeded"), "{text}");
+
+        app.entries()
+            .apply(&Event::ToolOutput("exit code: 0\ndone".into()));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("$ sleep 1; echo done"), "{text}");
+        assert!(text.contains("✓ succeeded"), "{text}");
+    }
+
+    #[test]
     fn a_running_command_shows_its_latest_lines() {
         let mut app = App::detached();
         app.entries().apply(&Event::ToolStart {

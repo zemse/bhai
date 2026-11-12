@@ -4775,6 +4775,35 @@ mod tests {
         assert!(batches(&registry, &[]).is_empty());
     }
 
+    #[tokio::test]
+    async fn a_silent_tool_announces_its_start_before_finishing() {
+        use fake::Fake;
+
+        let fake = Fake::new(vec![vec![rendezvous("a", "c1")]]);
+        let registry = Registry::new(Vec::new()).with_tool(Box::new(Rendezvous {
+            parallel: false,
+            met: Arc::new(tokio::sync::Notify::new()),
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut history = Vec::new();
+        let run = meet(&fake, &registry, &mut history, &tx);
+        tokio::pin!(run);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    _ = &mut run => panic!("the silent tool finished before being released"),
+                    event = rx.recv() => {
+                        if matches!(event, Some(AgentEvent::ToolStart { .. })) {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the tool's start was held until completion");
+    }
+
     /// Two calls that can only finish together do, and the transcript still shows the
     /// first one's start and output before the second's, though the second ended first.
     #[tokio::test]

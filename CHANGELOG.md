@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-12
 
+- The TUI draws a command's start before draining later events and bounds streaming batches, so a busy output queue cannot postpone its first frame until completion.
 - Goal lifecycle updates tell the model the current state and reason independently of the specification, surviving both compaction paths. Autonomous turns explicitly say the goal is active; a fresh user message retries narration-only idle pauses, while deliberate pauses and interruptions still require `/goal resume`.
 - Markdown link labels are clickable, including wrapped, styled and code-formatted labels. Local Markdown links open a read-only hackmd view with keyboard and mouse scrolling; Esc returns to the same transcript position and draft without interrupting the turn. Web links still open in the browser, and inline code outside links still copies.
 - Output tok/s uses source-clock samples of complete text and tool-argument streams, not separately tokenized chunks or whole request time. Waiting, retries and post-response bookkeeping stay out of the rate; quiet output is labelled, short coalesced replies have no invented rate, and attached sessions retain source timing.
