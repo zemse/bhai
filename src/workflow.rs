@@ -2688,16 +2688,35 @@ prompt: fix it\n"
         let workflow = workflow(&format!(
             "steps:\n  - id: triage\n    output_contract: {CONTRACT}\n    prompt: triage it\n"
         ));
-        let fake = Fake::new(vec![vec![say("{\"risky\": true}")]]);
+        let fake = Fake::new(vec![vec![say("{\"risky\": true}")]; 4]);
         let (report, _, dir) = go(&workflow, "", &fake).await;
-        assert_eq!(
-            statuses(&report),
-            [(
-                "triage",
-                &Status::Failed("ended without a result accepted by submit_result".to_string())
-            )]
+        assert!(
+            matches!(statuses(&report).as_slice(), [("triage", Status::Failed(reason))] if reason.contains("completion corrections") && reason.contains("accepted submit_result"))
         );
+        assert_eq!(fake.bodies.lock().unwrap().len(), 4);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_typed_step_recovers_a_missing_submission_in_the_same_assignment() {
+        use fake::call;
+        use serde_json::json;
+
+        let workflow = workflow(&format!(
+            "steps:\n  - id: triage\n    output_contract: {CONTRACT}\n    prompt: triage it\n"
+        ));
+        let fake = Fake::new(vec![
+            vec![say("{\"risky\": true}")],
+            vec![call(
+                tools::submit::NAME,
+                json!({"output": {"risky": true}}),
+            )],
+            vec![say("submitted")],
+        ]);
+        let (report, _, dir) = go(&workflow, "", &fake).await;
+        assert_eq!(statuses(&report), [("triage", &Status::Ok)]);
+        assert_eq!(fake.bodies.lock().unwrap().len(), 3);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

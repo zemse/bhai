@@ -836,6 +836,13 @@ fn render_working(frame: &mut Frame, area: Rect, app: &App) {
         Style::new().fg(Color::Yellow),
     )];
     let dim = Style::new().fg(Color::DarkGray);
+    let phase = app.session().execution().phase;
+    if !matches!(
+        phase,
+        crate::agent::Phase::Idle | crate::agent::Phase::Ended
+    ) {
+        spans.push(Span::styled(format!(" · {}", phase.label()), dim));
+    }
     if let Some(call) = &app.judging {
         spans.push(Span::styled(
             format!(" · auto mode is checking {}", clip(call, JUDGING_CLIP)),
@@ -1874,6 +1881,12 @@ fn child_row(child: &ChildRow, width: usize, spinner: usize, open: bool) -> Line
         };
     }
     timing.push_str(&quiet(child));
+    if !matches!(
+        child.execution.phase,
+        crate::agent::Phase::Idle | crate::agent::Phase::Ended
+    ) {
+        timing = format!(" · {}{timing}", child.execution.phase.label());
+    }
     let mut tail = format!(
         "{} · {} · {}",
         child.identity, child.model, child.description
@@ -2966,6 +2979,7 @@ mod tests {
             model: "gpt-5.5".into(),
             description: "a long description that will not fit in the row".into(),
             state: ChildState::Running,
+            execution: Default::default(),
             steps: 0,
             started: now,
             last: now,

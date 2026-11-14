@@ -33,6 +33,34 @@ It does not parse arguments, load credentials, start MCP servers or open a termi
   `identity::build` and `Policy::new` support explicit discovery/policy roots without
   changing the process directory. `Runtime` itself does not discover files.
 
+## Continuation and outcomes
+
+`AgentEvent::Phase` reports which operation owns the next transition. The session's
+`execution` snapshot carries the phase, transition count and change time; children carry
+their own snapshots. These events do not become conversation entries. Quiet model calls,
+tools and approvals are not retried merely because time passed. Tool and child event
+drains close when their operations finish, then forward the buffered events without
+waiting for retained sender handles.
+
+Empty or commentary-only terminal responses, output-limit endings and missing workflow
+submissions get at most three completion corrections per turn. Tool activity does not
+reset that budget. Exhaustion fails the turn rather than reporting success. These are
+new model calls on the existing history, not replayed tools. Interrupts and deliberate
+goal stops take precedence.
+
+An active goal may end a turn without ending its task: the session schedules its next
+turn. Live children and unread outcomes suppress those automatic goal turns until a
+report is consumed. A goal cannot complete or block while child assignments or their
+outcomes remain outstanding. Existing plan checks still apply. This is not a semantic
+proof that arbitrary prose answers or claimed test results satisfy the user's request.
+
+Delegated child outcomes are saved as private `child-ID.result.json` files before parent
+notification. CLI resume recovers saved outcomes missing from the parent's history,
+instead of calling those children interrupted. Continuing a child clears its old saved
+outcome before starting the new assignment. Child task panics publish failures; neither
+panic recovery nor resume reruns commands whose effects may already have happened.
+Saved outcomes cover process interruption, not a power-loss durability guarantee.
+
 ## Remaining seams
 
 This is not yet an in-process multi-project sandbox. Built-in tools and environment

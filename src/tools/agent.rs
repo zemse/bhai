@@ -2,9 +2,10 @@
 //! finished. Needs no approval itself; every call the child makes goes through the
 //! session's permission policy.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures_util::FutureExt as _;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
@@ -162,6 +163,20 @@ impl Tool for Agent {
             if let Some(e) = self.unserved(&identity).await {
                 return (e, false);
             }
+            // A continuation must never recover the preceding assignment's outcome.
+            if let Err(error) = std::fs::remove_file(report_path(&self.transcripts, &id))
+                && !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+            {
+                return (
+                    format!(
+                        "child {id} was not started: could not clear its prior outcome: {error}"
+                    ),
+                    false,
+                );
+            }
             let lease = match isolate {
                 true => match self.lease(&id).await {
                     Ok(lease) => Some(lease),
@@ -287,6 +302,8 @@ impl Agent {
         );
         // Taken here so an interrupt before the task is scheduled still stops it.
         let (tx, cancel) = (self.tx.clone(), self.cancel.child(&id));
+        self.cancel.expect_result(&id);
+        let supervisor_cancel = Arc::clone(&cancel);
         let children = Arc::clone(&self.children);
         // Status includes the child before its loop starts.
         {
@@ -305,6 +322,20 @@ impl Agent {
         // Forked now, so the child starts from what the session had done when it asked.
         let judge = self.judge.as_ref().map(|judge| judge.child(&id, &task));
         let span = crate::trace::child(&id, &identity.name);
+        let fallback = ChildResult {
+            id: id.clone(),
+            identity: identity.name.clone(),
+            description: description.clone(),
+            text: format!(
+                "child {id} ({}) failed: its task panicked. Side effects may have occurred; inspect its transcript before retrying.",
+                identity.name
+            ),
+        };
+        let report_file = report_path(&self.transcripts, &id);
+        let failure_file = report_file.clone();
+        let failure_results = results.clone();
+        let failure_tx = tx.clone();
+        let failure_id = id.clone();
         let run = async move {
             // A child stopped before it was scheduled has no transcript to report.
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -313,11 +344,22 @@ impl Agent {
                     identity.name
                 );
                 text.push_str(&settle(lease).await);
-                let _ = results.send(ChildResult {
-                    identity: identity.name.clone(),
-                    description,
-                    text,
+                let _ = tx.send(AgentEvent::ChildEnded {
+                    id: id.clone(),
+                    ok: false,
                 });
+                publish(
+                    &id,
+                    &report_file,
+                    &results,
+                    &tx,
+                    ChildResult {
+                        id: id.clone(),
+                        identity: identity.name.clone(),
+                        description,
+                        text,
+                    },
+                );
                 return;
             }
             let workdir = lease.as_ref().map(worktrees::Lease::rooted);
@@ -340,6 +382,10 @@ impl Agent {
                 workdir,
             })
             .await;
+            let _ = tx.send(AgentEvent::Child {
+                id: id.clone(),
+                event: Box::new(AgentEvent::Phase(agent::Phase::Delivering)),
+            });
             let name = &identity.name;
             let mut text = match finished.result {
                 Ok(text) => format!(
@@ -360,13 +406,33 @@ impl Agent {
                 ),
             };
             text.push_str(&settle(lease).await);
-            let _ = results.send(ChildResult {
-                identity: identity.name.clone(),
-                description,
-                text,
-            });
+            publish(
+                &id,
+                &report_file,
+                &results,
+                &tx,
+                ChildResult {
+                    id: id.clone(),
+                    identity: identity.name.clone(),
+                    description,
+                    text,
+                },
+            );
         };
-        tokio::spawn(run.instrument(span));
+        let failed = async move {
+            let _ = failure_tx.send(AgentEvent::ChildEnded {
+                id: failure_id.clone(),
+                ok: false,
+            });
+            publish(
+                &failure_id,
+                &failure_file,
+                &failure_results,
+                &failure_tx,
+                fallback,
+            );
+        };
+        tokio::spawn(supervise(run, supervisor_cancel, failed).instrument(span));
     }
 
     /// Where the identity a child was started as is kept, beside its transcript.
@@ -409,6 +475,11 @@ session returned."
         if self.cancel.running(id) {
             return Err(format!(
                 "child {id} is still running. Its report will reach you; continue it after that."
+            ));
+        }
+        if self.cancel.awaiting_result(id) {
+            return Err(format!(
+                "child {id}'s report is queued. Read its outcome before continuing the assignment."
             ));
         }
         let meta: Value = std::fs::read_to_string(self.meta(id))
@@ -513,6 +584,69 @@ identity and model it had, since its history belongs to them."
     }
 }
 
+async fn supervise(
+    run: impl std::future::Future<Output = ()>,
+    ownership: Arc<std::sync::atomic::AtomicBool>,
+    failed: impl std::future::Future<Output = ()>,
+) {
+    let _ownership = ownership;
+    if std::panic::AssertUnwindSafe(run)
+        .catch_unwind()
+        .await
+        .is_err()
+    {
+        failed.await;
+    }
+}
+
+fn report_path(directory: &Path, id: &str) -> PathBuf {
+    directory.join(format!("child-{id}.result.json"))
+}
+
+/// Read only an outcome owned by this session, never a path from model output.
+pub fn read_report(directory: &Path, id: &str) -> Option<ChildResult> {
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let path = report_path(directory, id);
+    if std::fs::metadata(&path).ok()?.len() > 1024 * 1024 {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let result: ChildResult = serde_json::from_str(&text).ok()?;
+    (result.id == id && result.text.starts_with(&format!("child {id} ("))).then_some(result)
+}
+
+fn publish(
+    id: &str,
+    path: &Path,
+    results: &Results,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+    result: ChildResult,
+) {
+    let save = || -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            crate::sessions::private_dir(parent)?;
+        }
+        let temporary = path.with_extension("json.tmp");
+        crate::sessions::private_write(&temporary, &serde_json::to_string(&result)?)?;
+        std::fs::rename(temporary, path)?;
+        Ok(())
+    };
+    if let Err(error) = save() {
+        let _ = tx.send(AgentEvent::Error(format!(
+            "{}could not save child outcome: {error:#}",
+            agent::TRANSCRIPT_ERROR
+        )));
+    }
+    let _ = tx.send(AgentEvent::Child {
+        id: id.to_string(),
+        event: Box::new(AgentEvent::Phase(agent::Phase::AwaitingReport)),
+    });
+    // A disk failure must not suppress the live outcome.
+    let _ = results.send(result);
+}
+
 /// Settle a child's worktree, off the runtime's threads, and say what became of it as a
 /// line of its report.
 async fn settle(lease: Option<worktrees::Lease>) -> String {
@@ -584,7 +718,9 @@ mod tests {
             let (started, ok) = self.agent.execute(&args).await;
             assert!(ok, "{started}");
             assert!(started.contains("started."), "{started}");
-            self.results.recv().await.expect("a report").text
+            let result = self.results.recv().await.expect("a report");
+            self.agent.cancel.acknowledge_result(&result.id);
+            result.text
         }
 
         fn cleanup(&self) {
@@ -633,6 +769,162 @@ mod tests {
             _events: rx,
             results,
         }
+    }
+
+    #[tokio::test]
+    async fn panic_supervision_keeps_execution_owned_until_failure_publication_finishes() {
+        let cancel = Arc::new(Cancel::default());
+        let ownership = cancel.child("abcdef");
+        let (publishing, started) = tokio::sync::oneshot::channel();
+        let (release, allowed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(supervise(
+            async { panic!("injected failure before publication") },
+            ownership,
+            async move {
+                publishing.send(()).unwrap();
+                allowed.await.unwrap();
+            },
+        ));
+        started.await.unwrap();
+        assert!(cancel.running("abcdef"));
+        release.send(()).unwrap();
+        task.await.unwrap();
+        assert!(!cancel.running("abcdef"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_child_publishes_a_durable_failure_and_releases_its_lifecycle() {
+        let fake =
+            Fake::new(vec![vec![say("unreachable")]]).during(|_| panic!("injected child panic"));
+        let mut harness = tool(&fake, false);
+        let args = json!({"description": "panic test", "prompt": "report"});
+        let (started, ok) = harness.agent.execute(&args).await;
+        assert!(ok, "{started}");
+        let id = started
+            .strip_prefix("child ")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), harness.results.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(result.text.contains("panicked"), "{}", result.text);
+        assert!(!harness.agent.cancel.running(id));
+        assert!(harness.agent.cancel.awaiting_result(id));
+        harness.agent.cancel.acknowledge_result(id);
+        assert!(!harness.agent.cancel.has_children());
+        assert!(
+            !harness
+                .agent
+                .delegation
+                .mailboxes
+                .lock()
+                .unwrap()
+                .contains_key(id)
+        );
+        assert_eq!(
+            read_report(&harness.agent.transcripts, id).unwrap().text,
+            result.text
+        );
+        let history = vec![json!({"type": "function_call_output", "output": started})];
+        let recovered = agent::abandoned_with_reports(&history, Some(&harness.agent.transcripts));
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].to_string().contains("panicked"));
+        let mut healed = history;
+        healed.extend(recovered);
+        assert!(
+            agent::abandoned_with_reports(&healed, Some(&harness.agent.transcripts)).is_empty()
+        );
+        harness.cleanup();
+    }
+
+    #[tokio::test]
+    async fn a_saved_child_outcome_survives_a_disconnected_parent() {
+        let fake = Fake::new(vec![vec![say("the observed result")]]);
+        let harness = tool(&fake, false);
+        let (started, ok) = harness
+            .agent
+            .execute(&json!({"description": "save result", "prompt": "report"}))
+            .await;
+        assert!(ok, "{started}");
+        let id = started
+            .strip_prefix("child ")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        drop(harness.results);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while harness.agent.cancel.running(&id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let saved = read_report(&harness.agent.transcripts, &id).unwrap();
+        assert!(saved.text.contains("the observed result"));
+        let history = vec![json!({"type": "function_call_output", "output": started})];
+        let recovered = agent::abandoned_with_reports(&history, Some(&harness.agent.transcripts));
+        assert!(recovered[0].to_string().contains("the observed result"));
+        std::fs::remove_dir_all(harness.agent.transcripts).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_saved_outcome_write_failure_does_not_lose_the_live_report() {
+        let fake = Fake::new(vec![vec![say("live outcome")]]);
+        let mut harness = tool(&fake, false);
+        let directory = harness.agent.transcripts.clone();
+        let file = directory.join("not-a-directory");
+        std::fs::write(&file, "fixture").unwrap();
+        harness.agent.transcripts = file;
+        let report = harness
+            .report(json!({"description": "report", "prompt": "report"}))
+            .await;
+        assert!(report.contains("live outcome"), "{report}");
+        assert!(!harness.agent.cancel.has_children());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuation_waits_for_report_consumption_and_clears_the_prior_saved_outcome() {
+        let fake = Fake::new(vec![
+            vec![say("first assignment")],
+            crate::agent::fake::step(crate::agent::fake::HANG),
+        ]);
+        let mut harness = tool(&fake, false);
+        let (started, ok) = harness
+            .agent
+            .execute(&json!({"description": "inspect", "prompt": "inspect"}))
+            .await;
+        assert!(ok, "{started}");
+        let result = harness.results.recv().await.unwrap();
+        let id = &result.id;
+        assert!(read_report(&harness.agent.transcripts, id).is_some());
+        let again = json!({"description": "continue", "prompt": "next assignment", "continue": id});
+        assert!(!harness.agent.execute(&again).await.1);
+        harness.agent.cancel.acknowledge_result(id);
+        assert!(harness.agent.execute(&again).await.1);
+        assert!(read_report(&harness.agent.transcripts, id).is_none());
+        harness.agent.cancel.stop_child(id);
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), harness.results.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!next.text.contains("first assignment"));
+        harness.cleanup();
+    }
+
+    #[test]
+    fn outcome_recovery_rejects_paths_and_malformed_records() {
+        let directory = super::super::temp_dir();
+        assert!(read_report(&directory, "../outside").is_none());
+        std::fs::write(report_path(&directory, "abcdef"), "partial record").unwrap();
+        assert!(read_report(&directory, "abcdef").is_none());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -737,14 +1029,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_with_no_text_in_it_is_not_an_answer() {
-        let fake = Fake::new(vec![vec![say("")]]);
+        let fake = Fake::new(vec![vec![say("")]; 4]);
         let mut harness = tool(&fake, false);
         let args = json!({"description": "say nothing", "prompt": "go"});
         let out = harness.report(args).await;
         assert!(
-            out.ends_with(
-                "(general) failed after 1 steps, 10/2 tokens: ended without a final message"
-            ),
+            out.contains("failed after 4 steps") && out.contains("completion corrections"),
             "{out}"
         );
         harness.cleanup();
@@ -1195,6 +1485,7 @@ mod tests {
             .next()
             .unwrap()
             .to_string();
+        harness.agent.cancel.acknowledge_result(&id);
         let again = json!({"description": "look", "prompt": "check", "continue": id});
         let (started, ok) = harness.agent.execute(&again).await;
         assert!(ok, "{started}");

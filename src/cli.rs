@@ -326,7 +326,9 @@ pub async fn entry() -> Result<()> {
             warnings.extend(loaded.warnings.iter().map(|w| format!("warning: {w}")));
             let mut writer = sessions::Writer::resume(&dir, &loaded)?;
             let mut history = loaded.items;
-            for report in agent::abandoned(&history) {
+            for report in
+                agent::abandoned_with_reports(&history, Some(&dir.join(&loaded.header.session)))
+            {
                 writer.append(&report)?;
                 history.push(report);
             }
@@ -1678,7 +1680,8 @@ async fn probe(setup: Setup, prompt: Option<String>) -> Result<()> {
             AgentEvent::Titled(name) => println!("[title] {name}"),
             // A probe prints what the model says, and the prompt behind it is a tui
             // readout: the size is already in the usage it prints when the call ends.
-            AgentEvent::Sending(_)
+            AgentEvent::Phase(_)
+            | AgentEvent::Sending(_)
             | AgentEvent::Cache(None)
             | AgentEvent::Call(_)
             | AgentEvent::Item(_)

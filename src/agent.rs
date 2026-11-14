@@ -1,7 +1,7 @@
 //! The agent loop: call the model, run the tools it asks for, feed the results back,
 //! repeat until it stops asking for tools.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,15 +37,68 @@ use crate::workflow::{self, Workflow};
 /// stuck on failing calls.
 const MAX_ERROR_ROUNDS: usize = 3;
 /// Calls in a row a turn makes on `end_turn: false` with no tool call between them,
-/// before it ends anyway.
+/// before it fails as stalled.
 const MAX_CONTINUES: usize = 8;
+/// Completion corrections per turn, including corrections separated by tool calls.
+const MAX_COMPLETION_RETRIES: usize = 3;
 
 /// How long an idle session with a goal active waits before opening a turn on it.
 const GOAL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The operation that owns the next transition; quiet time alone is not a stall.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    #[default]
+    Idle,
+    Ready,
+    Model,
+    Tools,
+    Approval,
+    Checking,
+    WaitingChildren,
+    Delivering,
+    AwaitingReport,
+    Ended,
+}
+
+impl Phase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Ready => "continuing",
+            Self::Model => "model",
+            Self::Tools => "tool",
+            Self::Approval => "approval",
+            Self::Checking => "checking completion",
+            Self::WaitingChildren => "waiting for children",
+            Self::Delivering => "delivering report",
+            Self::AwaitingReport => "report queued",
+            Self::Ended => "ended",
+        }
+    }
+}
+
+/// Runtime state, independent of the conversation and its token budget.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize, Serialize)]
+pub struct Execution {
+    pub phase: Phase,
+    pub transitions: u64,
+    pub changed_at: i64,
+}
+
+impl Execution {
+    pub fn set(&mut self, phase: Phase) {
+        self.phase = phase;
+        self.transitions = self.transitions.saturating_add(1);
+        self.changed_at = chrono::Utc::now().timestamp_millis();
+    }
+}
+
 /// Everything the agent tells the UI.
 #[derive(Debug)]
 pub enum AgentEvent {
+    Phase(Phase),
     Reasoning(String),
     Text(String),
     /// Restore an unanswered prompt only if the transcript still ends with it.
@@ -559,6 +612,10 @@ have partially executed. Check before relying on its effects.\n</turn_aborted>";
 /// what a session that ended mid-child holds: the call's "its report will reach you" with
 /// nothing after it. Nothing re-runs the child, so the model is told it is gone.
 pub fn abandoned(history: &[Value]) -> Vec<Value> {
+    abandoned_with_reports(history, None)
+}
+
+fn open_children(history: &[Value]) -> Vec<(&str, &str)> {
     let mut open: Vec<(&str, &str)> = Vec::new();
     for item in history {
         match item.get("type").and_then(Value::as_str) {
@@ -577,14 +634,31 @@ pub fn abandoned(history: &[Value]) -> Vec<Value> {
                     .and_then(Value::as_str)
                     .and_then(|text| text.strip_prefix(CHILD_RESULT));
                 if let Some(report) = report {
-                    open.retain(|(id, _)| !report.contains(&format!("child {id} (")));
+                    let reported = report
+                        .split_once("\n\n")
+                        .and_then(|(_, body)| body.strip_prefix("child "))
+                        .and_then(|body| body.split_once(" ("))
+                        .map(|(id, _)| id);
+                    open.retain(|(id, _)| Some(*id) != reported);
                 }
             }
             _ => {}
         }
     }
-    open.into_iter()
+    open
+}
+
+/// Recover saved outcomes before declaring an unreported child interrupted.
+pub fn abandoned_with_reports(history: &[Value], directory: Option<&Path>) -> Vec<Value> {
+    open_children(history).into_iter()
         .map(|(id, name)| {
+            let saved = directory.and_then(|directory| tools::agent::read_report(directory, id));
+            if let Some(result) = saved {
+                return json!({
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": format!("{CHILD_RESULT}\n\n{}", result.text)}],
+                });
+            }
             json!({
                 "type": "message",
                 "role": "user",
@@ -602,8 +676,10 @@ needed."
 }
 
 /// A detached child agent that has finished, on its way into the parent's history.
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Deserialize, Serialize)]
 pub struct ChildResult {
+    #[serde(default)]
+    pub id: String,
     pub identity: String,
     pub description: String,
     /// What the parent reads: the header and the child's final message, or why there
@@ -626,6 +702,7 @@ pub struct Cancel {
     turn: Arc<AtomicBool>,
     edit: Mutex<Option<String>>,
     children: Mutex<Vec<(String, Arc<AtomicBool>)>>,
+    pending_results: Mutex<HashSet<String>>,
 }
 
 impl Cancel {
@@ -678,6 +755,39 @@ impl Cancel {
         self.lock()
             .iter()
             .any(|(own, flag)| own == id && Arc::strong_count(flag) > 1)
+    }
+
+    /// An assignment is unfinished until its outcome joins the parent's history.
+    pub fn has_children(&self) -> bool {
+        self.lock()
+            .iter()
+            .any(|(_, flag)| Arc::strong_count(flag) > 1)
+            || !self
+                .pending_results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+
+    pub fn expect_result(&self, id: &str) {
+        self.pending_results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string());
+    }
+
+    pub fn awaiting_result(&self, id: &str) -> bool {
+        self.pending_results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+
+    pub fn acknowledge_result(&self, id: &str) {
+        self.pending_results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
     }
 
     /// Let the next turn run. A child already stopped stays stopped.
@@ -912,6 +1022,7 @@ pub(crate) async fn run_configured(
         }
         registry
             .with_goal(tools::goal::Goal {
+                children: Arc::clone(&stop),
                 goal: Arc::clone(&goal),
                 plan: plan.clone(),
                 requested: Arc::clone(&goal_requested),
@@ -1006,7 +1117,10 @@ pub(crate) async fn run_configured(
 
     loop {
         let wake =
-            !cancel.load(Ordering::Relaxed) && crate::privacy::current().ready() && lock_goal(&goal).as_ref().is_some_and(Goal::active);
+            !cancel.load(Ordering::Relaxed) && crate::privacy::current().ready() && !stop.has_children() && lock_goal(&goal).as_ref().is_some_and(Goal::active);
+        if stop.has_children() {
+            let _ = tx.send(AgentEvent::Phase(Phase::WaitingChildren));
+        }
         announce(&goal, &mut shown, &tx);
         persist(&goal, writer.as_mut(), &tx);
         // Only a backend with a prompt cache has one to lapse, and only a conversation
@@ -1079,7 +1193,7 @@ pub(crate) async fn run_configured(
                             let _ = tx.send(AgentEvent::TurnEnd);
                             continue;
                         }
-                        while rx_results.try_recv().is_ok() {}
+                        discard_results(&mut rx_results, &stop);
                         children.lock().unwrap_or_else(|e| e.into_inner()).clear();
                         let private = crate::privacy::active();
                         let before = compact::estimate(&history, tokenizer);
@@ -1413,8 +1527,8 @@ pub(crate) async fn run_configured(
                     result.description
                 )));
             }
-            let mut what = vec![land(result, resume, &mut history, &tx)];
-            what.extend(delivered(Some(&mut rx_results), resume, &mut history, &tx));
+            let mut what = vec![land(result, resume, &mut history, &tx, Some(&stop))];
+            what.extend(delivered(Some(&mut rx_results), resume, &mut history, &tx, Some(&stop)));
             if !resume {
                 let mut sink = writer.as_mut().map_or(Sink::Discard, Sink::Session);
                 record(&mut sink, &history[from..], &tx);
@@ -1480,6 +1594,7 @@ pub(crate) async fn run_configured(
         // The turn holds the history, so mid-turn requests see it as the turn started.
         let (before, calls_before) = (history.clone(), calls.clone());
         let goal_context = GoalContext {
+            children: Some(&stop),
             goal: &goal,
             plan: &plan,
             compact_requested: &compact_requested,
@@ -1823,6 +1938,7 @@ fn persist(
 
 /// The goal and progress whose context a turn keeps current.
 struct GoalContext<'a> {
+    children: Option<&'a Cancel>,
     goal: &'a goal::Shared,
     plan: &'a crate::plan::Shared,
     compact_requested: &'a tools::compact::Requested,
@@ -1890,6 +2006,14 @@ impl Turn {
     }
 }
 
+struct TurnActivity<'a>(&'a mpsc::UnboundedSender<AgentEvent>);
+
+impl Drop for TurnActivity<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.send(AgentEvent::Phase(Phase::Ended));
+    }
+}
+
 /// `sink` gets every history item as it lands.
 #[allow(clippy::too_many_arguments)]
 async fn turn(
@@ -1915,15 +2039,21 @@ async fn turn(
     limits: Option<Limits>,
 ) -> Turn {
     model.begin_turn();
+    let _activity = TurnActivity(tx);
     let mut error_rounds = 0usize;
     let mut acted = false;
     let mut continued = 0usize;
+    let mut completion_retries = 0usize;
     let local_quota = tools::status::Quota::default();
     let quota = goal_context.map_or(&local_quota, |context| context.quota);
 
     let mut step = 0usize;
     loop {
         step += 1;
+        let _ = tx.send(AgentEvent::Phase(Phase::Ready));
+        if cancel.load(Ordering::Relaxed) {
+            return Turn::ended(step - 1, acted);
+        }
         Span::current().record("steps", step);
         // Whatever was typed into this agent's pane, or queued for it, joins the history
         // before the call, so the next answer has it.
@@ -1941,7 +2071,15 @@ async fn turn(
         // call, so this step reads it. Only between steps, never at the end of the turn,
         // which is what frees the session while the rest of the children run.
         let from = history.len();
-        if !delivered(results.as_deref_mut(), false, history, tx).is_empty() {
+        if !delivered(
+            results.as_deref_mut(),
+            false,
+            history,
+            tx,
+            goal_context.and_then(|context| context.children),
+        )
+        .is_empty()
+        {
             record(sink, &history[from..], tx);
         }
         if monitor.tripped() {
@@ -1989,6 +2127,7 @@ async fn turn(
         let sent = history.len();
         let mut finished = None;
         let mut continues = false;
+        let mut truncated = false;
         let mut stalls = None;
         let mut on_delta = |delta: Delta| {
             let _ = tx.send(match delta {
@@ -2033,9 +2172,12 @@ async fn turn(
                     quota.observe(limits);
                     AgentEvent::RateLimits(limits)
                 }
-                Delta::Truncated => AgentEvent::Info(
-                    "cut off at the model's output limit; the answer is what it had".to_string(),
-                ),
+                Delta::Truncated => {
+                    truncated = true;
+                    AgentEvent::Info(
+                        "cut off at the model's output limit; checking continuation".to_string(),
+                    )
+                }
                 Delta::Downgraded(tier) => return downgraded(&tier, tx),
                 Delta::Retrying {
                     attempt,
@@ -2065,6 +2207,7 @@ async fn turn(
                 true,
             ));
         }
+        let _ = tx.send(AgentEvent::Phase(Phase::Model));
         let _ = tx.send(AgentEvent::Sending(prompt));
         let _ = tx.send(AgentEvent::Streaming(true));
         let span = info_span!(
@@ -2150,6 +2293,7 @@ async fn turn(
             .collect();
 
         if calls.is_empty() {
+            let _ = tx.send(AgentEvent::Phase(Phase::Checking));
             history.extend(items.iter().cloned());
             record(sink, &history[sent..], tx);
             // A message typed while that answer was being written is not lost: it goes
@@ -2158,21 +2302,59 @@ async fn turn(
                 record(sink, &history[from..], tx);
                 continue;
             }
-            // A preamble on `end_turn: false` is the model narrating before it carries on;
-            // ending there leaves the work undone.
-            if !continues {
+            if cancel.load(Ordering::Relaxed)
+                || goal_context.is_some_and(|context| {
+                    lock_goal(context.goal).as_ref().is_some_and(|goal| {
+                        matches!(goal.state, goal::State::Paused | goal::State::Blocked)
+                    })
+                })
+            {
                 return Turn::ended(step, acted);
             }
-            continued += 1;
-            if continued > MAX_CONTINUES {
-                let _ = tx.send(AgentEvent::Info(format!(
-                    "stopped: the model asked to carry on {MAX_CONTINUES} times without acting"
-                )));
-                return Turn::ended(step, acted);
+            // A preamble on `end_turn: false` is not a completion proposal.
+            if continues {
+                continued += 1;
+                if continued > MAX_CONTINUES {
+                    return Turn {
+                        steps: step,
+                        acted,
+                        result: Err(anyhow!(
+                            "stalled: the model asked to carry on {MAX_CONTINUES} times without acting"
+                        )),
+                    };
+                }
+                continue;
             }
+            let missing = completion_gap(&items, history, registry, goal_context, truncated);
+            let Some(missing) = missing else {
+                return Turn::ended(step, acted);
+            };
+            if completion_retries >= MAX_COMPLETION_RETRIES {
+                return Turn {
+                    steps: step,
+                    acted,
+                    result: Err(anyhow!(
+                        "stalled after {MAX_COMPLETION_RETRIES} completion corrections: {missing}"
+                    )),
+                };
+            }
+            completion_retries += 1;
+            let _ = tx.send(AgentEvent::Info(format!(
+                "completion deferred ({completion_retries}/{MAX_COMPLETION_RETRIES}): {missing}"
+            )));
+            let from = history.len();
+            history.push(json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": format!(
+                    "<completion_check>\n{missing}\nContinue the existing authorized task. Do not repeat completed side effects. If blocked, report the actual blocker; if finished, provide the required result.\n</completion_check>"
+                )}],
+            }));
+            record(sink, &history[from..], tx);
             continue;
         }
         continued = 0;
+        let _ = tx.send(AgentEvent::Phase(Phase::Tools));
 
         acted |= calls.iter().any(|call| {
             !matches!(
@@ -2243,9 +2425,22 @@ async fn turn(
                 })
                 .unzip();
             let requests = goal_context.map(|c| c.plan.listen());
+            let (done, completed) = oneshot::channel();
+            let work = async move {
+                let outcomes = futures_util::future::join_all(runs).await;
+                let _ = done.send(());
+                outcomes
+            };
             let (outcomes, ()) = tokio::join!(
-                futures_util::future::join_all(runs),
-                in_turn(events, tx, goal_context.map(|c| c.plan), requests, sink)
+                work,
+                in_turn(
+                    events,
+                    completed,
+                    tx,
+                    goal_context.map(|c| c.plan),
+                    requests,
+                    sink
+                )
             );
             for (result, ok) in outcomes {
                 all_failed &= !ok;
@@ -2301,6 +2496,44 @@ async fn turn(
     }
 }
 
+/// A terminal model response is only a proposal when the harness knows work remains.
+fn completion_gap(
+    items: &[Value],
+    history: &[Value],
+    registry: &Registry,
+    context: Option<&GoalContext<'_>>,
+    truncated: bool,
+) -> Option<String> {
+    if let Some(context) = context {
+        let goal = lock_goal(context.goal);
+        // A deliberate stop is authoritative, including an acknowledged blocker.
+        if goal
+            .as_ref()
+            .is_some_and(|goal| matches!(goal.state, goal::State::Paused | goal::State::Blocked))
+        {
+            return None;
+        }
+        // Reports wake the parent. Repeated model calls cannot make them arrive.
+        if context.children.is_some_and(Cancel::has_children) {
+            return None;
+        }
+    }
+    if truncated {
+        return Some("The response hit its output limit. Continue from where it was cut off without repeating completed work.".to_string());
+    }
+    if registry.get(tools::submit::NAME).is_some() {
+        let accepted = accepted_submission(history)
+            .is_some_and(|last| !history[last..].iter().any(|item| item["role"] == "user"));
+        return (!accepted).then(|| "This assignment requires an accepted submit_result after the latest task or steering message.".to_string());
+    }
+    let answered = items.iter().any(|item| {
+        item.get("role").and_then(Value::as_str) == Some("assistant")
+            && !crate::client::is_commentary(item)
+            && final_text(std::slice::from_ref(item)).is_some()
+    });
+    (!answered).then(|| "The model ended without a final answer or report. Continue from the last tool result, or report the outcome if the task is finished.".to_string())
+}
+
 /// The calls of one response split into what runs together: each run of calls to tools
 /// that may overlap is one batch, and any other call is a batch of its own, in order.
 fn batches(registry: &Registry, calls: &[&Value]) -> Vec<std::ops::Range<usize>> {
@@ -2320,16 +2553,25 @@ fn batches(registry: &Registry, calls: &[&Value]) -> Vec<std::ops::Range<usize>>
 /// Pass on each call's events once every call before it has finished, so a batch reads
 /// as calls made one after another and its approvals are still asked one at a time.
 async fn in_turn(
-    events: Vec<mpsc::UnboundedReceiver<AgentEvent>>,
+    mut events: Vec<mpsc::UnboundedReceiver<AgentEvent>>,
+    mut completed: oneshot::Receiver<()>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
     plan: Option<&crate::plan::Shared>,
     mut requests: Option<crate::plan::Listener>,
     sink: &mut Sink<'_>,
 ) {
-    for mut rx in events {
+    let mut closed = false;
+    for index in 0..events.len() {
         loop {
             tokio::select! {
-                event = rx.recv() => match event {
+                _ = &mut completed, if !closed => {
+                    // Operation completion, not sender ownership, bounds the drain.
+                    for rx in &mut events {
+                        rx.close();
+                    }
+                    closed = true;
+                }
+                event = events[index].recv() => match event {
                     Some(event) => { let _ = tx.send(event); }
                     None => break,
                 },
@@ -2449,6 +2691,7 @@ fn land(
     late: bool,
     history: &mut Vec<Value>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
+    children: Option<&Cancel>,
 ) -> String {
     let _ = tx.send(AgentEvent::ToolStart {
         tool: tools::agent::NAME.to_string(),
@@ -2469,7 +2712,22 @@ fn land(
         }],
     }));
     let _ = tx.send(AgentEvent::Item(history.len() - 1));
+    if let Some(children) = children {
+        children.acknowledge_result(&result.id);
+    }
+    if !result.id.is_empty() {
+        let _ = tx.send(AgentEvent::Child {
+            id: result.id,
+            event: Box::new(AgentEvent::Phase(Phase::Ended)),
+        });
+    }
     result.description
+}
+
+fn discard_results(results: &mut mpsc::UnboundedReceiver<ChildResult>, children: &Cancel) {
+    while let Ok(result) = results.try_recv() {
+        children.acknowledge_result(&result.id);
+    }
 }
 
 /// Every child that has finished since the last look, landed in the order they ended;
@@ -2479,13 +2737,14 @@ fn delivered(
     late: bool,
     history: &mut Vec<Value>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
+    children: Option<&Cancel>,
 ) -> Vec<String> {
     let Some(results) = results else {
         return Vec::new();
     };
     let mut landed = Vec::new();
     while let Ok(result) = results.try_recv() {
-        landed.push(land(result, late, history, tx));
+        landed.push(land(result, late, history, tx, children));
     }
     landed
 }
@@ -3106,6 +3365,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     });
 
     let (tx_child, mut rx_child) = mpsc::unbounded_channel();
+    let (done, mut completed) = oneshot::channel();
     let work = async move {
         let task = json!({
             "type": "message",
@@ -3145,6 +3405,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             steps = Empty
         ))
         .await;
+        let _ = done.send(());
         (result, history)
     };
     let tag = format!("[child {} {identity}]", child.id);
@@ -3155,7 +3416,20 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     let forward = async {
         let mut usage = Usage::default();
         let mut failure = None;
-        while let Some(event) = rx_child.recv().await {
+        let mut closed = false;
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = &mut completed, if !closed => {
+                    rx_child.close();
+                    closed = true;
+                    continue;
+                }
+                event = rx_child.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
             let event = match event {
                 AgentEvent::Usage(u) => {
                     let _ = child.tx.send(inside(AgentEvent::Usage(u)));
@@ -3242,7 +3516,8 @@ pub async fn run_child(child: Child<'_>) -> Finished {
                     continue;
                 }
                 // Everything the child says goes to its own pane.
-                said @ (AgentEvent::Reasoning(_)
+                said @ (AgentEvent::Phase(_)
+                | AgentEvent::Reasoning(_)
                 | AgentEvent::Text(_)
                 | AgentEvent::Commentary(_)
                 | AgentEvent::ToolStart { .. }
@@ -3314,6 +3589,16 @@ const UNSUBMITTED: &str = "ended without a result accepted by submit_result";
 /// string in it neutralised. A message typed into the child after that acceptance
 /// supersedes it, so a result from before the change of plan is not taken for one after.
 fn submitted(history: &[Value], accepted: &[Value]) -> Result<String, &'static str> {
+    let (Some(last), Some(value)) = (accepted_submission(history), accepted.last()) else {
+        return Err(UNSUBMITTED);
+    };
+    if history[last..].iter().any(|item| item["role"] == "user") {
+        return Err("was sent a message after its result was accepted and submitted none after it");
+    }
+    serde_json::to_string_pretty(&tools::submit::sanitized(value.clone())).map_err(|_| UNSUBMITTED)
+}
+
+fn accepted_submission(history: &[Value]) -> Option<usize> {
     let text = |item: &Value, key: &str| {
         item.get(key)
             .and_then(Value::as_str)
@@ -3326,21 +3611,11 @@ fn submitted(history: &[Value], accepted: &[Value]) -> Result<String, &'static s
         .filter(|item| text(item, "name") == tools::submit::NAME)
         .map(|item| text(item, "call_id"))
         .collect();
-    let last = history.iter().rposition(|item| {
+    history.iter().rposition(|item| {
         text(item, "type") == "function_call_output"
             && submits.contains(&text(item, "call_id"))
             && text(item, "output").starts_with(tools::submit::ACCEPTED)
-    });
-    let (Some(last), Some(value)) = (last, accepted.last()) else {
-        return Err(UNSUBMITTED);
-    };
-    let steered = history[last..]
-        .iter()
-        .any(|item| text(item, "role") == "user");
-    if steered {
-        return Err("was sent a message after its result was accepted and submitted none after it");
-    }
-    serde_json::to_string_pretty(&tools::submit::sanitized(value.clone())).map_err(|_| UNSUBMITTED)
+    })
 }
 
 /// The assistant text of the model's last answer, when it ended without tool calls.
@@ -3753,6 +4028,7 @@ async fn ask(
     tx: &mpsc::UnboundedSender<AgentEvent>,
 ) -> Option<(String, bool)> {
     let (reply, wait) = oneshot::channel();
+    let _ = tx.send(AgentEvent::Phase(Phase::Approval));
     if tx
         .send(AgentEvent::Approval {
             child: false,
@@ -3771,6 +4047,7 @@ async fn ask(
     }
 
     let answer = wait.await.unwrap_or(Answer::Reject);
+    let _ = tx.send(AgentEvent::Phase(Phase::Tools));
     if answer.accepted() {
         if let Some(rule) = answer.remember().and_then(|r| offers.get(r)) {
             let _ = tx.send(remembered(policy, rule));
@@ -3835,6 +4112,8 @@ pub mod fake {
     pub const REFUSE_IMAGE: &str = "fake.refuse_image";
     /// Leads a script step that ends on `end_turn: false`.
     pub const CONTINUES: &str = "fake.continues";
+    /// Leads a script step cut off at the output limit.
+    pub const TRUNCATED: &str = "fake.truncated";
     /// Leads a script step whose call completes with no usage block.
     pub const UNMETERED: &str = "fake.unmetered";
 
@@ -4033,6 +4312,10 @@ pub mod fake {
                     let limits =
                         RateLimits::from_event(&event, chrono::Utc::now().timestamp()).unwrap();
                     on_delta(Delta::RateLimits(limits));
+                }
+                if next.first().and_then(|item| item["type"].as_str()) == Some(TRUNCATED) {
+                    next.remove(0);
+                    on_delta(Delta::Truncated);
                 }
                 let unmetered =
                     next.first().and_then(|item| item["type"].as_str()) == Some(UNMETERED);
@@ -4257,6 +4540,16 @@ mod tests {
         healed.extend(missing);
         assert!(abandoned(&healed).is_empty());
     }
+    #[test]
+    fn a_child_report_cannot_close_another_assignment_by_quoting_its_id() {
+        let history = vec![
+            json!({"type": "function_call_output", "output": "child aaaaaa (worker) started."}),
+            json!({"type": "function_call_output", "output": "child bbbbbb (worker) started."}),
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("{CHILD_RESULT}\n\nchild aaaaaa (worker) finished\nquoted: child bbbbbb (worker) finished")}]}),
+        ];
+        assert_eq!(open_children(&history), [("bbbbbb", "worker")]);
+    }
+
     use super::*;
     use crate::permissions::Mode;
 
@@ -4573,6 +4866,7 @@ mod tests {
             let goal: goal::Shared = Arc::default();
             let plan = crate::plan::Shared::new(Arc::clone(&goal));
             let context = GoalContext {
+                children: None,
                 goal: &goal,
                 plan: &plan,
                 compact_requested: &requested,
@@ -5040,6 +5334,7 @@ mod tests {
             // step that asked for it and the next one.
             if n == 0 {
                 post.send(ChildResult {
+                    id: "abc123".to_string(),
                     identity: "worker".to_string(),
                     description: "look around".to_string(),
                     text: "child abc123 (worker) finished in 1 steps, 10/2 tokens\nwhat I found"
@@ -5296,6 +5591,275 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clearing_queued_reports_releases_their_assignments_for_new_goals() {
+        use crate::tools::Tool as _;
+        let children = Arc::new(Cancel::default());
+        children.expect_result("abcdef");
+        let (tx, mut results) = mpsc::unbounded_channel();
+        tx.send(ChildResult {
+            id: "abcdef".into(),
+            identity: "general".into(),
+            description: "old work".into(),
+            text: "child abcdef (general) finished".into(),
+        })
+        .unwrap();
+        discard_results(&mut results, &children);
+        assert!(!children.has_children());
+        let goal: goal::Shared = Arc::new(Mutex::new(Some(Goal::new("new work"))));
+        let plan = crate::plan::Shared::new(Arc::clone(&goal));
+        plan.update(&json!({"plan": [{"step": "verify", "status": "completed", "reason": "checks passed"}]})).unwrap();
+        let tool = tools::goal::Goal {
+            children,
+            goal,
+            plan,
+            requested: Arc::default(),
+        };
+        assert!(
+            tool.execute(&json!({"status": "complete", "reason": "verified"}))
+                .await
+                .1
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_completion_waits_for_a_child_outcome_published_during_the_model_call() {
+        use fake::{Fake, call, say};
+        let shared: goal::Shared = Arc::new(Mutex::new(Some(Goal::new("verify"))));
+        let plan = crate::plan::Shared::new(Arc::clone(&shared));
+        plan.update(&json!({"plan": [{"step": "verify", "status": "completed", "reason": "checks passed"}]})).unwrap();
+        let cancel = Arc::new(Cancel::default());
+        let flag = Mutex::new(Some(cancel.child("abcdef")));
+        cancel.expect_result("abcdef");
+        let (post, mut results) = mpsc::unbounded_channel();
+        let complete = || call("goal", json!({"status": "complete", "reason": "verified"}));
+        let fake = Fake::new(vec![vec![complete()], vec![complete()], vec![say("done")]]).during(
+            move |step| {
+                if step == 0 {
+                    drop(flag.lock().unwrap().take());
+                    post.send(ChildResult {
+                        id: "abcdef".into(),
+                        identity: "general".into(),
+                        description: "verify".into(),
+                        text: "child abcdef (general) failed: verification failed".into(),
+                    })
+                    .unwrap();
+                }
+            },
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = Registry::new(Vec::new()).with_goal(tools::goal::Goal {
+            children: Arc::clone(&cancel),
+            goal: Arc::clone(&shared),
+            plan: plan.clone(),
+            requested: Arc::default(),
+        });
+        let requested = Arc::default();
+        let context_usage = Arc::default();
+        let quota = Arc::default();
+        let context = GoalContext {
+            children: Some(&cancel),
+            goal: &shared,
+            plan: &plan,
+            compact_requested: &requested,
+            context_usage: &context_usage,
+            quota: &quota,
+        };
+        let outcome = turn(
+            &fake,
+            &registry,
+            &Policy::default(),
+            None,
+            &registry.schemas(),
+            "",
+            &mut Vec::new(),
+            &tx,
+            &cancel.flag(),
+            &mut Vec::new(),
+            &mut CacheMonitor::default(),
+            None,
+            &mut Sink::Discard,
+            None,
+            Some(&mut results),
+            Some(&context),
+            None,
+        )
+        .await;
+        assert!(outcome.result.is_ok());
+        let bodies = fake.bodies.lock().unwrap();
+        let second = bodies[1].1["input"].to_string();
+        assert!(second.contains("Child assignments"), "{second}");
+        assert!(second.contains("verification failed"), "{second}");
+        assert!(!cancel.has_children());
+        assert_eq!(
+            lock_goal(&shared).as_ref().unwrap().state,
+            goal::State::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn event_forwarding_drains_completed_operations_without_waiting_for_sender_drop() {
+        let (a, rx_a) = mpsc::unbounded_channel();
+        let (b, rx_b) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (done, completed) = oneshot::channel();
+        a.send(AgentEvent::Info("first".into())).unwrap();
+        b.send(AgentEvent::Info("second".into())).unwrap();
+        let mut sink = Sink::Discard;
+        let forward = in_turn(vec![rx_a, rx_b], completed, &tx, None, None, &mut sink);
+        tokio::pin!(forward);
+        // A quiet live operation must not be mistaken for a completed one.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut forward)
+                .await
+                .is_err()
+        );
+        done.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), forward)
+            .await
+            .unwrap();
+        assert!(a.is_closed() && b.is_closed());
+        let mut heard = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Info(text) = event {
+                heard.push(text);
+            }
+        }
+        assert_eq!(heard, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_ending_recovers_after_a_tool_without_reexecuting_it() {
+        use fake::{Fake, call, say};
+        let dir = tools::temp_dir();
+        let path = dir.join("result.txt");
+        std::fs::write(&path, "observed result").unwrap();
+        let fake = Fake::new(vec![
+            vec![call("read", json!({"path": path}))],
+            Vec::new(),
+            vec![say("finished")],
+        ]);
+        let (history, outcome, events) = run_turn(&fake, &dir).await;
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.steps, 3);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .count(),
+            1
+        );
+        assert_eq!(final_text(&history).as_deref(), Some("finished"));
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::Info(text) if text.contains("completion deferred"))
+        ));
+        assert!(fake.breaks.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_truncated_terminal_response_continues_without_waiting_for_a_user_message() {
+        use fake::{Fake, TRUNCATED, say};
+        let dir = tools::temp_dir();
+        let fake = Fake::new(vec![
+            vec![json!({"type": TRUNCATED}), say("partial report")],
+            vec![say("remaining report")],
+        ]);
+        let (_, outcome, _) = run_turn(&fake, &dir).await;
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.steps, 2);
+        assert!(
+            fake.bodies.lock().unwrap()[1].1["input"]
+                .to_string()
+                .contains("output limit")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_recovery_is_bounded_even_with_tool_activity_between_empty_endings() {
+        use fake::{Fake, call};
+        let dir = tools::temp_dir();
+        let path = dir.join("result.txt");
+        std::fs::write(&path, "result").unwrap();
+        let mut script = Vec::new();
+        for _ in 0..=MAX_COMPLETION_RETRIES {
+            script.push(vec![call("read", json!({"path": path}))]);
+            script.push(Vec::new());
+        }
+        let fake = Fake::new(script);
+        let (_, outcome, _) = run_turn(&fake, &dir).await;
+        assert_eq!(outcome.steps, 2 * (MAX_COMPLETION_RETRIES + 1));
+        assert!(
+            outcome
+                .result
+                .unwrap_err()
+                .to_string()
+                .contains("completion corrections")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_child_recovers_an_empty_ending_without_a_mailbox_message() {
+        use fake::{Fake, say};
+        let fake = Fake::new(vec![Vec::new(), vec![say("reported")]]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let finished = run_child(Child {
+            id: "c1",
+            description: "report",
+            task: "report the outcome",
+            prompt: SystemPrompt::default(),
+            model: &fake,
+            policy: &Policy::default(),
+            tx: &tx,
+            cancel: &Arc::new(AtomicBool::new(false)),
+            transcript: None,
+            children: &Children::default(),
+            steer: None,
+            judge: None,
+            contract: None,
+            history: Vec::new(),
+            workdir: None,
+        })
+        .await;
+        assert_eq!(finished.steps, 2);
+        assert_eq!(finished.result.unwrap(), "reported");
+    }
+
+    #[tokio::test]
+    async fn interruption_during_an_empty_response_never_starts_recovery() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        let fake = fake::Fake::new(vec![Vec::new()]).during(move |_| {
+            stop.store(true, Ordering::Relaxed);
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let finished = run_child(Child {
+            id: "c1",
+            description: "report",
+            task: "report",
+            prompt: SystemPrompt::default(),
+            model: &fake,
+            policy: &Policy::default(),
+            tx: &tx,
+            cancel: &cancel,
+            transcript: None,
+            children: &Children::default(),
+            steer: None,
+            judge: None,
+            contract: None,
+            history: Vec::new(),
+            workdir: None,
+        })
+        .await;
+        assert_eq!(finished.steps, 1);
+        assert!(finished.result.is_err());
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(
+            |event| matches!(event, AgentEvent::Info(text) if text.contains("completion deferred"))
+        ));
+    }
+
+    #[tokio::test]
     async fn a_preamble_on_end_turn_false_carries_the_turn_on_to_the_answer() {
         use fake::{Fake, preamble, say};
 
@@ -5369,11 +5933,10 @@ mod tests {
         .await;
 
         assert_eq!(finished.steps, MAX_CONTINUES + 1);
-        // With nothing but narration, the narration is all there is to report.
-        let report = finished.result.unwrap();
+        let reason = finished.result.unwrap_err().to_string();
         assert!(
-            report.ends_with(&format!("still going {MAX_CONTINUES}")),
-            "{report}"
+            reason.contains("stalled") && reason.contains("without acting"),
+            "{reason}"
         );
     }
 
@@ -5384,8 +5947,8 @@ mod tests {
         use fake::{Fake, say};
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        // An answer with no text in it, so the turn ends cleanly with nothing to report.
-        let fake = Fake::new(vec![vec![say("")]]);
+        // Empty endings exhaust recovery, independently of transcript write failures.
+        let fake = Fake::new(vec![vec![say("")]; MAX_COMPLETION_RETRIES + 1]);
         let policy = Policy::default();
         // `/dev/null` is a file, so creating a directory under it fails on every write.
         let transcript = Path::new("/dev/null/bhai/child-c1.jsonl");
@@ -5409,7 +5972,10 @@ mod tests {
         .await;
 
         let reason = format!("{:#}", finished.result.unwrap_err());
-        assert_eq!(reason, "ended without a final message");
+        assert!(
+            reason.contains("completion corrections") && reason.contains("without a final answer"),
+            "{reason}"
+        );
         // The write failure is still shown in the child's pane.
         drop(tx);
         let mut errors = Vec::new();
@@ -5710,6 +6276,13 @@ mod tests {
         let (files, meta): (Vec<_>, Vec<_>) = std::fs::read_dir(dir.join("sess"))
             .unwrap()
             .map(|e| e.unwrap().path())
+            .filter(|path| {
+                !path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(".result.json")
+            })
             .partition(|path| path.extension().is_some_and(|e| e == "jsonl"));
         assert_eq!(files.len(), 1);
         assert_eq!(meta.len(), 1);
@@ -6595,6 +7168,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let registry = Registry::new(Vec::new())
             .with_goal(tools::goal::Goal {
+                children: Arc::default(),
                 goal: Arc::clone(&shared),
                 plan: plan.clone(),
                 requested: Arc::default(),
@@ -6621,6 +7195,7 @@ mod tests {
         let context_usage = Arc::default();
         let quota = Arc::default();
         let context = GoalContext {
+            children: None,
             goal: &shared,
             plan: &plan,
             compact_requested: &requested,

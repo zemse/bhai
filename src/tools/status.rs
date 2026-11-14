@@ -63,7 +63,7 @@ impl Tool for Status {
             "description": "Read context usage (input_tokens, window_tokens, percent, estimated) and a succinct JSON snapshot of background work. Context reflects the latest model call; estimated is true when backend usage is unavailable. \
         rate_limits, when available, reports subscription window used_percent, window_minutes, resets_at (Unix seconds), credits, observed_at and age_seconds from this agent's latest quota report, not a live fetch. \
         Commands include running sessions and exited ones with next: collect (use write_stdin with that id). \
-        Children include only active tasks. Monitors include state and a short summary. \
+        Children include running assignments and report_queued outcomes not yet consumed by the parent. Monitors include state and a short summary. \
         Empty sections are omitted. Reads do not wait, collect results or change anything; push updates arrive separately.",
             "strict": true,
             "parameters": {
@@ -93,9 +93,16 @@ impl Tool for Status {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .filter(|child| self.cancel.running(&child.id))
+                .filter(|child| {
+                    self.cancel.running(&child.id) || self.cancel.awaiting_result(&child.id)
+                })
                 .map(|child| {
-                    json!({"id": child.id, "task": brief(&child.description), "state": "running"})
+                    let state = if self.cancel.running(&child.id) {
+                        "running"
+                    } else {
+                        "report_queued"
+                    };
+                    json!({"id": child.id, "task": brief(&child.description), "state": state})
                 })
                 .collect();
             let monitors = self.monitors.as_ref().map_or_else(Vec::new, |m| m.views());
@@ -372,6 +379,36 @@ mod tests {
         let (text, _) = status.execute(&json!({})).await;
         let value: Value = serde_json::from_str(&text).unwrap();
         assert!(value.get("children").is_none());
+    }
+
+    #[tokio::test]
+    async fn status_distinguishes_a_queued_report_from_a_running_child() {
+        let status = Status {
+            children: Arc::default(),
+            cancel: Arc::default(),
+            monitors: None,
+            context: Arc::default(),
+            quota: Arc::default(),
+        };
+        status.children.lock().unwrap().push(ChildUsage {
+            id: "abcdef".into(),
+            description: "verify".into(),
+            ..ChildUsage::default()
+        });
+        status.cancel.expect_result("abcdef");
+        let (text, ok) = status.execute(&json!({})).await;
+        assert!(ok);
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["children"][0]["state"], "report_queued");
+        assert!(status.cancel.has_children());
+        status.cancel.acknowledge_result("abcdef");
+        let (text, _) = status.execute(&json!({})).await;
+        assert!(
+            serde_json::from_str::<Value>(&text)
+                .unwrap()
+                .get("children")
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -151,6 +151,8 @@ pub enum Event {
     RateLimits(RateLimits),
     /// A call is about to be sent with this estimated prompt size.
     Sending(u64),
+    /// The operation responsible for the next runtime transition.
+    Phase(crate::agent::Phase),
     /// A model call is on the wire, or is over.
     Streaming(bool),
     /// Output throughput sampled on the backend's clock.
@@ -243,6 +245,7 @@ pub struct ChildRow {
     pub model: String,
     pub description: String,
     pub state: ChildState,
+    pub execution: crate::agent::Execution,
     /// Events heard from this child. A coarse sign of progress, since a child that is
     /// working says something every few seconds and one that is wedged says nothing.
     pub steps: u32,
@@ -330,6 +333,7 @@ pub struct State {
     pub identity: String,
     pub mode: Mode,
     pub working: bool,
+    pub execution: crate::agent::Execution,
     /// The interrupted parent can be continued from the empty prompt.
     pub resumable: bool,
     /// Prompts waiting for the running turn, in the order they will run.
@@ -659,6 +663,7 @@ pub const APPROVAL_SETTLE: Duration = Duration::from_millis(300);
 #[derive(Default)]
 struct Inner {
     working: bool,
+    execution: crate::agent::Execution,
     resumable: bool,
     /// What was typed while a turn ran, oldest first.
     queue: VecDeque<Waiting>,
@@ -854,6 +859,7 @@ impl Session {
             self.privacy.clear();
         }
         inner.working = state["working"].as_bool().unwrap_or_default();
+        inner.execution = read(state, "execution").unwrap_or_default();
         inner.resumable = state["resumable"].as_bool().unwrap_or_default();
         inner.started = inner.working.then(Instant::now);
         let queued: Vec<String> = read(state, "queued").unwrap_or_default();
@@ -1048,6 +1054,7 @@ impl Session {
                     .push_front((approval, oneshot::channel().0, false));
                 inner.shown = Some(Instant::now());
             }
+            Event::Phase(phase) => inner.execution.set(*phase),
             Event::Resolved { id, .. } => inner.pending.retain(|(a, _, _)| a.id != *id),
             Event::Usage(usage) => {
                 inner.total += *usage;
@@ -1186,6 +1193,10 @@ impl Session {
         }
     }
 
+    pub fn execution(&self) -> crate::agent::Execution {
+        self.lock().execution.clone()
+    }
+
     pub fn state(&self) -> State {
         // Read before the rest, so an event racing the snapshot is replayed, not lost.
         let seq = self.seq();
@@ -1205,6 +1216,7 @@ impl Session {
             identity: self.identity.clone(),
             mode: self.policy.mode(),
             working: inner.working,
+            execution: inner.execution.clone(),
             resumable: inner.resumable,
             queued: inner.queue.iter().map(Waiting::shown).collect(),
             input_tokens: inner.total.input,
@@ -2543,6 +2555,10 @@ A background session can be polled with write_stdin.",
                 description,
                 task,
             },
+            AgentEvent::Phase(phase) => {
+                inner.execution.set(phase);
+                Event::Phase(phase)
+            }
             AgentEvent::ChildEnded { id, ok } => Event::ChildEnded { id, ok },
             AgentEvent::Child { id, event } => match said(*event) {
                 Some(event) => Event::Child {
@@ -2754,6 +2770,7 @@ A background session can be polled with write_stdin.",
                     pane.row.model = model.clone();
                     pane.row.description = description.clone();
                     pane.row.state = ChildState::Running;
+                    pane.row.execution.set(crate::agent::Phase::Ready);
                     pane.row.started = Instant::now();
                     pane.row.last = pane.row.started;
                     pane.entries
@@ -2776,6 +2793,7 @@ A background session can be polled with write_stdin.",
                         model: model.clone(),
                         description: description.clone(),
                         state: ChildState::Running,
+                        execution: crate::agent::Execution::default(),
                         steps: 0,
                         started: Instant::now(),
                         last: Instant::now(),
@@ -2793,10 +2811,19 @@ A background session can be polled with write_stdin.",
                 }
             }
             Event::Child { id, event } => {
-                if let Some(pane) = children.iter_mut().find(|p| p.row.id == *id) {
+                let mut ended = self.ended.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(pane) = children
+                    .iter_mut()
+                    .find(|p| p.row.id == *id)
+                    .or_else(|| ended.iter_mut().find(|p| p.row.id == *id))
+                {
+                    if let Event::Phase(phase) = &**event {
+                        pane.row.execution.set(*phase);
+                    }
                     pane.row.steps += 1;
                     pane.row.last = Instant::now();
                     let entries = Arc::clone(&pane.entries);
+                    drop(ended);
                     drop(children);
                     entries
                         .lock()
@@ -2923,6 +2950,7 @@ A background session can be polled with write_stdin.",
 /// get here; anything else has no place in a pane and is dropped.
 fn said(event: AgentEvent) -> Option<Event> {
     Some(match event {
+        AgentEvent::Phase(phase) => Event::Phase(phase),
         AgentEvent::Reasoning(s) => Event::Reasoning(s),
         AgentEvent::Text(s) => Event::Text(s),
         AgentEvent::Commentary(s) => Event::Commentary(s),
@@ -3015,6 +3043,52 @@ mod tests {
             ),
             rx_user,
         )
+    }
+
+    #[test]
+    fn execution_phases_are_observable_without_conversation_entries() {
+        use crate::agent::Phase;
+        let (session, _prompts) = session();
+        for phase in [
+            Phase::Ready,
+            Phase::Model,
+            Phase::Tools,
+            Phase::Checking,
+            Phase::Ended,
+        ] {
+            session.on_agent(AgentEvent::Phase(phase));
+        }
+        let execution = session.state().execution;
+        assert_eq!(execution.phase, Phase::Ended);
+        assert_eq!(execution.transitions, 5);
+        assert!(execution.changed_at > 0);
+        assert!(session.snapshot().transcript.is_empty());
+        session.on_agent(AgentEvent::ChildStarted {
+            id: "abcdef".into(),
+            identity: "general".into(),
+            model: "fake".into(),
+            description: "inspect".into(),
+            task: "inspect".into(),
+        });
+        session.on_agent(AgentEvent::Child {
+            id: "abcdef".into(),
+            event: Box::new(AgentEvent::Phase(Phase::Approval)),
+        });
+        assert_eq!(
+            session.snapshot().children[0].row.execution.phase,
+            Phase::Approval
+        );
+        assert_eq!(session.state().execution, execution);
+        let seed = Seed {
+            state: serde_json::to_value(session.state()).unwrap(),
+            ..Seed::default()
+        };
+        let (attached, _) = self::session();
+        attached.seed(seed);
+        assert_eq!(attached.execution(), execution);
+        attached.mirror(Event::Phase(Phase::WaitingChildren));
+        assert_eq!(attached.execution().transitions, 6);
+        assert_eq!(attached.execution().phase, Phase::WaitingChildren);
     }
 
     #[test]

@@ -53,6 +53,7 @@ impl Blocker {
 }
 
 pub struct Goal {
+    pub children: Arc<crate::agent::Cancel>,
     pub goal: Shared,
     pub plan: crate::plan::Shared,
     /// Only a turn opened by the user may adopt or resume a task, once per turn.
@@ -244,6 +245,9 @@ impl Tool for Goal {
                     {
                         return ("The goal needs a short outcome-oriented plan before completion. Record the work and its checks with update_plan.".to_string(), false);
                     }
+                    if matches!(status, "complete" | "blocked") && self.children.has_children() {
+                        return ("Child assignments are still running or delivering their reports. Wait for their outcomes before completing or blocking the goal.".to_string(), false);
+                    }
                     if status == "complete" && goal.plan.as_ref().is_some_and(|plan| !plan.done()) {
                         return ("The goal's plan has unfinished steps. Finish them or mark unnecessary steps skipped with reasons, then verify the requirements before completing.".to_string(), false);
                     }
@@ -285,6 +289,7 @@ mod tests {
     fn tool(goal: Option<goal::Goal>, requested: bool) -> Goal {
         let shared = Arc::new(std::sync::Mutex::new(goal));
         Goal {
+            children: Arc::default(),
             goal: Arc::clone(&shared),
             plan: crate::plan::Shared::new(shared),
             requested: Arc::new(AtomicBool::new(requested)),
@@ -306,6 +311,28 @@ mod tests {
             "alternatives": ["offline tests passed; signing requires the user's hardware key"],
             "work_remaining": false
         }})
+    }
+
+    #[tokio::test]
+    async fn completion_and_blocking_wait_for_live_child_assignments() {
+        let tool = tool(Some(goal::Goal::new("verify")), false);
+        tool.plan.update(&json!({"plan": [{"step": "verify", "status": "completed", "reason": "offline checks passed"}]})).unwrap();
+        let child = tool.children.child("abc123");
+        for args in [
+            json!({"status": "complete", "reason": "verified"}),
+            blocked("needs input"),
+        ] {
+            let (text, ok) = tool.execute(&args).await;
+            assert!(!ok, "{text}");
+            assert!(text.contains("Child assignments"), "{text}");
+            assert!(tool.goal.lock().unwrap().as_ref().unwrap().active());
+        }
+        drop(child);
+        assert!(
+            tool.execute(&json!({"status": "complete", "reason": "verified"}))
+                .await
+                .1
+        );
     }
 
     #[tokio::test]

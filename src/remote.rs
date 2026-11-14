@@ -323,6 +323,7 @@ fn child(value: &Value, entry: impl Fn(&Value) -> Option<Entry>) -> Option<Child
         model: text("model"),
         description: text("description"),
         state: serde_json::from_value(row["state"].clone()).ok()?,
+        execution: serde_json::from_value(row["execution"].clone()).unwrap_or_default(),
         steps: u32::try_from(row["steps"].as_u64().unwrap_or_default()).unwrap_or(u32::MAX),
         started: Instant::now()
             .checked_sub(Duration::from_secs(
@@ -1987,6 +1988,7 @@ mod tests {
                 model: String::new(),
                 description: String::new(),
                 state,
+                execution: Default::default(),
                 steps,
                 started: Instant::now(),
                 last: Instant::now(),
