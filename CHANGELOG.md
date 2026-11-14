@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-11-15
+
+- Double-clicked transcript words copy only their visible text, without Markdown formatting or the rest of a styled span. Drag selections still copy Markdown.
+
 ## 2026-11-12
 
 - Quota reports no longer inject checkpoint instructions, pause goals or suppress automatic compaction. Usage reporting and quota notifications remain informational.

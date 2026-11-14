@@ -231,6 +231,8 @@ pub struct App {
     opener: fn(&str) -> std::io::Result<()>,
     /// The selected span of the transcript, drawn reversed and copied by `ctrl+y`.
     pub selection: Option<Selection>,
+    /// A double-clicked word copies as visible text, not markdown.
+    word_selection: bool,
     /// The wrapped cell a transcript drag anchors at.
     anchor: Option<(usize, usize)>,
     /// Where a left press landed, until the pointer moves off that cell.
@@ -468,6 +470,7 @@ impl App {
             pointer: None,
             opener: crate::links::launch,
             selection: None,
+            word_selection: false,
             anchor: None,
             press: None,
             clicks: None,
@@ -1186,6 +1189,7 @@ impl App {
             .any(|(_, toggle)| toggle.row == cell.0 && toggle.chars.contains(&cell.1));
         let count = if control { 1 } else { self.click_count(x, y) };
         // A single press drops the old selection; a drag builds the new one.
+        self.word_selection = count == 2;
         self.selection = match count {
             2 => Some(Selection::word(&self.lines[cell.0], cell)),
             3 => Some(Selection::line(&self.lines[cell.0], cell)),
@@ -1468,6 +1472,7 @@ impl App {
         let Some(last) = self.lines.len().checked_sub(1) else {
             return;
         };
+        self.word_selection = false;
         self.selection = Some(Selection {
             anchor: (0, 0),
             head: (last, self.lines[last].chars().count()),
@@ -1507,13 +1512,14 @@ impl App {
         let (Some(anchor), Some(head)) = (self.anchor, self.drag_cell(x, y)) else {
             return scrolled;
         };
+        self.word_selection = false;
         let selection = Some(Selection { anchor, head });
         std::mem::replace(&mut self.selection, selection) != selection || scrolled
     }
 
-    /// The selected transcript text. What an assistant message drew copies as the
-    /// markdown under it; anything else as the text on screen, with trailing spaces and
-    /// the renderer's margins trimmed and the rows the wrap broke back on one line.
+    /// The selected transcript text. Double-clicked words copy as visible text; other
+    /// assistant selections as markdown. Screen text has trailing spaces and margins
+    /// trimmed and the rows the wrap broke back on one line.
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
         let (from, to) = selection.range();
@@ -1521,7 +1527,9 @@ impl App {
         let mut parts: Vec<(Join, String)> = Vec::new();
         let mut line = from.0;
         while line <= last {
-            let entry = self.source_at(line);
+            let entry = (!self.word_selection)
+                .then(|| self.source_at(line))
+                .flatten();
             let mut end = line;
             while entry.is_some() && end < last && self.source_at(end + 1) == entry {
                 end += 1;

@@ -4107,6 +4107,49 @@ mod tests {
     }
 
     #[test]
+    fn a_double_clicked_word_copies_only_its_visible_text() {
+        for source in [
+            "**Creatinine / kidney function**",
+            "*Creatinine / kidney function*",
+            "~~Creatinine / kidney function~~",
+            "`Creatinine / kidney function`",
+            "[Creatinine / kidney function](https://example.com)",
+            "## Creatinine / kidney function",
+            "**Créatinine / kidney function**",
+        ] {
+            let word = if source.contains("Créatinine") {
+                "Créatinine"
+            } else {
+                "Creatinine"
+            };
+            let (mut app, _) = drawn(source, 60);
+            let (line, column) = find(&app, word);
+            let area = app.transcript_area.unwrap();
+            let (x, y) = (
+                area.x + column as u16 + 2,
+                area.y + (line - app.scroll) as u16,
+            );
+            // The first release may activate a link or copy inline code.
+            app.on_mouse(down(x, y));
+            app.on_mouse(down(x, y));
+            app.on_mouse(up(x, y));
+            assert_eq!(app.selected_text().as_deref(), Some(word), "{source}");
+            assert_eq!(crate::clipboard::last_copied().as_deref(), Some(word));
+            app.on_key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL,
+            ));
+            assert_eq!(crate::clipboard::last_copied().as_deref(), Some(word));
+
+            app.on_key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+            ));
+            assert!(app.selected_text().unwrap().trim_end().ends_with(source));
+        }
+    }
+
+    #[test]
     fn a_selection_copies_the_markdown_under_it() {
         let source = "## Plan\n\nrun **this one** now\n\n```rust\nfn main() {\n    go();\n}\n```\n\n\
                       | a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\n- first\n- second";
