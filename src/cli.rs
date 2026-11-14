@@ -326,9 +326,12 @@ pub async fn entry() -> Result<()> {
             warnings.extend(loaded.warnings.iter().map(|w| format!("warning: {w}")));
             let mut writer = sessions::Writer::resume(&dir, &loaded)?;
             let mut history = loaded.items;
-            for report in
-                agent::abandoned_with_reports(&history, Some(&dir.join(&loaded.header.session)))
-            {
+            let children = dir.join(&loaded.header.session);
+            for report in agent::saved_child_reports(&children, &loaded.child_reports) {
+                writer.append(&report)?;
+                history.push(report);
+            }
+            for report in agent::abandoned_with_reports(&history, Some(&children)) {
                 writer.append(&report)?;
                 history.push(report);
             }

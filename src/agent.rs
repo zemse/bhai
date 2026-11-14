@@ -591,6 +591,7 @@ pub type Children = Arc<Mutex<Vec<ChildUsage>>>;
 /// history read back from disk shows it as a report rather than as something the user
 /// typed.
 pub const CHILD_RESULT: &str = "A child agent you started has finished.";
+pub(crate) const CHILD_RECEIPT: &str = "bhai_child_report";
 
 /// Added when the report opens a turn of its own. By then the user already has an answer,
 /// so the report is an addendum: without this the model re-answers from the top and every
@@ -656,6 +657,7 @@ pub fn abandoned_with_reports(history: &[Value], directory: Option<&Path>) -> Ve
             if let Some(result) = saved {
                 return json!({
                     "type": "message", "role": "user",
+                    "bhai_child_report": result.report_id,
                     "content": [{"type": "input_text", "text": format!("{CHILD_RESULT}\n\n{}", result.text)}],
                 });
             }
@@ -675,9 +677,54 @@ needed."
         .collect()
 }
 
+pub(crate) fn child_receipt(item: &Value) -> Option<&str> {
+    if item["role"] != "user"
+        || !item
+            .pointer("/content/0/text")?
+            .as_str()?
+            .starts_with(CHILD_RESULT)
+    {
+        return None;
+    }
+    item.get(CHILD_RECEIPT)?
+        .as_str()
+        .filter(|id| !id.is_empty())
+}
+
+/// Recover unconsumed outcomes even when compaction removed their start records.
+pub fn saved_child_reports(directory: &Path, consumed: &HashSet<String>) -> Vec<Value> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    });
+    paths.into_iter().filter_map(|path| {
+        let name = path.file_name()?.to_str()?;
+        let id = name.strip_prefix("child-")?.strip_suffix(".result.json")?;
+        let result = tools::agent::read_report(directory, id)?;
+        if result.report_id.is_empty() || consumed.contains(&result.report_id) {
+            return None;
+        }
+        Some(json!({
+            "type": "message", "role": "user",
+            "bhai_child_report": result.report_id,
+            "content": [{"type": "input_text", "text": format!("{CHILD_RESULT}\n\n{}", result.text)}],
+        }))
+    }).collect()
+}
+
 /// A detached child agent that has finished, on its way into the parent's history.
 #[derive(Debug, Clone, serde::Deserialize, Serialize)]
 pub struct ChildResult {
+    #[serde(default)]
+    pub report_id: String,
     #[serde(default)]
     pub id: String,
     pub identity: String,
@@ -1193,7 +1240,12 @@ pub(crate) async fn run_configured(
                             let _ = tx.send(AgentEvent::TurnEnd);
                             continue;
                         }
-                        discard_results(&mut rx_results, &stop);
+                        let discarded = discard_results(&mut rx_results, &stop);
+                        if let Some(writer) = writer.as_mut()
+                            && let Err(error) = writer.child_receipts(&discarded)
+                        {
+                            let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}could not save discarded child receipts: {error:#}")));
+                        }
                         children.lock().unwrap_or_else(|e| e.into_inner()).clear();
                         let private = crate::privacy::active();
                         let before = compact::estimate(&history, tokenizer);
@@ -2703,6 +2755,7 @@ fn land(
     history.push(json!({
         "type": "message",
         "role": "user",
+        "bhai_child_report": result.report_id,
         "content": [{
             "type": "input_text",
             "text": match late {
@@ -2724,10 +2777,18 @@ fn land(
     result.description
 }
 
-fn discard_results(results: &mut mpsc::UnboundedReceiver<ChildResult>, children: &Cancel) {
+fn discard_results(
+    results: &mut mpsc::UnboundedReceiver<ChildResult>,
+    children: &Cancel,
+) -> Vec<String> {
+    let mut discarded = Vec::new();
     while let Ok(result) = results.try_recv() {
         children.acknowledge_result(&result.id);
+        if !result.report_id.is_empty() {
+            discarded.push(result.report_id);
+        }
     }
+    discarded
 }
 
 /// Every child that has finished since the last look, landed in the order they ended;
@@ -5334,6 +5395,7 @@ mod tests {
             // step that asked for it and the next one.
             if n == 0 {
                 post.send(ChildResult {
+                    report_id: "report-abc123".to_string(),
                     id: "abc123".to_string(),
                     identity: "worker".to_string(),
                     description: "look around".to_string(),
@@ -5597,13 +5659,17 @@ mod tests {
         children.expect_result("abcdef");
         let (tx, mut results) = mpsc::unbounded_channel();
         tx.send(ChildResult {
+            report_id: "discarded-report".into(),
             id: "abcdef".into(),
             identity: "general".into(),
             description: "old work".into(),
             text: "child abcdef (general) finished".into(),
         })
         .unwrap();
-        discard_results(&mut results, &children);
+        assert_eq!(
+            discard_results(&mut results, &children),
+            ["discarded-report"]
+        );
         assert!(!children.has_children());
         let goal: goal::Shared = Arc::new(Mutex::new(Some(Goal::new("new work"))));
         let plan = crate::plan::Shared::new(Arc::clone(&goal));
@@ -5637,6 +5703,7 @@ mod tests {
                 if step == 0 {
                     drop(flag.lock().unwrap().take());
                     post.send(ChildResult {
+                        report_id: "report-abcdef".into(),
                         id: "abcdef".into(),
                         identity: "general".into(),
                         description: "verify".into(),

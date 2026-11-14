@@ -55,9 +55,10 @@ outcomes remain outstanding. Existing plan checks still apply. This is not a sem
 proof that arbitrary prose answers or claimed test results satisfy the user's request.
 
 Delegated child outcomes are saved as private `child-ID.result.json` files before parent
-notification. CLI resume recovers saved outcomes missing from the parent's history,
-instead of calling those children interrupted. Continuing a child clears its old saved
-outcome before starting the new assignment. Child task panics publish failures; neither
+notification. Per-assignment receipts stay in the session journal through compaction and
+`/clear`, outside model-visible context. CLI resume recovers outcomes without receipts,
+even when their start records have been compacted away. Continuing a child clears its
+old saved outcome before starting the new assignment. Child task panics publish failures; neither
 panic recovery nor resume reruns commands whose effects may already have happened.
 Saved outcomes cover process interruption, not a power-loss durability guarantee.
 

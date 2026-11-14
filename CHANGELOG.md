@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-15
 
+- Child outcome delivery receipts survive compaction and `/clear` without entering model input. Resume recovers saved outcomes even when their start records are gone, and per-assignment IDs prevent duplicate reports after continuing the same child.
 - Agent and tool event drains finish with their operations rather than waiting for retained senders. Parent and child execution phases, transition counts and change times are visible in session snapshots; the TUI shows the current phase.
 - Empty, commentary-only and output-limited endings, and missing workflow submissions, receive bounded completion corrections without replaying tools. Repeated narration fails as stalled instead of succeeding; interruption, deliberate goal stops and legitimate child waits take precedence.
 - Delegated child outcomes are saved before notification and recovered on resume when missing from the parent's history. Panics publish failures while retaining lifecycle ownership. Goals wait for running children and unread outcomes before completing or blocking; continuing a child waits for report consumption and clears its prior saved outcome.

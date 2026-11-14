@@ -1,6 +1,7 @@
 //! Saved sessions: each session's history as append-only JSONL under
 //! `.bhai/sessions/<id>.jsonl`, a header line first, so `--resume` can continue it.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -269,6 +270,14 @@ impl Writer {
         self.write(record)
     }
 
+    /// Discarded reports still need receipts after the conversation is cleared.
+    pub fn child_receipts(&mut self, reports: &[String]) -> Result<()> {
+        if reports.is_empty() {
+            return Ok(());
+        }
+        self.write(json!({"type": "child_receipts", "reports": reports}))
+    }
+
     /// Record a `/model` switch, so a resume comes back on the model the session was
     /// last on. Before the header has gone out there is nothing to follow it with, so
     /// the header itself is what changes.
@@ -483,6 +492,8 @@ pub struct Loaded {
     pub model: String,
     pub effort: String,
     pub items: Vec<Value>,
+    /// Consumed child outcomes, including those removed from history by compaction.
+    pub child_reports: HashSet<String>,
     /// The goal as last recorded.
     pub goal: Option<crate::goal::Goal>,
     /// The plan as last recorded.
@@ -519,6 +530,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
     let mut authorizations = Vec::new();
     let mut legacy_sources = Vec::new();
     let mut preceding_assistant = None;
+    let mut child_reports = Vec::new();
     while let Some(line) = lines.next() {
         let record = serde_json::from_str::<Value>(line)
             .ok()
@@ -544,7 +556,22 @@ pub fn load(path: &Path) -> Result<Loaded> {
             let Some(compacted) = record.get("items").and_then(Value::as_array) else {
                 bail!("{}: compaction {id} has no items", path.display());
             };
+            child_reports.extend(
+                compacted
+                    .iter()
+                    .filter_map(crate::agent::child_receipt)
+                    .map(|id| (id.to_string(), index)),
+            );
             items = compacted.iter().map(|item| (item.clone(), index)).collect();
+        } else if kind == Some("child_receipts") {
+            let reports: Vec<String> = serde_json::from_value(record["reports"].clone())
+                .with_context(|| format!("{}: invalid child receipts {id}", path.display()))?;
+            child_reports.extend(
+                reports
+                    .into_iter()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| (id, index)),
+            );
         } else if kind == Some("model") {
             let text = |key| record.get(key).and_then(Value::as_str).map(str::to_string);
             let (Some(switched), Some(to)) = (text("model"), text("effort")) else {
@@ -636,6 +663,9 @@ pub fn load(path: &Path) -> Result<Loaded> {
                         .filter(|text| !text.is_empty() && text.len() <= 4000);
                 }
             }
+            if let Some(report) = crate::agent::child_receipt(item) {
+                child_reports.push((report.to_string(), index));
+            }
             items.push((item.clone(), index));
         }
         len += line.len() as u64;
@@ -711,6 +741,11 @@ pub fn load(path: &Path) -> Result<Loaded> {
         effort,
         last: records.last().map(|(id, _)| id.clone()),
         items: items.into_iter().map(|(item, _)| item).collect(),
+        child_reports: child_reports
+            .into_iter()
+            .filter(|(_, index)| *index < records.len())
+            .map(|(id, _)| id)
+            .collect(),
         goal,
         plan,
         authorization,
@@ -1015,7 +1050,10 @@ pub fn prune_report(pruned: &Pruned) -> String {
 }
 
 fn legacy_user_text(item: &Value) -> Option<String> {
-    if item.get("role")?.as_str()? != "user" || item["bhai_automatic"] == true {
+    if item.get("role")?.as_str()? != "user"
+        || item["bhai_automatic"] == true
+        || crate::agent::child_receipt(item).is_some()
+    {
         return None;
     }
     let parts = item.get("content")?.as_array()?;
@@ -1069,6 +1107,30 @@ mod tests {
         assert!(!path.with_extension("json.tmp").exists());
         std::fs::write(&path, "not json").unwrap();
         assert!(read_name(&path).is_err());
+    }
+
+    #[test]
+    fn child_receipts_survive_compaction_and_deliberate_conversation_clear() {
+        let dir = temp_dir();
+        let mut writer = Writer::create(&dir, header("receipts"));
+        let report = json!({
+            "type": "message", "role": "user", "bhai_child_report": "consumed-run",
+            "content": [{"type": "input_text", "text": format!("{}\n\nchild abcdef (general) finished", crate::agent::CHILD_RESULT)}],
+        });
+        assert!(legacy_user_text(&report).is_none());
+        writer.append(&report).unwrap();
+        writer.compact("fold", 100, 10, &[]).unwrap();
+        writer
+            .child_receipts(&["discarded-run".to_string()])
+            .unwrap();
+        writer.compact("clear", 10, 0, &[]).unwrap();
+        let loaded = load(&path(&dir, "receipts")).unwrap();
+        assert!(loaded.items.is_empty());
+        assert_eq!(
+            loaded.child_reports,
+            HashSet::from(["consumed-run".to_string(), "discarded-run".to_string()])
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -163,6 +163,7 @@ pub(crate) fn timed_input(input: &[Value]) -> Vec<Value> {
         .map(|mut item| {
             if let Some(item) = item.as_object_mut() {
                 item.remove("bhai_automatic");
+                item.remove(crate::agent::CHILD_RECEIPT);
             }
             let stamp = item
                 .as_object_mut()
@@ -799,6 +800,18 @@ mod tests {
         assert_eq!(timestamp_message(call.clone()), call);
         let reasoning = json!({"type": "reasoning", "summary": []});
         assert_eq!(timestamp_message(reasoning.clone()), reasoning);
+    }
+
+    #[test]
+    fn child_delivery_receipts_never_reach_model_input() {
+        let item = json!({
+            "type": "message", "role": "user", "bhai_child_report": "private-receipt",
+            "content": [{"type": "input_text", "text": "child result"}],
+        });
+        let input = timed_input(std::slice::from_ref(&item));
+        assert!(input[0].get(crate::agent::CHILD_RECEIPT).is_none());
+        assert_eq!(input[0]["content"], item["content"]);
+        assert!(item.get(crate::agent::CHILD_RECEIPT).is_some());
     }
 
     #[test]

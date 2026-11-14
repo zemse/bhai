@@ -322,7 +322,9 @@ impl Agent {
         // Forked now, so the child starts from what the session had done when it asked.
         let judge = self.judge.as_ref().map(|judge| judge.child(&id, &task));
         let span = crate::trace::child(&id, &identity.name);
+        let report_id = uuid::Uuid::new_v4().simple().to_string();
         let fallback = ChildResult {
+            report_id: report_id.clone(),
             id: id.clone(),
             identity: identity.name.clone(),
             description: description.clone(),
@@ -354,6 +356,7 @@ impl Agent {
                     &results,
                     &tx,
                     ChildResult {
+                        report_id: report_id.clone(),
                         id: id.clone(),
                         identity: identity.name.clone(),
                         description,
@@ -412,6 +415,7 @@ impl Agent {
                 &results,
                 &tx,
                 ChildResult {
+                    report_id,
                     id: id.clone(),
                     identity: identity.name.clone(),
                     description,
@@ -871,6 +875,54 @@ mod tests {
         let recovered = agent::abandoned_with_reports(&history, Some(&harness.agent.transcripts));
         assert!(recovered[0].to_string().contains("the observed result"));
         std::fs::remove_dir_all(harness.agent.transcripts).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_outcomes_recover_without_start_records_and_do_not_replay_after_compaction() {
+        let fake = Fake::new(vec![vec![say("same answer")], vec![say("same answer")]]);
+        let mut harness = tool(&fake, false);
+        let first = harness
+            .report(json!({"description": "inspect", "prompt": "inspect"}))
+            .await;
+        let id = first
+            .strip_prefix("child ")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        let directory = &harness.agent.transcripts;
+        let initial = read_report(directory, &id).unwrap();
+        let reports = agent::saved_child_reports(directory, &std::collections::HashSet::new());
+        assert_eq!(reports.len(), 1);
+        let mut writer = crate::sessions::Writer::create(
+            directory,
+            crate::sessions::Header::new("parent", "general", "fake", "medium", directory),
+        );
+        writer.append(&reports[0]).unwrap();
+        writer.compact("fold", 100, 1, &[]).unwrap();
+        let loaded = crate::sessions::load(&crate::sessions::path(directory, "parent")).unwrap();
+        assert!(loaded.items.is_empty());
+        assert!(agent::saved_child_reports(directory, &loaded.child_reports).is_empty());
+        let (started, ok) = harness
+            .agent
+            .execute(&json!({"description": "again", "prompt": "again", "continue": id}))
+            .await;
+        assert!(ok, "{started}");
+        let next = harness.results.recv().await.unwrap();
+        assert_ne!(next.report_id, initial.report_id);
+        let pending = agent::saved_child_reports(directory, &loaded.child_reports);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            agent::child_receipt(&pending[0]),
+            Some(next.report_id.as_str())
+        );
+        writer.append(&pending[0]).unwrap();
+        writer.compact("fold", 100, 1, &[]).unwrap();
+        let loaded = crate::sessions::load(&crate::sessions::path(directory, "parent")).unwrap();
+        assert!(agent::saved_child_reports(directory, &loaded.child_reports).is_empty());
+        harness.agent.cancel.acknowledge_result(&id);
+        harness.cleanup();
     }
 
     #[tokio::test]
