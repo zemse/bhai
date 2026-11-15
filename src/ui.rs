@@ -376,6 +376,24 @@ fn draw(frame: &mut Frame, app: &mut App) {
         crate::monitorview::height(&monitors, frame.area().height)
     };
 
+    let approval_height = if app.input_expanded && app.pending.is_none() && app.diff.is_none() {
+        let reserved = 2u16
+            .saturating_add(plan_height)
+            .saturating_add(monitor_height)
+            .saturating_add(children_height)
+            .saturating_add(queued_height)
+            .saturating_add(menu_height)
+            .saturating_add(shell_height)
+            .saturating_add(working_height);
+        frame
+            .area()
+            .height
+            .saturating_sub(reserved)
+            .max(approval_height)
+    } else {
+        approval_height
+    };
+
     let [
         transcript_area,
         plan_area,
@@ -1979,7 +1997,15 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             Color::DarkGray
         }))
-        .title_bottom(mode_chip(app.mode));
+        .title_bottom(mode_chip(app.mode))
+        .title_bottom(Line::styled(
+            if app.input_expanded {
+                " F2 collapse "
+            } else {
+                " F2 expand "
+            },
+            Style::new().fg(Color::DarkGray),
+        ));
     if shell {
         block = block.title(Line::styled(
             " shell · output saved for agent ",
@@ -4623,6 +4649,56 @@ mod tests {
         let text = screen(&terminal);
         assert!(text.contains("line 11") && !text.contains("line 3"));
         assert_eq!(terminal.get_cursor_position().unwrap().y, area.bottom() - 1);
+    }
+
+    #[test]
+    fn f2_expands_and_restores_the_input_without_changing_the_draft() {
+        let mut app = App::detached();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let draft = (0..100).map(|i| format!("line {i}\n")).collect::<String>();
+        app.input.set(draft.clone());
+        app.input.select_all();
+        let cursor = app.input.cursor();
+        let selection = app.input.selection();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let compact = app.input_area.unwrap().0.height;
+        assert_eq!(compact, MAX_INPUT_LINES as u16);
+        assert!(screen(&terminal).contains("F2 expand"));
+
+        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (area, top, _) = app.input_area.unwrap();
+        assert!(app.input_expanded);
+        assert_eq!(area.height, 20);
+        assert!(top > 0);
+        assert_eq!(terminal.get_cursor_position().unwrap().y, area.bottom() - 1);
+        assert!(screen(&terminal).contains("F2 collapse"));
+        assert_eq!(app.input.value(), draft);
+        assert_eq!(app.input.cursor(), cursor);
+        assert_eq!(app.input.selection(), selection);
+
+        app.on_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!app.input_expanded);
+        assert_eq!(app.input_area.unwrap().0.height, compact);
+        assert_eq!(app.input.value(), draft);
+        assert_eq!(app.input.selection(), selection);
+    }
+
+    #[test]
+    fn expanded_input_fits_small_terminals() {
+        for height in 4..16 {
+            let mut app = App::detached();
+            let mut terminal = Terminal::new(TestBackend::new(30, height)).unwrap();
+            app.input_expanded = true;
+            app.input.set("long draft\n".repeat(100));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let (area, _, _) = app.input_area.unwrap();
+            assert!(area.bottom() <= height);
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert!(cursor.y < height);
+            assert!(cursor.x < 30);
+        }
     }
 
     #[test]

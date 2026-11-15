@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-11-16
+
+- F2 expands the input box into the available terminal space and restores its compact height, keeping the draft, cursor and selection intact. The prompt border and `/help` show the shortcut.
+
 ## 2026-11-15
 
 - Child outcome delivery receipts survive compaction and `/clear` without entering model input. Resume recovers saved outcomes even when their start records are gone, and per-assignment IDs prevent duplicate reports after continuing the same child.

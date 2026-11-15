@@ -359,6 +359,7 @@ pub fn help() -> String {
     out.push_str(concat!(
         "\nkeys",
         "\n  enter send · alt+enter or ctrl+j newline · shift+tab permission mode",
+        "\n  F2 expands or collapses the input box",
         "\n  ctrl+c interrupt, clear the draft (ctrl+z restores), then quit on a second press · ctrl+d quit on an empty prompt",
         "\n  @<path> finds a file in the project and writes its path",
         "\n  !<command> or $<command> runs a shell command yourself, shown here and not told to the model",

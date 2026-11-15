@@ -244,6 +244,7 @@ pub struct App {
     /// The last drag's copy, for the note drawn where the drag ended.
     pub copied: Option<Copied>,
     pub input: Editor,
+    pub input_expanded: bool,
     /// Images pasted into the prompt, sent with it.
     attachments: Attachments,
     /// The `/` menu's highlighted row, while the menu is open.
@@ -477,6 +478,7 @@ impl App {
             mouse: true,
             copied: None,
             input: Editor::default(),
+            input_expanded: false,
             attachments: Attachments::default(),
             menu: None,
             files: crate::files::Finder::new(std::env::current_dir().unwrap_or_default()),
@@ -783,6 +785,7 @@ impl App {
             KeyCode::Esc if self.working => self.interrupt_turn(),
             KeyCode::Esc if self.selection.is_some() => self.selection = None,
             KeyCode::Char('b') if ctrl && self.session.background_shell() => {}
+            KeyCode::F(2) => self.input_expanded = !self.input_expanded,
             KeyCode::Char('t') if ctrl => self.all_badges = !self.all_badges,
             KeyCode::Char('s') if ctrl => self.toggle_bg(),
             KeyCode::Char('l') if ctrl => self.toggle_folds(),
