@@ -234,7 +234,6 @@ impl Goal {
     }
 
     pub fn user_followup(&mut self) {
-        self.retry_idle();
         if self.state != State::Complete {
             self.review_pending = true;
         }
@@ -282,15 +281,6 @@ impl Goal {
         }
     }
 
-    /// A fresh user message retries an idle loop, but never overrides a deliberate stop.
-    pub fn retry_idle(&mut self) {
-        if self.state == State::Paused && self.note == IDLE_PAUSE {
-            self.state = State::Active;
-            self.idle_turns = 0;
-            self.note.clear();
-        }
-    }
-
     /// What the model is told when a turn opens on it.
     pub fn prompt(&self) -> String {
         format!(
@@ -309,9 +299,6 @@ before asking for essential input."
         }
         match self.state {
             State::Active | State::Complete => {}
-            State::Paused if self.note == IDLE_PAUSE => {
-                line.push_str("; reply to retry or /goal resume")
-            }
             State::Paused => line.push_str("; ask to continue or /goal resume"),
             State::Blocked => line.push_str("; reply with the missing input or /goal resume"),
         }
@@ -479,29 +466,23 @@ mod tests {
     }
 
     #[test]
-    fn only_idle_pauses_recover_on_a_user_message() {
-        for (state, reason, resumes) in [
-            (State::Paused, IDLE_PAUSE, true),
-            (State::Paused, "paused by you", false),
-            (State::Paused, "interrupted", false),
-            (State::Paused, "the last few tool calls all failed", false),
-            (State::Blocked, "needs Zig", false),
-            (State::Complete, "verified", false),
+    fn user_messages_request_review_without_resuming_any_stopped_goal() {
+        for (state, reason) in [
+            (State::Paused, IDLE_PAUSE),
+            (State::Paused, "paused by you"),
+            (State::Paused, "interrupted"),
+            (State::Paused, "the last few tool calls all failed"),
+            (State::Blocked, "needs Zig"),
+            (State::Complete, "verified"),
         ] {
             let mut goal = Goal::new("build");
             goal.state = state;
             goal.note = reason.to_string();
             goal.idle_turns = 3;
-            goal.retry_idle();
-            if resumes {
-                assert!(goal.active());
-                assert!(goal.note.is_empty());
-                goal.progress(false);
-                assert!(goal.active(), "idle streak must reset");
-            } else {
-                assert_eq!(goal.state, state);
-                assert_eq!(goal.note, reason);
-            }
+            goal.user_followup();
+            assert_eq!(goal.state, state);
+            assert_eq!(goal.note, reason);
+            assert_eq!(goal.review_pending, state != State::Complete);
         }
     }
 
@@ -543,7 +524,7 @@ mod tests {
                 shared.as_mut().unwrap().pause("interrupted");
             }
             let goal = shared.as_mut().unwrap();
-            goal.retry_idle();
+            goal.user_followup();
             assert_eq!(goal.state, State::Paused);
             assert_eq!(
                 goal.note,

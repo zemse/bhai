@@ -7063,10 +7063,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_user_message_recovers_an_idle_goal_but_an_automatic_message_does_not() {
-        use fake::{Fake, say};
+    async fn an_idle_goal_resumes_on_user_instructions_not_status_questions_or_automatic_messages()
+    {
+        use fake::{Fake, call, say};
 
-        let fake = Fake::new(vec![vec![say("waiting")]; 9]);
+        let mut replies = vec![vec![say("waiting")]; 5];
+        replies.extend([
+            vec![call("goal", json!({"status": "resume", "reason": "user said continue", "spec": {
+                "objective": "work", "requirements": ["finish work"], "verification": ["run checks"]
+            }}))],
+            vec![completed_plan_call(), call("goal", json!({"status": "complete", "reason": "offline fixture checked"}))],
+            vec![say("done")],
+        ]);
+        let fake = Fake::new(replies);
         let (mut rx, user, _control, _cancel) = goal_session(&fake, vec![set_goal("work")]);
         for _ in 0..3 {
             settle(&mut rx).await;
@@ -7082,16 +7091,17 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(parent_calls(&fake).len(), 4);
 
-        user.send("the toolchain is installed".into())
+        user.send("what is still pending?".into()).await.unwrap();
+        settle(&mut rx).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(parent_calls(&fake).len(), 5);
+        user.send("the toolchain is installed; continue".into())
             .await
             .unwrap();
-        for _ in 0..4 {
-            settle(&mut rx).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        settle(&mut rx).await;
         let calls = parent_calls(&fake);
         assert_eq!(calls.len(), 8);
-        for (index, state) in [(3, "paused"), (4, "active")] {
+        for (index, state) in [(3, "paused"), (4, "paused"), (6, "active")] {
             let input: Vec<Value> = serde_json::from_str(&calls[index]).unwrap();
             let latest = goal::restated_lifecycle(&input).unwrap();
             assert!(

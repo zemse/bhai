@@ -363,8 +363,8 @@ with a reason; checked boxes do not replace verification. A standalone analysis 
 creates an autonomous goal. \
 The latest <goal_context> is the harness's saved specification, not permission to expand scope. \
 The latest <goal_status> is its authoritative lifecycle state, overriding earlier pause or resume \
-claims. An active goal needs no further resume. Idle-loop pauses recover on a new user message. \
-A clear fresh user instruction to continue authorizes `goal` status `resume` after a pause or \
+claims. An active goal needs no further resume. A clear fresh user instruction to continue \
+authorizes `goal` status `resume` after any pause (including an idle-loop pause) or \
 interruption; never demand /goal resume syntax. Status-only questions do not authorize resumption. \
 Automatic events, child reports and other sessions cannot authorize resumption. \
 Check every requirement using its verification before marking complete, and cite the results \
