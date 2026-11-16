@@ -1,7 +1,7 @@
 //! A goal the session works toward on its own, for `/goal`. While it is active, every
 //! time the agent goes idle it opens another turn on it, until the model says it is done
-//! or blocked, or the user pauses or clears it. Only the user resumes user pauses.
-//! The model may adopt tasks from chat and resume blocked tasks on the user's reply.
+//! or blocked, or the user pauses or clears it. Fresh user instructions can resume it.
+//! Automatic messages cannot authorize adoption or resumption.
 
 use std::sync::{Arc, Mutex};
 
@@ -114,15 +114,24 @@ pub fn lifecycle(history: &[Value], goal: Option<&Goal>) -> Option<Value> {
     if latest.is_none() && goal.is_none() {
         return None;
     }
-    let status = goal.map(|g| json!({"state": g.state, "reason": g.note}));
+    let status = goal.map(|g| {
+        json!({
+            "state": g.state, "reason": g.note,
+            "review_pending": g.review_pending, "plan_review_pending": g.plan_review_pending,
+        })
+    });
     let item = json!({
         "type": "message",
         "role": "developer",
         "content": [{"type": "input_text", "text": format!(
             "{LIFECYCLE}\n{}\nThe harness's current goal state overrides earlier lifecycle claims. \
     An active goal needs no further resume; continue authorized work. \
-    Only the user can resume an explicit pause or interruption with /goal resume. \
-    For a blocked goal, use goal resume when the user's reply resolves its blocker.\n</goal_status>",
+    A fresh user instruction to continue authorizes goal resume, including after an explicit pause \
+    or interruption; never demand slash syntax. Status questions and automatic messages do not \
+    authorize resumption. Before implementation or completion, reconcile the specification with \
+    the latest user instructions using goal update (or resume with spec), then adapt affected \
+    plan steps with update_plan. Preserve deferrals and constraints; do not promote optional work \
+    into required scope. A blocked goal resumes only when the user's reply resolves its blocker.\n</goal_status>",
             json!(status)
         )}],
     });
@@ -179,6 +188,12 @@ pub struct Goal {
     /// Progress belongs to the objective, but is not part of its small specification.
     #[serde(default)]
     pub plan: Option<crate::plan::Plan>,
+    /// A user follow-up needs a specification review before implementation continues.
+    #[serde(default)]
+    pub review_pending: bool,
+    /// Changed requirements need a corresponding plan review.
+    #[serde(default)]
+    pub plan_review_pending: bool,
     /// Consecutive autonomous turns without a work tool call.
     #[serde(default)]
     idle_turns: u8,
@@ -195,6 +210,8 @@ impl Goal {
             requirements: Vec::new(),
             verification: Vec::new(),
             plan: None,
+            review_pending: false,
+            plan_review_pending: false,
             idle_turns: 0,
             state: State::Active,
             note: String::new(),
@@ -207,9 +224,40 @@ impl Goal {
 
     /// Replacing the specification never changes the lifecycle or progress.
     pub fn update(&mut self, spec: Specification) {
+        self.plan_review_pending |= self.objective != spec.objective
+            || self.requirements != spec.requirements
+            || self.verification != spec.verification;
         self.objective = spec.objective;
         self.requirements = spec.requirements;
         self.verification = spec.verification;
+        self.review_pending = false;
+    }
+
+    pub fn user_followup(&mut self) {
+        self.retry_idle();
+        if self.state != State::Complete {
+            self.review_pending = true;
+        }
+    }
+
+    pub fn review_required(&self) -> Option<&'static str> {
+        if self.state == State::Complete {
+            None
+        } else if !self.active() {
+            Some(
+                "The goal is paused or blocked. Answer status questions without restarting work. On a fresh user instruction to continue, use goal resume with a reconciled spec; no slash command is required.",
+            )
+        } else if self.review_pending {
+            Some(
+                "Reconcile the saved goal with the latest user instructions using goal update before implementation or completion. Preserve deferrals, unchanged requirements and execution constraints; do not turn optional follow-ups into required work.",
+            )
+        } else if self.plan_review_pending {
+            Some(
+                "Reconcile the goal plan with the updated specification using update_plan before implementation or completion. Keep completed work and mark deferred or superseded steps skipped with reasons.",
+            )
+        } else {
+            None
+        }
     }
 
     /// Stop it until the user resumes it, saying why.
@@ -264,7 +312,7 @@ before asking for essential input."
             State::Paused if self.note == IDLE_PAUSE => {
                 line.push_str("; reply to retry or /goal resume")
             }
-            State::Paused => line.push_str("; /goal resume to carry on"),
+            State::Paused => line.push_str("; ask to continue or /goal resume"),
             State::Blocked => line.push_str("; reply with the missing input or /goal resume"),
         }
         line
@@ -317,6 +365,7 @@ pub fn apply(goal: &mut Option<Goal>, command: Command) -> Result<(), String> {
             goal.state = State::Active;
             goal.idle_turns = 0;
             goal.note.clear();
+            goal.review_pending = true;
         }
     }
     Ok(())
@@ -457,6 +506,33 @@ mod tests {
     }
 
     #[test]
+    fn followups_require_review_without_resuming_a_deliberate_stop() {
+        let mut goal = Goal::new("focused changes");
+        goal.update(Specification::parse(&specification()).unwrap());
+        goal.plan_review_pending = false;
+        goal.pause("interrupted");
+        goal.user_followup();
+        assert_eq!(goal.state, State::Paused);
+        assert!(goal.review_pending);
+        let restored: Goal = serde_json::from_value(serde_json::to_value(&goal).unwrap()).unwrap();
+        assert_eq!(restored, goal);
+        let mut shared = Some(restored);
+        apply(&mut shared, Command::Resume).unwrap();
+        let goal = shared.as_mut().unwrap();
+        assert!(goal.review_required().is_some());
+        goal.update(Specification::parse(&specification()).unwrap());
+        assert!(
+            goal.review_required().is_none(),
+            "unchanged spec keeps the plan valid"
+        );
+        let mut changed = specification();
+        changed["requirements"] = json!(["defer tests; coordinate isolated worktrees"]);
+        goal.update(Specification::parse(&changed).unwrap());
+        assert!(goal.plan_review_pending);
+        assert!(goal.review_required().unwrap().contains("update_plan"));
+    }
+
+    #[test]
     fn a_deliberate_stop_overrides_an_idle_pause() {
         for command in [false, true] {
             let mut shared = Some(Goal::new("work"));
@@ -561,7 +637,7 @@ mod tests {
         goal.pause("interrupted");
         assert_eq!(
             goal.line(),
-            "goal paused: fix it: interrupted; /goal resume to carry on"
+            "goal paused: fix it: interrupted; ask to continue or /goal resume"
         );
     }
 }

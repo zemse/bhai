@@ -4,7 +4,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 
@@ -310,6 +310,7 @@ pub struct Conversation<'a> {
 pub struct Registry {
     tools: Vec<Box<dyn Tool>>,
     goal: Option<crate::goal::Shared>,
+    goal_requested: Option<Arc<AtomicBool>>,
     /// The hub calls to functions `tool_search` loaded are resolved against.
     native: Option<Arc<crate::mcp::Hub>>,
     /// A child's worktree, which its calls are moved into.
@@ -324,6 +325,7 @@ impl Registry {
             native: None,
             rooted: None,
             goal: None,
+            goal_requested: None,
         }
     }
 
@@ -349,6 +351,7 @@ impl Registry {
             native: None,
             rooted: None,
             goal: None,
+            goal_requested: None,
         }
     }
 
@@ -395,25 +398,33 @@ impl Registry {
     /// persistent objective can be completed or blocked.
     pub fn with_goal(mut self, goal: goal::Goal) -> Self {
         self.goal = Some(Arc::clone(&goal.goal));
+        self.goal_requested = Some(Arc::clone(&goal.requested));
         self.tools.push(Box::new(goal));
         self
     }
 
-    /// Implementation tools wait for a goal-owned plan; inspection stays available.
-    pub fn requires_plan(&self, name: &str, args: &Value) -> bool {
-        let missing = self.goal.as_ref().is_some_and(|shared| {
-            shared
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .is_some_and(|goal| {
-                    goal.active() && goal.plan.as_ref().is_none_or(|p| p.steps.is_empty())
-                })
-        });
-        if !missing {
-            return false;
+    /// Queued user instructions carry the same authority as a newly opened user turn.
+    pub fn user_followup(&self) {
+        if let Some(requested) = &self.goal_requested {
+            requested.store(true, Ordering::Relaxed);
         }
-        match name {
+        if let Some(shared) = &self.goal
+            && let Some(goal) = shared.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        {
+            goal.user_followup();
+        }
+    }
+
+    /// Implementation waits for current scope and a goal-owned plan; inspection stays available.
+    pub fn implementation_block(&self, name: &str, args: &Value) -> Option<&'static str> {
+        let shared = self.goal.as_ref()?;
+        let shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let goal = shared.as_ref()?;
+        let reason = goal.review_required().or_else(|| {
+            (goal.active() && goal.plan.as_ref().is_none_or(|p| p.steps.is_empty()))
+                .then_some("Create a short outcome-oriented goal plan with update_plan before implementation. Planning and read-only inspection remain available.")
+        })?;
+        let implementation = match name {
             "write" | "edit" | "apply_patch" | "agent" => true,
             "bash" => !args
                 .get("command")
@@ -429,7 +440,8 @@ impl Registry {
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.is_empty() && s != "\u{3}"),
             _ => false,
-        }
+        };
+        implementation.then_some(reason)
     }
 
     /// `update_plan`, for the main agent, past the identity's narrowing like `goal`: it
@@ -746,6 +758,66 @@ pub fn temp_dir() -> std::path::PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn user_followups_gate_implementation_until_spec_and_plan_are_reconciled() {
+        let mut saved = crate::goal::Goal::new("follow-ups");
+        saved.plan = crate::plan::Plan::parse(&json!({"plan": [
+            {"step": "example", "status": "pending"}
+        ]}))
+        .unwrap();
+        let shared = Arc::new(std::sync::Mutex::new(Some(saved)));
+        let requested = Arc::new(AtomicBool::new(false));
+        let plan = crate::plan::Shared::new(Arc::clone(&shared));
+        let registry = Registry::empty().with_goal(goal::Goal {
+            children: Arc::default(),
+            goal: Arc::clone(&shared),
+            plan: plan.clone(),
+            requested: Arc::clone(&requested),
+        });
+        assert!(registry.implementation_block("write", &json!({})).is_none());
+        registry.user_followup();
+        assert!(requested.load(Ordering::Relaxed));
+        assert!(
+            registry
+                .implementation_block("write", &json!({}))
+                .unwrap()
+                .contains("goal update")
+        );
+        for name in ["read", "goal", "update_plan", "status"] {
+            assert!(registry.implementation_block(name, &json!({})).is_none());
+        }
+        shared
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .update(crate::goal::Specification {
+                objective: "follow-ups".into(),
+                requirements: vec!["Defer hook tests".into()],
+                verification: vec!["Compile example".into()],
+            });
+        assert!(
+            registry
+                .implementation_block("edit", &json!({}))
+                .unwrap()
+                .contains("update_plan")
+        );
+        assert!(
+            plan.update_with(&json!({"changes": []}), |_, _| Err("disk full".into()))
+                .is_err()
+        );
+        assert!(registry.implementation_block("edit", &json!({})).is_some());
+        plan.update(&json!({"changes": []})).unwrap();
+        assert!(registry.implementation_block("edit", &json!({})).is_none());
+        shared
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .pause("interrupted");
+        assert!(registry.implementation_block("write", &json!({})).is_some());
+    }
 
     #[test]
     fn setting_aws_scope_preserves_registration_order_and_identity_narrowing() {

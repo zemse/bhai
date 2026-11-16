@@ -152,6 +152,7 @@ impl Shared {
                     }
                 }
                 goal.plan = next.clone();
+                goal.plan_review_pending = false;
             }
             _ => {}
         }
@@ -597,18 +598,24 @@ mod tests {
                 .is_err()
         );
         assert!(shared.get().is_none());
-        let goal = Arc::new(Mutex::new(Some(crate::goal::Goal::new("ship"))));
+        let mut saved = crate::goal::Goal::new("ship");
+        saved.plan_review_pending = true;
+        let goal = Arc::new(Mutex::new(Some(saved)));
         let shared = Shared::new(Arc::clone(&goal));
         assert!(
             shared
                 .update_with(&args, |candidate, _| {
                     assert!(candidate.as_ref().unwrap().plan.is_some());
+                    assert!(!candidate.as_ref().unwrap().plan_review_pending);
                     Err("disk full".into())
                 })
                 .is_err()
         );
         assert!(shared.get().is_none());
         assert!(goal.lock().unwrap().as_ref().unwrap().plan.is_none());
+        assert!(goal.lock().unwrap().as_ref().unwrap().plan_review_pending);
+        shared.update(&args).unwrap();
+        assert!(!goal.lock().unwrap().as_ref().unwrap().plan_review_pending);
     }
 
     #[test]

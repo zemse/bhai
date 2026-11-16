@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-16
 
+- Fresh user instructions can resume paused or interrupted goals without slash syntax; automatic messages cannot. Follow-ups require specification reconciliation before implementation or completion, and changed requirements require a persisted plan review, preserving deferrals and execution constraints.
 - F2 expands the input box into the available terminal space and restores its compact height, keeping the draft, cursor and selection intact. The prompt border and `/help` show the shortcut.
 
 ## 2026-11-15

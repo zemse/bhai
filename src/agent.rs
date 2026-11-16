@@ -1610,7 +1610,7 @@ pub(crate) async fn run_configured(
             if message.user_text.is_some()
                 && let Some(goal) = lock_goal(&goal).as_mut()
             {
-                goal.retry_idle();
+                goal.user_followup();
             }
             // The judge decides against the task just given, with a fresh budget.
             if let Some(judge) = &judge {
@@ -1642,7 +1642,10 @@ pub(crate) async fn run_configured(
             record(&mut sink, &history[from..], &tx);
         }
 
-        goal_requested.store(message.is_some(), Ordering::Relaxed);
+        goal_requested.store(
+            message.as_ref().is_some_and(|message| message.user_text.is_some()),
+            Ordering::Relaxed,
+        );
         // The turn holds the history, so mid-turn requests see it as the turn started.
         let (before, calls_before) = (history.clone(), calls.clone());
         let goal_context = GoalContext {
@@ -2110,6 +2113,12 @@ async fn turn(
         // Whatever was typed into this agent's pane, or queued for it, joins the history
         // before the call, so the next answer has it.
         if let Some(from) = steered(steer.as_mut(), history, tx, judge) {
+            if history[from..]
+                .iter()
+                .any(|item| item["role"] == "user" && item["bhai_automatic"] != true)
+            {
+                registry.user_followup();
+            }
             record(sink, &history[from..], tx);
         }
         if let Err(error) = refresh_authorization(judge, policy, sink, tx, cancel).await {
@@ -2351,6 +2360,12 @@ async fn turn(
             // A message typed while that answer was being written is not lost: it goes
             // in and the agent keeps going rather than ending on the answer before it.
             if let Some(from) = steered(steer.as_mut(), history, tx, judge) {
+                if history[from..]
+                    .iter()
+                    .any(|item| item["role"] == "user" && item["bhai_automatic"] != true)
+                {
+                    registry.user_followup();
+                }
                 record(sink, &history[from..], tx);
                 continue;
             }
@@ -3782,8 +3797,8 @@ async fn execute(
     if let Some(updated) = before.updated_input {
         args = registry.rooted(name, updated);
     }
-    if registry.requires_plan(name, &args) {
-        return ("Create a short outcome-oriented goal plan with update_plan before implementation. Planning and read-only inspection remain available.".to_string(), false);
+    if let Some(reason) = registry.implementation_block(name, &args) {
+        return (reason.to_string(), false);
     }
     let summary = match tool.describe(&args) {
         Ok(summary) => summary,
@@ -6934,7 +6949,11 @@ mod tests {
             vec![say("please supply the key")],
             vec![call(
                 "goal",
-                json!({"status": "resume", "reason": "key supplied"}),
+                json!({"status": "resume", "reason": "key supplied; scope unchanged", "spec": {
+                    "objective": "build a generator",
+                    "requirements": ["support state_4"],
+                    "verification": ["compare state_4 outputs"]
+                }}),
             )],
             vec![say("checking")],
             vec![
@@ -7173,6 +7192,94 @@ mod tests {
         steer_goal(&goal, &plan, goal::Command::Clear, &tx);
         assert!(plan.get().is_none());
         assert!(lock_goal(&goal).is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_user_resume_reconciles_scope_and_plan_but_status_and_automatic_turns_do_not() {
+        use fake::{Fake, call, say};
+        let dir = tools::temp_dir();
+        let file = dir.join("not-written");
+        let spec = json!({
+            "objective": "focused follow-ups",
+            "requirements": ["Defer hook tests", "Use worktrees and coordinate integration into cloaked3"],
+            "verification": ["Check the consumer example"]
+        });
+        let fake = Fake::new(vec![
+            vec![call(
+                "goal",
+                json!({"status": "resume", "reason": "automatic notification"}),
+            )],
+            vec![say("waiting for user authorization")],
+            vec![say("the task is paused")],
+            vec![call(
+                "write",
+                json!({"path": file, "content": "must not execute"}),
+            )],
+            vec![call(
+                "goal",
+                json!({"status": "resume", "reason": "user instructed continuation in worktrees", "spec": spec}),
+            )],
+            vec![call(
+                "write",
+                json!({"path": file, "content": "must reconcile plan first"}),
+            )],
+            vec![completed_plan_call()],
+            vec![call(
+                "goal",
+                json!({"status": "complete", "reason": "offline fixture checked"}),
+            )],
+            vec![say("done")],
+        ]);
+        let (mut rx, user, _control, _cancel) = goal_session(
+            &fake,
+            vec![
+                set_goal("focused follow-ups"),
+                Control::Goal(goal::Command::Pause),
+            ],
+        );
+        user.send(UserInput {
+            text: "background observation".into(),
+            images: Vec::new(),
+            user_text: None,
+        })
+        .await
+        .unwrap();
+        settle(&mut rx).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(parent_calls(&fake).len(), 2);
+        user.send("what is still pending?".into()).await.unwrap();
+        settle(&mut rx).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(parent_calls(&fake).len(), 3);
+        user.send("continue in worktrees, coordinate integration; do not test hooks".into())
+            .await
+            .unwrap();
+        settle(&mut rx).await;
+        assert!(!file.exists());
+        let calls = parent_calls(&fake);
+        assert_eq!(calls.len(), 9);
+        let input: Vec<Value> = serde_json::from_str(calls.last().unwrap()).unwrap();
+        let outputs: Vec<_> = input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .filter_map(|item| item["output"].as_str())
+            .collect();
+        assert!(outputs.iter().any(|s| s.contains("Only a new user turn")));
+        assert!(
+            outputs
+                .iter()
+                .any(|s| s.contains("fresh user instruction to continue"))
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|s| s.contains("Reconcile the goal plan"))
+        );
+        let context = goal::restated(&input).unwrap();
+        let text = context["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Defer hook tests"));
+        assert!(text.contains("coordinate integration into cloaked3"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
