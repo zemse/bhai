@@ -174,6 +174,8 @@ fn class(c: char) -> u8 {
     }
 }
 pub struct App {
+    /// Rendered QR rows, kept only in the local pairing modal.
+    pub rc_pairing: Option<Vec<String>>,
     /// Screen rows of each visible entry, filled in by the renderer.
     pub rows: Vec<(Range<u16>, usize)>,
     /// The entry under the mouse.
@@ -442,6 +444,7 @@ impl App {
                 .to_string(),
         ));
         let mut app = Self {
+            rc_pairing: None,
             rows: Vec::new(),
             hover: None,
             mouse_row: None,
@@ -561,6 +564,14 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if self.rc_pairing.is_some() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.rc_pairing = None;
+            }
             return;
         }
         if let Some(reader) = self.reader.as_mut() {
@@ -858,7 +869,7 @@ impl App {
 
     /// Bracketed paste: the text goes into the input as typed, newlines and all.
     pub fn on_paste(&mut self, text: &str) {
-        if self.reader.is_some() {
+        if self.rc_pairing.is_some() || self.reader.is_some() {
             return;
         }
         if !self.passwords.is_empty() {
@@ -1025,6 +1036,9 @@ impl App {
 
     /// Returns whether the screen needs a redraw.
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.rc_pairing.is_some() {
+            return false;
+        }
         if let Some(reader) = self.reader.as_mut() {
             return reader.mouse(mouse);
         }
@@ -3531,6 +3545,48 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rc_pairing_takes_keys_paste_and_mouse_before_prompt_or_approval() {
+        for approval in [false, true] {
+            for close in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('c')] {
+                let (mut app, mut user, mut control) = connected();
+                assert!(app.rc_pairing.is_none());
+                app.input.set("unsent draft".to_string());
+                if approval {
+                    app.pending = Some(Approval {
+                        id: 7,
+                        tool: "bash".to_string(),
+                        command: "ls".to_string(),
+                        preview: None,
+                        offers: Default::default(),
+                    });
+                }
+                let entries = app.entries().list.len();
+                app.rc_pairing = Some(vec!["private QR".to_string()]);
+                for code in [KeyCode::Char('y'), KeyCode::Char('n'), KeyCode::Tab] {
+                    app.on_key(key(code, KeyModifiers::NONE));
+                }
+                app.on_paste("ignored paste");
+                assert!(!app.on_mouse(at(MouseEventKind::Down(MouseButton::Left), 0, 0)));
+                app.on_key(key(
+                    close,
+                    if close == KeyCode::Char('c') {
+                        KeyModifiers::CONTROL
+                    } else {
+                        KeyModifiers::NONE
+                    },
+                ));
+                assert!(app.rc_pairing.is_none());
+                assert_eq!(app.input.value(), "unsent draft");
+                assert_eq!(app.pending.is_some(), approval);
+                assert_eq!(app.entries().list.len(), entries);
+                assert!(!app.quit);
+                assert!(user.try_recv().is_err());
+                assert!(control.try_recv().is_err());
+            }
+        }
+    }
 
     #[test]
     fn name_commands_update_the_session_without_starting_a_turn() {

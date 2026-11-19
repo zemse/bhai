@@ -60,6 +60,12 @@ const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const MESSAGE_MARK: &str = "⏺ ";
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    if let Some(qr) = &app.rc_pairing {
+        app.links.clear();
+        app.label_links.clear();
+        render_rc_pairing(frame, qr);
+        return;
+    }
     if let Some(reader) = app.reader.as_mut() {
         reader.draw(frame);
         return;
@@ -72,6 +78,62 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_copied(frame, app);
     // After everything, so a link never runs under an overlay drawn over the transcript.
     render_links(frame, app);
+}
+
+fn render_rc_pairing(frame: &mut Frame, qr: &[String]) {
+    let title = "Pair remote control";
+    let instruction = "Scan from the relay website. Keep this key private.";
+    let close = "Esc or Enter to close";
+    let screen = frame.area();
+    let width = qr
+        .iter()
+        .map(|row| unicode_width::UnicodeWidthStr::width(row.as_str()))
+        .chain([instruction.len()])
+        .max()
+        .unwrap_or_default()
+        .saturating_add(4);
+    let height = qr.len().saturating_add(8);
+    let fits = width <= screen.width as usize && height <= screen.height as usize;
+    let (width, height, lines) = if fits {
+        let mut lines = vec![Line::from(title), Line::default()];
+        lines.extend(qr.iter().map(|row| Line::from(row.as_str())));
+        lines.extend([
+            Line::default(),
+            Line::from(instruction),
+            Line::default(),
+            Line::from(close),
+        ]);
+        (width as u16, height as u16, lines)
+    } else {
+        let text = format!(
+            "{title}\n\nEnlarge the terminal to show the QR code ({width} columns, {height} rows).\n\n{instruction}\n\n{close}",
+        );
+        let width = screen.width.min(58);
+        let lines = wrap(&text, width.saturating_sub(4).max(1) as usize);
+        let height = lines.len().saturating_add(2).min(screen.height as usize) as u16;
+        (width, height, lines.into_iter().map(Line::from).collect())
+    };
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, screen);
+    let style = Style::new().fg(Color::Black).bg(Color::White);
+    frame.render_widget(Block::new().style(style), area);
+    let inner = Rect::new(
+        area.x + area.width.min(2),
+        area.y + area.height.min(1),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+    );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(style)
+            .alignment(ratatui::layout::Alignment::Center),
+        inner,
+    );
 }
 
 /// The URLs and file paths in the transcript rows in view, as OSC 8 links, kept for
@@ -2398,6 +2460,62 @@ mod tests {
             cache_write: 0,
             output,
             reasoning,
+        }
+    }
+
+    #[test]
+    fn rc_pairing_draws_complete_centered_monochrome_qr_without_copy_targets() {
+        let mut app = App::detached();
+        let qr = vec!["▀ ".repeat(35); 30];
+        app.rc_pairing = Some(qr.clone());
+        let entries = app.entries().list.len();
+        let mut terminal = Terminal::new(TestBackend::new(80, 42)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for (row, text) in qr.iter().enumerate() {
+            for (column, symbol) in text.chars().enumerate() {
+                let cell = &buffer[(5 + column as u16, 5 + row as u16)];
+                assert_eq!(cell.symbol(), symbol.to_string());
+                assert_eq!(cell.fg, Color::Black);
+                assert_eq!(cell.bg, Color::White);
+            }
+        }
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Pair remote control"));
+        assert!(text.contains("Scan from the relay website. Keep this key private."));
+        assert!(text.contains("Esc or Enter to close"));
+        assert_eq!(app.entries().list.len(), entries);
+        assert!(
+            !serde_json::to_string(&app.session().state())
+                .unwrap()
+                .contains('▀')
+        );
+        assert!(app.lines.is_empty());
+        assert!(app.copies.is_empty());
+        assert!(app.links.is_empty());
+        assert!(app.label_links.is_empty());
+    }
+
+    #[test]
+    fn rc_pairing_never_draws_a_partial_qr_on_small_terminals() {
+        for (width, height) in [(60, 42), (80, 20), (1, 1), (0, 0)] {
+            let mut app = App::detached();
+            app.rc_pairing = Some(vec!["▀".repeat(70); 30]);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(!text.contains('▀'));
+            if width >= 60 {
+                assert!(text.contains("Enlarge the terminal"));
+                assert!(text.contains("74 columns"));
+                assert!(text.contains("38 rows"));
+            }
         }
     }
 
