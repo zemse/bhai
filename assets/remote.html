@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="dark light">
+  <title>bhai remote</title>
+  <style>
+    :root { font: 16px/1.5 system-ui, sans-serif; color-scheme: dark; background: #11151b; color: #e3e9ef; }
+    * { box-sizing: border-box; }
+    body { margin: auto; max-width: 1100px; padding: 16px; padding-bottom: max(24px, env(safe-area-inset-bottom)); }
+    header { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+    h1 { font-size: 1.4rem; margin: 0; }
+    h2 { font-size: 1.15rem; margin-top: 0; }
+    h3 { font-size: 1rem; }
+    section, details.panel { background: #1a212b; border: 1px solid #374355; border-radius: 12px; padding: 16px; margin: 14px 0; }
+    summary { cursor: pointer; padding: 4px; overflow-wrap: anywhere; }
+    label { display: block; margin: 10px 0; }
+    input, textarea, select, button { font: inherit; border: 1px solid #56657a; border-radius: 7px; padding: 10px; color: inherit; background: #121922; max-width: 100%; }
+    input:not([type=checkbox]), textarea, select { width: 100%; }
+    textarea { resize: vertical; min-height: 90px; }
+    button { cursor: pointer; min-height: 44px; }
+    button:hover { background: #2b3d51; }
+    button:disabled { opacity: .5; cursor: wait; }
+    button.primary { background: #234d72; }
+    button.danger { border-color: #e4957c; }
+    :focus-visible { outline: 2px solid #a3d5ff; outline-offset: 3px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .row > label { flex: 1 1 180px; }
+    .muted { color: #b1bdcc; font-size: .9rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; font: .9rem/1.5 ui-monospace, monospace; }
+    #notice { position: sticky; top: 0; z-index: 2; background: #302b1d; border-radius: 6px; padding: 10px; }
+    #status { color: #aed5ff; }
+    #approval { border: 2px solid #e6bc67; }
+    #transcript { max-height: 65vh; overflow: auto; overscroll-behavior: contain; }
+    .entry { padding: 12px 4px; border-bottom: 1px solid #344050; }
+    .entry.user { border-left: 3px solid #80bfff; padding-left: 10px; }
+    .entry.error, .entry.failed { color: #ffc0ad; }
+    .kind { color: #a8bfd7; font-size: .8rem; text-transform: uppercase; }
+    video { width: 100%; max-height: 45vh; }
+    [hidden] { display: none !important; }
+    @media (min-width: 800px) { .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; } }
+  </style>
+</head>
+<body>
+  <header><h1>bhai remote</h1><span id="status" role="status">Not paired</span><button id="reconnect">Reconnect</button><button id="forget" class="danger">Forget key</button></header>
+  <p id="notice" role="alert" hidden></p>
+  <details id="pairing" class="panel" open>
+    <summary>Pair this browser</summary>
+    <p>Scan the machine's pairing QR or paste its JSON. Pair only with a relay you trust. The private key stays saved in this browser until you forget it. Bearer tokens are kept only in memory.</p>
+    <p class="muted">Anyone with access to this browser's storage can use the saved key. Do not pair on a shared device.</p>
+    <div class="row"><button id="camera">Scan with camera</button><button id="stop-camera" hidden>Stop camera</button><label>QR photo <input id="photo" type="file" accept="image/*"></label></div>
+    <p id="scan-help" class="muted"></p>
+    <video id="video" autoplay muted playsinline hidden></video>
+    <form id="pair-form">
+      <label>Pairing JSON or base64url PKCS8 private key<textarea id="pair-data" autocomplete="off" spellcheck="false" required></textarea></label>
+      <label>Relay HTTPS URL (for key-only import)<input id="relay" type="url" placeholder="https://relay.example" autocomplete="off"></label>
+      <button class="primary">Save key and connect</button>
+    </form>
+  </details>
+  <section>
+    <label>Machine <output id="machine">Not connected</output></label>
+    <label>Session<select id="session"><option value="">Choose a session</option></select></label>
+    <p id="session-status" class="muted">Waiting for connection</p>
+  </section>
+  <main id="controls" hidden>
+    <section id="approval" hidden><h2>Approval required</h2><pre id="approval-text"></pre><div id="approval-buttons" class="row"></div></section>
+    <section>
+      <div class="row"><h2>Transcript</h2><label><input id="follow" type="checkbox" checked> Follow latest</label><button id="refresh">Refresh</button></div>
+      <div id="transcript" tabindex="0" aria-label="Session transcript"></div>
+      <form id="prompt-form"><label>Message or supported slash command<textarea id="prompt" required placeholder="Send a message"></textarea></label><button class="primary">Send</button></form>
+      <p class="muted">Messages queue while busy. Failed or uncertain actions are never automatically resent. Refresh and check the session before sending again.</p>
+      <div class="row" id="turn-actions"></div>
+    </section>
+    <div class="grid">
+      <details class="panel" open><summary>Model and permissions</summary>
+        <form id="model-form"><label>Model<input id="model" required></label><label>Effort<input id="effort" placeholder="low, medium, high, xhigh"></label><button>Set model / effort</button></form>
+        <form id="mode-form"><label>Mode<select id="mode"><option>ask</option><option>auto</option><option>bypass</option></select></label><button>Set mode</button></form>
+        <label><input id="fast" type="checkbox"> Fast mode</label>
+        <p class="muted">Bypass and trust can allow commands without approval.</p>
+        <div id="trust-actions" class="row"></div>
+        <form id="allow-form"><label>Allow rule<input id="rule" required placeholder="Bash(cargo test:*)"></label><button>Add allow rule</button></form>
+      </details>
+      <details class="panel"><summary>Goal and plan</summary><pre id="goal-state"></pre>
+        <form id="goal-form"><label>Objective<textarea id="goal-text" required></textarea></label><button>Set goal</button></form><div id="goal-actions" class="row"></div>
+      </details>
+    </div>
+    <details class="panel" id="children-panel"><summary>Children and steering</summary><div id="children"></div></details>
+    <details class="panel" id="background-panel"><summary>Background and monitors</summary><div id="background"></div><pre id="monitors"></pre></details>
+    <details class="panel" id="schedules-panel"><summary>Schedules</summary><div id="schedules"></div>
+      <form id="schedule-form"><label>When<input id="spec" required placeholder="in 20m, every 2h, at 17:30, cron ..."></label><label>Message<textarea id="schedule-text" required></textarea></label><div class="row"><label>Repeat count (optional)<input id="times" type="number" min="1" max="4294967295" step="1"></label><label>Lasts (optional)<input id="lasts" placeholder="2d"></label></div><button>Add schedule</button></form>
+    </details>
+    <details class="panel" id="context-panel"><summary>Context, permissions and session state</summary><button id="context-refresh">Load context / permissions</button><pre id="context"></pre><pre id="permissions"></pre><details><summary>Full session state (usage, quota, queue)</summary><pre id="state"></pre></details></details>
+  </main>
+  <script>
+    'use strict';
+    const $ = id => document.getElementById(id);
+    const storageKey = 'bhai.remote.pairing.v1';
+    let pairing = null, privateKey = null, token = '', generation = 0, authenticating = null;
+    let selected = '', currentState = {}, polling = false, actionBusy = false, lastSessions = 0;
+    let stream = null, scanTimer = null, detector = null;
+    const rendered = new Map();
+    const pretty = value => typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    function text(id, value) { $(id).textContent = pretty(value ?? ''); }
+    function notice(message = '') { text('notice', message); $('notice').hidden = !message; }
+    function status(message) { text('status', message); }
+    function node(tag, value, className) {
+      const el = document.createElement(tag);
+      if (value !== undefined) el.textContent = value;
+      if (className) el.className = className;
+      return el;
+    }
+    function button(parent, title, action, danger = false) {
+      const el = node('button', title, danger ? 'danger' : '');
+      el.type = 'button';
+      el.onclick = () => run(action, el);
+      parent.append(el);
+      return el;
+    }
+    async function run(fn, el) {
+      if (el) el.disabled = true;
+      try { await fn(); } catch (error) { notice(error.message || 'Operation failed'); }
+      finally { if (el) el.disabled = false; }
+    }
+    function decode(value) {
+      if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+={0,2}$/.test(value)) throw new Error('Invalid base64url');
+      const raw = atob(value.replace(/-/g, '+').replace(/_/g, '/'));
+      return Uint8Array.from(raw, c => c.charCodeAt(0));
+    }
+    function encode(bytes) {
+      return btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+    function rawToDer(raw) {
+      raw = new Uint8Array(raw);
+      if (raw.length !== 64) throw new Error('Expected a P256 signature');
+      function integer(part) {
+        let offset = 0;
+        while (offset < part.length - 1 && part[offset] === 0) offset++;
+        part = Array.from(part.slice(offset));
+        if (part[0] & 128) part.unshift(0);
+        return [2, part.length, ...part];
+      }
+      const body = [...integer(raw.slice(0, 32)), ...integer(raw.slice(32))];
+      return new Uint8Array([48, body.length, ...body]);
+    }
+    async function prepare(data) {
+      if (!crypto.subtle) throw new Error('WebCrypto requires a secure HTTPS browser context');
+      let value;
+      try {
+        value = typeof data === 'string' ? JSON.parse(data) : data;
+      } catch { value = { v: 1, key: data.trim(), relay: $('relay').value.trim() }; }
+      if (!value || value.v !== 1 || typeof value.key !== 'string') throw new Error('Expected v:1 pairing JSON or a private key');
+      const relay = new URL(value.relay);
+      if (relay.protocol !== 'https:' || relay.username || relay.password || relay.search || relay.hash) throw new Error('Relay must be HTTPS without credentials, query or fragment');
+      try {
+        const key = await crypto.subtle.importKey('pkcs8', decode(value.key), { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+        const jwk = await crypto.subtle.exportKey('jwk', key);
+        const pub = new Uint8Array([4, ...decode(jwk.x), ...decode(jwk.y)]);
+        if (value.public_key && encode(decode(value.public_key)) !== encode(pub)) throw new Error('Public key mismatch');
+        const signingKey = await crypto.subtle.importKey('pkcs8', decode(value.key), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+        return { data: { v: 1, relay: relay.href.replace(/\/$/, ''), key: value.key, public_key: encode(pub) }, key: signingKey };
+      } catch { throw new Error('Invalid P256 pairing key or mismatched public key'); }
+    }
+    async function importPairing(data) {
+      const prepared = await prepare(data);
+      if (!confirm('Save a permanent controller key for ' + prepared.data.relay + '?')) return;
+      try { localStorage.setItem(storageKey, JSON.stringify(prepared.data)); }
+      catch { throw new Error('Browser storage is unavailable. Enable storage to save this pairing.'); }
+      generation++;
+      pairing = prepared.data; privateKey = prepared.key; token = ''; authenticating = null;
+      selected = ''; resetView(); stopCamera(); $('pair-data').value = ''; $('relay').value = '';
+      $('pairing').open = false; notice();
+      await authenticate(); await refresh();
+    }
+    async function request(path, method = 'GET', body, authenticated = true) {
+      if (!pairing) throw new Error('Pair this browser first');
+      const headers = { Accept: 'application/json' };
+      if (authenticated) headers.Authorization = 'Bearer ' + token;
+      if (body !== undefined) headers['Content-Type'] = 'application/json';
+      const response = await fetch(pairing.relay + '/api' + path, {
+        method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+        cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error', signal: AbortSignal.timeout(15000)
+      });
+      if (!response.ok) {
+        if (authenticated && (response.status === 401 || response.status === 403)) token = '';
+        // Server errors can contain submitted data; do not echo them during pairing.
+        throw new Error('Request failed (HTTP ' + response.status + '). Refresh before repeating an action.');
+      }
+      return response.status === 204 ? {} : response.json();
+    }
+    async function authenticate() {
+      if (authenticating) return authenticating;
+      const epoch = generation;
+      const task = (async () => {
+        status('Authenticating');
+        const { nonce } = await request('/challenge', 'GET', undefined, false);
+        if (epoch !== generation) return;
+        if (typeof nonce !== 'string') throw new Error('Invalid relay challenge');
+        const raw = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey,
+          new TextEncoder().encode('bhai-rc-v1\ncontroller\n' + nonce));
+        if (epoch !== generation) return;
+        const result = await request('/auth', 'POST', { nonce, role: 'controller', public_key: pairing.public_key, signature: encode(rawToDer(raw)) }, false);
+        if (epoch !== generation) return;
+        if (typeof result.token !== 'string' || !result.token) throw new Error('Relay returned no token');
+        token = result.token; text('machine', result.machine); status('Connected');
+      })();
+      authenticating = task;
+      try { await task; } finally { if (authenticating === task) authenticating = null; }
+    }
+    function resetView() {
+      rendered.clear(); currentState = {}; $('controls').hidden = true;
+      $('session').replaceChildren(node('option', 'Choose a session'));
+      $('session').firstChild.value = ''; lastSessions = 0;
+      text('machine', 'Not connected'); text('session-status', 'Waiting for connection');
+      for (const id of ['transcript', 'children', 'background', 'schedules', 'monitors', 'context', 'permissions', 'state', 'goal-state']) {
+        $(id).replaceChildren(); delete $(id).dataset.rendered;
+      }
+      $('approval').hidden = true;
+    }
+    async function sessionGet(route, id = selected) {
+      return request('/sessions/' + encodeURIComponent(id) + '/' + route);
+    }
+    async function act(route, body = {}, confirmText = '') {
+      if (actionBusy) throw new Error('Another action is in flight');
+      if (!selected) throw new Error('Choose a session');
+      if (confirmText && !confirm(confirmText)) return false;
+      actionBusy = true;
+      const id = selected, epoch = generation;
+      try {
+        if (!token) await authenticate();
+        if (epoch !== generation || id !== selected) throw new Error('Connection changed. Action not sent.');
+        // Some session routes reserve id for the target or numeric approval id.
+        const requestId = crypto.randomUUID();
+        const payload = { id: requestId, ...body, request_id: requestId };
+        const result = await request('/sessions/' + encodeURIComponent(id) + '/' + route, 'POST', payload);
+        notice(result.queued ? 'Queued at position ' + result.queued : 'Action accepted');
+        lastSessions = 0;
+        return true;
+      } catch (error) {
+        throw new Error(error.message + ' The action was not retried; its outcome may be unknown.');
+      } finally { actionBusy = false; }
+    }
+    function updateSessions(rows) {
+      const list = JSON.stringify(rows);
+      if (rendered.get('sessions') === list) return;
+      rendered.set('sessions', list);
+      const options = [node('option', 'Choose a session')]; options[0].value = '';
+      for (const row of rows) {
+        const option = node('option', (row.title || row.id) + ' · ' + (row.project || '') + (row.connected ? '' : ' (offline)'));
+        option.value = row.id; options.push(option);
+      }
+      $('session').replaceChildren(...options);
+      if (!rows.some(row => row.id === selected)) { selected = ''; $('controls').hidden = true; }
+      $('session').value = selected;
+    }
+    function entries(parent, rows) {
+      const fingerprint = JSON.stringify(rows);
+      if (parent.dataset.rendered === fingerprint) return;
+      parent.dataset.rendered = fingerprint;
+      const expanded = Array.from(parent.children, el => !!el.querySelector('details')?.open);
+      const fragment = document.createDocumentFragment();
+      for (const [index, entry] of (rows || []).entries()) {
+        const kind = entry.kind || 'info';
+        const el = node('article', undefined, 'entry');
+        if (['user', 'failed', 'error'].includes(kind)) el.classList.add(kind);
+        const value = entry.data ?? entry.text ?? '';
+        if (['output', 'diff', 'reasoning', 'summary'].includes(kind)) {
+          const fold = node('details'); fold.open = !!expanded[index];
+          fold.append(node('summary', kind), node('pre', pretty(value))); el.append(fold);
+        } else { el.append(node('div', kind, 'kind'), node('pre', pretty(value))); }
+        fragment.append(el);
+      }
+      const top = parent.scrollTop;
+      parent.replaceChildren(fragment);
+      parent.scrollTop = parent.id === 'transcript' && $('follow').checked ? parent.scrollHeight : top;
+    }
+    function approval(pending) {
+      const fingerprint = JSON.stringify(pending);
+      if (rendered.get('approval') === fingerprint) return;
+      rendered.set('approval', fingerprint);
+      $('approval').hidden = !pending;
+      $('approval-buttons').replaceChildren();
+      if (!pending) return;
+      text('approval-text', pending);
+      const target = { id: pending.id };
+      button($('approval-buttons'), 'Approve once', () => act('approve', target));
+      for (const remember of ['exact', 'prefix']) {
+        if (pending[remember]) button($('approval-buttons'), 'Approve + remember ' + remember,
+          () => act('approve', { ...target, remember }, 'Remember permission rule: ' + pending[remember] + '?'));
+      }
+      button($('approval-buttons'), 'Reject', () => act('reject', target), true);
+    }
+    function snapshot(data) {
+      currentState = data.state || {};
+      const s = currentState;
+      text('session-status', (data.title || s.name || selected) + ' · ' + (s.working ? 'Working' : 'Idle') + ' · ' + s.model + ' · ' + s.mode + ' · queued ' + (s.queued || []).length);
+      text('state', s); text('goal-state', { goal: s.goal, plan: s.plan });
+      approval(s.pending); entries($('transcript'), data.transcript || []);
+      for (const id of ['model', 'effort', 'mode']) {
+        if (document.activeElement !== $(id) && !$(id).dataset.dirty) $(id).value = s[id] || '';
+      }
+      if (document.activeElement !== $('fast') && !actionBusy) $('fast').checked = !!s.fast;
+      renderChildren(data.children || []);
+    }
+    function renderChildren(rows) {
+      const fingerprint = JSON.stringify(rows);
+      if (rendered.get('children') === fingerprint || $('children').contains(document.activeElement)) return;
+      const drafts = new Map(Array.from($('children').children, panel => [panel.dataset.id,
+        { open: panel.open, text: panel.querySelector('textarea')?.value || '' }]));
+      rendered.set('children', fingerprint); $('children').replaceChildren();
+      if (!rows.length) $('children').append(node('p', 'No children'));
+      for (const row of rows) {
+        const child = row.child || {}, panel = node('details');
+        panel.dataset.id = child.id; panel.open = !!drafts.get(child.id)?.open;
+        panel.append(node('summary', (child.name || child.id) + ' · ' + (child.status || '')), node('pre', pretty(child)));
+        const transcript = node('div'); entries(transcript, row.entries); panel.append(transcript);
+        const form = node('form'), label = node('label', 'Steer child'), input = node('textarea');
+        input.required = true; input.value = drafts.get(child.id)?.text || '';
+        label.append(input); form.append(label, node('button', 'Send to child'));
+        form.onsubmit = event => { event.preventDefault(); run(async () => { if (await act('steer', { id: child.id, text: input.value })) input.value = ''; }, form.lastChild); };
+        panel.append(form);
+        button(panel, 'Interrupt child', () => act('children/' + encodeURIComponent(child.id) + '/interrupt', {}, 'Interrupt this child?'), true);
+        $('children').append(panel);
+      }
+    }
+    async function extras(id, epoch) {
+      for (const [panel, route] of [['background-panel', 'background'], ['background-panel', 'monitors'], ['schedules-panel', 'schedules']]) {
+        if (!$(panel).open) continue;
+        try {
+          const data = await sessionGet(route, id);
+          if (selected !== id || generation !== epoch) return;
+          const fingerprint = JSON.stringify(data);
+          if (rendered.get(route) === fingerprint) continue;
+          rendered.set(route, fingerprint);
+          if (route === 'monitors') { text('monitors', data); continue; }
+          const container = $(route); container.replaceChildren();
+          for (const row of data[route] || []) {
+            const el = node('article', undefined, 'entry'); el.append(node('pre', pretty(row)));
+            if (route === 'schedules') button(el, 'Cancel schedule', () => act('schedule/cancel', { id: row.id }, 'Cancel this schedule?'), true);
+            else button(el, 'Stop', () => act('background/kill', { id: row.id, kind: row.kind }, 'Stop this background item?'), true);
+            container.append(el);
+          }
+          if (!(data[route] || []).length) container.append(node('p', 'No ' + route));
+          if (data.unreadable?.length) container.append(node('pre', pretty(data.unreadable)));
+        } catch (error) {
+          if (selected === id && generation === epoch) { rendered.delete(route); text(route, error.message); }
+        }
+      }
+    }
+    async function refresh() {
+      if (polling || !pairing) return;
+      polling = true;
+      const epoch = generation;
+      try {
+        if (!token) await authenticate();
+        if (epoch !== generation || !token) return;
+        if (Date.now() - lastSessions > 5000) {
+          const result = await request('/sessions');
+          if (epoch !== generation) return;
+          updateSessions(result.sessions || []); lastSessions = Date.now();
+        }
+        const id = selected;
+        if (id) {
+          const data = await sessionGet('snapshot', id);
+          if (selected !== id || generation !== epoch) return;
+          snapshot(data); await extras(id, epoch);
+        }
+        if (epoch === generation) status('Connected · updated ' + new Date().toLocaleTimeString());
+      } catch (error) { if (epoch === generation) { status('Disconnected · retrying reads'); notice(error.message); } }
+      finally { polling = false; }
+    }
+    async function loadContext() {
+      const id = selected, epoch = generation;
+      if (!id) return;
+      for (const route of ['context', 'permissions']) {
+        try {
+          const data = await sessionGet(route, id);
+          if (selected === id && generation === epoch) text(route, data);
+        } catch (error) { if (selected === id && generation === epoch) text(route, error.message); }
+      }
+    }
+    function form(id, route, body, clear) {
+      $(id).onsubmit = event => {
+        event.preventDefault();
+        run(async () => { if (await act(route, body()) && clear) clear(); }, $(id).querySelector('button'));
+      };
+    }
+    form('prompt-form', 'prompt', () => ({ text: $('prompt').value }), () => { $('prompt').value = ''; });
+    form('model-form', 'model', () => ({ model: $('model').value.trim(), ...($('effort').value.trim() ? { effort: $('effort').value.trim() } : {}) }), () => {
+      delete $('model').dataset.dirty; delete $('effort').dataset.dirty;
+    });
+    form('mode-form', 'mode', () => {
+      if ($('mode').value === 'bypass' && !confirm('Enable bypass mode without tool approvals?')) throw new Error('Mode unchanged');
+      return { mode: $('mode').value };
+    }, () => { delete $('mode').dataset.dirty; });
+    for (const id of ['model', 'effort', 'mode']) $(id).oninput = () => { $(id).dataset.dirty = 'true'; };
+    form('goal-form', 'goal', () => ({ text: $('goal-text').value }));
+    form('allow-form', 'allow', () => {
+      if (!confirm('Allow rule ' + $('rule').value + '?')) throw new Error('Rule unchanged');
+      return { rule: $('rule').value };
+    });
+    form('schedule-form', 'schedule', () => ({ spec: $('spec').value, text: $('schedule-text').value,
+      times: $('times').value ? Number($('times').value) : null, lasts: $('lasts').value || null }));
+    for (const [label, route] of [['Interrupt', 'interrupt'], ['Interrupt parent turn', 'interrupt/turn'], ['Retry failed turn', 'retry'], ['Resume turn', 'resume']]) {
+      button($('turn-actions'), label, () => act(route), route.startsWith('interrupt'));
+    }
+    for (const command of ['pause', 'resume', 'clear']) button($('goal-actions'), command + ' goal', () => act('goal', { text: command }, command === 'clear' ? 'Clear this goal?' : ''));
+    button($('trust-actions'), 'Trust project', () => act('trust', {}, 'Trust this project and its instructions?'), true);
+    button($('trust-actions'), 'Untrust project', () => act('untrust'));
+    $('fast').onchange = () => run(() => act('fast', { on: $('fast').checked }), $('fast'));
+    $('session').onchange = () => {
+      selected = $('session').value; rendered.delete('approval'); rendered.delete('children');
+      $('controls').hidden = !selected; $('approval').hidden = true;
+      for (const id of ['model', 'effort', 'mode']) delete $(id).dataset.dirty;
+      for (const id of ['transcript', 'children', 'background', 'schedules', 'monitors', 'context', 'permissions', 'state', 'goal-state']) {
+        $(id).replaceChildren(); delete $(id).dataset.rendered; rendered.delete(id);
+      }
+      run(refresh);
+    };
+    $('refresh').onclick = () => run(refresh);
+    $('context-refresh').onclick = () => run(loadContext, $('context-refresh'));
+    $('reconnect').onclick = () => run(async () => { token = ''; await authenticate(); lastSessions = 0; await refresh(); }, $('reconnect'));
+    $('pair-form').onsubmit = event => { event.preventDefault(); run(() => importPairing($('pair-data').value.trim()), $('pair-form').querySelector('button')); };
+    $('forget').onclick = () => run(async () => {
+      if (!confirm('Forget the saved controller key on this browser? This does not revoke copies on other devices.')) return;
+      localStorage.removeItem(storageKey); generation++; token = ''; pairing = null; privateKey = null; authenticating = null; selected = '';
+      stopCamera(); resetView(); $('pairing').open = true; $('pair-data').value = ''; $('relay').value = ''; notice(); status('Key forgotten');
+    });
+    function stopCamera() {
+      clearTimeout(scanTimer); scanTimer = null;
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      stream = null; $('video').srcObject = null; $('video').hidden = true; $('stop-camera').hidden = true;
+    }
+    async function scanCamera() {
+      if (!stream) return;
+      try {
+        const codes = await detector.detect($('video'));
+        if (!stream) return;
+        if (codes.length) { stopCamera(); await run(() => importPairing(codes[0].rawValue)); return; }
+      } catch { /* A frame may not be ready yet. */ }
+      if (stream) scanTimer = setTimeout(scanCamera, 300);
+    }
+    $('stop-camera').onclick = stopCamera;
+    $('camera').onclick = () => run(async () => {
+      stopCamera();
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+      $('video').srcObject = stream; $('video').hidden = false; $('stop-camera').hidden = false;
+      try { await $('video').play(); await scanCamera(); } catch { stopCamera(); throw new Error('Camera could not start. Paste pairing data instead.'); }
+    }, $('camera'));
+    $('photo').onchange = () => run(async () => {
+      const file = $('photo').files[0]; if (!file) return;
+      let image;
+      try {
+        image = await createImageBitmap(file);
+        const codes = await detector.detect(image);
+        if (!codes.length) throw new Error('No QR code found. Try another photo or paste pairing data.');
+        await importPairing(codes[0].rawValue);
+      } finally { image?.close(); $('photo').value = ''; }
+    });
+    async function init() {
+      // Pairing secrets are never accepted through URLs.
+      if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+      try {
+        if ('BarcodeDetector' in window && (await BarcodeDetector.getSupportedFormats()).includes('qr_code')) detector = new BarcodeDetector({ formats: ['qr_code'] });
+      } catch { detector = null; }
+      $('camera').disabled = !detector || !navigator.mediaDevices?.getUserMedia;
+      $('photo').disabled = !detector || !window.createImageBitmap;
+      text('scan-help', detector ? 'Scan live or choose a QR photo. Camera access requires HTTPS and your permission.' : 'This browser does not support native QR scanning. Use the paste form, or a browser with BarcodeDetector QR support. No scanner library is downloaded.');
+      try {
+        const saved = localStorage.getItem(storageKey);
+        if (saved) {
+          const prepared = await prepare(saved); pairing = prepared.data; privateKey = prepared.key;
+          $('pairing').open = false; await refresh();
+        }
+      } catch { notice('Could not load saved pairing. Re-pair or forget the saved key.'); }
+      setInterval(() => { if (!document.hidden) void refresh(); }, 1000);
+    }
+    document.addEventListener('visibilitychange', () => { if (document.hidden) stopCamera(); else void refresh(); });
+    window.addEventListener('pagehide', stopCamera);
+    void init();
+  </script>
+</body>
+</html>
