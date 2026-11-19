@@ -294,7 +294,7 @@
       rendered.set('sessions', list);
       const options = [node('option', 'Choose a session')]; options[0].value = '';
       for (const row of rows) {
-        const option = node('option', (row.title || row.id) + ' · ' + (row.project || '') + (row.connected ? '' : ' (offline)'));
+        const option = node('option', (row.title || 'bhai') + ' · ' + row.id.slice(0, 8) + ' · ' + (row.project || '') + (row.connected ? '' : ' (offline)'));
         option.value = row.id; options.push(option);
       }
       if (selected && !rows.some(row => row.id === selected)) {

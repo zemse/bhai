@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-20
 
+- Remote session choices include short IDs, so sessions with the same title and project remain distinguishable.
 - Remote-control startup shows a private pairing QR, reopened with `/rc`. Phone camera/photo pairing falls back to bundled jsQR when native scanning is unavailable, with local-only decoding, touch-sized controls and narrow-screen layouts. Update the HTTP/TLS dependencies to current stable releases and bundle the scanner and license in the binary.
 - `--relay` serves a mobile controller and relays authenticated laptop sessions; `--rc ADDRESS` publishes a local session over a reconnecting outbound WebSocket. A machine-wide private control key signs expiring challenges, session discovery is scoped to its public identity, and bounded action receipts prevent duplicates across reconnects. The browser controls prompts, approvals, settings, shell commands, files, child agents, goals and background work. Pairing supports permanent key import and a private TUI QR overlay.
 
