@@ -234,6 +234,11 @@ pub const COMMANDS: &[Command] = &[
         help: "toggle mouse capture",
     },
     Command {
+        name: "rc",
+        args: "",
+        help: "show this machine's private remote-control pairing QR",
+    },
+    Command {
         name: "quit",
         args: "",
         help: "leave bhai",

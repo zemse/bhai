@@ -100,9 +100,25 @@ impl Identity {
     }
 
     pub fn pairing(&self, relay: &str) -> String {
-        json!({"v":1,"relay":relay,"key":B64.encode(self.key.serialized_der()),
-            "public_key":B64.encode(self.key.public_key_raw())})
-        .to_string()
+        json!({"v":1,"relay":relay,"key":B64.encode(self.key.serialized_der())}).to_string()
+    }
+
+    pub fn qr(&self, relay: &str) -> Result<Vec<String>> {
+        let qr = qrcodegen::QrCode::encode_text(&self.pairing(relay), qrcodegen::QrCodeEcc::Medium)
+            .map_err(|_| anyhow::anyhow!("relay address is too long for the pairing QR"))?;
+        let mut rows = Vec::new();
+        for y in (-4..qr.size() + 4).step_by(2) {
+            let row = (-4..qr.size() + 4)
+                .map(|x| match (qr.get_module(x, y), qr.get_module(x, y + 1)) {
+                    (true, true) => '█',
+                    (true, false) => '▀',
+                    (false, true) => '▄',
+                    (false, false) => ' ',
+                })
+                .collect();
+            rows.push(row);
+        }
+        Ok(rows)
     }
 
     fn auth(&self, nonce: String, role: &str) -> Result<Auth> {
@@ -231,6 +247,24 @@ pub async fn serve(bind: std::net::SocketAddr) -> Result<()> {
 fn router(hub: Arc<Hub>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route(
+            "/static/jsQR.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../assets/vendor/jsQR.js"),
+                )
+            }),
+        )
+        .route(
+            "/static/jsQR.LICENSE",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../assets/vendor/jsQR.LICENSE"),
+                )
+            }),
+        )
         .route("/health", get(|| async { Json(json!({"ok":true})) }))
         .route("/api/challenge", get(nonce))
         .route(
@@ -885,6 +919,43 @@ mod tests {
         auth.role = "controller".into();
         auth.nonce = "another".into();
         assert!(verified(&auth).is_none());
+    }
+
+    #[test]
+    fn pairing_qr_preserves_modules_and_a_four_module_quiet_zone() {
+        let identity = identity();
+        let relay = "https://relay.example.com";
+        let pairing: Value = serde_json::from_str(&identity.pairing(relay)).unwrap();
+        assert_eq!(pairing["v"], 1);
+        assert_eq!(pairing["relay"], relay);
+        assert!(pairing.get("public_key").is_none());
+        assert_eq!(
+            B64.decode(pairing["key"].as_str().unwrap()).unwrap(),
+            identity.key.serialize_der()
+        );
+        let expected =
+            qrcodegen::QrCode::encode_text(&identity.pairing(relay), qrcodegen::QrCodeEcc::Medium)
+                .unwrap();
+        let rows = identity.qr(relay).unwrap();
+        assert!(rows[0].chars().all(|cell| cell == ' '));
+        for (row, line) in rows.iter().enumerate() {
+            assert_eq!(line.chars().count(), expected.size() as usize + 8);
+            for (column, cell) in line.chars().enumerate() {
+                let bits = match cell {
+                    '█' => (true, true),
+                    '▀' => (true, false),
+                    '▄' => (false, true),
+                    ' ' => (false, false),
+                    _ => panic!("invalid QR cell"),
+                };
+                let x = column as i32 - 4;
+                let y = row as i32 * 2 - 4;
+                assert_eq!(
+                    bits,
+                    (expected.get_module(x, y), expected.get_module(x, y + 1))
+                );
+            }
+        }
     }
 
     #[test]

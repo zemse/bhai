@@ -485,22 +485,24 @@ allow it.",
     if private {
         start_private(&session).await?;
     }
-    let _remote_control = if let Some(relay) = &args.rc {
+    let (_remote_control, rc_pairing) = if let Some(relay) = &args.rc {
         let identity = crate::relay::Identity::machine()?;
+        let pairing = interactive
+            .then(|| identity.qr(relay).map(|rows| (relay.clone(), rows)))
+            .transpose()?;
         notices.push(format!(
-            "remote control: {relay}; machine key in ~/.bhai/control-key.pem"
+            "remote control: {relay}; machine key in ~/.bhai/control-key.pem; /rc reopens pairing"
         ));
-        Some(
-            crate::relay::Control::start(
-                relay.clone(),
-                identity,
-                Arc::clone(&session),
-                session_id.clone(),
-            )
-            .await?,
+        let control = crate::relay::Control::start(
+            relay.clone(),
+            identity,
+            Arc::clone(&session),
+            session_id.clone(),
         )
+        .await?;
+        (Some(control), pairing)
     } else {
-        None
+        (None, None)
     };
     startup::end("start");
     // `--workflow` is a run of its own: no TUI, no turn, just the steps and their report.
@@ -651,6 +653,7 @@ allow it.",
         requests,
         schedules,
         None,
+        rc_pairing,
     )
     .await;
     drop(guard);
@@ -842,6 +845,7 @@ async fn attach(
         None,
         None,
         Some(attached.resync),
+        None,
     )
     .await;
     if let Some((tunnel, _)) = through {
@@ -1968,6 +1972,7 @@ async fn run(
     askpass: Option<mpsc::UnboundedReceiver<askpass::Request>>,
     schedules: Option<Arc<schedules::Schedules>>,
     resync: Option<mpsc::UnboundedReceiver<()>>,
+    rc_pairing: Option<(String, Vec<String>)>,
 ) -> Result<Option<i32>> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -2055,6 +2060,10 @@ async fn run(
 
     let mouse = modes.mouse;
     let mut app = App::new(Arc::clone(&session));
+    if let Some((relay, rows)) = rc_pairing {
+        app.rc_relay = Some(relay);
+        app.rc_pairing = Some(rows);
+    }
     app.mouse = mouse;
     app.skills = skills;
     app.mcp = hub;

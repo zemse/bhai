@@ -176,6 +176,8 @@ fn class(c: char) -> u8 {
 pub struct App {
     /// Rendered QR rows, kept only in the local pairing modal.
     pub rc_pairing: Option<Vec<String>>,
+    /// The relay whose pairing QR `/rc` opens again.
+    pub rc_relay: Option<String>,
     /// Screen rows of each visible entry, filled in by the renderer.
     pub rows: Vec<(Range<u16>, usize)>,
     /// The entry under the mouse.
@@ -445,6 +447,7 @@ impl App {
         ));
         let mut app = Self {
             rc_pairing: None,
+            rc_relay: None,
             rows: Vec::new(),
             hover: None,
             mouse_row: None,
@@ -2114,6 +2117,20 @@ impl App {
             }
             return;
         }
+        if message == "/rc" {
+            match self.rc_relay.as_deref() {
+                Some(relay) => {
+                    match crate::relay::Identity::machine().and_then(|key| key.qr(relay)) {
+                        Ok(rows) => self.rc_pairing = Some(rows),
+                        Err(error) => self.note(Entry::Error(error.to_string())),
+                    }
+                }
+                None => self.note(Entry::Error(
+                    "start bhai with --rc ADDRESS to pair remote control".into(),
+                )),
+            }
+            return;
+        }
         if message == "/help" {
             self.follow = true;
             self.note(Entry::Info(commands::help()));
@@ -3586,6 +3603,20 @@ mod tests {
                 assert!(control.try_recv().is_err());
             }
         }
+    }
+
+    #[test]
+    fn rc_without_a_relay_never_starts_a_model_turn() {
+        let (mut app, mut user, mut control) = connected();
+        app.input.set("/rc".to_string());
+        app.submit();
+        assert!(app.rc_pairing.is_none());
+        assert!(app.rc_relay.is_none());
+        assert!(app.entries().list.iter().any(
+            |entry| matches!(entry, Entry::Error(message) if message.contains("--rc ADDRESS"))
+        ));
+        assert!(user.try_recv().is_err());
+        assert!(control.try_recv().is_err());
     }
 
     #[test]
