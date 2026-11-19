@@ -1,0 +1,7 @@
+jsQR 1.4.0
+Latest published version from https://registry.npmjs.org/jsqr/latest
+Source: https://registry.npmjs.org/jsqr/-/jsqr-1.4.0.tgz
+Integrity: sha512-dxLob7q65Xg2DvstYkRpkYtmKm2sPJ9oFhrhmudT1dZvNFFTlroai3AWSpLey/w5vMcLBXRgOJsbXpdN9HzU/A==
+SHA512 integrity verified before extracting package/dist/jsQR.js and package/LICENSE.
+Files are unmodified. License: Apache-2.0 (see jsQR.LICENSE).
+Upstream: https://github.com/cozmo/jsQR

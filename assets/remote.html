@@ -9,14 +9,18 @@
   <style>
     :root { font: 16px/1.5 system-ui, sans-serif; color-scheme: dark; background: #11151b; color: #e3e9ef; }
     * { box-sizing: border-box; }
-    body { margin: auto; max-width: 1100px; padding: 16px; padding-bottom: max(24px, env(safe-area-inset-bottom)); }
+    body { margin: auto; max-width: 1100px; padding: 16px; padding-bottom: max(24px, env(safe-area-inset-bottom)); overflow-wrap: anywhere; }
     header { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
     h1 { font-size: 1.4rem; margin: 0; }
     h2 { font-size: 1.15rem; margin-top: 0; }
     h3 { font-size: 1rem; }
     section, details.panel { background: #1a212b; border: 1px solid #374355; border-radius: 12px; padding: 16px; margin: 14px 0; }
-    summary { cursor: pointer; padding: 4px; overflow-wrap: anywhere; }
+    summary { cursor: pointer; padding: 10px 4px; min-height: 44px; overflow-wrap: anywhere; }
     label { display: block; margin: 10px 0; }
+    label:has(input[type=checkbox]) { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 8px 0; }
+    input[type=checkbox] { width: 22px; height: 22px; flex-shrink: 0; }
+    input::file-selector-button { min-height: 44px; font: inherit; }
+    input, textarea, select { min-width: 0; }
     input, textarea, select, button { font: inherit; border: 1px solid #56657a; border-radius: 7px; padding: 10px; color: inherit; background: #121922; max-width: 100%; }
     input:not([type=checkbox]), textarea, select { width: 100%; }
     textarea { resize: vertical; min-height: 90px; }
@@ -27,20 +31,25 @@
     button.danger { border-color: #e4957c; }
     :focus-visible { outline: 2px solid #a3d5ff; outline-offset: 3px; }
     .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .row > * { min-width: 0; }
     .row > label { flex: 1 1 180px; }
+    button { white-space: normal; overflow-wrap: anywhere; }
+    .grid > * { min-width: 0; }
     .muted { color: #b1bdcc; font-size: .9rem; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; font: .9rem/1.5 ui-monospace, monospace; }
     #notice { position: sticky; top: 0; z-index: 2; background: #302b1d; border-radius: 6px; padding: 10px; }
     #status { color: #aed5ff; }
     #approval { border: 2px solid #e6bc67; }
-    #transcript { max-height: 65vh; overflow: auto; overscroll-behavior: contain; }
+    #approval-text { max-height: 40vh; overflow: auto; padding: 8px; border: 1px solid #56657a; border-radius: 7px; overscroll-behavior: contain; }
+    #transcript { max-height: 65vh; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
     .entry { padding: 12px 4px; border-bottom: 1px solid #344050; }
     .entry.user { border-left: 3px solid #80bfff; padding-left: 10px; }
     .entry.error, .entry.failed { color: #ffc0ad; }
     .kind { color: #a8bfd7; font-size: .8rem; text-transform: uppercase; }
     video { width: 100%; max-height: 45vh; }
     [hidden] { display: none !important; }
-    @media (min-width: 800px) { .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; } }
+    @media (max-width: 430px) { body { padding: 12px; padding-bottom: max(24px, env(safe-area-inset-bottom)); } section, details.panel { padding: 12px; } }
+    @media (min-width: 800px) { .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; } }
   </style>
 </head>
 <body>
@@ -51,7 +60,7 @@
     <p>Scan the machine's pairing QR or paste its JSON. Pair only with a relay you trust. The private key stays saved in this browser until you forget it. Bearer tokens are kept only in memory.</p>
     <p class="muted">Anyone with access to this browser's storage can use the saved key. Do not pair on a shared device.</p>
     <div class="row"><button id="camera">Scan with camera</button><button id="stop-camera" hidden>Stop camera</button><label>QR photo <input id="photo" type="file" accept="image/*"></label></div>
-    <p id="scan-help" class="muted"></p>
+    <p id="scan-help" class="muted" role="status"></p>
     <video id="video" autoplay muted playsinline hidden></video>
     <form id="pair-form">
       <label>Pairing JSON or base64url PKCS8 private key<textarea id="pair-data" autocomplete="off" spellcheck="false" required></textarea></label>
@@ -65,7 +74,7 @@
     <p id="session-status" class="muted">Waiting for connection</p>
   </section>
   <main id="controls" hidden>
-    <section id="approval" hidden><h2>Approval required</h2><pre id="approval-text"></pre><div id="approval-buttons" class="row"></div></section>
+    <section id="approval" hidden><h2>Approval required</h2><p id="approval-help" class="muted">Review the entire request before approving. Scroll inside the request for long commands.</p><pre id="approval-text" tabindex="0" aria-label="Pending approval request" aria-describedby="approval-help"></pre><div id="approval-buttons" class="row"></div></section>
     <section>
       <div class="row"><h2>Transcript</h2><label><input id="follow" type="checkbox" checked> Follow latest</label><button id="refresh">Refresh</button></div>
       <div id="transcript" tabindex="0" aria-label="Session transcript"></div>
@@ -101,13 +110,17 @@
     </details>
     <details class="panel" id="context-panel"><summary>Context, permissions and session state</summary><button id="context-refresh">Load context / permissions</button><pre id="context"></pre><pre id="permissions"></pre><details><summary>Full session state (usage, quota, queue)</summary><pre id="state"></pre></details></details>
   </main>
+  <script src="/static/jsQR.js"></script>
   <script>
     'use strict';
     const $ = id => document.getElementById(id);
     const storageKey = 'bhai.remote.pairing.v1';
     let pairing = null, privateKey = null, token = '', generation = 0, authenticating = null;
     let selected = '', currentState = {}, polling = false, actionBusy = false, lastSessions = 0;
-    let stream = null, scanTimer = null, detector = null;
+    let stream = null, scanTimer = null, detector = null, cameraEpoch = 0;
+    const scanCanvas = document.createElement('canvas');
+    const scanContext = scanCanvas.getContext('2d', { willReadFrequently: true });
+    const scanHelp = 'Scan live or choose a QR photo. Images are decoded only on this device. Camera access requires HTTPS and your permission.';
     const rendered = new Map();
     const pretty = value => typeof value === 'string' ? value : JSON.stringify(value, null, 2);
     function text(id, value) { $(id).textContent = pretty(value ?? ''); }
@@ -318,7 +331,7 @@
       $('approval').hidden = !pending;
       $('approval-buttons').replaceChildren();
       if (!pending) return;
-      text('approval-text', pending);
+      text('approval-text', pending); $('approval-text').scrollTop = 0;
       const target = { id: pending.id };
       button($('approval-buttons'), 'Approve once', () => act('approve', target));
       for (const remember of ['exact', 'prefix']) {
@@ -493,46 +506,92 @@
       localStorage.removeItem(storageKey); generation++; token = ''; pairing = null; privateKey = null; authenticating = null; selected = '';
       stopCamera(); resetView(); $('pairing').open = true; $('pair-data').value = ''; $('relay').value = ''; notice(); status('Key forgotten');
     });
+    async function readQR(source) {
+      if (detector) {
+        try {
+          const codes = await detector.detect(source);
+          if (codes.length) return codes[0].rawValue;
+        } catch { detector = null; }
+      }
+      if (!scanContext || typeof window.jsQR !== 'function') throw new Error('QR scanner unavailable. Reload or paste pairing data.');
+      const width = source.videoWidth || source.naturalWidth;
+      const height = source.videoHeight || source.naturalHeight;
+      if (!width || !height) return '';
+      const scale = Math.min(1, (source === $('video') ? 1280 : 2048) / Math.max(width, height));
+      scanCanvas.width = Math.max(1, Math.round(width * scale));
+      scanCanvas.height = Math.max(1, Math.round(height * scale));
+      scanContext.drawImage(source, 0, 0, scanCanvas.width, scanCanvas.height);
+      const pixels = scanContext.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
+      try {
+        return window.jsQR(pixels.data, pixels.width, pixels.height)?.data || '';
+      } finally { scanCanvas.width = scanCanvas.height = 0; }
+    }
     function stopCamera() {
+      cameraEpoch++;
       clearTimeout(scanTimer); scanTimer = null;
       if (stream) stream.getTracks().forEach(track => track.stop());
       stream = null; $('video').srcObject = null; $('video').hidden = true; $('stop-camera').hidden = true;
+      text('scan-help', scanHelp);
     }
-    async function scanCamera() {
-      if (!stream) return;
+    async function scanCamera(epoch) {
+      if (!stream || epoch !== cameraEpoch) return;
       try {
-        const codes = await detector.detect($('video'));
-        if (!stream) return;
-        if (codes.length) { stopCamera(); await run(() => importPairing(codes[0].rawValue)); return; }
-      } catch { /* A frame may not be ready yet. */ }
-      if (stream) scanTimer = setTimeout(scanCamera, 300);
+        const data = await readQR($('video'));
+        if (!stream || epoch !== cameraEpoch) return;
+        if (data) { stopCamera(); await run(() => importPairing(data)); return; }
+      } catch {
+        if (epoch !== cameraEpoch) return;
+        stopCamera(); notice('Camera frame could not be read. Try a QR photo or paste pairing data.'); return;
+      }
+      if (stream && epoch === cameraEpoch) scanTimer = setTimeout(() => scanCamera(epoch), 300);
     }
     $('stop-camera').onclick = stopCamera;
+    $('pairing').addEventListener('toggle', () => { if (!$('pairing').open) stopCamera(); });
     $('camera').onclick = () => run(async () => {
       stopCamera();
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
-      $('video').srcObject = stream; $('video').hidden = false; $('stop-camera').hidden = false;
-      try { await $('video').play(); await scanCamera(); } catch { stopCamera(); throw new Error('Camera could not start. Paste pairing data instead.'); }
+      const epoch = cameraEpoch;
+      text('scan-help', 'Requesting camera access. Allow access to scan your pairing QR.');
+      try {
+        const camera = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+        if (epoch !== cameraEpoch || !$('pairing').open || document.hidden) { camera.getTracks().forEach(track => track.stop()); return; }
+        stream = camera;
+        $('video').srcObject = stream; $('video').hidden = false; $('stop-camera').hidden = false;
+        await $('video').play();
+        if (epoch !== cameraEpoch) return;
+        text('scan-help', 'Scanning on this device. Point the rear camera at the entire QR code in good light.');
+        await scanCamera(epoch);
+      } catch (error) {
+        if (epoch !== cameraEpoch) return;
+        stopCamera();
+        throw new Error(error.name === 'NotAllowedError' ? 'Camera permission denied. Allow camera access in browser settings, choose a QR photo, or paste pairing data.' : 'Camera could not start. Choose a QR photo or paste pairing data.');
+      }
     }, $('camera'));
     $('photo').onchange = () => run(async () => {
       const file = $('photo').files[0]; if (!file) return;
-      let image;
+      stopCamera();
+      const url = URL.createObjectURL(file), image = new Image();
       try {
-        image = await createImageBitmap(file);
-        const codes = await detector.detect(image);
-        if (!codes.length) throw new Error('No QR code found. Try another photo or paste pairing data.');
-        await importPairing(codes[0].rawValue);
-      } finally { image?.close(); $('photo').value = ''; }
-    });
+        text('scan-help', 'Reading QR photo on this device.');
+        await new Promise((resolve, reject) => {
+          image.onload = resolve;
+          image.onerror = () => reject(new Error('Photo could not be opened. Try a PNG or JPEG, or paste pairing data.'));
+          image.src = url;
+        });
+        const data = await readQR(image);
+        if (!data) throw new Error('No QR code found. Try a clear, cropped photo or paste pairing data.');
+        await importPairing(data);
+      } finally { URL.revokeObjectURL(url); image.src = ''; $('photo').value = ''; text('scan-help', scanHelp); }
+    }, $('photo'));
     async function init() {
       // Pairing secrets are never accepted through URLs.
       if (location.hash) history.replaceState(null, '', location.pathname + location.search);
       try {
         if ('BarcodeDetector' in window && (await BarcodeDetector.getSupportedFormats()).includes('qr_code')) detector = new BarcodeDetector({ formats: ['qr_code'] });
       } catch { detector = null; }
-      $('camera').disabled = !detector || !navigator.mediaDevices?.getUserMedia;
-      $('photo').disabled = !detector || !window.createImageBitmap;
-      text('scan-help', detector ? 'Scan live or choose a QR photo. Camera access requires HTTPS and your permission.' : 'This browser does not support native QR scanning. Use the paste form, or a browser with BarcodeDetector QR support. No scanner library is downloaded.');
+      const scanner = !!detector || (typeof window.jsQR === 'function' && !!scanContext);
+      $('camera').disabled = !scanner || !navigator.mediaDevices?.getUserMedia;
+      $('photo').disabled = !scanner;
+      text('scan-help', !scanner ? 'QR scanner unavailable. Reload or paste pairing data.' : !navigator.mediaDevices?.getUserMedia ? 'Camera unavailable. Open this page over HTTPS, choose a QR photo, or paste pairing data. Photos are decoded only on this device.' : scanHelp);
       try {
         const saved = localStorage.getItem(storageKey);
         if (saved) {
