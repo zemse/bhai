@@ -75,6 +75,15 @@ pub async fn entry() -> Result<()> {
     if args.tart {
         return crate::tart::launch(forwarded).await;
     }
+    if let Some(bind) = args.relay {
+        return crate::relay::serve(bind).await;
+    }
+    if let Some(address) = &args.rc {
+        args.rc = Some(crate::relay::address(address)?);
+        if args.headless && args.serve.is_none() {
+            args.serve = Some(0);
+        }
+    }
     tools::bash::kill_all_on_signal()?;
     if let Some(dir) = &args.cd {
         std::env::set_current_dir(dir)
@@ -252,7 +261,8 @@ pub async fn entry() -> Result<()> {
     // `--workflow` and `exec` answer every approval but the workflow's own with no, so a
     // call the rules leave at `Ask` is refused for good. The agent is told that rather
     // than told to ask someone who is not there. `exec --serve` has the server to ask.
-    let unattended = args.workflow.is_some() || (args.exec.is_some() && args.serve.is_none());
+    let unattended = args.workflow.is_some()
+        || (args.exec.is_some() && args.serve.is_none() && args.rc.is_none());
     let policy = match unattended {
         true => policy.unattended(),
         false => policy,
@@ -475,6 +485,23 @@ allow it.",
     if private {
         start_private(&session).await?;
     }
+    let _remote_control = if let Some(relay) = &args.rc {
+        let identity = crate::relay::Identity::machine()?;
+        notices.push(format!(
+            "remote control: {relay}; machine key in ~/.bhai/control-key.pem"
+        ));
+        Some(
+            crate::relay::Control::start(
+                relay.clone(),
+                identity,
+                Arc::clone(&session),
+                session_id.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     startup::end("start");
     // `--workflow` is a run of its own: no TUI, no turn, just the steps and their report.
     if let Some((name, input)) = args.workflow.clone() {
@@ -508,7 +535,13 @@ allow it.",
             }
             None => None,
         };
-        let result = headless_exec(&session, prompt, args.json, served.is_some()).await;
+        let result = headless_exec(
+            &session,
+            prompt,
+            args.json,
+            served.is_some() || args.rc.is_some(),
+        )
+        .await;
         if let Some(server) = served {
             server.abort();
         }
@@ -981,6 +1014,8 @@ struct Args {
     judge_eval: Option<Option<String>>,
     /// Port for the debug server, when `--serve` is given.
     serve: Option<u16>,
+    rc: Option<String>,
+    relay: Option<std::net::SocketAddr>,
     headless: bool,
     /// `--token-file`: where the debug server's token is kept across runs.
     token_file: Option<PathBuf>,

@@ -15,6 +15,8 @@ SIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the se
 On a server, bhai serve (or --serve PORT --headless) runs sessions with no terminal, under tmux or systemd: see serve --help.
 From a laptop, tunnel the port with ssh -L and run bhai attach: see attach --help. The servers listen on 127.0.0.1 only.
 Requests carry the token in x-bhai-token; --token-file or BHAI_TOKEN keeps it across restarts.
+For mobile control, --rc https://RELAY publishes a local session using ~/.bhai/control-key.pem.
+--relay [BIND] runs the trusted relay's web interface; terminate HTTPS in front of its loopback listener.
 Over HTTP: GET /state (with quota), GET /events?since=N replays then streams, GET /file and POST /upload move files under the project root.";
 
 #[derive(Debug, Parser)]
@@ -79,8 +81,14 @@ pub(super) struct Cli {
     /// Start the debug HTTP server on 127.0.0.1 (default port: 7878).
     #[arg(long, global = true, num_args = 0..=1, default_missing_value = "7878", value_name = "PORT")]
     serve: Option<u16>,
-    /// Run the debug server without the terminal UI; SIGINT ends it as SIGTERM does.
-    #[arg(long, global = true, requires = "serve")]
+    /// Connect this session to a remote-control relay over HTTPS.
+    #[arg(long, global = true, value_name = "ADDRESS")]
+    rc: Option<String>,
+    /// Run the remote-control relay (default: 127.0.0.1:8787; put HTTPS in front).
+    #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:8787", value_name = "BIND")]
+    relay: Option<std::net::SocketAddr>,
+    /// Run the debug or remote-control session without the terminal UI.
+    #[arg(long, global = true)]
     headless: bool,
     /// Read the server token from this file, or create it (mode 600) with a new one; overrides BHAI_TOKEN.
     #[arg(long, global = true, value_name = "PATH")]
@@ -348,6 +356,8 @@ impl Cli {
             cache_check: self.cache_check,
             judge_eval: self.judge_eval,
             serve: self.serve,
+            rc: self.rc,
+            relay: self.relay,
             headless: self.headless,
             token_file: self.token_file,
             profile: self.profile,
@@ -373,6 +383,41 @@ impl Cli {
                 bare: self.bare,
             },
         };
+        if parsed.headless && parsed.serve.is_none() && parsed.rc.is_none() {
+            return Err(Self::invalid("--headless requires --serve or --rc"));
+        }
+        if parsed.relay.is_some()
+            && (parsed.rc.is_some()
+                || parsed.command.is_some()
+                || parsed.serve.is_some()
+                || parsed.headless
+                || parsed.exec.is_some()
+                || parsed.workflow.is_some()
+                || parsed.probe.is_some()
+                || parsed.cache_check.is_some()
+                || parsed.judge_eval.is_some()
+                || parsed.resume.is_some()
+                || parsed.pick
+                || parsed.model.is_some()
+                || parsed.effort.is_some()
+                || parsed.flags.mode.is_some()
+                || parsed.identity.is_some()
+                || parsed.trust
+                || parsed.tart)
+        {
+            return Err(Self::invalid("--relay runs on its own"));
+        }
+        if parsed.rc.is_some()
+            && (parsed.command.is_some() && parsed.exec.is_none()
+                || parsed.workflow.is_some()
+                || parsed.probe.is_some()
+                || parsed.cache_check.is_some()
+                || parsed.judge_eval.is_some())
+        {
+            return Err(Self::invalid(
+                "--rc runs a local session, not a utility command or workflow",
+            ));
+        }
         if parsed.workflow.is_some() && (parsed.serve.is_some() || parsed.headless || parsed.pick) {
             return Err(Self::invalid(
                 "--workflow runs on its own, without --serve, --headless or --pick",
@@ -494,6 +539,27 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Args, clap::Error> {
         Cli::parse(std::iter::once("bhai").chain(args.iter().copied()))?.into_args()
+    }
+
+    #[test]
+    fn relay_and_remote_control_have_distinct_run_modes() {
+        let relay = parse(&["--relay"]).unwrap();
+        assert_eq!(relay.relay.unwrap().to_string(), "127.0.0.1:8787");
+        assert!(relay.rc.is_none());
+        let remote = parse(&["--rc", "relay.example", "--headless"]).unwrap();
+        assert_eq!(remote.rc.as_deref(), Some("relay.example"));
+        assert!(remote.headless);
+        assert!(parse(&["exec", "test", "--rc", "relay.example"]).is_ok());
+        for args in [
+            vec!["--relay", "--rc", "relay.example"],
+            vec!["--relay", "--model", "test-model"],
+            vec!["--relay", "--serve"],
+            vec!["--relay", "exec", "test"],
+            vec!["--rc", "relay.example", "models"],
+            vec!["--headless"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]

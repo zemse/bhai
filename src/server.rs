@@ -155,6 +155,9 @@ fn router(session: Arc<Session>, token: String) -> Router {
         .route("/snapshot", get(snapshot))
         .route("/events", get(events))
         .route("/prompt", post(prompt))
+        .route("/shell", post(shell))
+        .route("/shell/background", post(background_shell))
+        .route("/queue/clear", post(clear_queue))
         .route("/approve", post(approve))
         .route("/reject", post(reject))
         .route("/interrupt", post(interrupt))
@@ -240,6 +243,42 @@ fn constant_eq(given: &str, token: &str) -> bool {
 struct Prompt {
     text: String,
     id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ShellBody {
+    command: String,
+}
+
+async fn shell(State(session): State<Arc<Session>>, Json(body): Json<ShellBody>) -> Response {
+    if body.command.trim().is_empty() || body.command.len() > 64 * 1024 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "command is empty or longer than 64 KiB",
+        );
+    }
+    if session.privacy.active() {
+        return error(
+            StatusCode::CONFLICT,
+            "shell commands are unavailable in private mode",
+        );
+    }
+    session.shell(&body.command, "");
+    ok()
+}
+
+async fn background_shell(State(session): State<Arc<Session>>) -> Response {
+    match session.background_shell() {
+        true => ok(),
+        false => error(
+            StatusCode::CONFLICT,
+            "no foreground command is ready to background",
+        ),
+    }
+}
+
+async fn clear_queue(State(session): State<Arc<Session>>) -> Response {
+    Json(json!({"ok":true,"cleared":session.clear_queue()})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1038,6 +1077,24 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(serve(listener, Arc::clone(&session), TOKEN.to_string()));
         (base, session)
+    }
+
+    #[tokio::test]
+    async fn shell_and_queue_controls_validate_before_acting() {
+        let (base, _) = quiet().await;
+        let http = reqwest::Client::new();
+        assert_eq!(
+            post(&http, format!("{base}/shell"), json!({"command":" "})).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(&http, format!("{base}/shell/background"), json!({})).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post(&http, format!("{base}/queue/clear"), json!({})).await,
+            StatusCode::OK
+        );
     }
 
     fn text(s: &str) -> session::Event {

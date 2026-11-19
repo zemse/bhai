@@ -88,6 +88,7 @@ pub mod profile;
 pub mod prompt;
 mod reader;
 mod redact;
+pub mod relay;
 pub mod remote;
 mod runtime;
 mod sandbox;

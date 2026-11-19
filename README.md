@@ -201,6 +201,20 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
+### relay remote control
+
+`bhai --rc https://relay.example.com` keeps the session on this machine and connects outward to a trusted relay. `bhai --relay` runs that relay on `127.0.0.1:8787`; put an HTTPS reverse proxy in front of it. `--relay=HOST:PORT` changes the listener. no model credentials or inference are needed on the relay.
+
+all sessions explicitly started with `--rc` share `~/.bhai/control-key.pem`, an ECDSA P-256 private key created atomically with mode 600. the browser imports a permanent pairing key and proves possession by signing a single-use, short-lived challenge. the relay verifies the public key, never needs the private key, and scopes session discovery and control to that machine. pairing JSON contains `v: 1`, the relay origin and a base64url PKCS8 `key`; the browser derives the public key. key-only import also accepts that base64url PKCS8 value with the relay URL entered separately. terminal QR pairing is not wired into startup yet.
+
+the mobile web page shows transcripts, tools, approvals, child agents, goals, schedules, background work, context and usage. it sends prompts, answers approvals, changes model and permission settings, runs direct shell commands, clears queued prompts and transfers files within the project. the existing permission rules and file protections still apply. `--rc --headless` serves a session without a terminal; `exec PROMPT --rc ADDRESS` waits for remote permission decisions instead of rejecting them unattended.
+
+local work continues when either connection drops. the laptop reconnects automatically, and the browser reauthenticates and reads a fresh snapshot. actions are not automatically retried after an uncertain result. a caller-supplied UUID in `X-Bhai-Request-Id` deduplicates the last 512 actions on the laptop across transport reconnects; reusing an ID for another action is refused. the relay keeps no persistent transcripts or session inventory. a stopped process disappears from discovery; this does not install a laptop-side session daemon.
+
+this is a **trusted relay**, not end-to-end encryption: the relay can read and manipulate session traffic, and its web code can use the browser's saved key. HTTPS is required outside loopback. browser storage holds the permanent key until it is forgotten; anyone with a copy has full control. to revoke all copies, stop the machine's remote-control sessions, move the key aside and restart them with a newly generated key, then pair again. forgetting one browser does not revoke other copies.
+
+security follows the [OWASP WebSocket guidance](https://cheatsheetseries.owasp.org/cheatsheets/WebSocket_Security_Cheat_Sheet.html): no credentials in URLs, origin checks, bounded messages and pending requests, expiring authorization and replay-resistant challenges. native camera/photo QR scanning currently requires browser `BarcodeDetector` support; unsupported browsers can paste pairing data instead.
+
 ### driving bhai from another harness
 
 `bhai models` lists exact model IDs, supported reasoning efforts and known context windows. `bhai models --json` returns one JSON object with `models` and `notes`, unlike the JSONL event stream from `exec --json`. listing reads backend metadata without starting an agent session or requesting inference.

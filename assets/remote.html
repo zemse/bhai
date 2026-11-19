@@ -86,6 +86,14 @@
         <form id="goal-form"><label>Objective<textarea id="goal-text" required></textarea></label><button>Set goal</button></form><div id="goal-actions" class="row"></div>
       </details>
     </div>
+    <details class="panel"><summary>Shell and files</summary>
+      <p class="muted">Shell commands run as you, just like typing ! in the terminal. Existing deny rules and private-mode restrictions still apply.</p>
+      <form id="shell-form"><label>Shell command<textarea id="shell-command" required></textarea></label><button>Run shell command</button></form>
+      <button id="shell-background">Background foreground command</button>
+      <form id="upload-form"><label>File<input id="upload-file" type="file" required></label><label>Project-relative destination<input id="upload-path" required></label><label><input id="overwrite" type="checkbox"> Replace an existing file</label><button>Upload file</button></form>
+      <form id="download-form"><label>Project-relative file to download<input id="download-path" required></label><button>Download file</button></form>
+      <p class="muted">Files are limited to 16 MiB and stay inside the project. Protected paths and deny rules still apply.</p>
+    </details>
     <details class="panel" id="children-panel"><summary>Children and steering</summary><div id="children"></div></details>
     <details class="panel" id="background-panel"><summary>Background and monitors</summary><div id="background"></div><pre id="monitors"></pre></details>
     <details class="panel" id="schedules-panel"><summary>Schedules</summary><div id="schedules"></div>
@@ -152,7 +160,9 @@
       } catch { value = { v: 1, key: data.trim(), relay: $('relay').value.trim() }; }
       if (!value || value.v !== 1 || typeof value.key !== 'string') throw new Error('Expected v:1 pairing JSON or a private key');
       const relay = new URL(value.relay);
-      if (relay.protocol !== 'https:' || relay.username || relay.password || relay.search || relay.hash) throw new Error('Relay must be HTTPS without credentials, query or fragment');
+      const loopback = relay.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(relay.hostname);
+      if ((!loopback && relay.protocol !== 'https:') || relay.username || relay.password || relay.search || relay.hash || relay.pathname !== '/') throw new Error('Relay must be an HTTPS origin (HTTP is allowed only on loopback)');
+      if (relay.origin !== location.origin) throw new Error('Open the pairing relay website before importing this key');
       try {
         const key = await crypto.subtle.importKey('pkcs8', decode(value.key), { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
         const jwk = await crypto.subtle.exportKey('jwk', key);
@@ -178,6 +188,7 @@
       const headers = { Accept: 'application/json' };
       if (authenticated) headers.Authorization = 'Bearer ' + token;
       if (body !== undefined) headers['Content-Type'] = 'application/json';
+      if (authenticated && method === 'POST') headers['X-Bhai-Request-Id'] = body.request_id;
       const response = await fetch(pairing.relay + '/api' + path, {
         method, headers, body: body === undefined ? undefined : JSON.stringify(body),
         cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error', signal: AbortSignal.timeout(15000)
@@ -241,6 +252,28 @@
         throw new Error(error.message + ' The action was not retried; its outcome may be unknown.');
       } finally { actionBusy = false; }
     }
+    async function transfer(route, method = 'GET', body) {
+      if (actionBusy || !selected || !pairing) throw new Error('Choose a connected session with no action in flight');
+      actionBusy = true;
+      const id = selected, epoch = generation;
+      try {
+        if (!token) await authenticate();
+        if (epoch !== generation || id !== selected) throw new Error('Connection changed. File request not sent.');
+        const headers = { Authorization: 'Bearer ' + token };
+        if (method === 'POST') {
+          headers['Content-Type'] = 'application/octet-stream';
+          headers['X-Bhai-Request-Id'] = crypto.randomUUID();
+        }
+        const response = await fetch(pairing.relay + '/api/sessions/' + encodeURIComponent(id) + '/' + route, {
+          method, headers, body, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', redirect: 'error', signal: AbortSignal.timeout(30000)
+        });
+        if (!response.ok) {
+          if (response.status === 401) token = '';
+          throw new Error('File request failed (HTTP ' + response.status + '). Check state before retrying.');
+        }
+        return response;
+      } finally { actionBusy = false; }
+    }
     function updateSessions(rows) {
       const list = JSON.stringify(rows);
       if (rendered.get('sessions') === list) return;
@@ -250,8 +283,11 @@
         const option = node('option', (row.title || row.id) + ' · ' + (row.project || '') + (row.connected ? '' : ' (offline)'));
         option.value = row.id; options.push(option);
       }
+      if (selected && !rows.some(row => row.id === selected)) {
+        const offline = node('option', 'Reconnecting to ' + selected);
+        offline.value = selected; options.push(offline);
+      }
       $('session').replaceChildren(...options);
-      if (!rows.some(row => row.id === selected)) { selected = ''; $('controls').hidden = true; }
       $('session').value = selected;
     }
     function entries(parent, rows) {
@@ -387,6 +423,36 @@
       };
     }
     form('prompt-form', 'prompt', () => ({ text: $('prompt').value }), () => { $('prompt').value = ''; });
+    $('shell-form').onsubmit = event => {
+      event.preventDefault();
+      run(async () => {
+        if (await act('shell', { command: $('shell-command').value }, 'Run this shell command on the laptop as you?')) $('shell-command').value = '';
+      }, $('shell-form').querySelector('button'));
+    };
+    $('shell-background').onclick = () => run(() => act('shell/background'), $('shell-background'));
+    $('upload-file').onchange = () => { if (!$('upload-path').value) $('upload-path').value = $('upload-file').files[0]?.name || ''; };
+    $('upload-form').onsubmit = event => {
+      event.preventDefault();
+      run(async () => {
+        const file = $('upload-file').files[0];
+        if (!file || file.size > 16 * 1024 * 1024) throw new Error('Choose a file no larger than 16 MiB');
+        if ($('overwrite').checked && !confirm('Replace the file at this project-relative path?')) return;
+        const query = new URLSearchParams({ path: $('upload-path').value, overwrite: $('overwrite').checked ? '1' : '0' });
+        await transfer('upload?' + query, 'POST', file);
+        notice('File uploaded. Mention its project-relative path in your prompt.');
+      }, $('upload-form').querySelector('button'));
+    };
+    $('download-form').onsubmit = event => {
+      event.preventDefault();
+      run(async () => {
+        const path = $('download-path').value;
+        const response = await transfer('file?' + new URLSearchParams({ path }));
+        const url = URL.createObjectURL(await response.blob());
+        const link = node('a'); link.href = url; link.download = path.split('/').pop() || 'download';
+        document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }, $('download-form').querySelector('button'));
+    };
+    button($('turn-actions'), 'Clear queued prompts', () => act('queue/clear', {}, 'Clear all queued prompts?'), true);
     form('model-form', 'model', () => ({ model: $('model').value.trim(), ...($('effort').value.trim() ? { effort: $('effort').value.trim() } : {}) }), () => {
       delete $('model').dataset.dirty; delete $('effort').dataset.dirty;
     });

@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-11-20
+
+- `--relay` serves a mobile controller and relays authenticated laptop sessions; `--rc ADDRESS` publishes a local session over a reconnecting outbound WebSocket. A machine-wide private control key signs expiring challenges, session discovery is scoped to its public identity, and bounded action receipts prevent duplicates across reconnects. The browser controls prompts, approvals, settings, shell commands, files, child agents, goals and background work. Pairing supports permanent key import and a private TUI QR overlay; startup QR generation remains pending.
+
 ## 2026-11-16
 
 - Fresh user instructions can resume paused or interrupted goals without slash syntax; status questions and automatic messages leave even idle-loop pauses stopped. Follow-ups require specification reconciliation before implementation or completion, and changed requirements require a persisted plan review, preserving deferrals and execution constraints.
