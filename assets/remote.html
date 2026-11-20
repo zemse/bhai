@@ -41,19 +41,68 @@
     #status { color: #aed5ff; }
     #approval { border: 2px solid #e6bc67; }
     #approval-text { max-height: 40vh; overflow: auto; padding: 8px; border: 1px solid #56657a; border-radius: 7px; overscroll-behavior: contain; }
-    #transcript { max-height: 65vh; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
-    .entry { padding: 12px 4px; border-bottom: 1px solid #344050; }
-    .entry.user { border-left: 3px solid #80bfff; padding-left: 10px; }
-    .entry.error, .entry.failed { color: #ffc0ad; }
-    .kind { color: #a8bfd7; font-size: .8rem; text-transform: uppercase; }
+    #transcript { overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 12px; flex: 1; min-height: 0; }
+    .entry { padding: 12px 14px; margin: 8px 0; border-radius: 12px; }
+    .entry.user { background: #223951; margin-left: 12%; border: 1px solid #365674; }
+    .entry.assistant { background: #18222e; }
+    .entry.commentary { color: #c6d5e5; border-left: 2px solid #597893; }
+    .entry.command, .entry.running, .entry.output, .entry.diff { background: #101720; border: 1px solid #344050; font-size: .9rem; }
+    .entry.info, .entry.done, .entry.automatic { color: #aab9ca; font-size: .85rem; padding-block: 4px; }
+    .entry.error, .entry.failed, .entry.rejected { color: #ffc0ad; border: 1px solid #8b5144; }
+    .kind { color: #a8bfd7; font-size: .75rem; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; margin-bottom: 6px; }
+    .message p { margin: .65em 0; white-space: pre-wrap; }
+    .message > :first-child { margin-top: 0; }
+    .message > :last-child { margin-bottom: 0; }
+    .message h2, .message h3, .message h4 { margin: 1em 0 .4em; }
+    .message ul, .message ol { padding-left: 1.4em; }
+    .message li { margin: .3em 0; }
+    .message blockquote { border-left: 3px solid #597893; margin: .7em 0; padding-left: 12px; color: #b5c5d7; }
+    .table-scroll { overflow-x: auto; margin: 12px 0; }
+    .message table { border-collapse: collapse; min-width: 100%; font-size: .9rem; }
+    .message th, .message td { border: 1px solid #344050; padding: 8px 10px; text-align: left; }
+    .message th { background: #223142; }
+    code { font: .88em/1.5 ui-monospace, monospace; background: #0c131c; border-radius: 4px; padding: 2px 4px; }
+    .code-block { background: #0c131c; border: 1px solid #344050; border-radius: 8px; margin: 12px 0; overflow: hidden; }
+    .code-block .row { justify-content: space-between; padding: 4px 10px; color: #a8bfd7; font-size: .8rem; }
+    .code-block pre { padding: 12px; margin: 0; white-space: pre; overflow-x: auto; overflow-wrap: normal; }
+    .code-block code { padding: 0; background: none; }
+    a { color: #9bd0ff; }
+    .app-nav { display: flex; gap: 4px; margin-left: auto; }
+    .app-nav button { padding: 8px 12px; border-color: transparent; background: transparent; }
+    .app-nav button[aria-pressed=true] { background: #23405c; color: #d2e9ff; }
+    #status { font-size: .75rem; display: block; }
+    #session-bar { padding: 8px 12px; margin: 8px 0; }
+    #session-bar label { margin: 0; }
+    #session-bar .machine-label { font-size: .75rem; color: #b1bdcc; }
+    #session-status { margin: 5px 0 0; font-size: .75rem; }
+    #chat-panel { padding: 0; margin: 0; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+    .chat-heading { padding: 6px 12px; border-bottom: 1px solid #344050; justify-content: space-between; }
+    .chat-heading h2 { margin: 0; font-size: .9rem; }
+    .chat-heading label { margin: 0; font-size: .75rem; min-height: 44px; }
+    .composer { padding: 8px 12px max(8px, env(safe-area-inset-bottom)); border-top: 1px solid #344050; background: #1a212b; }
+    #prompt-form { display: flex; gap: 8px; align-items: flex-end; }
+    #prompt-form textarea { min-height: 48px; max-height: 140px; resize: none; }
+    #prompt-form button { flex-shrink: 0; }
+    .composer .muted { font-size: .7rem; margin: 5px 0 0; }
+    #approval { margin: 0 0 8px; padding: 10px; max-height: 38dvh; overflow: auto; flex-shrink: 0; }
+    #approval h2 { margin-bottom: 4px; }
+    #approval-help { margin: 4px 0; }
+    #approval-text { max-height: 15dvh; }
+    body[data-view=chat]:has(#controls:not([hidden])) { height: var(--app-height, 100dvh); display: flex; flex-direction: column; padding-block: max(8px, env(safe-area-inset-top)) 0; }
+    body[data-view=chat] #controls { flex: 1; display: flex; flex-direction: column; min-height: 0; padding-bottom: 8px; }
+    body[data-view=chat] #chat-panel { flex: 1; }
+    body:not([data-view=connection]) #pairing, body:not([data-view=connection]) .connection-action, body:not([data-view=connection]) #credits { display: none; }
+    body:not([data-view=tools]) #tools, body[data-view=tools] #chat-panel, body[data-view=connection] #controls { display: none; }
+    body[data-view=chat] .machine-label { display: none; }
+    .empty-chat { text-align: center; color: #a8bfd7; padding: 15vh 12px; }
     video { width: 100%; max-height: 45vh; }
     [hidden] { display: none !important; }
     @media (max-width: 430px) { body { padding: 12px; padding-bottom: max(24px, env(safe-area-inset-bottom)); } section, details.panel { padding: 12px; } }
     @media (min-width: 800px) { .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; } }
   </style>
 </head>
-<body>
-  <header><h1>bhai remote</h1><span id="status" role="status">Not paired</span><button id="reconnect">Reconnect</button><button id="forget" class="danger">Forget key</button></header>
+<body data-view="connection">
+  <header><div><h1>bhai</h1><span id="status" role="status">Not paired</span></div><nav class="app-nav" aria-label="Remote views"><button id="view-chat" aria-pressed="false">Chat</button><button id="view-tools" aria-pressed="false">Tools</button><button id="view-connection" aria-pressed="true">Connect</button></nav><button id="reconnect" class="connection-action">Reconnect</button><button id="forget" class="danger connection-action">Forget key</button></header>
   <p id="notice" role="alert" hidden></p>
   <details id="pairing" class="panel" open>
     <summary>Pair this browser</summary>
@@ -68,22 +117,25 @@
       <button class="primary">Save key and connect</button>
     </form>
   </details>
-  <section>
-    <label>Machine <output id="machine">Not connected</output></label>
-    <label>Session<select id="session"><option value="">Choose a session</option></select></label>
+  <section id="session-bar">
+    <label class="machine-label">Machine <output id="machine">Not connected</output></label>
+    <label><span class="machine-label">Session</span><select id="session" aria-label="Session"><option value="">Choose a session</option></select></label>
     <p id="session-status" class="muted">Waiting for connection</p>
   </section>
   <main id="controls" hidden>
     <section id="approval" hidden><h2>Approval required</h2><p id="approval-help" class="muted">Review the entire request before approving. Scroll inside the request for long commands.</p><pre id="approval-text" tabindex="0" aria-label="Pending approval request" aria-describedby="approval-help"></pre><div id="approval-buttons" class="row"></div></section>
-    <section>
-      <div class="row"><h2>Transcript</h2><label><input id="follow" type="checkbox" checked> Follow latest</label><button id="refresh">Refresh</button></div>
-      <div id="transcript" tabindex="0" aria-label="Session transcript"></div>
-      <form id="prompt-form"><label>Message or supported slash command<textarea id="prompt" required placeholder="Send a message"></textarea></label><button class="primary">Send</button></form>
-      <p class="muted">Messages queue while busy. Failed or uncertain actions are never automatically resent. Refresh and check the session before sending again.</p>
-      <div class="row" id="turn-actions"></div>
+    <section id="chat-panel">
+      <div class="row chat-heading"><h2>Conversation</h2><label><input id="follow" type="checkbox" checked> Follow latest</label><button id="refresh" aria-label="Refresh conversation" title="Refresh conversation">↻</button></div>
+      <div id="transcript" tabindex="0" role="region" aria-label="Session transcript"></div>
+      <div class="composer">
+        <form id="prompt-form"><textarea id="prompt" rows="1" required aria-label="Message or supported slash command" placeholder="Message bhai…"></textarea><button class="primary">Send</button><button id="stop-turn" type="button" class="danger" hidden>Stop</button></form>
+        <p class="muted">Messages queue while busy. Check the conversation before retrying an uncertain send.</p>
+      </div>
     </section>
+    <div id="tools">
+    <section><h2>Turn controls</h2><div class="row" id="turn-actions"></div></section>
     <div class="grid">
-      <details class="panel" open><summary>Model and permissions</summary>
+      <details class="panel"><summary>Model and permissions</summary>
         <form id="model-form"><label>Model<input id="model" required></label><label>Effort<input id="effort" placeholder="low, medium, high, xhigh"></label><button>Set model / effort</button></form>
         <form id="mode-form"><label>Mode<select id="mode"><option>ask</option><option>auto</option><option>bypass</option></select></label><button>Set mode</button></form>
         <label><input id="fast" type="checkbox"> Fast mode</label>
@@ -109,8 +161,9 @@
       <form id="schedule-form"><label>When<input id="spec" required placeholder="in 20m, every 2h, at 17:30, cron ..."></label><label>Message<textarea id="schedule-text" required></textarea></label><div class="row"><label>Repeat count (optional)<input id="times" type="number" min="1" max="4294967295" step="1"></label><label>Lasts (optional)<input id="lasts" placeholder="2d"></label></div><button>Add schedule</button></form>
     </details>
     <details class="panel" id="context-panel"><summary>Context, permissions and session state</summary><button id="context-refresh">Load context / permissions</button><pre id="context"></pre><pre id="permissions"></pre><details><summary>Full session state (usage, quota, queue)</summary><pre id="state"></pre></details></details>
+    </div>
   </main>
-  <p class="muted">QR decoding uses <a href="/static/jsQR.LICENSE">jsQR (Apache-2.0)</a>, bundled locally.</p>
+  <p id="credits" class="muted">QR decoding uses <a href="/static/jsQR.LICENSE">jsQR (Apache-2.0)</a>, bundled locally.</p>
   <script src="/static/jsQR.js"></script>
   <script>
     'use strict';
@@ -123,10 +176,18 @@
     const scanContext = scanCanvas.getContext('2d', { willReadFrequently: true });
     const scanHelp = 'Scan live or choose a QR photo. Images are decoded only on this device. Camera access requires HTTPS and your permission.';
     const rendered = new Map();
+    function viewport() { document.documentElement.style.setProperty('--app-height', (window.visualViewport?.height || window.innerHeight) + 'px'); }
+    window.visualViewport?.addEventListener('resize', viewport);
+    window.addEventListener('resize', viewport); viewport();
+    function view(name) {
+      document.body.dataset.view = name;
+      for (const tab of ['chat', 'tools', 'connection']) $('view-' + tab).setAttribute('aria-pressed', String(tab === name));
+    }
+    for (const tab of ['chat', 'tools', 'connection']) $('view-' + tab).onclick = () => view(tab);
     const pretty = value => typeof value === 'string' ? value : JSON.stringify(value, null, 2);
     function text(id, value) { $(id).textContent = pretty(value ?? ''); }
     function notice(message = '') { text('notice', message); $('notice').hidden = !message; }
-    function status(message) { text('status', message); }
+    function status(message) { text('status', message.split(' · ')[0]); $('status').title = message; }
     function node(tag, value, className) {
       const el = document.createElement(tag);
       if (value !== undefined) el.textContent = value;
@@ -234,7 +295,7 @@
       try { await task; } finally { if (authenticating === task) authenticating = null; }
     }
     function resetView() {
-      rendered.clear(); currentState = {}; $('controls').hidden = true;
+      rendered.clear(); currentState = {}; $('controls').hidden = true; view('connection');
       $('session').replaceChildren(node('option', 'Choose a session'));
       $('session').firstChild.value = ''; lastSessions = 0;
       text('machine', 'Not connected'); text('session-status', 'Waiting for connection');
@@ -303,27 +364,106 @@
       }
       $('session').replaceChildren(...options);
       $('session').value = selected;
+      const connected = rows.filter(row => row.connected);
+      if (!selected && connected.length === 1) {
+        $('session').value = connected[0].id; $('session').onchange();
+      }
+    }
+    function inline(parent, value) {
+      const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\([^\s)]+\))/g;
+      let offset = 0;
+      for (const match of value.matchAll(pattern)) {
+        parent.append(document.createTextNode(value.slice(offset, match.index)));
+        const part = match[0];
+        if (part.startsWith('`')) parent.append(node('code', part.slice(1, -1)));
+        else if (part.startsWith('**')) parent.append(node('strong', part.slice(2, -2)));
+        else if (part.startsWith('*')) parent.append(node('em', part.slice(1, -1)));
+        else {
+          const link = /^\[([^\]]+)\]\(([^\s)]+)\)$/.exec(part);
+          if (/^https?:\/\//i.test(link[2])) {
+            const a = node('a', link[1]); a.href = link[2]; a.target = '_blank'; a.rel = 'noopener noreferrer'; parent.append(a);
+          } else parent.append(document.createTextNode(part));
+        }
+        offset = match.index + part.length;
+      }
+      parent.append(document.createTextNode(value.slice(offset)));
+    }
+    function message(value) {
+      const container = node('div', undefined, 'message');
+      const lines = String(value).split('\n');
+      let paragraph = [], list = null;
+      function flush() {
+        if (paragraph.length) { const p = node('p'); inline(p, paragraph.join('\n')); container.append(p); paragraph = []; }
+        list = null;
+      }
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i], fence = /^\s*```([^`]*)$/.exec(line);
+        if (fence) {
+          flush(); const code = [];
+          while (++i < lines.length && !/^\s*```\s*$/.test(lines[i])) code.push(lines[i]);
+          const block = node('div', undefined, 'code-block'), bar = node('div', undefined, 'row');
+          bar.append(node('span', fence[1].trim() || 'code'));
+          button(bar, 'Copy', async () => { await navigator.clipboard.writeText(code.join('\n')); });
+          const pre = node('pre'); pre.append(node('code', code.join('\n'))); block.append(bar, pre); container.append(block);
+        } else if (line.includes('|') && i + 1 < lines.length && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[i + 1])) {
+          flush(); const table = node('table'), scroll = node('div', undefined, 'table-scroll');
+          function cells(row) { return row.trim().replace(/^\||\|$/g, '').split('|').map(cell => cell.trim()); }
+          function tableRow(row, tag) {
+            const tr = node('tr');
+            for (const cell of cells(row)) { const td = node(tag); inline(td, cell); tr.append(td); }
+            return tr;
+          }
+          const head = node('thead'), body = node('tbody'); head.append(tableRow(line, 'th')); i++;
+          while (i + 1 < lines.length && lines[i + 1].trim() && lines[i + 1].includes('|')) body.append(tableRow(lines[++i], 'td'));
+          table.append(head, body); scroll.append(table); container.append(scroll);
+        } else if (!line.trim()) flush();
+        else if (/^#{1,6}\s/.test(line)) {
+          flush(); const heading = /^(#{1,6})\s+(.*)$/.exec(line), el = node('h' + Math.min(4, heading[1].length + 1));
+          inline(el, heading[2]); container.append(el);
+        } else if (/^\s*(?:[-*+] |\d+\. )/.test(line)) {
+          const item = /^\s*([-*+]|\d+\.)\s+(.*)$/.exec(line), tag = /^\d/.test(item[1]) ? 'ol' : 'ul';
+          if (!list || list.localName !== tag) { flush(); list = node(tag); container.append(list); }
+          const li = node('li'); inline(li, item[2]); list.append(li);
+        } else if (/^>\s?/.test(line)) {
+          flush(); const quote = node('blockquote'); inline(quote, line.replace(/^>\s?/, '')); container.append(quote);
+        } else { if (list) flush(); paragraph.push(line); }
+      }
+      flush(); return container;
     }
     function entries(parent, rows) {
       const fingerprint = JSON.stringify(rows);
       if (parent.dataset.rendered === fingerprint) return;
       parent.dataset.rendered = fingerprint;
-      const expanded = Array.from(parent.children, el => !!el.querySelector('details')?.open);
-      const fragment = document.createDocumentFragment();
-      for (const [index, entry] of (rows || []).entries()) {
-        const kind = entry.kind || 'info';
-        const el = node('article', undefined, 'entry');
-        if (['user', 'failed', 'error'].includes(kind)) el.classList.add(kind);
-        const value = entry.data ?? entry.text ?? '';
-        if (['output', 'diff', 'reasoning', 'summary'].includes(kind)) {
-          const fold = node('details'); fold.open = !!expanded[index];
-          fold.append(node('summary', kind), node('pre', pretty(value))); el.append(fold);
-        } else { el.append(node('div', kind, 'kind'), node('pre', pretty(value))); }
-        fragment.append(el);
-      }
       const top = parent.scrollTop;
-      parent.replaceChildren(fragment);
-      parent.scrollTop = parent.id === 'transcript' && $('follow').checked ? parent.scrollHeight : top;
+      const wasFollowing = parent.id === 'transcript' && $('follow').checked;
+      if (!rows?.length) {
+        parent.replaceChildren(node('p', 'Start a conversation. Your messages and bhai’s replies appear here.', 'empty-chat'));
+        return;
+      }
+      for (const [index, entry] of rows.entries()) {
+        const signature = JSON.stringify(entry), previous = parent.children[index];
+        if (previous?.dataset.entry === signature) continue;
+        const kind = entry.kind || 'info', value = entry.data ?? entry.text ?? '';
+        const el = node('article', undefined, 'entry');
+        if (['user', 'assistant', 'commentary', 'command', 'running', 'output', 'diff', 'reasoning', 'summary', 'info', 'done', 'automatic', 'failed', 'error', 'rejected'].includes(kind)) el.classList.add(kind);
+        el.dataset.entry = signature;
+        if (['output', 'diff', 'reasoning', 'summary'].includes(kind)) {
+          const fold = node('details'); fold.open = !!previous?.querySelector('details')?.open;
+          fold.append(node('summary', { output: 'Tool output', diff: 'Changes', reasoning: 'Thinking', summary: 'Conversation summary' }[kind]), node('pre', pretty(value))); el.append(fold);
+        } else if (kind === 'command') {
+          el.append(node('div', value.tool || 'Tool', 'kind'), node('pre', value.summary || pretty(value)));
+        } else if (kind === 'running') {
+          el.append(node('div', 'Running · ' + (value.lines || 0) + ' lines', 'kind'), node('pre', value.tail || ''));
+        } else if (['assistant', 'commentary', 'summary'].includes(kind)) {
+          el.append(node('div', kind === 'assistant' ? 'bhai' : 'Working', 'kind'), message(pretty(value)));
+        } else if (kind === 'user') {
+          const body = node('div', undefined, 'message'); body.append(node('p', pretty(value)));
+          el.append(node('div', 'You', 'kind'), body);
+        } else el.append(node('div', kind, 'kind'), node('pre', pretty(value)));
+        if (previous) previous.replaceWith(el); else parent.append(el);
+      }
+      while (parent.children.length > rows.length) parent.lastChild.remove();
+      parent.scrollTop = wasFollowing ? parent.scrollHeight : top;
     }
     function approval(pending) {
       const fingerprint = JSON.stringify(pending);
@@ -344,7 +484,8 @@
     function snapshot(data) {
       currentState = data.state || {};
       const s = currentState;
-      text('session-status', (data.title || s.name || selected) + ' · ' + (s.working ? 'Working' : 'Idle') + ' · ' + s.model + ' · ' + s.mode + ' · queued ' + (s.queued || []).length);
+      text('session-status', (s.pending ? 'Approval needed' : s.working ? 'Working' : 'Ready') + ' · ' + (s.model || 'bhai') + ' · ' + (s.mode || 'ask') + ((s.queued || []).length ? ' · ' + s.queued.length + ' queued' : ''));
+      $('stop-turn').hidden = !s.working;
       text('state', s); text('goal-state', { goal: s.goal, plan: s.plan });
       approval(s.pending); entries($('transcript'), data.transcript || []);
       for (const id of ['model', 'effort', 'mode']) {
@@ -436,7 +577,18 @@
         run(async () => { if (await act(route, body()) && clear) clear(); }, $(id).querySelector('button'));
       };
     }
-    form('prompt-form', 'prompt', () => ({ text: $('prompt').value }), () => { $('prompt').value = ''; });
+    function sizePrompt() {
+      $('prompt').style.height = 'auto';
+      $('prompt').style.height = Math.min(140, $('prompt').scrollHeight) + 'px';
+    }
+    $('prompt').oninput = sizePrompt;
+    $('stop-turn').onclick = () => run(() => act('interrupt'), $('stop-turn'));
+    $('transcript').onscroll = () => {
+      const el = $('transcript');
+      $('follow').checked = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    };
+    $('follow').onchange = () => { if ($('follow').checked) $('transcript').scrollTop = $('transcript').scrollHeight; };
+    form('prompt-form', 'prompt', () => ({ text: $('prompt').value }), () => { $('prompt').value = ''; sizePrompt(); });
     $('shell-form').onsubmit = event => {
       event.preventDefault();
       run(async () => {
@@ -492,6 +644,8 @@
     $('session').onchange = () => {
       selected = $('session').value; rendered.delete('approval'); rendered.delete('children');
       $('controls').hidden = !selected; $('approval').hidden = true;
+      $('follow').checked = true;
+      view(selected ? 'chat' : 'connection');
       for (const id of ['model', 'effort', 'mode']) delete $(id).dataset.dirty;
       for (const id of ['transcript', 'children', 'background', 'schedules', 'monitors', 'context', 'permissions', 'state', 'goal-state']) {
         $(id).replaceChildren(); delete $(id).dataset.rendered; rendered.delete(id);

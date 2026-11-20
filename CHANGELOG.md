@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-20
 
+- Remote control opens a chat-first phone layout with separate tools and connection views, rich text, code copying, tables, tool cards and a pinned composer. Polling preserves unchanged messages, expanded output and reading position; a single connected session opens automatically. Offline Chrome checks cover narrow layouts, message safety and prompt, approval and stop actions.
 - Pairing QR solid cells use background colours; `L` switches to a larger, glyph-free QR, with complete-code size checks in both modes.
 - Remote session choices include short IDs, so sessions with the same title and project remain distinguishable.
 - Remote-control startup shows a private pairing QR, reopened with `/rc`. Phone camera/photo pairing falls back to bundled jsQR when native scanning is unavailable, with local-only decoding, touch-sized controls and narrow-screen layouts. Update the HTTP/TLS dependencies to current stable releases and bundle the scanner and license in the binary.
