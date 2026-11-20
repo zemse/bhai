@@ -12,6 +12,9 @@ Both need the project trusted (--trust), else the session runs in ask. BHAI_MODE
 SIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints the -r command that resumes it.
 [notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends, failed logins and a 98% used week.
 
+Interactive sessions have a native terminal host: /minimise returns to the shell without stopping the agent.
+bhai sessions lists active sessions; bhai attach ID returns to one. /quit stops the native session.
+/remote-control [URL] enables relay control at runtime; the global remote_control_relay supplies the default URL.
 On a server, bhai serve (or --serve PORT --headless) runs sessions with no terminal, under tmux or systemd: see serve --help.
 From a laptop, tunnel the port with ssh -L and run bhai attach: see attach --help. The servers listen on 127.0.0.1 only.
 Requests carry the token in x-bhai-token; --token-file or BHAI_TOKEN keeps it across restarts.
@@ -120,10 +123,10 @@ pub(super) enum Command {
         /// Instructions for the agent, or - to read stdin.
         prompt: String,
     },
-    /// Open the terminal UI on a session another bhai serves with --serve.
+    /// Reattach a local session by ID, or open the UI on a served port or URL.
     #[command(after_help = ATTACH_HELP)]
     Attach {
-        /// The server: a port, 127.0.0.1:PORT, localhost:PORT or an http:// URL (default: 7878); with --ssh, its port there.
+        /// A local active session ID or unique nonnumeric prefix, or a server port/URL (default: 7878); with --ssh, its port there.
         target: Option<String>,
         /// The server's token; --token-file reads it from a file, else BHAI_TOKEN.
         #[arg(long, value_name = "TOKEN")]
@@ -164,7 +167,7 @@ pub(super) enum Command {
     Identities,
     /// Show the subscription's usage windows and credits.
     Usage,
-    /// List saved sessions in this project.
+    /// List active sessions on this machine and saved sessions in this project.
     Sessions {
         #[command(subcommand)]
         command: Option<SessionsCommand>,
@@ -176,7 +179,13 @@ pub(super) enum Command {
     },
 }
 
-const ATTACH_HELP: &str = "The server listens on 127.0.0.1 only. --ssh DEST runs the ssh tunnel to it and restarts it when it drops; without it, run your own.
+const ATTACH_HELP: &str = "Run bhai sessions to list active local sessions, then bhai attach ID (a unique nonnumeric prefix also works).
+Native terminal sessions keep their original UI, draft and agent: /minimise detaches; /quit stops the session.
+Only one native terminal may attach at a time. Terminal or SSH loss detaches without stopping the agent.
+Headless sessions attach by ID through their authenticated local API, with the HTTP-view limitations below.
+Private sessions are not listed or attached by ID; leave private mode before minimising.
+
+For port/URL attachment, the server listens on 127.0.0.1 only. --ssh DEST runs the ssh tunnel to it and restarts it when it drops; without it, run your own.
 Against bhai serve, --session ID picks a session; without it the only one is used, or you choose from a list.
 Leaving (ctrl+c twice, ctrl+d, /quit) only detaches: the session keeps running. esc interrupts its turn; enter on an empty prompt resumes it.
 To stop a session, DELETE /sessions/ID on bhai serve, or SIGTERM the bhai that serves it; bhai -r ID resumes it there.

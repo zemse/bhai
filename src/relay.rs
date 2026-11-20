@@ -635,6 +635,60 @@ fn allowed(path: &str, method: &str) -> bool {
     }
 }
 
+pub enum Change {
+    Enable(String),
+    Disable,
+}
+
+/// Relay tasks belong to the worker, not to a terminal attachment.
+#[derive(Default)]
+pub struct Controller {
+    address: Option<String>,
+    control: Option<Control>,
+}
+
+impl Controller {
+    pub fn new(address: Option<String>) -> Self {
+        Self {
+            address,
+            control: None,
+        }
+    }
+
+    pub fn address(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+
+    pub fn active(&self) -> bool {
+        self.control.is_some()
+    }
+
+    pub fn disable(&mut self) {
+        self.control = None;
+    }
+
+    pub async fn enable(&mut self, given: &str, session: Arc<Session>, id: String) -> Result<()> {
+        let relay = address(given)?;
+        if self.active() && self.address.as_deref() == Some(&relay) {
+            return Ok(());
+        }
+        self.open(relay, Identity::machine()?, session, id).await
+    }
+
+    async fn open(
+        &mut self,
+        relay: String,
+        identity: Identity,
+        session: Arc<Session>,
+        id: String,
+    ) -> Result<()> {
+        let control = Control::start(relay.clone(), identity, session, id).await?;
+        self.control = Some(control);
+        self.address = Some(relay);
+        Ok(())
+    }
+}
+
 /// Owns both the loopback API and the reconnecting outbound connection.
 pub struct Control {
     local: tokio::task::JoinHandle<Result<()>>,
@@ -905,6 +959,67 @@ mod tests {
         Identity {
             key: rcgen::KeyPair::generate().unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_controller_starts_once_and_stops_without_ending_the_session() {
+        let (tx_user, mut user) = tokio::sync::mpsc::channel(1);
+        let (tx_control, mut controls) = tokio::sync::mpsc::channel(1);
+        let session = Session::new(
+            "test".into(),
+            "low".into(),
+            "general".into(),
+            tx_user,
+            tx_control,
+            Arc::default(),
+            Arc::default(),
+            None,
+        );
+        let listener = server::bind(0).await.unwrap();
+        let relay = format!("http://{}", listener.local_addr().unwrap());
+        let hub = Arc::new(Hub::default());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router(hub)).await.unwrap();
+        });
+        let mut controller = Controller::new(Some(relay.clone()));
+        assert!(!controller.active());
+        controller
+            .open(
+                relay.clone(),
+                identity(),
+                Arc::clone(&session),
+                "runtime-session".into(),
+            )
+            .await
+            .unwrap();
+        assert!(controller.active());
+        let local = controller.control.as_ref().unwrap().local.abort_handle();
+        let remote = controller.control.as_ref().unwrap().remote.abort_handle();
+        let task_id = controller.control.as_ref().unwrap().remote.id();
+        controller
+            .enable(&relay, Arc::clone(&session), "runtime-session".into())
+            .await
+            .unwrap();
+        assert_eq!(controller.control.as_ref().unwrap().remote.id(), task_id);
+        assert!(
+            controller
+                .enable(
+                    "http://unsafe.example.com",
+                    Arc::clone(&session),
+                    "runtime-session".into()
+                )
+                .await
+                .is_err()
+        );
+        assert!(controller.active());
+        controller.disable();
+        tokio::task::yield_now().await;
+        assert!(!controller.active());
+        assert_eq!(controller.address(), Some(relay.as_str()));
+        assert!(local.is_finished() && remote.is_finished());
+        assert!(user.try_recv().is_err());
+        assert!(controls.try_recv().is_err());
+        task.abort();
     }
 
     #[test]

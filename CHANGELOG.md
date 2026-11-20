@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-20
 
+- Native terminal sessions keep running after `/minimise` or terminal loss, with active-session discovery in `bhai sessions` and reattachment by ID. Private PTY hosts preserve the original UI and running agent without terminal replay logs; headless sessions attach through their authenticated local API. `/remote-control [URL]` enables relay control at runtime, with explicit status/off controls and a global-only default relay.
 - Remote control opens a chat-first phone layout with separate tools and connection views, rich text, code copying, tables, tool cards and a pinned composer. Polling preserves unchanged messages, expanded output and reading position; a single connected session opens automatically. Offline Chrome checks cover narrow layouts, message safety and prompt, approval and stop actions.
 - Pairing QR solid cells use background colours; `L` switches to a larger, glyph-free QR, with complete-code size checks in both modes.
 - Remote session choices include short IDs, so sessions with the same title and project remain distinguishable.

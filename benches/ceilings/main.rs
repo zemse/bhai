@@ -93,16 +93,24 @@ mod notify;
 mod ollama;
 #[path = "../../src/palette.rs"]
 mod palette;
+#[path = "../../src/peers.rs"]
+mod peers;
 #[path = "../../src/permissions/mod.rs"]
 mod permissions;
 #[path = "../../src/plan.rs"]
 mod plan;
+#[path = "../../src/privacy.rs"]
+mod privacy;
 #[path = "../../src/profile.rs"]
 mod profile;
 #[path = "../../src/prompt.rs"]
 mod prompt;
+#[path = "../../src/reader.rs"]
+mod reader;
 #[path = "../../src/redact.rs"]
 mod redact;
+#[path = "../../src/relay.rs"]
+mod relay;
 #[path = "../../src/runtime.rs"]
 mod runtime;
 #[path = "../../src/sandbox.rs"]
@@ -133,6 +141,8 @@ mod statusline;
 mod syntax;
 #[path = "../../src/tart.rs"]
 mod tart;
+#[path = "../../src/terminal_host.rs"]
+mod terminal_host;
 #[path = "../../src/title.rs"]
 mod title;
 #[path = "../../src/tokens.rs"]

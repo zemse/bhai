@@ -6,6 +6,8 @@
 use std::ffi::OsString;
 use std::sync::OnceLock;
 
+pub const TERMINAL_SOCKET_ENV: &str = "BHAI_TERMINAL_SOCKET";
+
 /// Name parts (split on `_`) that mark a variable as a credential.
 const SECRET_PARTS: [&str; 10] = [
     "KEY",
@@ -37,8 +39,9 @@ fn looks_secret(name: &str) -> bool {
 
 fn withheld_from(vars: impl Iterator<Item = OsString>, pass: &[String]) -> Vec<OsString> {
     vars.filter(|name| {
-        name.to_str()
-            .is_some_and(|n| looks_secret(n) && !pass.iter().any(|p| p == n))
+        name.to_str().is_some_and(|n| {
+            n == TERMINAL_SOCKET_ENV || (looks_secret(n) && !pass.iter().any(|p| p == n))
+        })
     })
     .collect()
 }
@@ -107,6 +110,15 @@ mod tests {
         for name in ["PATH", "HOME", "KEYBOARD", "AUTHOR", "PASSTHROUGH", "TERM"] {
             assert!(!looks_secret(name), "{name}");
         }
+    }
+
+    #[test]
+    fn native_terminal_control_is_never_forwarded_to_tools() {
+        let socket = TERMINAL_SOCKET_ENV;
+        assert_eq!(
+            withheld_from(names(&[socket]).into_iter(), &[socket.to_string()]),
+            names(&[socket])
+        );
     }
 
     #[test]

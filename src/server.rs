@@ -149,7 +149,7 @@ pub async fn serve(
     Ok(axum::serve(listener, router(session, token)).await?)
 }
 
-fn router(session: Arc<Session>, token: String) -> Router {
+pub(crate) fn router(session: Arc<Session>, token: String) -> Router {
     Router::new()
         .route("/state", get(state))
         .route("/snapshot", get(snapshot))

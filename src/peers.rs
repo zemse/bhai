@@ -33,6 +33,8 @@ struct Record {
     id: String,
     port: u16,
     token: String,
+    #[serde(default)]
+    terminal: Option<PathBuf>,
 }
 
 impl Record {
@@ -48,6 +50,17 @@ pub struct Info {
     pub name: Option<String>,
     pub cwd: PathBuf,
     pub working: bool,
+    #[serde(default)]
+    pub attached: Option<bool>,
+    #[serde(default)]
+    pub attachable: bool,
+}
+
+pub struct Attachment {
+    pub id: String,
+    pub terminal: Option<PathBuf>,
+    pub base: String,
+    pub token: String,
 }
 
 struct Peer {
@@ -125,11 +138,22 @@ fn http() -> Result<reqwest::Client> {
         .build()?)
 }
 
+#[cfg(test)]
 pub async fn register(
     dir: &Path,
     id: &str,
     cwd: &Path,
     session: &Arc<Session>,
+) -> Result<Registration> {
+    register_terminal(dir, id, cwd, session, None).await
+}
+
+pub async fn register_terminal(
+    dir: &Path,
+    id: &str,
+    cwd: &Path,
+    session: &Arc<Session>,
+    terminal: Option<PathBuf>,
 ) -> Result<Registration> {
     let path = path(dir, id)?;
     crate::sessions::private_dir(dir)?;
@@ -141,6 +165,7 @@ pub async fn register(
         id: id.to_string(),
         port: listener.local_addr()?.port(),
         token: crate::server::mint(),
+        terminal,
     };
     crate::redact::register(&record.token);
     let staging = dir.join(format!("{}.tmp", crate::server::mint()));
@@ -153,6 +178,7 @@ pub async fn register(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(path.clone(), record.clone());
+    let session_router = crate::server::router(Arc::clone(session), record.token.clone());
     let peer = Arc::new(Peer {
         record,
         dir: dir.to_path_buf(),
@@ -164,7 +190,8 @@ pub async fn register(
         .route("/message", post(deliver))
         .layer(DefaultBodyLimit::max(MAX_MESSAGE * 8))
         .layer(middleware::from_fn_with_state(Arc::clone(&peer), authorize))
-        .with_state(peer);
+        .with_state(peer)
+        .nest("/session", session_router);
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
@@ -192,6 +219,17 @@ async fn info(State(peer): State<Arc<Peer>>) -> Response {
     let Some(session) = peer.session.upgrade() else {
         return StatusCode::GONE.into_response();
     };
+    if session.privacy.active() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let attached = match &peer.record.terminal {
+        Some(path) => tokio::time::timeout(WAIT, crate::terminal_host::status(path))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|s| s.attached),
+        None => None,
+    };
     let working = session.working();
     match session.privacy.public(|| {
         Ok(Info {
@@ -200,6 +238,8 @@ async fn info(State(peer): State<Arc<Peer>>) -> Response {
             name: session.name(),
             cwd: peer.cwd.clone(),
             working,
+            attached,
+            attachable: true,
         })
     }) {
         Ok(info) => Json(info).into_response(),
@@ -298,6 +338,68 @@ pub async fn list(dir: &Path) -> Result<Vec<Info>> {
     Ok(found)
 }
 
+/// Resolve only a live, authenticated session, never a saved transcript or stale record.
+pub async fn attachment(dir: &Path, prefix: &str) -> Result<Attachment> {
+    ensure!(valid_id(prefix), "invalid session id");
+    let live = list(dir).await?;
+    let matches: Vec<_> = live
+        .iter()
+        .filter(|info| info.id.starts_with(prefix))
+        .collect();
+    let info = match matches.as_slice() {
+        [one] => *one,
+        [] => anyhow::bail!("no active session matches `{prefix}`; run bhai sessions"),
+        _ => anyhow::bail!("`{prefix}` matches several active sessions; use a longer id"),
+    };
+    ensure!(
+        info.attachable,
+        "this session was started by an older bhai; use its --serve port, or restart it with the new binary to enable attachment by ID"
+    );
+    let record = read(dir, &info.id).await?;
+    inspect(&http()?, &record).await?;
+    Ok(Attachment {
+        id: record.id.clone(),
+        terminal: record.terminal.clone(),
+        base: format!("{}/session", record.base()),
+        token: record.token,
+    })
+}
+
+pub fn report(rows: &[Info]) -> String {
+    fn one_line(text: &str) -> String {
+        text.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(180)
+            .collect()
+    }
+    if rows.is_empty() {
+        return "No active sessions. Run bhai to start one.\n".to_string();
+    }
+    let mut out = String::from("Active sessions (this machine):\n");
+    for row in rows {
+        let state = if row.working { "working" } else { "idle" };
+        let terminal = match (row.attachable, row.attached) {
+            (false, _) => "legacy",
+            (true, Some(true)) => "attached",
+            (true, Some(false)) => "minimised",
+            (true, None) => "HTTP",
+        };
+        out.push_str(&format!(
+            "{}  {state:<7}  {terminal:<9}  {}  {}\n",
+            row.id,
+            one_line(&row.cwd.to_string_lossy()),
+            one_line(
+                row.name
+                    .as_deref()
+                    .or(row.title.as_deref())
+                    .unwrap_or("bhai")
+            ),
+        ));
+    }
+    out.push_str("Attach with bhai attach <session_id>.\n");
+    out
+}
+
 pub async fn send(dir: &Path, sender: &str, receiver: &str, text: &str) -> Result<Value> {
     validate_message(text)?;
     ensure!(
@@ -368,6 +470,57 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         dir
+    }
+
+    #[tokio::test]
+    async fn attachment_resolves_live_ids_and_prefixes_without_exposing_tokens() {
+        let dir = directory();
+        let (a, _rx_a) = quiet();
+        let (b, _rx_b) = quiet();
+        let first = register(&dir, "session-alpha", Path::new("/a"), &a)
+            .await
+            .unwrap();
+        let second = register(&dir, "session-beta", Path::new("/b"), &b)
+            .await
+            .unwrap();
+        assert!(attachment(&dir, "session-").await.is_err());
+        assert!(attachment(&dir, "../session-alpha").await.is_err());
+        let target = attachment(&dir, "session-a").await.unwrap();
+        assert_eq!(target.id, "session-alpha");
+        assert!(target.terminal.is_none());
+        let client = http().unwrap();
+        assert_eq!(
+            client
+                .get(format!("{}/state", target.base))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let state: Value = client
+            .get(format!("{}/state", target.base))
+            .header(crate::server::TOKEN_HEADER, &target.token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(state["working"], false);
+        let report = report(&list(&dir).await.unwrap());
+        assert!(report.contains("session-alpha"));
+        assert!(report.contains("HTTP"));
+        assert!(!report.contains(&target.token));
+        a.privacy.begin();
+        assert!(attachment(&dir, "session-alpha").await.is_err());
+        a.privacy.clear();
+        drop(first);
+        assert!(attachment(&dir, "session-alpha").await.is_err());
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

@@ -177,8 +177,12 @@ pub struct App {
     /// Rendered QR rows, kept only in the local pairing modal.
     pub rc_pairing: Option<Vec<String>>,
     pub rc_pairing_large: bool,
-    /// The relay whose pairing QR `/rc` opens again.
+    /// The active or configured relay offered by `/remote-control`.
     pub rc_relay: Option<String>,
+    pub rc_running: bool,
+    pub rc_request: Option<crate::relay::Change>,
+    pub native_terminal: bool,
+    pub minimising: bool,
     /// Screen rows of each visible entry, filled in by the renderer.
     pub rows: Vec<(Range<u16>, usize)>,
     /// The entry under the mouse.
@@ -389,6 +393,8 @@ const ATTACHED: &[&str] = &[
     "context",
     "quit",
     "exit",
+    "minimise",
+    "minimize",
     "tokens",
     "copy",
     "btw",
@@ -450,6 +456,10 @@ impl App {
             rc_pairing: None,
             rc_pairing_large: false,
             rc_relay: None,
+            rc_running: false,
+            rc_request: None,
+            native_terminal: false,
+            minimising: false,
             rows: Vec::new(),
             hover: None,
             mouse_row: None,
@@ -569,6 +579,10 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if key.code == KeyCode::F(3) && key.modifiers.is_empty() {
+            self.minimise();
             return;
         }
         if self.rc_pairing.is_some() {
@@ -2125,8 +2139,45 @@ impl App {
             }
             return;
         }
+        if message == "/minimise" || message == "/minimize" {
+            self.minimise();
+            return;
+        }
+        if let Some(rest) = message.strip_prefix("/remote-control")
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            match rest.trim() {
+                "off" => self.rc_request = Some(crate::relay::Change::Disable),
+                "status" => self.note(Entry::Info(if self.rc_running {
+                    format!(
+                        "remote control enabled: {}",
+                        self.rc_relay.as_deref().unwrap_or_default()
+                    )
+                } else {
+                    "remote control is off; /remote-control <relay URL> enables it".into()
+                })),
+                given => {
+                    let relay = if given.is_empty() {
+                        self.rc_relay.as_deref().unwrap_or_default()
+                    } else {
+                        given
+                    };
+                    if relay.is_empty() {
+                        self.note(Entry::Error("use /remote-control <relay URL>, or set remote_control_relay in your global config; no session is shared until you enable it".into()));
+                    } else {
+                        match crate::relay::address(relay) {
+                            Ok(relay) => {
+                                self.rc_request = Some(crate::relay::Change::Enable(relay))
+                            }
+                            Err(error) => self.note(Entry::Error(error.to_string())),
+                        }
+                    }
+                }
+            }
+            return;
+        }
         if message == "/rc" {
-            match self.rc_relay.as_deref() {
+            match self.rc_relay.as_deref().filter(|_| self.rc_running) {
                 Some(relay) => {
                     match crate::relay::Identity::machine().and_then(|key| key.qr(relay)) {
                         Ok(rows) => self.rc_pairing = Some(rows),
@@ -2134,7 +2185,7 @@ impl App {
                     }
                 }
                 None => self.note(Entry::Error(
-                    "start bhai with --rc ADDRESS to pair remote control".into(),
+                    "use /remote-control <relay URL> or start bhai with --rc ADDRESS to pair remote control".into(),
                 )),
             }
             return;
@@ -3381,6 +3432,21 @@ ctx, the token totals, the cache rate, cache alerts, the rate limits and the hin
     /// Whether there is anything to stop: a turn, or a child still running after the
     /// turn that started it has ended.
     /// Quit on the second call within `QUIT_WINDOW`; the first only says so.
+    fn minimise(&mut self) {
+        if self.attached().is_some() {
+            self.quit = true;
+        } else if !self.native_terminal {
+            self.note(Entry::Error("this terminal is not managed; start a new interactive bhai session to use /minimise".into()));
+        } else if self.session.privacy.active() {
+            self.note(Entry::Error(
+                "private sessions are not discoverable; leave private mode before minimising"
+                    .into(),
+            ));
+        } else {
+            self.minimising = true;
+        }
+    }
+
     fn confirm_quit(&mut self) {
         let now = Instant::now();
         match self.quit_armed {
@@ -3615,6 +3681,88 @@ mod tests {
                 assert!(control.try_recv().is_err());
             }
         }
+    }
+
+    #[test]
+    fn minimise_keeps_running_turn_and_never_sends_an_interrupt() {
+        for working in [false, true] {
+            let (mut app, mut user, mut control) = connected();
+            app.native_terminal = true;
+            app.working = working;
+            app.input.set("/minimise".into());
+            app.submit();
+            assert!(app.minimising);
+            assert!(!app.quit);
+            assert_eq!(app.working, working);
+            assert!(user.try_recv().is_err());
+            assert!(control.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn f3_minimises_with_an_approval_waiting_without_answering_it() {
+        let (mut app, mut user, mut control) = connected();
+        app.native_terminal = true;
+        app.working = true;
+        app.pending = Some(Approval {
+            id: 7,
+            tool: "bash".into(),
+            command: "cargo test".into(),
+            preview: None,
+            offers: Default::default(),
+        });
+        app.input.set("unsent draft".into());
+        app.on_key(key(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(app.minimising && !app.quit);
+        assert_eq!(app.input.value(), "unsent draft");
+        assert_eq!(app.pending.as_ref().unwrap().id, 7);
+        assert!(app.working);
+        assert!(user.try_recv().is_err());
+        assert!(control.try_recv().is_err());
+    }
+
+    #[test]
+    fn minimise_refuses_unmanaged_and_private_sessions() {
+        let (mut app, mut user, mut control) = connected();
+        app.input.set("/minimise".into());
+        app.submit();
+        assert!(!app.minimising && !app.quit);
+        app.native_terminal = true;
+        app.session.privacy.begin();
+        app.input.set("/minimise".into());
+        app.submit();
+        assert!(!app.minimising && !app.quit);
+        assert!(user.try_recv().is_err());
+        assert!(control.try_recv().is_err());
+    }
+
+    #[test]
+    fn runtime_remote_control_is_explicit_and_never_becomes_a_prompt() {
+        let (mut app, mut user, mut control) = connected();
+        app.working = true;
+        app.input.set("/remote-control".into());
+        app.submit();
+        assert!(app.rc_request.is_none());
+        app.rc_relay = Some("https://relay.example.com".into());
+        app.input.set("/remote-control".into());
+        app.submit();
+        assert!(
+            matches!(app.rc_request.take(), Some(crate::relay::Change::Enable(url)) if url == "https://relay.example.com")
+        );
+        app.input
+            .set("/remote-control http://untrusted.example.com".into());
+        app.submit();
+        assert!(app.rc_request.is_none());
+        app.input.set("/remote-control off".into());
+        app.submit();
+        assert!(matches!(
+            app.rc_request.take(),
+            Some(crate::relay::Change::Disable)
+        ));
+        assert!(app.working);
+        assert!(!app.quit);
+        assert!(user.try_recv().is_err());
+        assert!(control.try_recv().is_err());
     }
 
     #[test]

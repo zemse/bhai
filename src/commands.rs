@@ -234,6 +234,16 @@ pub const COMMANDS: &[Command] = &[
         help: "toggle mouse capture",
     },
     Command {
+        name: "remote-control",
+        args: " [URL|status|off]",
+        help: "enable relay control for this session; use the configured relay when no URL is given",
+    },
+    Command {
+        name: "minimise",
+        args: "",
+        help: "detach the terminal without stopping the session or its agent",
+    },
+    Command {
         name: "rc",
         args: "",
         help: "show this machine's private remote-control pairing QR",
@@ -364,7 +374,7 @@ pub fn help() -> String {
     out.push_str(concat!(
         "\nkeys",
         "\n  enter send · alt+enter or ctrl+j newline · shift+tab permission mode",
-        "\n  F2 expands or collapses the input box",
+        "\n  F2 expands or collapses the input box · F3 minimises, including while an approval waits",
         "\n  ctrl+c interrupt, clear the draft (ctrl+z restores), then quit on a second press · ctrl+d quit on an empty prompt",
         "\n  @<path> finds a file in the project and writes its path",
         "\n  !<command> or $<command> runs a shell command yourself, shown here and not told to the model",

@@ -24,7 +24,7 @@ use tokio::{
 
 pub const HOST_FLAG: &str = "__terminal-host";
 pub const CHILD_FLAG: &str = "__terminal-child";
-pub const SOCKET_ENV: &str = "BHAI_TERMINAL_SOCKET";
+pub const SOCKET_ENV: &str = crate::childenv::TERMINAL_SOCKET_ENV;
 const ATTACH: u8 = 1;
 const INPUT: u8 = 2;
 const RESIZE: u8 = 3;
@@ -33,6 +33,7 @@ const STATUS: u8 = 5;
 const OUTPUT: u8 = 6;
 const OK: u8 = 7;
 const ERROR: u8 = 8;
+const EXIT: u8 = 9;
 const MAX_FRAME: usize = 65536;
 type Frame = (u8, Vec<u8>);
 
@@ -159,7 +160,7 @@ pub async fn host(path: PathBuf, args: Vec<String>) -> Result<()> {
     trusted_path(&path)?;
     let mut command = Command::new(std::env::current_exe()?);
     command.arg(CHILD_FLAG).args(args);
-    host_command(path, command).await
+    host_inner(path, command, true).await
 }
 
 struct SocketGuard {
@@ -247,6 +248,14 @@ fn resize(fd: &impl AsRawFd, bytes: &[u8]) -> Result<()> {
     // SAFETY: ioctl reads a valid winsize for this owned PTY descriptor.
     if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ, &size) } < 0 {
         return Err(io::Error::last_os_error().into());
+    }
+    // Editors need a repaint even when a new terminal has the same dimensions.
+    let mut foreground: libc::pid_t = 0;
+    // SAFETY: the group comes from this owned PTY's foreground process group.
+    unsafe {
+        if libc::ioctl(fd.as_raw_fd(), libc::TIOCGPGRP, &mut foreground) == 0 && foreground > 0 {
+            libc::killpg(foreground, libc::SIGWINCH);
+        }
     }
     Ok(())
 }
@@ -361,7 +370,7 @@ async fn connection(stream: UnixStream, id: u64, requests: mpsc::Sender<Request>
         ) {
             break;
         }
-        if frame.0 == ERROR || frame.0 == STATUS || frame.0 == MINIMISE {
+        if matches!(frame.0, ERROR | STATUS | MINIMISE | EXIT) {
             break;
         }
     }
@@ -377,7 +386,12 @@ async fn connection(stream: UnixStream, id: u64, requests: mpsc::Sender<Request>
     }
 }
 
-async fn host_command(path: PathBuf, mut command: Command) -> Result<()> {
+#[cfg(test)]
+async fn host_command(path: PathBuf, command: Command) -> Result<()> {
+    host_inner(path, command, false).await
+}
+
+async fn host_inner(path: PathBuf, mut command: Command, wait_for_terminal: bool) -> Result<()> {
     check_path(&path, false)?;
     let listener = UnixListener::bind(&path)?;
     let meta = fs::symlink_metadata(&path)?;
@@ -405,30 +419,71 @@ async fn host_command(path: PathBuf, mut command: Command) -> Result<()> {
             Ok(())
         });
     }
-    let mut worker = command.spawn()?;
-    let mut guard = WorkerGuard(worker.id());
-    drop(command);
     let (requests, mut incoming) = mpsc::channel::<Request>(32);
     let mut attached: Option<(u64, mpsc::Sender<Frame>)> = None;
     let mut next_id = 0;
-    let mut pending_input = Vec::new();
-    let mut bytes = [0; 8192];
-    loop {
+    let mut connections = tokio::task::JoinSet::new();
+    // Startup errors must reach the first terminal, not disappear before it connects.
+    let startup = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(startup);
+    while wait_for_terminal && attached.is_none() {
         tokio::select! {
-            result = worker.wait() => { result?; guard.0 = None; break; }
+            _ = &mut startup => bail!("no terminal attached to start the session"),
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 next_id += 1;
-                tokio::spawn(connection(stream, next_id, requests.clone()));
+                connections.spawn(connection(stream, next_id, requests.clone()));
             }
-            output = fd_read(&master, &mut bytes) => {
+            Some(request) = incoming.recv() => {
+                match request.frame.0 {
+                    STATUS => { let _ = request.reply.try_send((STATUS, serde_json::to_vec(&Status { attached: false })?)); }
+                    ATTACH if resize(master.get_ref(), &request.frame.1).is_ok() => {
+                        let _ = request.reply.try_send((OK, vec![]));
+                        attached = Some((request.id, request.reply));
+                    }
+                    _ => { let _ = request.reply.try_send((ERROR, b"attach a terminal to start the session".to_vec())); }
+                }
+            }
+        }
+        while connections.try_join_next().is_some() {}
+    }
+    let mut worker = command.spawn()?;
+    let mut guard = WorkerGuard(worker.id());
+    drop(command);
+    let mut pending_input = Vec::new();
+    let mut bytes = [0; 8192];
+    let mut pty_open = true;
+    loop {
+        tokio::select! {
+            result = worker.wait() => {
+                let status = result?;
+                guard.0 = None;
+                if let Some((_, tx)) = &attached {
+                    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                        loop {
+                            match fd_read(&master, &mut bytes).await {
+                                Ok(n) if n > 0 => { if tx.send((OUTPUT, bytes[..n].to_vec())).await.is_err() { break; } }
+                                _ => break,
+                            }
+                        }
+                    }).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(2), tx.send((EXIT, status.code().unwrap_or(1).to_be_bytes().to_vec()))).await;
+                }
+                break;
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                next_id += 1;
+                connections.spawn(connection(stream, next_id, requests.clone()));
+            }
+            output = fd_read(&master, &mut bytes), if pty_open => {
                 match output {
-                    Ok(0) => break,
+                    Ok(0) => pty_open = false,
                     Ok(n) => {
                         if let Some((_, tx)) = &attached
                             && tx.try_send((OUTPUT, bytes[..n].to_vec())).is_err() { attached = None; }
                     }
-                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => pty_open = false,
                     Err(error) => return Err(error.into()),
                 }
             }
@@ -472,7 +527,15 @@ async fn host_command(path: PathBuf, mut command: Command) -> Result<()> {
         if attached.is_none() {
             pending_input.clear();
         }
+        while connections.try_join_next().is_some() {}
     }
+    drop(attached);
+    drop(incoming);
+    drop(requests);
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
     Ok(())
 }
 
@@ -570,7 +633,11 @@ impl TerminalInput {
                         let _ = send.try_send(Err(error));
                         break;
                     }
-                    if send.try_send(Ok(bytes[..n as usize].to_vec())).is_err() || n == 0 {
+                    if send
+                        .blocking_send(Ok(bytes[..n as usize].to_vec()))
+                        .is_err()
+                        || n == 0
+                    {
                         break;
                     }
                 }
@@ -585,6 +652,7 @@ impl TerminalInput {
 
 impl Drop for TerminalInput {
     fn drop(&mut self) {
+        self.incoming.close();
         let _ = self.wake.write_all(&[1]);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -607,6 +675,9 @@ pub async fn attach(path: &Path) -> Result<()> {
     write_frame(&mut stream, &(ATTACH, size_bytes()?)).await?;
     let (kind, message) = read_frame(&mut stream).await?;
     ensure!(kind == OK, "{}", String::from_utf8_lossy(&message));
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     crossterm::terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
     let mut input = TerminalInput::new()?;
@@ -638,6 +709,11 @@ pub async fn attach(path: &Path) -> Result<()> {
             frame = rx.recv() => match frame {
                 Some((OUTPUT, bytes)) => { io::stdout().write_all(&bytes)?; io::stdout().flush()?; }
                 Some((MINIMISE, _)) | None => break,
+                Some((EXIT, bytes)) => {
+                    let code = i32::from_be_bytes(bytes.try_into().map_err(|_| anyhow::anyhow!("invalid worker exit status"))?);
+                    ensure!(code == 0, "session worker exited with status {code}");
+                    break;
+                }
                 _ => bail!("invalid terminal host response"),
             },
             bytes = input.incoming.recv() => {
@@ -647,6 +723,9 @@ pub async fn attach(path: &Path) -> Result<()> {
                 write_frame(&mut writer, &(INPUT, bytes)).await?;
             }
             _ = resized.recv() => { write_frame(&mut writer, &(RESIZE, size_bytes()?)).await?; }
+            _ = hangup.recv() => break,
+            _ = terminate.recv() => break,
+            _ = interrupt.recv() => break,
         }
     }
     Ok(())
@@ -797,6 +876,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_waits_for_a_terminal_and_delivers_failure_output_and_exit_status() {
+        let directory = Directory::new();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("echo started > started; printf 'startup-failure'; exit 7")
+            .current_dir(&directory.0);
+        let task = tokio::spawn(host_inner(directory.socket(), command, true));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while status(&directory.socket()).await.is_err() {
+                assert!(!task.is_finished());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!directory.0.join("started").exists());
+        let mut stream = frontend(&directory.socket(), 80, 24).await;
+        assert!(
+            until(&mut stream, "startup-failure")
+                .await
+                .contains("startup-failure")
+        );
+        let (kind, code) = read_frame(&mut stream).await.unwrap();
+        assert_eq!(kind, EXIT);
+        assert_eq!(i32::from_be_bytes(code.try_into().unwrap()), 7);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!directory.socket().exists());
+    }
+
+    #[tokio::test]
     async fn worker_exit_closes_frontend_and_cleans_socket() {
         let directory = Directory::new();
         let task = start(&directory, "read line; exit 0").await;
@@ -848,10 +962,10 @@ mod tests {
         .await;
         let pid = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if let Ok(text) = fs::read_to_string(directory.0.join("worker.pid")) {
-                    if let Ok(pid) = text.trim().parse::<i32>() {
-                        break pid;
-                    }
+                if let Ok(text) = fs::read_to_string(directory.0.join("worker.pid"))
+                    && let Ok(pid) = text.trim().parse::<i32>()
+                {
+                    break pid;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1056,6 +1170,21 @@ mod tests {
         ] {
             assert!(output.contains(sequence));
         }
+    }
+
+    #[test]
+    fn a_full_frontend_input_queue_is_cancellable() {
+        let (send, incoming) = mpsc::channel(1);
+        send.try_send(Ok(vec![1])).unwrap();
+        let (wake, _stop) = std::os::unix::net::UnixStream::pair().unwrap();
+        let thread = std::thread::spawn(move || {
+            assert!(send.blocking_send(Ok(vec![2])).is_err());
+        });
+        drop(TerminalInput {
+            incoming,
+            wake,
+            thread: Some(thread),
+        });
     }
 
     #[tokio::test]

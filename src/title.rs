@@ -103,6 +103,10 @@ impl Tab {
         self.work = Some(work.to_string());
     }
 
+    pub fn redraw(&mut self) {
+        self.shown = None;
+    }
+
     /// The title for `state`, or `None` when it is the one already showing.
     pub fn refresh(&mut self, state: State) -> Option<String> {
         let title = self
@@ -256,6 +260,16 @@ mod tests {
         );
         assert_eq!(tab.refresh(State::Approval), None);
         assert_eq!(tab.refresh(State::Idle).as_deref(), Some("fix cache"));
+    }
+
+    #[test]
+    fn reattachment_redraws_an_unchanged_title() {
+        let mut tab = Tab::new(PathBuf::from("/project"));
+        tab.named("fix cache");
+        let title = tab.refresh(State::Working).unwrap();
+        assert_eq!(tab.refresh(State::Working), None);
+        tab.redraw();
+        assert_eq!(tab.refresh(State::Working), Some(title));
     }
 
     #[test]

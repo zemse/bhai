@@ -62,7 +62,26 @@ enum Event {
 /// Run the existing command-line frontend. May exit the process on CLI errors.
 pub async fn entry() -> Result<()> {
     startup::begin();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == crate::terminal_host::HOST_FLAG)
+    {
+        anyhow::ensure!(args.len() >= 2, "missing terminal host socket");
+        let path = PathBuf::from(args.remove(1));
+        args.remove(0);
+        return crate::terminal_host::host(path, args).await;
+    }
+    let native_child = args
+        .first()
+        .is_some_and(|arg| arg == crate::terminal_host::CHILD_FLAG);
+    if native_child {
+        args.remove(0);
+    }
+    let native_socket = native_child
+        .then(|| std::env::var_os(crate::terminal_host::SOCKET_ENV))
+        .flatten()
+        .map(PathBuf::from);
     // sudo runs this as `SUDO_ASKPASS`, and reads its stdout as the password.
     if args.first().is_some_and(|a| a == askpass::FLAG) {
         std::process::exit(askpass::helper(&args[1..]));
@@ -84,7 +103,19 @@ pub async fn entry() -> Result<()> {
             args.serve = Some(0);
         }
     }
-    tools::bash::kill_all_on_signal()?;
+    if !native_child && native_session(&args) {
+        use std::io::IsTerminal as _;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            crate::terminal_host::launch(forwarded).await?;
+            println!(
+                "bhai: bhai sessions lists sessions still running; bhai attach <session_id> returns to one"
+            );
+            return Ok(());
+        }
+    }
+    if !matches!(&args.command, Some(arguments::Command::Attach { .. })) {
+        tools::bash::kill_all_on_signal()?;
+    }
     if let Some(dir) = &args.cd {
         std::env::set_current_dir(dir)
             .with_context(|| format!("could not use project directory {}", dir.display()))?;
@@ -115,7 +146,16 @@ pub async fn entry() -> Result<()> {
                         keep.unwrap_or(sessions::PRUNE_KEEP)
                     ))
                 ),
-                None => print!("{}", sessions::report(&sessions::list(&dir))),
+                None => {
+                    if let Some(active) = crate::peers::directory() {
+                        print!(
+                            "{}",
+                            crate::peers::report(&crate::peers::list(&active).await?)
+                        );
+                    }
+                    println!("\nSaved sessions (this project):");
+                    print!("{}", sessions::report(&sessions::list(&dir)));
+                }
             }
             return Ok(());
         }
@@ -253,6 +293,7 @@ pub async fn entry() -> Result<()> {
         choice,
         statusline,
         sudo,
+        remote_control_relay,
     } = load(args.flags, &name, Some(&session_id)).await?;
     let private = private && resume.is_none();
     if private {
@@ -485,24 +526,23 @@ allow it.",
     if private {
         start_private(&session).await?;
     }
-    let (_remote_control, rc_pairing) = if let Some(relay) = &args.rc {
-        let identity = crate::relay::Identity::machine()?;
-        let pairing = interactive
-            .then(|| identity.qr(relay).map(|rows| (relay.clone(), rows)))
-            .transpose()?;
+    let mut remote_control = crate::relay::Controller::new(remote_control_relay);
+    let rc_pairing = if let Some(relay) = &args.rc {
+        remote_control
+            .enable(relay, Arc::clone(&session), session_id.clone())
+            .await?;
         notices.push(format!(
             "remote control: {relay}; machine key in ~/.bhai/control-key.pem; /rc reopens pairing"
         ));
-        let control = crate::relay::Control::start(
-            relay.clone(),
-            identity,
-            Arc::clone(&session),
-            session_id.clone(),
-        )
-        .await?;
-        (Some(control), pairing)
+        interactive
+            .then(|| {
+                crate::relay::Identity::machine()?
+                    .qr(relay)
+                    .map(|rows| (relay.clone(), rows))
+            })
+            .transpose()?
     } else {
-        (None, None)
+        None
     };
     startup::end("start");
     // `--workflow` is a run of its own: no TUI, no turn, just the steps and their report.
@@ -557,7 +597,15 @@ allow it.",
     // Only a run that stays up receives messages from other local sessions.
     let _peer = if !private {
         if let Some(dir) = crate::peers::directory() {
-            match crate::peers::register(&dir, &session_id, &cwd, &session).await {
+            match crate::peers::register_terminal(
+                &dir,
+                &session_id,
+                &cwd,
+                &session,
+                native_socket.clone(),
+            )
+            .await
+            {
                 Ok(peer) => Some(peer),
                 Err(error) => {
                     eprintln!("bhai: session messaging unavailable: {error:#}");
@@ -654,6 +702,8 @@ allow it.",
         schedules,
         None,
         rc_pairing,
+        Some(remote_control),
+        native_socket.is_some(),
     )
     .await;
     drop(guard);
@@ -749,10 +799,16 @@ async fn serve(port: Option<u16>, open: bool, args: Args) -> Result<()> {
     daemon::run(daemon, listener, token.value).await
 }
 
-/// `bhai attach`: the tui over a session served elsewhere. Leaving only detaches, so
-/// nothing here is stopped or saved on the way out.
-/// With `ssh`, attach runs the tunnel to the server's port itself, and reads the token
-/// from the file there when none is given here.
+fn local_session_id(target: &str) -> bool {
+    !target.is_empty()
+        && target
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        && !target.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// Native IDs return to their original terminal; HTTP targets open a mirrored view.
+/// With `ssh`, the port and token are reached through an owned tunnel.
 async fn attach(
     target: Option<&str>,
     token: Option<String>,
@@ -760,13 +816,36 @@ async fn attach(
     session: Option<&str>,
     ssh: Option<(tunnel::Ssh, Option<String>)>,
 ) -> Result<()> {
+    let local = if ssh.is_none() && target.is_some_and(local_session_id) {
+        anyhow::ensure!(
+            token.is_none() && file.is_none() && session.is_none(),
+            "a local session id takes no token or --session; use a port or URL for HTTP attachment"
+        );
+        let dir = crate::peers::directory().context("HOME is needed to find active sessions")?;
+        let found = crate::peers::attachment(&dir, target.unwrap()).await?;
+        if let Some(path) = &found.terminal {
+            crate::terminal_host::attach(path).await?;
+            println!(
+                "bhai: terminal closed for {}; bhai sessions lists sessions still running",
+                found.id
+            );
+            return Ok(());
+        }
+        Some(found)
+    } else {
+        None
+    };
+    tools::bash::kill_all_on_signal()?;
     let env = std::env::var(server::TOKEN_ENV).ok();
     let (base, token, through) = match ssh {
-        None => (
-            remote::base_url(target)?,
-            remote::token(token, file, env)?,
-            None,
-        ),
+        None => match local {
+            Some(found) => (found.base, found.token, None),
+            None => (
+                remote::base_url(target)?,
+                remote::token(token, file, env)?,
+                None,
+            ),
+        },
         Some((ssh, remote_file)) => {
             let port = match target.map(str::trim) {
                 None | Some("") => server::DEFAULT_PORT,
@@ -846,6 +925,8 @@ async fn attach(
         None,
         Some(attached.resync),
         None,
+        None,
+        false,
     )
     .await;
     if let Some((tunnel, _)) = through {
@@ -1050,6 +1131,16 @@ struct Args {
     flags: Flags,
 }
 
+fn native_session(args: &Args) -> bool {
+    args.command.is_none()
+        && !args.headless
+        && args.exec.is_none()
+        && args.workflow.is_none()
+        && args.probe.is_none()
+        && args.cache_check.is_none()
+        && args.judge_eval.is_none()
+}
+
 /// Everything a session is built from once the config, the identity and the project's
 /// instructions have been read.
 struct Setup {
@@ -1069,6 +1160,7 @@ struct Setup {
     statusline: Option<String>,
     /// `[bash] sudo`.
     sudo: bool,
+    remote_control_relay: Option<String>,
 }
 
 /// Config and instruction files for the working directory, as the system prompt for
@@ -1140,6 +1232,7 @@ async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> 
     let choice = config.choice.clone();
     let statusline = config.statusline.clone();
     let sudo = config.sudo;
+    let remote_control_relay = config.remote_control_relay.clone();
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
     startup::mark("prompt");
@@ -1155,6 +1248,7 @@ async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> 
         choice,
         statusline,
         sudo,
+        remote_control_relay,
     })
 }
 
@@ -1973,6 +2067,8 @@ async fn run(
     schedules: Option<Arc<schedules::Schedules>>,
     resync: Option<mpsc::UnboundedReceiver<()>>,
     rc_pairing: Option<(String, Vec<String>)>,
+    mut remote_control: Option<crate::relay::Controller>,
+    native_terminal: bool,
 ) -> Result<Option<i32>> {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<Event>();
 
@@ -2060,6 +2156,11 @@ async fn run(
 
     let mouse = modes.mouse;
     let mut app = App::new(Arc::clone(&session));
+    app.native_terminal = native_terminal;
+    if let Some(control) = &remote_control {
+        app.rc_relay = control.address().map(str::to_string);
+        app.rc_running = control.active();
+    }
     if let Some((relay, rows)) = rc_pairing {
         app.rc_relay = Some(relay);
         app.rc_pairing = Some(rows);
@@ -2105,7 +2206,7 @@ async fn run(
             "debug server on http://{addr} ({})",
             token.shown()
         )));
-        tokio::spawn(server::serve(listener, session, token.value));
+        tokio::spawn(server::serve(listener, Arc::clone(&session), token.value));
     }
     // The tab says where the session is running until the model says what it is doing.
     let mut tab = title::Tab::new(std::env::current_dir().unwrap_or_default());
@@ -2117,6 +2218,13 @@ async fn run(
     let mut captured = mouse;
     let mut notifier = notify::Notifier::from_env();
     let mut signalled = None;
+    let mut repaint = if native_terminal {
+        Some(tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::user_defined1(),
+        )?)
+    } else {
+        None
+    };
     while !app.quit {
         if let Some(text) = tab.refresh(tab_state(&app)) {
             title::set(&text);
@@ -2126,6 +2234,27 @@ async fn run(
             app.drawn();
         }
         let event = tokio::select! {
+            _ = async {
+                match repaint.as_mut() {
+                    Some(signal) => { signal.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                reader.paused.store(true, Ordering::SeqCst);
+                let held = reader.reading.lock().unwrap_or_else(|e| e.into_inner());
+                let modes = Modes { mouse: app.mouse, ..modes };
+                modes.release();
+                let entered = execute!(std::io::stdout(), EnterAlternateScreen);
+                modes.restore();
+                let cleared = terminal.clear();
+                drop(held);
+                reader.paused.store(false, Ordering::SeqCst);
+                entered?;
+                cleared?;
+                tab.redraw();
+                dirty = true;
+                continue;
+            }
             event = rx_event.recv() => event,
             Some(signal) = signals.recv() => {
                 signalled = Some(signal);
@@ -2142,6 +2271,47 @@ async fn run(
             if app.quit {
                 break;
             }
+        }
+        if std::mem::take(&mut app.minimising)
+            && let Err(error) = crate::terminal_host::minimise().await
+        {
+            app.entries()
+                .push(app::Entry::Error(format!("could not minimise: {error}")));
+            dirty = true;
+        }
+        if let Some(change) = app.rc_request.take()
+            && let Some(control) = remote_control.as_mut()
+        {
+            match change {
+                crate::relay::Change::Disable => {
+                    control.disable();
+                    app.rc_running = false;
+                    app.entries()
+                        .push(app::Entry::Info("remote control disabled".into()));
+                }
+                crate::relay::Change::Enable(relay) => {
+                    match control
+                        .enable(&relay, Arc::clone(&session), app.session_id.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            app.rc_relay = control.address().map(str::to_string);
+                            app.rc_running = true;
+                            match crate::relay::Identity::machine().and_then(|key| key.qr(&relay)) {
+                                Ok(rows) => app.rc_pairing = Some(rows),
+                                Err(error) => {
+                                    app.entries().push(app::Entry::Error(error.to_string()))
+                                }
+                            }
+                            app.entries().push(app::Entry::Info(format!("remote control enabled: {relay}; /rc reopens pairing, /remote-control off disables it")));
+                        }
+                        Err(error) => app.entries().push(app::Entry::Error(format!(
+                            "could not enable remote control: {error}"
+                        ))),
+                    }
+                }
+            }
+            dirty = true;
         }
         // `/mouse` hands the pointer back to the terminal, and takes it again.
         if app.mouse != captured {
@@ -2302,6 +2472,37 @@ fn attention(event: &session::Event, root: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::prompt;
+
+    #[test]
+    fn native_hosting_only_wraps_interactive_sessions_and_keeps_attach_targets_distinct() {
+        assert!(native_session(&parsed(&[]).unwrap()));
+        assert!(native_session(
+            &parsed(&["--rc", "https://relay.example.com"]).unwrap()
+        ));
+        for flags in [
+            vec!["--serve", "0", "--headless"],
+            vec!["exec", "hello"],
+            vec!["sessions"],
+            vec!["--probe"],
+            vec!["--cache-check"],
+            vec!["--judge-eval"],
+        ] {
+            assert!(!native_session(&parsed(&flags).unwrap()), "{flags:?}");
+        }
+        for id in ["123e4567-e89b-12d3-a456-426614174000", "abc123", "abc-"] {
+            assert!(local_session_id(id));
+        }
+        for target in [
+            "",
+            "7878",
+            "127.0.0.1:7878",
+            "localhost:7878",
+            "http://localhost:7878",
+            "../session",
+        ] {
+            assert!(!local_session_id(target));
+        }
+    }
 
     #[test]
     fn a_command_start_ends_the_frame_batch() {

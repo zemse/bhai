@@ -2105,6 +2105,12 @@ fn render_input(frame: &mut Frame, area: Rect, app: &mut App) {
             },
             Style::new().fg(Color::DarkGray),
         ));
+    if app.native_terminal || app.attached().is_some() {
+        block = block.title_bottom(Line::styled(
+            " F3 minimise ",
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
     if shell {
         block = block.title(Line::styled(
             " shell · output saved for agent ",
@@ -2274,10 +2280,16 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         format!(" allow {}? ", pending.tool)
     };
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .title(title)
         .title_bottom(mode_chip(app.mode))
         .border_style(Style::new().fg(Color::Yellow));
+    if app.native_terminal || app.attached().is_some() {
+        block = block.title_bottom(Line::styled(
+            " F3 minimise ",
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

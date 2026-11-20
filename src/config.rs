@@ -89,6 +89,8 @@ pub struct Config {
     pub dictation: Option<crate::dictation::Settings>,
     /// `[notify]`: the command run when the session wants the user, or `None` for none.
     pub notify: Option<crate::notify::Settings>,
+    /// `remote_control_relay`: the relay `/remote-control` starts on explicit request.
+    pub remote_control_relay: Option<String>,
 }
 
 impl Default for Config {
@@ -124,6 +126,7 @@ impl Default for Config {
             #[cfg(feature = "dictation")]
             dictation: None,
             notify: None,
+            remote_control_relay: None,
         }
     }
 }
@@ -220,6 +223,7 @@ struct Layer {
     #[cfg(feature = "dictation")]
     dictation: Option<crate::dictation::Settings>,
     notify: Option<crate::notify::Settings>,
+    remote_control_relay: Option<String>,
     #[serde(default)]
     permissions: RulesLayer,
 }
@@ -445,6 +449,9 @@ impl Config {
             }
             if layer.notify.is_some() {
                 self.notify = layer.notify.clone();
+            }
+            if layer.remote_control_relay.is_some() {
+                self.remote_control_relay = layer.remote_control_relay.clone();
             }
         }
         // A project file may turn the sandbox on and the network off, never the reverse.
@@ -887,6 +894,34 @@ mod tests {
 
         write(&global_path(&home), "[dictation]\nrecorder = []\n");
         assert!(Config::load(Some(&home), &cwd).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remote_control_relay_is_global_and_does_not_enable_sharing() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "remote_control_relay = \"https://untrusted.example.com\"\n",
+        );
+        assert_eq!(
+            Config::load(Some(&home), &cwd)
+                .unwrap()
+                .remote_control_relay,
+            None
+        );
+        write(
+            &global_path(&home),
+            "remote_control_relay = \"https://relay.example.com\"\n",
+        );
+        assert_eq!(
+            Config::load(Some(&home), &cwd)
+                .unwrap()
+                .remote_control_relay
+                .as_deref(),
+            Some("https://relay.example.com")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
