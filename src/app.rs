@@ -176,6 +176,7 @@ fn class(c: char) -> u8 {
 pub struct App {
     /// Rendered QR rows, kept only in the local pairing modal.
     pub rc_pairing: Option<Vec<String>>,
+    pub rc_pairing_large: bool,
     /// The relay whose pairing QR `/rc` opens again.
     pub rc_relay: Option<String>,
     /// Screen rows of each visible entry, filled in by the renderer.
@@ -447,6 +448,7 @@ impl App {
         ));
         let mut app = Self {
             rc_pairing: None,
+            rc_pairing_large: false,
             rc_relay: None,
             rows: Vec::new(),
             hover: None,
@@ -574,6 +576,12 @@ impl App {
                 || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
             {
                 self.rc_pairing = None;
+            } else if matches!(key.code, KeyCode::Char('l' | 'L'))
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                self.rc_pairing_large = !self.rc_pairing_large;
             }
             return;
         }
@@ -3581,6 +3589,10 @@ mod tests {
                 }
                 let entries = app.entries().list.len();
                 app.rc_pairing = Some(vec!["private QR".to_string()]);
+                app.on_key(key(KeyCode::Char('l'), KeyModifiers::NONE));
+                assert!(app.rc_pairing_large);
+                app.on_key(key(KeyCode::Char('L'), KeyModifiers::SHIFT));
+                assert!(!app.rc_pairing_large);
                 for code in [KeyCode::Char('y'), KeyCode::Char('n'), KeyCode::Tab] {
                     app.on_key(key(code, KeyModifiers::NONE));
                 }

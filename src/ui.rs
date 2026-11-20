@@ -63,7 +63,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let Some(qr) = &app.rc_pairing {
         app.links.clear();
         app.label_links.clear();
-        render_rc_pairing(frame, qr);
+        render_rc_pairing(frame, qr, app.rc_pairing_large);
         return;
     }
     if let Some(reader) = app.reader.as_mut() {
@@ -80,23 +80,60 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_links(frame, app);
 }
 
-fn render_rc_pairing(frame: &mut Frame, qr: &[String]) {
+fn rc_pairing_lines(qr: &[String], large: bool) -> Vec<Line<'static>> {
+    let dark = Style::new().fg(Color::Black).bg(Color::Black);
+    let light = Style::new().fg(Color::Black).bg(Color::White);
+    let mut lines = Vec::new();
+    for row in qr {
+        if large {
+            for bottom in [false, true] {
+                lines.push(Line::from(
+                    row.chars()
+                        .map(|symbol| {
+                            let black =
+                                symbol == '█' || symbol == if bottom { '▄' } else { '▀' };
+                            Span::styled("  ", if black { dark } else { light })
+                        })
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        } else {
+            lines.push(Line::from(
+                row.chars()
+                    .map(|symbol| match symbol {
+                        '█' => Span::styled(" ", dark),
+                        ' ' => Span::styled(" ", light),
+                        symbol => Span::styled(symbol.to_string(), light),
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+    lines
+}
+
+fn render_rc_pairing(frame: &mut Frame, qr: &[String], large: bool) {
     let title = "Pair remote control";
     let instruction = "Scan from the relay website. Keep this key private.";
-    let close = "Esc or Enter to close";
+    let close = if large {
+        "L: compact QR · Esc or Enter to close"
+    } else {
+        "L: large QR · Esc or Enter to close"
+    };
     let screen = frame.area();
-    let width = qr
+    let qr_lines = rc_pairing_lines(qr, large);
+    let width = qr_lines
         .iter()
-        .map(|row| unicode_width::UnicodeWidthStr::width(row.as_str()))
-        .chain([instruction.len()])
+        .map(Line::width)
+        .chain([instruction.len(), close.len()])
         .max()
         .unwrap_or_default()
         .saturating_add(4);
-    let height = qr.len().saturating_add(8);
+    let height = qr_lines.len().saturating_add(8);
     let fits = width <= screen.width as usize && height <= screen.height as usize;
     let (width, height, lines) = if fits {
         let mut lines = vec![Line::from(title), Line::default()];
-        lines.extend(qr.iter().map(|row| Line::from(row.as_str())));
+        lines.extend(qr_lines);
         lines.extend([
             Line::default(),
             Line::from(instruction),
@@ -2466,7 +2503,7 @@ mod tests {
     #[test]
     fn rc_pairing_draws_complete_centered_monochrome_qr_without_copy_targets() {
         let mut app = App::detached();
-        let qr = vec!["▀ ".repeat(35); 30];
+        let qr = vec!["█▀▄ ".repeat(17); 30];
         app.rc_pairing = Some(qr.clone());
         let entries = app.entries().list.len();
         let mut terminal = Terminal::new(TestBackend::new(80, 42)).unwrap();
@@ -2474,10 +2511,24 @@ mod tests {
         let buffer = terminal.backend().buffer();
         for (row, text) in qr.iter().enumerate() {
             for (column, symbol) in text.chars().enumerate() {
-                let cell = &buffer[(5 + column as u16, 5 + row as u16)];
-                assert_eq!(cell.symbol(), symbol.to_string());
+                let cell = &buffer[(6 + column as u16, 5 + row as u16)];
+                assert_eq!(
+                    cell.symbol(),
+                    if symbol == '█' {
+                        " ".to_string()
+                    } else {
+                        symbol.to_string()
+                    }
+                );
                 assert_eq!(cell.fg, Color::Black);
-                assert_eq!(cell.bg, Color::White);
+                assert_eq!(
+                    cell.bg,
+                    if symbol == '█' {
+                        Color::Black
+                    } else {
+                        Color::White
+                    }
+                );
             }
         }
         let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
@@ -2494,6 +2545,48 @@ mod tests {
         assert!(app.copies.is_empty());
         assert!(app.links.is_empty());
         assert!(app.label_links.is_empty());
+    }
+
+    #[test]
+    fn rc_pairing_large_uses_only_backgrounds_and_preserves_every_module() {
+        let mut app = App::detached();
+        app.rc_pairing = Some(vec!["█▀▄ ".repeat(8); 12]);
+        app.rc_pairing_large = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..24 {
+            for x in 0..64 {
+                let cell = &buffer[(8 + x, 7 + y)];
+                let black = match (x / 2) % 4 {
+                    0 => true,
+                    1 => y % 2 == 0,
+                    2 => y % 2 == 1,
+                    _ => false,
+                };
+                assert_eq!(cell.symbol(), " ");
+                assert_eq!(cell.bg, if black { Color::Black } else { Color::White });
+            }
+        }
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("L: compact QR"));
+        assert!(app.copies.is_empty());
+        assert!(app.lines.is_empty());
+    }
+
+    #[test]
+    fn rc_pairing_large_never_clips_and_offers_compact_mode() {
+        let mut app = App::detached();
+        app.rc_pairing = Some(vec!["█".repeat(70); 30]);
+        app.rc_pairing_large = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 42)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("144 columns"));
+        assert!(text.contains("68 rows"));
+        assert!(text.contains("L: compact QR"));
+        assert!(buffer.content.iter().all(|cell| cell.bg != Color::Black));
     }
 
     #[test]
