@@ -94,6 +94,14 @@ On the server, in tmux or as the systemd unit in the README:
 On the laptop:
   bhai attach 7878 --ssh ubuntu@HOST --ssh-arg=-i --ssh-arg=~/key.pem";
 
+const COMPLETIONS_HELP: &str = "zsh, with ~/.zfunc on fpath before compinit runs in ~/.zshrc:
+  mkdir -p ~/.zfunc && bhai completions zsh > ~/.zfunc/_bhai
+bash:
+  bhai completions bash > ~/.local/share/bash-completion/completions/bhai
+fish:
+  bhai completions fish > ~/.config/fish/completions/bhai.fish
+Regenerate after upgrading bhai, so new commands and options complete.";
+
 const SERVE_HELP: &str = "Each session runs as its own bhai --serve --headless, in any project; the daemon opens, lists and stops them.
   GET /sessions         id, title, project, working, pending approval, created, updated
   POST /sessions/new    optional JSON: project, model, mode, effort, resume (an id or latest), trust, as
@@ -179,6 +187,15 @@ struct Serving {
 pub(super) struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
+    #[command(flatten)]
+    root: Root,
+    #[command(flatten)]
+    legacy: Legacy,
+}
+
+/// The options bhai takes with no command: those of the terminal UI and --print.
+#[derive(Debug, Group)]
+struct Root {
     /// Use this directory as the project root.
     #[arg(short = 'C', long, global = true, value_name = "DIR")]
     cd: Option<PathBuf>,
@@ -200,7 +217,12 @@ pub(super) struct Cli {
     /// Run with no terminal UI, reached only through --serve or --rc.
     #[arg(long, help_heading = SERVER)]
     headless: bool,
-    // The forms the subcommands replaced, kept so scripts and units keep working.
+}
+
+/// The forms the subcommands replaced, kept so scripts and units keep working. They are
+/// left out of completions, which would offer them although hidden.
+#[derive(Debug, Group)]
+struct Legacy {
     #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "127.0.0.1:8787")]
     relay: Option<SocketAddr>,
     #[arg(long, hide = true, num_args = 1..=2, value_names = ["NAME", "INPUT"])]
@@ -298,6 +320,12 @@ enum Cmd {
         #[arg(default_value = "127.0.0.1:8787")]
         bind: SocketAddr,
     },
+    /// Print a shell completion script.
+    #[command(after_help = COMPLETIONS_HELP)]
+    Completions {
+        /// The shell to complete for.
+        shell: clap_complete::Shell,
+    },
     /// Check model auth, prompt caching or the approval judge.
     Debug {
         #[command(subcommand)]
@@ -381,6 +409,9 @@ pub(super) enum Command {
     Mcp {
         command: McpCommand,
     },
+    Completions {
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -441,6 +472,12 @@ impl Common {
 }
 
 impl Cli {
+    /// The grammar without the hidden legacy flags, for completion scripts.
+    pub fn completions() -> clap::Command {
+        use clap::{Args as _, Subcommand as _};
+        Cmd::augment_subcommands(Root::augment_args(clap::Command::new("bhai")))
+    }
+
     /// Parse `args`, the program name first.
     pub fn parse<I, T>(args: I) -> Result<Self, clap::Error>
     where
@@ -453,6 +490,10 @@ impl Cli {
     pub fn into_args(self) -> Result<Args, clap::Error> {
         let Cli {
             command,
+            root,
+            legacy,
+        } = self;
+        let Root {
             cd,
             resume,
             pick,
@@ -461,13 +502,15 @@ impl Cli {
             common,
             serving,
             headless,
+        } = root;
+        let Legacy {
             relay,
             workflow,
             workflow_yes,
             probe,
             cache_check,
             judge_eval,
-        } = self;
+        } = legacy;
         let legacy = [
             relay.is_some(),
             workflow.is_some(),
@@ -637,6 +680,9 @@ impl Cli {
                     Cmd::Usage => args.command = Some(Command::Usage),
                     Cmd::Mcp { command } => args.command = Some(Command::Mcp { command }),
                     Cmd::Relay { bind } => args.relay = Some(bind),
+                    Cmd::Completions { shell } => {
+                        args.command = Some(Command::Completions { shell })
+                    }
                     Cmd::Debug { command } => match command {
                         DebugCommand::Probe { prompt } => args.probe = Some(prompt),
                         DebugCommand::CacheCheck { minutes } => args.cache_check = Some(minutes),
@@ -931,6 +977,34 @@ mod tests {
             vec!["--workflow-yes"],
         ] {
             assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn completions_cover_the_commands_and_hide_the_old_flags() {
+        assert_eq!(
+            parse(&["completions", "zsh"]).unwrap().command,
+            Some(Command::Completions {
+                shell: clap_complete::Shell::Zsh
+            })
+        );
+        assert!(parse(&["completions", "nope"]).is_err());
+        assert!(parse(&["-m", "x", "completions", "zsh"]).is_err());
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+        ] {
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::completions(), "bhai", &mut script);
+            let script = String::from_utf8(script).unwrap();
+            for word in ["attach", "minimised", "model", "resume", "completions"] {
+                assert!(script.contains(word), "{shell}: {word} missing");
+            }
+            assert!(
+                !script.contains("--workflow-yes"),
+                "{shell} completes a hidden flag"
+            );
         }
     }
 

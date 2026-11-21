@@ -154,6 +154,11 @@ async fn command(
             return Ok(());
         }
         Some(arguments::Command::Identities) => return identities(),
+        Some(arguments::Command::Completions { shell }) => {
+            let mut grammar = arguments::Cli::completions();
+            clap_complete::generate(shell, &mut grammar, "bhai", &mut std::io::stdout());
+            return Ok(());
+        }
         Some(arguments::Command::Sessions { command }) => {
             let dir = std::env::current_dir()?.join(sessions::DIR);
             match command {

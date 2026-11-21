@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-11-22
+
+- `bhai completions SHELL` prints a completion script for zsh, bash, fish, elvish or PowerShell, covering every command and option except the hidden legacy flags.
+
 ## 2026-11-21
 
 - A native session that fails to start or panics prints its error after the terminal is restored, instead of only `session worker exited with status 1`. The still-running note prints only on a detach, not when the session ended. Resuming a session that another bhai holds names `bhai attach` as the way back to it.

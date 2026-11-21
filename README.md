@@ -52,7 +52,7 @@ bhai exec "review this code" -m ollama:<name> --mode auto
 
 session options work before or after `exec`. approvals left at ask are rejected because no user is there to answer them. configure allow rules or explicitly select `--mode auto` for unattended tools; this does not bypass explicit ask or deny rules.
 
-`sessions` (alias `ls`) `[minimised | prune [n]]`, `identities`, `usage`, `mcp approve|login|logout <server>`, `workflow <name> [input] [--yes]`, `relay [bind]` and `debug probe|cache-check|judge-eval` each take only their own options; `bhai help <command>` shows them. the older `--workflow`, `--relay`, `--probe`, `--cache-check` and `--judge-eval` flags still parse but are hidden.
+`sessions` (alias `ls`) `[minimised | prune [n]]`, `identities`, `usage`, `mcp approve|login|logout <server>`, `workflow <name> [input] [--yes]`, `relay [bind]` and `debug probe|cache-check|judge-eval` each take only their own options; `bhai help <command>` shows them. the older `--workflow`, `--relay`, `--probe`, `--cache-check` and `--judge-eval` flags still parse but are hidden. `bhai completions zsh|bash|fish|elvish|powershell` prints a completion script; `bhai completions --help` says where each shell reads it.
 
 ### Tart sessions
 
