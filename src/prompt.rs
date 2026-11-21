@@ -306,6 +306,14 @@ fn base(tools: &[&str]) -> String {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     let os = std::env::consts::OS;
+    let interactive = if tools.contains(&"bash") {
+        "- For interactive commands (prompts, REPLs and debuggers), use `bash` with `tty: true`, \
+then `write_stdin` with the returned session ID to send approved input or poll output. \
+Use a short `yield_time_ms` to read the first prompt before responding. Prefer noninteractive \
+flags for editors, pagers and git operations.\n"
+    } else {
+        ""
+    };
     let tools = tools_paragraph(tools);
 
     format!(
@@ -330,10 +338,7 @@ when the deterministic checker cannot read them; in auto mode the judge reviews 
 original command. Plain commands joined by `&&` are easier for the checker to inspect.
 - Prefer `grep`, `sed` and `awk` over writing a script for what one command does.
 - When a test states the requirement, fix the code under test, not the test.
-- For interactive commands (prompts, REPLs and debuggers), use `bash` with `tty: true`, \
-then `write_stdin` with the returned session ID to send approved input or poll output. \
-Use a short `yield_time_ms` to read the first prompt before responding. Prefer noninteractive \
-flags for editors, pagers and git operations. Never fabricate or expose user secrets or ask \
+{interactive}- Never fabricate or expose user secrets or ask \
 the user to send them through tool input. Fresh randomness may be generated locally through \
 the OS CSPRNG or a tool's documented secure randomness facility. Distinguish public supplemental \
 inputs from secret material; a local test setup is not a production ceremony. Require user \

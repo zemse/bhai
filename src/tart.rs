@@ -498,8 +498,10 @@ esac
         #[test]
         fn homebrew_wrapper_resolves_to_the_native_app_executable() {
             let fake = FakeTart::new(false);
-            let wrapper = fake.dir.join("bin/tart");
-            let native = fake.dir.join("libexec/tart.app/Contents/MacOS/tart");
+            // The wrapper is read at its canonical path; macOS temp dirs sit under /var -> /private/var.
+            let dir = fake.dir.canonicalize().unwrap();
+            let wrapper = dir.join("bin/tart");
+            let native = dir.join("libexec/tart.app/Contents/MacOS/tart");
             std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
             std::fs::create_dir_all(native.parent().unwrap()).unwrap();
             std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &native).unwrap();

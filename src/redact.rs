@@ -272,10 +272,11 @@ mod tests {
         let mut stdout = Stream::default();
         let mut stderr = Stream::default();
         assert_eq!(stdout.push(b"bounded-stream-"), "");
-        assert_eq!(stderr.push(b"secret"), "secret");
+        // Other tests' values share the registry, so stderr may hold back a tail until finish.
+        let stderr_out = stderr.push(b"secret") + &stderr.finish();
+        assert_eq!(stderr_out, "secret");
         assert_eq!(stdout.push(b"secret"), MARK);
         assert_eq!(stdout.finish(), "");
-        assert_eq!(stderr.finish(), "");
 
         let bytes = "~".repeat(1024 * 1024);
         assert_eq!(stdout.push(bytes.as_bytes()), bytes);

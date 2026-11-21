@@ -8226,9 +8226,12 @@ mod tests {
                 );
                 assert!(!repo.join("original.txt").exists());
             }
-            assert_eq!(backend.calls.lock().unwrap().len(), 2);
+            // The original, then each judged replacement; the denied secret read was one.
+            let calls = backend.calls.lock().unwrap();
+            assert_eq!(calls.len(), if outcome == "secret" { 3 } else { 2 });
             let context: Value =
-                serde_json::from_str(&backend.calls.lock().unwrap()[1].reconsideration).unwrap();
+                serde_json::from_str(&calls.last().unwrap().reconsideration).unwrap();
+            drop(calls);
             assert_eq!(context["original_target"], original_command);
             assert_eq!(
                 context["round"],
