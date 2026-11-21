@@ -875,7 +875,21 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
-        until(&mut stream, "DONE").await;
+        // Only the tail is searched: the burst is too long to rescan per frame.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut tail = Vec::new();
+            loop {
+                let (kind, bytes) = read_frame(&mut stream).await.unwrap();
+                assert_eq!(kind, OUTPUT);
+                tail.extend_from_slice(&bytes);
+                if tail.windows(4).any(|w| w == b"DONE") {
+                    break;
+                }
+                tail.drain(..tail.len().saturating_sub(3));
+            }
+        })
+        .await
+        .unwrap();
         assert!(status(&path).await.unwrap().attached);
         task.abort();
         let _ = task.await;
