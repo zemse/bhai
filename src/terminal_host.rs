@@ -451,15 +451,21 @@ async fn host_inner(path: PathBuf, mut command: Command, wait_for_terminal: bool
     let mut guard = WorkerGuard(worker.id());
     drop(command);
     let mut pending_input = Vec::new();
+    // Output the frontend has no room for yet. The pty is not read while it waits, so a
+    // slow terminal slows the worker; a stuck one is dropped by the write timeout.
+    let mut pending_output: Option<Vec<u8>> = None;
     let mut bytes = [0; 8192];
     let mut pty_open = true;
     loop {
+        let sender = attached.as_ref().map(|(_, tx)| tx.clone());
         tokio::select! {
             result = worker.wait() => {
                 let status = result?;
                 guard.0 = None;
                 if let Some((_, tx)) = &attached {
                     let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                        if let Some(pending) = pending_output.take()
+                            && tx.send((OUTPUT, pending)).await.is_err() { return; }
                         loop {
                             match fd_read(&master, &mut bytes).await {
                                 Ok(n) if n > 0 => { if tx.send((OUTPUT, bytes[..n].to_vec())).await.is_err() { break; } }
@@ -476,15 +482,26 @@ async fn host_inner(path: PathBuf, mut command: Command, wait_for_terminal: bool
                 next_id += 1;
                 connections.spawn(connection(stream, next_id, requests.clone()));
             }
-            output = fd_read(&master, &mut bytes), if pty_open => {
+            output = fd_read(&master, &mut bytes), if pty_open && pending_output.is_none() => {
                 match output {
                     Ok(0) => pty_open = false,
                     Ok(n) => {
-                        if let Some((_, tx)) = &attached
-                            && tx.try_send((OUTPUT, bytes[..n].to_vec())).is_err() { attached = None; }
+                        if let Some((_, tx)) = &attached {
+                            match tx.try_send((OUTPUT, bytes[..n].to_vec())) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full((_, data))) => pending_output = Some(data),
+                                Err(mpsc::error::TrySendError::Closed(_)) => attached = None,
+                            }
+                        }
                     }
                     Err(error) if error.raw_os_error() == Some(libc::EIO) => pty_open = false,
                     Err(error) => return Err(error.into()),
+                }
+            }
+            permit = reserve(sender.as_ref()), if pending_output.is_some() => {
+                match permit {
+                    Ok(permit) => permit.send((OUTPUT, pending_output.take().unwrap_or_default())),
+                    Err(_) => attached = None,
                 }
             }
             written = fd_write(&master, &pending_input), if !pending_input.is_empty() => {
@@ -526,6 +543,7 @@ async fn host_inner(path: PathBuf, mut command: Command, wait_for_terminal: bool
         }
         if attached.is_none() {
             pending_input.clear();
+            pending_output = None;
         }
         while connections.try_join_next().is_some() {}
     }
@@ -537,6 +555,15 @@ async fn host_inner(path: PathBuf, mut command: Command, wait_for_terminal: bool
     })
     .await;
     Ok(())
+}
+
+async fn reserve(
+    sender: Option<&mpsc::Sender<Frame>>,
+) -> Result<mpsc::Permit<'_, Frame>, mpsc::error::SendError<()>> {
+    match sender {
+        Some(sender) => sender.reserve().await,
+        None => Err(mpsc::error::SendError(())),
+    }
 }
 
 async fn connect(path: &Path) -> Result<UnixStream> {
@@ -830,6 +857,26 @@ mod tests {
             .unwrap();
         let output = until(&mut stream, "FRESH").await;
         assert!(!output.contains('\0'));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_briefly_slow_frontend_stays_attached_through_a_burst() {
+        let directory = Directory::new();
+        let task = start(
+            &directory,
+            "read line; dd if=/dev/zero bs=4096 count=512 2>/dev/null | tr '\\0' x; printf 'DONE'; read line",
+        )
+        .await;
+        let path = directory.socket();
+        let mut stream = frontend(&path, 80, 24).await;
+        write_frame(&mut stream, &(INPUT, b"go\n".to_vec()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        until(&mut stream, "DONE").await;
+        assert!(status(&path).await.unwrap().attached);
         task.abort();
         let _ = task.await;
     }

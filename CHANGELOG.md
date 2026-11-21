@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-11-21
+
+- A native terminal that falls behind a burst of output stays attached: the host stops reading the session's PTY until the terminal catches up, instead of hanging up on it.
+
 ## 2026-11-20
 
 - Native terminal sessions keep running after `/minimise` or terminal loss, with active-session discovery in `bhai sessions` and reattachment by ID. Private PTY hosts preserve the original UI and running agent without terminal replay logs; headless sessions attach through their authenticated local API. `/remote-control [URL]` enables relay control at runtime, with explicit status/off controls and a global-only default relay.
