@@ -473,7 +473,7 @@ fn hold(file: &std::fs::File, session: &str) -> Result<()> {
     match file.try_lock() {
         Ok(()) => Ok(()),
         Err(std::fs::TryLockError::WouldBlock) => {
-            bail!("session {session} is open in another bhai")
+            bail!("session {session} is open in another bhai; bhai attach {session} returns to it")
         }
         Err(std::fs::TryLockError::Error(e)) => {
             Err(e).with_context(|| format!("could not lock session {session}"))

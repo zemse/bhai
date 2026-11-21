@@ -6,7 +6,7 @@ use ratatui::crossterm;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -87,6 +87,50 @@ fn check_path(path: &Path, socket: bool) -> Result<()> {
     Ok(())
 }
 
+/// Where a worker leaves the error it exits with. Anything it writes to the pty goes
+/// with the alternate screen, so the frontend prints this once the terminal is restored.
+fn failure_path(socket: &Path) -> PathBuf {
+    socket.with_extension("err")
+}
+
+const MAX_FAILURE: u64 = 16384;
+
+/// Record `message` for the host to deliver with the worker's exit status.
+pub fn record_failure(socket: &Path, message: &str) {
+    if let Ok(mut file) = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(failure_path(socket))
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+/// Record panics as failures too; hooks set later chain to this one.
+pub fn record_panics(socket: PathBuf) {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        record_failure(&socket, &info.to_string());
+        hook(info);
+    }));
+}
+
+fn take_failure(socket: &Path) -> Vec<u8> {
+    let path = failure_path(socket);
+    let mut bytes = Vec::new();
+    if let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        let _ = file.take(MAX_FAILURE).read_to_end(&mut bytes);
+    }
+    let _ = fs::remove_file(&path);
+    bytes
+}
+
 fn terminal_directory() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is unset")?;
     Ok(PathBuf::from(home).join(".config/bhai/terminals"))
@@ -115,7 +159,7 @@ fn create_terminal_directory() -> Result<PathBuf> {
     Ok(directory)
 }
 
-pub async fn launch(args: Vec<String>) -> Result<()> {
+pub async fn launch(args: Vec<String>) -> Result<Ended> {
     let directory = create_terminal_directory()?;
     let path = directory.join(format!(
         "{}.sock",
@@ -401,6 +445,7 @@ async fn host_inner(path: PathBuf, mut command: Command, wait_for_terminal: bool
         inode: meta.ino(),
     };
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    let _ = fs::remove_file(failure_path(&path));
     let (master, slave) = pty()?;
     command
         .env(SOCKET_ENV, &path)
@@ -473,8 +518,11 @@ async fn host_inner(path: PathBuf, mut command: Command, wait_for_terminal: bool
                             }
                         }
                     }).await;
-                    let _ = tokio::time::timeout(Duration::from_secs(2), tx.send((EXIT, status.code().unwrap_or(1).to_be_bytes().to_vec()))).await;
+                    let mut exit = status.code().unwrap_or(1).to_be_bytes().to_vec();
+                    exit.extend(take_failure(&path));
+                    let _ = tokio::time::timeout(Duration::from_secs(2), tx.send((EXIT, exit))).await;
                 }
+                let _ = fs::remove_file(failure_path(&path));
                 break;
             }
             accepted = listener.accept() => {
@@ -697,7 +745,16 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub async fn attach(path: &Path) -> Result<()> {
+/// How an attached terminal came back to the shell.
+#[derive(Debug, PartialEq)]
+pub enum Ended {
+    /// The session is still running.
+    Detached,
+    /// The session ended cleanly.
+    Exited,
+}
+
+pub async fn attach(path: &Path) -> Result<Ended> {
     let mut stream = connect(path).await?;
     write_frame(&mut stream, &(ATTACH, size_bytes()?)).await?;
     let (kind, message) = read_frame(&mut stream).await?;
@@ -706,7 +763,7 @@ pub async fn attach(path: &Path) -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     crossterm::terminal::enable_raw_mode()?;
-    let _guard = TerminalGuard;
+    let guard = TerminalGuard;
     let mut input = TerminalInput::new()?;
     io::stdout().write_all(
         b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b[=1u",
@@ -731,14 +788,16 @@ pub async fn attach(path: &Path) -> Result<()> {
         }
     }
     let _output = Abort(output);
+    let mut exit = None;
     loop {
         tokio::select! {
             frame = rx.recv() => match frame {
                 Some((OUTPUT, bytes)) => { io::stdout().write_all(&bytes)?; io::stdout().flush()?; }
                 Some((MINIMISE, _)) | None => break,
                 Some((EXIT, bytes)) => {
-                    let code = i32::from_be_bytes(bytes.try_into().map_err(|_| anyhow::anyhow!("invalid worker exit status"))?);
-                    ensure!(code == 0, "session worker exited with status {code}");
+                    let (code, message) = bytes.split_at_checked(4).context("invalid worker exit status")?;
+                    let code = i32::from_be_bytes(code.try_into()?);
+                    exit = Some((code, String::from_utf8_lossy(message).trim_end().to_string()));
                     break;
                 }
                 _ => bail!("invalid terminal host response"),
@@ -755,7 +814,16 @@ pub async fn attach(path: &Path) -> Result<()> {
             _ = interrupt.recv() => break,
         }
     }
-    Ok(())
+    drop(input);
+    drop(guard);
+    match exit {
+        None => Ok(Ended::Detached),
+        Some((0, _)) => Ok(Ended::Exited),
+        Some((code, message)) if message.is_empty() => {
+            bail!("session worker exited with status {code}")
+        }
+        Some((_, message)) => bail!("{message}"),
+    }
 }
 
 #[cfg(test)]
@@ -969,6 +1037,54 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!directory.socket().exists());
+    }
+
+    #[tokio::test]
+    async fn a_recorded_failure_arrives_with_the_exit_status_and_is_removed() {
+        let directory = Directory::new();
+        let socket = directory.socket();
+        let task = start(
+            &directory,
+            &format!(
+                "read line; printf 'session x is open in another bhai\\n' > '{}.err'; exit 1",
+                socket.display()
+            ),
+        )
+        .await;
+        let mut stream = frontend(&socket, 80, 24).await;
+        write_frame(&mut stream, &(INPUT, b"go\n".to_vec()))
+            .await
+            .unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (kind, bytes) = read_frame(&mut stream).await.unwrap();
+                if kind == EXIT {
+                    return bytes;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(i32::from_be_bytes(exit[..4].try_into().unwrap()), 1);
+        assert_eq!(&exit[4..], b"session x is open in another bhai\n");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!failure_path(&socket).exists());
+    }
+
+    #[test]
+    fn failures_and_panics_are_recorded_beside_the_socket() {
+        let directory = Directory::new();
+        let socket = directory.socket();
+        record_failure(&socket, "first");
+        record_failure(&socket, "second");
+        let mode = fs::metadata(failure_path(&socket)).unwrap().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(take_failure(&socket), b"first\nsecond\n");
+        assert!(take_failure(&socket).is_empty());
     }
 
     #[tokio::test]

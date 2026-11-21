@@ -82,6 +82,21 @@ pub async fn entry() -> Result<()> {
         .then(|| std::env::var_os(crate::terminal_host::SOCKET_ENV))
         .flatten()
         .map(PathBuf::from);
+    if let Some(socket) = &native_socket {
+        crate::terminal_host::record_panics(socket.clone());
+    }
+    let result = Box::pin(command(args, native_child, native_socket.clone())).await;
+    if let (Err(error), Some(socket)) = (&result, &native_socket) {
+        crate::terminal_host::record_failure(socket, &format!("{error:#}"));
+    }
+    result
+}
+
+async fn command(
+    args: Vec<String>,
+    native_child: bool,
+    native_socket: Option<PathBuf>,
+) -> Result<()> {
     // sudo runs this as `SUDO_ASKPASS`, and reads its stdout as the password.
     if args.first().is_some_and(|a| a == askpass::FLAG) {
         std::process::exit(askpass::helper(&args[1..]));
@@ -106,10 +121,13 @@ pub async fn entry() -> Result<()> {
     if !native_child && native_session(&args) {
         use std::io::IsTerminal as _;
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-            crate::terminal_host::launch(forwarded).await?;
-            println!(
-                "bhai: bhai sessions lists sessions still running; bhai attach <session_id> returns to one"
-            );
+            if crate::terminal_host::launch(forwarded).await?
+                == crate::terminal_host::Ended::Detached
+            {
+                println!(
+                    "bhai: the session is still running; bhai ls lists it and bhai attach <session_id> returns to it"
+                );
+            }
             return Ok(());
         }
     }
@@ -832,11 +850,12 @@ async fn attach(
         let dir = crate::peers::directory().context("HOME is needed to find active sessions")?;
         let found = crate::peers::attachment(&dir, target.unwrap()).await?;
         if let Some(path) = &found.terminal {
-            crate::terminal_host::attach(path).await?;
-            println!(
-                "bhai: terminal closed for {}; bhai sessions lists sessions still running",
-                found.id
-            );
+            if crate::terminal_host::attach(path).await? == crate::terminal_host::Ended::Detached {
+                println!(
+                    "bhai: {} is still running; bhai attach {} returns to it",
+                    found.id, found.id
+                );
+            }
             return Ok(());
         }
         Some(found)
