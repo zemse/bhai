@@ -1,185 +1,77 @@
 //! The command-line grammar, shared by the frontend and offline parser tests.
+//!
+//! Each command declares only the options it reads, so clap's help and errors for it are
+//! the whole story. [`Cli::into_args`] folds the result into the flat [`Args`] the
+//! frontend runs from.
 
-use clap::{CommandFactory, FromArgMatches as _, Parser, Subcommand};
+use clap::{Args as Group, CommandFactory, Parser, Subcommand};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use super::Args;
 use crate::{config::Flags, permissions};
 
-const TOP_HELP: &str = "Run bhai with no command for the terminal UI. -r resumes the latest session here, -r ID a given one; bhai sessions lists them.
-exec or --print runs one unattended turn: text on stdout, progress on stderr, --json for JSONL events.
---mode auto lets the judge approve; bypass runs all but ask rules and protected paths (.git, .env, keys, credentials), which still ask, and deny rules, which refuse.
-Both need the project trusted (--trust), else the session runs in ask. BHAI_MODE takes ask or auto, never bypass.
-SIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session and prints the -r command that resumes it.
-[notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends, failed logins and a 98% used week.
+const SESSION: &str = "Session options";
+const MODEL: &str = "Model options";
+const PERMISSIONS: &str = "Permission options";
+const INSTRUCTIONS: &str = "Instruction options";
+const SERVER: &str = "Server and remote control";
+const DEBUGGING: &str = "Debugging options";
 
-Interactive sessions have a native terminal host: /minimise returns to the shell without stopping the agent.
-bhai sessions lists active sessions; bhai attach ID returns to one. /quit stops the native session.
-/remote-control [URL] enables relay control at runtime; the global remote_control_relay supplies the default URL.
-On a server, bhai serve (or --serve PORT --headless) runs sessions with no terminal, under tmux or systemd: see serve --help.
-From a laptop, tunnel the port with ssh -L and run bhai attach: see attach --help. The servers listen on 127.0.0.1 only.
-Requests carry the token in x-bhai-token; --token-file or BHAI_TOKEN keeps it across restarts.
-For mobile control, --rc https://RELAY publishes a local session using ~/.bhai/control-key.pem.
---relay [BIND] runs the trusted relay's web interface; terminate HTTPS in front of its loopback listener.
-Over HTTP: GET /state (with quota), GET /events?since=N replays then streams, GET /file and POST /upload move files under the project root.";
+const EXAMPLES: &str = "Examples:
+  bhai                        open the terminal UI in this project
+  bhai -r                     resume the latest session here (bhai ls lists them)
+  bhai exec 'fix the test'    run one unattended turn and exit
+  bhai ls minimised           list sessions running without a terminal
+  bhai attach ID              return to a running session
+  bhai serve 7878 --open      run headless sessions for bhai attach over ssh
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "bhai",
-    version,
-    propagate_version = true,
-    about = "An agent harness.",
-    after_help = TOP_HELP
-)]
-pub(super) struct Cli {
-    #[command(subcommand)]
-    pub command: Option<Command>,
-    /// Run one prompt without the terminal UI; omit the prompt or use - to read stdin.
-    #[arg(short = 'p', long = "print", num_args = 0..=1, default_missing_value = "-", value_name = "PROMPT")]
-    print: Option<String>,
-    /// Run the entire session in the default Tart VM configured on this host.
-    #[arg(long, global = true)]
-    tart: bool,
-    /// Use this directory as the project root.
-    #[arg(short = 'C', long, global = true, value_name = "DIR")]
-    cd: Option<std::path::PathBuf>,
-    /// Print exec events as JSON lines, or the models catalogue as JSON.
-    #[arg(long, global = true)]
-    json: bool,
-    /// Select the model (including ollama:<name>).
-    #[arg(short = 'm', long, global = true, value_name = "MODEL")]
-    model: Option<String>,
-    /// Set the model's reasoning effort.
-    #[arg(long, global = true, value_name = "LEVEL")]
-    effort: Option<String>,
-    /// Run as a configured agent identity.
-    #[arg(long = "as", global = true, value_name = "IDENTITY", conflicts_with_all = ["resume", "pick"])]
-    identity: Option<String>,
-    /// Resume a saved session, or the latest when no ID is given.
-    #[arg(short = 'r', long, global = true, num_args = 0..=1, value_name = "ID", conflicts_with = "pick")]
-    resume: Option<Option<String>>,
-    /// Choose a session interactively.
-    #[arg(long, global = true)]
-    pick: bool,
-    /// Set the permission mode; auto and bypass need a trusted project.
-    #[arg(long, global = true, value_parser = ["ask", "auto", "bypass"])]
-    mode: Option<String>,
-    /// Trust the project as it is now: honour its permission rules and allow auto or bypass.
-    #[arg(long, global = true)]
-    trust: bool,
-    /// Skip global instruction files.
-    #[arg(long, global = true)]
-    no_global: bool,
-    /// Skip project instruction files.
-    #[arg(long, global = true)]
-    no_project: bool,
-    /// Disable instruction files and optional integrations.
-    #[arg(long, global = true)]
-    bare: bool,
-    /// Log model usage, headers and trace spans under .bhai/sessions/<id>/debug.
-    #[arg(long, global = true)]
-    profile: bool,
-    /// Refuse requests that break the prompt cache.
-    #[arg(long, global = true)]
-    strict_cache: bool,
-    /// Start the debug HTTP server on 127.0.0.1 (default port: 7878).
-    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "7878", value_name = "PORT")]
-    serve: Option<u16>,
-    /// Connect this session to a remote-control relay over HTTPS.
-    #[arg(long, global = true, value_name = "ADDRESS")]
-    rc: Option<String>,
-    /// Run the remote-control relay (default: 127.0.0.1:8787; put HTTPS in front).
-    #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:8787", value_name = "BIND")]
-    relay: Option<std::net::SocketAddr>,
-    /// Run the debug or remote-control session without the terminal UI.
-    #[arg(long, global = true)]
-    headless: bool,
-    /// Read the server token from this file, or create it (mode 600) with a new one; overrides BHAI_TOKEN.
-    #[arg(long, global = true, value_name = "PATH")]
-    token_file: Option<std::path::PathBuf>,
-    /// Run a workflow, with optional input.
-    #[arg(long, num_args = 1..=2, value_names = ["NAME", "INPUT"])]
-    workflow: Option<Vec<String>>,
-    /// Confirm the workflow plan instead of only printing it.
-    #[arg(long, requires = "workflow")]
-    workflow_yes: bool,
-    /// Check model auth and tool-result replay without executing tools.
-    #[arg(long, num_args = 0..=1, value_name = "PROMPT", group = "diagnostic")]
-    pub probe: Option<Option<String>>,
-    /// Check prefix caching, optionally again after a number of minutes.
-    #[arg(long, num_args = 0..=1, value_name = "MINUTES", value_parser = cache_wait, group = "diagnostic")]
-    pub cache_check: Option<Option<std::time::Duration>>,
-    /// Score the approval judge against a file of cases.
-    #[arg(long, num_args = 0..=1, value_name = "FILE", group = "diagnostic")]
-    pub judge_eval: Option<Option<String>>,
-}
+Run bhai help COMMAND, or bhai COMMAND --help, for each command's options.";
 
-#[derive(Debug, PartialEq, Subcommand)]
-pub(super) enum Command {
-    /// Run one unattended turn; use - as the prompt to read stdin.
-    #[command(
-        after_help = "Text output goes to stdout, progress to stderr. --json emits session events as JSONL.\nApprovals left at ask are rejected; configure allow rules or select --mode auto (with --trust in a project not yet trusted).\n-r [ID] continues a saved session. A failed or interrupted turn exits 1.\n\nWith --serve [PORT] (after the prompt, or as --serve=PORT) the debug server serves the run:\nan approval left at ask waits for POST /approve or /reject (or bhai attach) and fires the [notify] command,\n/prompt joins or queues behind the turn, and /steer, /interrupt and /events work.\nThe process exits once the turn and anything queued behind it have ended, with the usual status.\nThere is no terminal UI to leave out, so --headless is refused.\n  bhai exec 'fix the flaky test' --serve 7878 --token-file ~/.config/bhai/server-token"
-    )]
-    Exec {
-        /// Instructions for the agent, or - to read stdin.
-        prompt: String,
-    },
-    /// Reattach a local session by ID, or open the UI on a served port or URL.
-    #[command(after_help = ATTACH_HELP)]
-    Attach {
-        /// A local active session ID or unique nonnumeric prefix, or a server port/URL (default: 7878); with --ssh, its port there.
-        target: Option<String>,
-        /// The server's token; --token-file reads it from a file, else BHAI_TOKEN.
-        #[arg(long, value_name = "TOKEN")]
-        token: Option<String>,
-        /// The session to show when the server is bhai serve, by its id or a prefix of it.
-        #[arg(long, value_name = "ID")]
-        session: Option<String>,
-        /// Reach the server over ssh to DEST (user@host): attach runs the tunnel and restarts it when it drops.
-        #[arg(long, value_name = "DEST")]
-        ssh: Option<String>,
-        /// An argument for ssh, before DEST; repeat it: --ssh-arg=-i --ssh-arg=~/key.pem.
-        #[arg(
-            long = "ssh-arg",
-            value_name = "ARG",
-            requires = "ssh",
-            allow_hyphen_values = true
-        )]
-        ssh_args: Vec<String>,
-        /// With --ssh and no token given, read it from this file on the server (default: ~/.config/bhai/server-token).
-        #[arg(long, value_name = "PATH", requires = "ssh")]
-        remote_token_file: Option<String>,
-    },
-    /// Serve several sessions from one headless process, opened and closed over HTTP.
-    #[command(after_help = SERVE_HELP)]
-    Serve {
-        /// The port on 127.0.0.1 (default: 7878).
-        port: Option<u16>,
-        /// Open a session in the project root at startup, with --model, --mode, --resume and the rest.
-        #[arg(long)]
-        open: bool,
-    },
-    /// List available model IDs, reasoning efforts and context windows.
-    #[command(
-        after_help = "Use --json for a single object with models and discovery notes.\nPass models[].id to --model and an efforts[].name to --effort.\nCached Codex results are labelled in notes; no agent session or inference call is started."
-    )]
-    Models,
-    /// List configured agent identities.
-    Identities,
-    /// Show the subscription's usage windows and credits.
-    Usage,
-    /// List active sessions on this machine and saved sessions in this project.
-    Sessions {
-        #[command(subcommand)]
-        command: Option<SessionsCommand>,
-    },
-    /// Approve an MCP server or manage its OAuth login.
-    Mcp {
-        #[command(subcommand)]
-        command: McpCommand,
-    },
-}
+const TOP_HELP: &str = "Examples:
+  bhai                        open the terminal UI in this project
+  bhai -r                     resume the latest session here (bhai ls lists them)
+  bhai exec 'fix the test'    run one unattended turn and exit
+  bhai ls minimised           list sessions running without a terminal
+  bhai attach ID              return to a running session
+  bhai serve 7878 --open      run headless sessions for bhai attach over ssh
 
-const ATTACH_HELP: &str = "Run bhai sessions to list active local sessions, then bhai attach ID (a unique nonnumeric prefix also works).
+Run bhai help COMMAND, or bhai COMMAND --help, for each command's options.
+
+Sessions:
+  /minimise (or F3) returns to the shell and leaves the session running; /quit stops it.
+  SIGTERM or SIGHUP (and SIGINT with --headless) interrupts the turn, keeps the session
+  and prints the -r command that resumes it.
+
+Permissions:
+  ask approves each tool call. auto lets the judge approve. bypass runs everything except
+  ask rules and protected paths (.git, .env, keys, credentials), which still ask, and deny
+  rules, which refuse. auto and bypass need a trusted project (--trust), else the session
+  runs in ask. BHAI_MODE sets ask or auto, never bypass.
+
+Serving:
+  --serve [PORT] serves this session on 127.0.0.1; requests carry x-bhai-token, which
+  --token-file or BHAI_TOKEN keeps across restarts. GET /state, GET /events?since=N,
+  POST /prompt, /approve, /reject, /interrupt; GET /file and POST /upload move files.
+  --rc https://RELAY publishes the session to a relay for phone control, using
+  ~/.bhai/control-key.pem; /remote-control [URL] does it at runtime.
+
+Notifications:
+  The [notify] command in ~/.config/bhai/config.toml runs on approvals, turn ends,
+  failed logins and a 98% used week.";
+
+const EXEC_HELP: &str =
+    "Text goes to stdout, progress to stderr; --json writes session events as JSON lines.
+Approvals left at ask are rejected: configure allow rules or pass --mode auto (with --trust
+in a project not yet trusted). -r [ID] continues a saved session. A failed or interrupted
+turn exits 1. A prompt that starts with - follows the terminator: bhai exec -- '-x'.
+
+With --serve [PORT] the debug server serves the run: an approval left at ask waits for
+POST /approve or /reject (or bhai attach) and fires the [notify] command, /prompt joins or
+queues behind the turn, and /steer, /interrupt and /events work. The process exits once
+the turn and anything queued behind it have ended.
+  bhai exec 'fix the flaky test' --serve 7878 --token-file ~/.config/bhai/server-token";
+
+const ATTACH_HELP: &str = "Run bhai ls to list live local sessions, then bhai attach ID (a unique nonnumeric prefix also works).
 Native terminal sessions keep their original UI, draft and agent: /minimise detaches; /quit stops the session.
 Only one native terminal may attach at a time. Terminal or SSH loss detaches without stopping the agent.
 Headless sessions attach by ID through their authenticated local API, with the HTTP-view limitations below.
@@ -215,11 +107,287 @@ Under systemd, set KillMode=mixed so only the daemon gets the SIGTERM (the READM
   bhai serve 7878 --token-file ~/.config/bhai/server-token --open --mode auto --trust
   bhai attach 7878 --token-file ~/.config/bhai/remote-token --session ID";
 
+/// What shapes a session wherever one starts: the terminal UI, exec, a workflow and
+/// the session serve --open starts.
+#[derive(Debug, Default, Clone, PartialEq, Group)]
+struct Common {
+    /// Select the model, including ollama:<name>; bhai models lists them.
+    #[arg(short = 'm', long, value_name = "MODEL", help_heading = MODEL)]
+    model: Option<String>,
+    /// Set the model's reasoning effort.
+    #[arg(long, value_name = "LEVEL", help_heading = MODEL)]
+    effort: Option<String>,
+    /// Start a new session as a configured agent identity; bhai identities lists them.
+    #[arg(long = "as", value_name = "IDENTITY", help_heading = MODEL)]
+    identity: Option<String>,
+    /// How tool calls are approved; auto and bypass need a trusted project.
+    #[arg(long, value_parser = ["ask", "auto", "bypass"], help_heading = PERMISSIONS)]
+    mode: Option<String>,
+    /// Trust the project as it is now: honour its permission rules and allow auto or bypass.
+    #[arg(long, help_heading = PERMISSIONS)]
+    trust: bool,
+    /// Skip global instruction files.
+    #[arg(long, help_heading = INSTRUCTIONS)]
+    no_global: bool,
+    /// Skip project instruction files.
+    #[arg(long, help_heading = INSTRUCTIONS)]
+    no_project: bool,
+    /// Disable instruction files and optional integrations.
+    #[arg(long, help_heading = INSTRUCTIONS)]
+    bare: bool,
+    /// Run the session inside the default Tart VM configured on this host.
+    #[arg(long, help_heading = SESSION)]
+    tart: bool,
+    /// Log model usage, headers and trace spans under .bhai/sessions/<id>/debug.
+    #[arg(long, help_heading = DEBUGGING)]
+    profile: bool,
+    /// Refuse requests that break the prompt cache.
+    #[arg(long, help_heading = DEBUGGING)]
+    strict_cache: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Group)]
+struct Resume {
+    /// Resume a saved session, or the latest here when no ID is given; bhai ls lists them.
+    #[arg(short = 'r', long, num_args = 0..=1, value_name = "ID", help_heading = SESSION)]
+    resume: Option<Option<String>>,
+}
+
+/// Serving a session that this process runs.
+#[derive(Debug, Default, Clone, PartialEq, Group)]
+struct Serving {
+    /// Serve the session over HTTP on 127.0.0.1 (default port: 7878); bhai attach PORT opens it.
+    #[arg(long, num_args = 0..=1, default_missing_value = "7878", value_name = "PORT", help_heading = SERVER)]
+    serve: Option<u16>,
+    /// Publish the session to a remote-control relay over HTTPS, for control from a phone.
+    #[arg(long, value_name = "ADDRESS", help_heading = SERVER)]
+    rc: Option<String>,
+    /// Keep the server's token in this file, created (mode 600) when missing; overrides BHAI_TOKEN.
+    #[arg(long, value_name = "PATH", requires = "serve", help_heading = SERVER)]
+    token_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "bhai",
+    version,
+    about = "An agent harness: a terminal UI over a model that runs tools.",
+    override_usage = "bhai [OPTIONS]            open the terminal UI\n       bhai [OPTIONS] -p PROMPT  run one unattended turn\n       bhai COMMAND [OPTIONS]",
+    after_help = EXAMPLES,
+    after_long_help = TOP_HELP
+)]
+pub(super) struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+    /// Use this directory as the project root.
+    #[arg(short = 'C', long, global = true, value_name = "DIR")]
+    cd: Option<PathBuf>,
+    #[command(flatten)]
+    resume: Resume,
+    /// Choose the saved session to resume from a list.
+    #[arg(long, conflicts_with = "resume", help_heading = SESSION)]
+    pick: bool,
+    /// Run one unattended turn, as bhai exec does; omit the prompt or use - to read stdin.
+    #[arg(short = 'p', long = "print", num_args = 0..=1, default_missing_value = "-", value_name = "PROMPT", help_heading = SESSION)]
+    print: Option<String>,
+    /// With --print, write session events as JSON lines.
+    #[arg(long, help_heading = SESSION)]
+    json: bool,
+    #[command(flatten)]
+    common: Common,
+    #[command(flatten)]
+    serving: Serving,
+    /// Run with no terminal UI, reached only through --serve or --rc.
+    #[arg(long, help_heading = SERVER)]
+    headless: bool,
+    // The forms the subcommands replaced, kept so scripts and units keep working.
+    #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "127.0.0.1:8787")]
+    relay: Option<SocketAddr>,
+    #[arg(long, hide = true, num_args = 1..=2, value_names = ["NAME", "INPUT"])]
+    workflow: Option<Vec<String>>,
+    #[arg(long, hide = true, requires = "workflow")]
+    workflow_yes: bool,
+    #[arg(long, hide = true, num_args = 0..=1)]
+    probe: Option<Option<String>>,
+    #[arg(long, hide = true, num_args = 0..=1, value_parser = cache_wait)]
+    cache_check: Option<Option<Duration>>,
+    #[arg(long, hide = true, num_args = 0..=1)]
+    judge_eval: Option<Option<String>>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Run one unattended turn and exit; use - as the prompt to read stdin.
+    #[command(after_help = EXEC_HELP)]
+    Exec {
+        /// Instructions for the agent, or - to read stdin.
+        prompt: String,
+        /// Write session events as JSON lines instead of text.
+        #[arg(long, help_heading = SESSION)]
+        json: bool,
+        #[command(flatten)]
+        resume: Resume,
+        #[command(flatten)]
+        common: Common,
+        #[command(flatten)]
+        serving: Serving,
+    },
+    /// List live sessions on this machine and saved sessions in this project.
+    #[command(visible_alias = "ls")]
+    Sessions {
+        #[command(subcommand)]
+        command: Option<SessionsCommand>,
+    },
+    /// Return to a live session by ID, or open the UI on a served port or URL.
+    #[command(after_help = ATTACH_HELP)]
+    Attach(Attach),
+    /// Serve many headless sessions from one process, opened and closed over HTTP.
+    #[command(after_help = SERVE_HELP)]
+    Serve {
+        /// The port on 127.0.0.1 (default: 7878).
+        port: Option<u16>,
+        /// Open a session in the project root at startup, shaped by the session options.
+        #[arg(long)]
+        open: bool,
+        /// Keep the server's token in this file, created (mode 600) when missing; overrides BHAI_TOKEN.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+        #[command(flatten)]
+        resume: Resume,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Run a workflow without the terminal UI; without --yes it only prints the plan.
+    Workflow {
+        /// The workflow's name.
+        name: String,
+        /// Input for the workflow.
+        input: Option<String>,
+        /// Confirm the plan and run it.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        resume: Resume,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// List model IDs, reasoning efforts and context windows.
+    #[command(
+        after_help = "Pass models[].id to --model and an efforts[].name to --effort.\nCached Codex results are labelled in notes; no agent session or inference call is started."
+    )]
+    Models {
+        /// Print one JSON object with the models and discovery notes.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List configured agent identities.
+    Identities,
+    /// Show the subscription's usage windows and credits.
+    Usage,
+    /// Approve an MCP server or manage its OAuth login.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    /// Run the remote-control relay that --rc and /remote-control connect to.
+    #[command(
+        after_help = "It needs no model credentials. Put an HTTPS reverse proxy in front of its loopback listener."
+    )]
+    Relay {
+        /// The address to listen on.
+        #[arg(default_value = "127.0.0.1:8787")]
+        bind: SocketAddr,
+    },
+    /// Check model auth, prompt caching or the approval judge.
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+}
+
+#[derive(Debug, PartialEq, Group)]
+struct Attach {
+    /// A live local session ID or unique nonnumeric prefix, or a server port/URL (default: 7878); with --ssh, its port there.
+    target: Option<String>,
+    /// The server's token; --token-file reads it from a file, else BHAI_TOKEN.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
+    /// Read the server's token from this file.
+    #[arg(long, value_name = "PATH")]
+    token_file: Option<PathBuf>,
+    /// The session to show when the server is bhai serve, by its id or a prefix of it.
+    #[arg(long, value_name = "ID")]
+    session: Option<String>,
+    /// Reach the server over ssh to DEST (user@host): attach runs the tunnel and restarts it when it drops.
+    #[arg(long, value_name = "DEST")]
+    ssh: Option<String>,
+    /// An argument for ssh, before DEST; repeat it: --ssh-arg=-i --ssh-arg=~/key.pem.
+    #[arg(
+        long = "ssh-arg",
+        value_name = "ARG",
+        requires = "ssh",
+        allow_hyphen_values = true
+    )]
+    ssh_args: Vec<String>,
+    /// With --ssh and no token given, read it from this file on the server (default: ~/.config/bhai/server-token).
+    #[arg(long, value_name = "PATH", requires = "ssh")]
+    remote_token_file: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum DebugCommand {
+    /// Check model auth and tool-result replay without executing tools.
+    Probe {
+        /// The prompt to send.
+        prompt: Option<String>,
+    },
+    /// Check prefix caching, optionally again after a number of minutes.
+    CacheCheck {
+        /// Minutes to wait before checking the cache lasted.
+        #[arg(value_parser = cache_wait)]
+        minutes: Option<Duration>,
+    },
+    /// Score the approval judge against a file of cases.
+    JudgeEval {
+        /// The cases; the built-in set without one.
+        file: Option<String>,
+    },
+}
+
+/// A command the frontend dispatches on; the rest of the command line is in [`Args`].
+#[derive(Debug, PartialEq)]
+pub(super) enum Command {
+    Exec {
+        prompt: String,
+    },
+    Attach {
+        target: Option<String>,
+        token: Option<String>,
+        session: Option<String>,
+        ssh: Option<String>,
+        ssh_args: Vec<String>,
+        remote_token_file: Option<String>,
+    },
+    Serve {
+        port: Option<u16>,
+        open: bool,
+    },
+    Models,
+    Identities,
+    Usage,
+    Sessions {
+        command: Option<SessionsCommand>,
+    },
+    Mcp {
+        command: McpCommand,
+    },
+}
+
 #[derive(Debug, PartialEq, Subcommand)]
 pub(super) enum SessionsCommand {
-    /// Remove old sessions, retaining the newest N (default: 20).
+    /// Remove old saved sessions, keeping the newest N (default: 20).
     Prune { keep: Option<usize> },
-    /// List only active sessions with no terminal attached.
+    /// List only live sessions with no terminal attached.
     #[command(visible_alias = "minimized")]
     Minimised,
 }
@@ -234,7 +402,7 @@ pub(super) enum McpCommand {
     Logout { server: String },
 }
 
-fn cache_wait(value: &str) -> Result<std::time::Duration, String> {
+fn cache_wait(value: &str) -> Result<Duration, String> {
     let minutes = value
         .trim_end_matches('m')
         .parse::<u64>()
@@ -242,301 +410,287 @@ fn cache_wait(value: &str) -> Result<std::time::Duration, String> {
     let seconds = minutes
         .checked_mul(60)
         .ok_or_else(|| "minutes exceed the supported duration".to_string())?;
-    Ok(std::time::Duration::from_secs(seconds))
+    Ok(Duration::from_secs(seconds))
 }
 
-/// The global options each command's help shows; the rest still parse there, for
-/// `into_args` to refuse or ignore, but would only mislead in its help.
-const SHOWN: &[(&str, &[&str])] = &[
-    ("attach", &["token_file"]),
-    (
-        "serve",
-        &[
-            "cd",
-            "model",
-            "effort",
-            "identity",
-            "resume",
-            "mode",
-            "trust",
-            "no_global",
-            "no_project",
-            "bare",
-            "profile",
-            "strict_cache",
-            "token_file",
-        ],
-    ),
-    (
-        "exec",
-        &[
-            "tart",
-            "cd",
-            "json",
-            "model",
-            "effort",
-            "identity",
-            "resume",
-            "mode",
-            "trust",
-            "no_global",
-            "no_project",
-            "bare",
-            "profile",
-            "strict_cache",
-            "serve",
-            "token_file",
-        ],
-    ),
-];
-
-impl Cli {
-    /// The grammar, with each command's help trimmed to the global options it takes.
-    /// clap copies a global option into a command only where it has none of that id, so
-    /// a hidden copy put there first is the one the command parses and leaves out of help.
-    pub fn grammar() -> clap::Command {
-        let mut grammar = Self::command();
-        let globals: Vec<clap::Arg> = grammar
-            .get_arguments()
-            .filter(|arg| arg.is_global_set())
-            .cloned()
-            .collect();
-        for (name, shown) in SHOWN {
-            grammar = grammar.mut_subcommand(name, |mut command| {
-                for arg in &globals {
-                    if !shown.contains(&arg.get_id().as_str()) {
-                        command = command.arg(arg.clone().hide(true));
-                    } else if *name == "attach" && arg.get_id() == "token_file" {
-                        // attach only reads the file; it never makes one.
-                        command =
-                            command.arg(arg.clone().help("Read the server's token from this file"));
-                    }
-                }
-                command
-            });
+impl Common {
+    /// Options given after the command win over those before it.
+    fn or(self, before: Self) -> Self {
+        Self {
+            model: self.model.or(before.model),
+            effort: self.effort.or(before.effort),
+            identity: self.identity.or(before.identity),
+            mode: self.mode.or(before.mode),
+            trust: self.trust || before.trust,
+            no_global: self.no_global || before.no_global,
+            no_project: self.no_project || before.no_project,
+            bare: self.bare || before.bare,
+            tart: self.tart || before.tart,
+            profile: self.profile || before.profile,
+            strict_cache: self.strict_cache || before.strict_cache,
         }
-        grammar
     }
 
-    /// Parse `args`, the program name first, with the help [`Self::grammar`] gives.
+    fn shapes_a_session(&self) -> bool {
+        self.model.is_some()
+            || self.effort.is_some()
+            || self.identity.is_some()
+            || self.mode.is_some()
+            || self.trust
+    }
+}
+
+impl Cli {
+    /// Parse `args`, the program name first.
     pub fn parse<I, T>(args: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
-        Self::from_arg_matches(&Self::grammar().try_get_matches_from(args)?)
+        Self::try_parse_from(args)
     }
 
     pub fn into_args(self) -> Result<Args, clap::Error> {
-        if (self.probe.is_some() || self.cache_check.is_some() || self.judge_eval.is_some())
-            && (self.command.is_some()
-                || self.print.is_some()
-                || self.serve.is_some()
-                || self.workflow.is_some()
-                || self.resume.is_some()
-                || self.pick)
-        {
-            return Err(Self::invalid("diagnostic flags run on their own"));
+        let Cli {
+            command,
+            cd,
+            resume,
+            pick,
+            print,
+            json,
+            common,
+            serving,
+            headless,
+            relay,
+            workflow,
+            workflow_yes,
+            probe,
+            cache_check,
+            judge_eval,
+        } = self;
+        let legacy = [
+            relay.is_some(),
+            workflow.is_some(),
+            probe.is_some(),
+            cache_check.is_some(),
+            judge_eval.is_some(),
+        ]
+        .into_iter()
+        .filter(|on| *on)
+        .count();
+        let runs_here = resume != Resume::default()
+            || pick
+            || print.is_some()
+            || serving != Serving::default()
+            || headless;
+        if legacy > 1 || legacy == 1 && (command.is_some() || runs_here && workflow.is_none()) {
+            return Err(Self::invalid(
+                "--relay, --workflow and the diagnostic flags each run on their own",
+            ));
         }
-        let exec = match self.command.as_ref() {
-            Some(Command::Exec { prompt }) => {
-                if self.print.is_some() {
+        if relay.is_some() && common != Common::default() {
+            return Err(Self::invalid(
+                "the relay runs no session, so it takes no session options",
+            ));
+        }
+        if workflow.is_some()
+            && (serving != Serving::default() || headless || pick || print.is_some())
+        {
+            return Err(Self::invalid(
+                "a workflow runs on its own, without --serve, --rc, --headless, --pick or --print",
+            ));
+        }
+        let mut args = Args {
+            tart: false,
+            command: None,
+            cd,
+            probe,
+            cache_check,
+            judge_eval,
+            serve: serving.serve,
+            rc: serving.rc,
+            relay,
+            headless,
+            token_file: serving.token_file,
+            profile: false,
+            strict_cache: false,
+            identity: None,
+            model: None,
+            effort: None,
+            trust: false,
+            resume: resume.resume,
+            pick,
+            workflow: workflow.map(|values| {
+                let mut values = values.into_iter();
+                (
+                    values.next().unwrap_or_default(),
+                    values.next().unwrap_or_default(),
+                )
+            }),
+            workflow_yes,
+            exec: print,
+            json,
+            flags: Flags::default(),
+        };
+        let before = common;
+        let common = match command {
+            None => before,
+            Some(Cmd::Exec {
+                prompt,
+                json,
+                resume,
+                common,
+                serving,
+            }) => {
+                if args.exec.is_some() {
                     return Err(Self::invalid("exec and --print are alternatives"));
                 }
-                Some(prompt.clone())
-            }
-            Some(_) => {
-                if self.print.is_some() {
-                    return Err(Self::invalid("--print cannot be used with a command"));
+                if args.pick || args.headless {
+                    return Err(Self::invalid(
+                        "exec never draws the terminal UI, so it takes no --pick or --headless; --serve alone serves the run",
+                    ));
                 }
-                None
+                args.exec = Some(prompt.clone());
+                args.command = Some(Command::Exec { prompt });
+                args.json |= json;
+                args.resume = resume.resume.or(args.resume);
+                args.serve = serving.serve.or(args.serve);
+                args.rc = serving.rc.or(args.rc);
+                args.token_file = serving.token_file.or(args.token_file);
+                common.or(before)
             }
-            None => self.print,
+            Some(Cmd::Serve {
+                port,
+                open,
+                token_file,
+                resume,
+                common,
+            }) => {
+                if args.pick || args.json || args.exec.is_some() || args.headless {
+                    return Err(Self::invalid(
+                        "bhai serve opens sessions over HTTP, without --pick, --print, --json or --headless",
+                    ));
+                }
+                if args.serve.is_some() || args.rc.is_some() || args.token_file.is_some() {
+                    return Err(Self::invalid(
+                        "bhai serve is always headless; give the port as bhai serve PORT, and --token-file after serve",
+                    ));
+                }
+                let common = common.or(before);
+                args.resume = resume.resume.or(args.resume);
+                if (common.shapes_a_session() || args.resume.is_some()) && !open {
+                    return Err(Self::invalid(
+                        "--model, --effort, --mode, --resume, --as and --trust are for the session --open starts; POST /sessions/new takes them per session",
+                    ));
+                }
+                args.token_file = token_file;
+                args.command = Some(Command::Serve { port, open });
+                common
+            }
+            Some(Cmd::Workflow {
+                name,
+                input,
+                yes,
+                resume,
+                common,
+            }) => {
+                if args.pick
+                    || args.headless
+                    || args.json
+                    || args.exec.is_some()
+                    || args.serve.is_some()
+                    || args.rc.is_some()
+                {
+                    return Err(Self::invalid(
+                        "a workflow runs on its own, without --serve, --rc, --headless, --pick or --print",
+                    ));
+                }
+                args.workflow = Some((name, input.unwrap_or_default()));
+                args.workflow_yes = yes;
+                args.resume = resume.resume.or(args.resume);
+                common.or(before)
+            }
+            Some(other) => {
+                if runs_here || args.json || before != Common::default() {
+                    return Err(Self::invalid(
+                        "this command starts no session; put session options on bhai, exec, workflow or serve --open",
+                    ));
+                }
+                match other {
+                    Cmd::Sessions { command } => args.command = Some(Command::Sessions { command }),
+                    Cmd::Attach(attach) => {
+                        args.token_file = attach.token_file;
+                        args.command = Some(Command::Attach {
+                            target: attach.target,
+                            token: attach.token,
+                            session: attach.session,
+                            ssh: attach.ssh,
+                            ssh_args: attach.ssh_args,
+                            remote_token_file: attach.remote_token_file,
+                        });
+                    }
+                    Cmd::Models { json } => {
+                        args.json = json;
+                        args.command = Some(Command::Models);
+                    }
+                    Cmd::Identities => args.command = Some(Command::Identities),
+                    Cmd::Usage => args.command = Some(Command::Usage),
+                    Cmd::Mcp { command } => args.command = Some(Command::Mcp { command }),
+                    Cmd::Relay { bind } => args.relay = Some(bind),
+                    Cmd::Debug { command } => match command {
+                        DebugCommand::Probe { prompt } => args.probe = Some(prompt),
+                        DebugCommand::CacheCheck { minutes } => args.cache_check = Some(minutes),
+                        DebugCommand::JudgeEval { file } => args.judge_eval = Some(file),
+                    },
+                    Cmd::Exec { .. } | Cmd::Serve { .. } | Cmd::Workflow { .. } => unreachable!(),
+                }
+                Common::default()
+            }
         };
-        let workflow = self.workflow.map(|values| {
-            let mut values = values.into_iter();
-            (
-                values.next().unwrap_or_default(),
-                values.next().unwrap_or_default(),
-            )
-        });
-        let parsed = Args {
-            tart: self.tart,
-            command: self.command,
-            cd: self.cd,
-            probe: self.probe,
-            cache_check: self.cache_check,
-            judge_eval: self.judge_eval,
-            serve: self.serve,
-            rc: self.rc,
-            relay: self.relay,
-            headless: self.headless,
-            token_file: self.token_file,
-            profile: self.profile,
-            strict_cache: self.strict_cache,
-            identity: self.identity,
-            model: self.model,
-            effort: self.effort,
-            trust: self.trust,
-            resume: self.resume,
-            pick: self.pick,
-            workflow,
-            workflow_yes: self.workflow_yes,
-            exec,
-            json: self.json,
-            flags: Flags {
-                mode: self
-                    .mode
-                    .map(|mode| mode.parse::<permissions::Mode>())
-                    .transpose()
-                    .map_err(|error| Self::invalid(&error))?,
-                no_global: self.no_global,
-                no_project: self.no_project,
-                bare: self.bare,
-            },
+        if common.identity.is_some() && (args.resume.is_some() || args.pick) {
+            return Err(Self::invalid(
+                "--as starts a new session, so it cannot be used with --resume or --pick",
+            ));
+        }
+        args.tart = common.tart;
+        args.profile = common.profile;
+        args.strict_cache = common.strict_cache;
+        args.identity = common.identity;
+        args.model = common.model;
+        args.effort = common.effort;
+        args.trust = common.trust;
+        args.flags = Flags {
+            mode: common
+                .mode
+                .map(|mode| mode.parse::<permissions::Mode>())
+                .transpose()
+                .map_err(|error| Self::invalid(&error))?,
+            no_global: common.no_global,
+            no_project: common.no_project,
+            bare: common.bare,
         };
-        if parsed.headless && parsed.serve.is_none() && parsed.rc.is_none() {
+        if args.exec.is_some() && args.pick {
+            return Err(Self::invalid(
+                "--print runs a new turn, so it takes no --pick",
+            ));
+        }
+        if args.headless && args.serve.is_none() && args.rc.is_none() {
             return Err(Self::invalid("--headless requires --serve or --rc"));
         }
-        if parsed.relay.is_some()
-            && (parsed.rc.is_some()
-                || parsed.command.is_some()
-                || parsed.serve.is_some()
-                || parsed.headless
-                || parsed.exec.is_some()
-                || parsed.workflow.is_some()
-                || parsed.probe.is_some()
-                || parsed.cache_check.is_some()
-                || parsed.judge_eval.is_some()
-                || parsed.resume.is_some()
-                || parsed.pick
-                || parsed.model.is_some()
-                || parsed.effort.is_some()
-                || parsed.flags.mode.is_some()
-                || parsed.identity.is_some()
-                || parsed.trust
-                || parsed.tart)
-        {
-            return Err(Self::invalid("--relay runs on its own"));
-        }
-        if parsed.rc.is_some()
-            && (parsed.command.is_some() && parsed.exec.is_none()
-                || parsed.workflow.is_some()
-                || parsed.probe.is_some()
-                || parsed.cache_check.is_some()
-                || parsed.judge_eval.is_some())
-        {
-            return Err(Self::invalid(
-                "--rc runs a local session, not a utility command or workflow",
-            ));
-        }
-        if parsed.workflow.is_some() && (parsed.serve.is_some() || parsed.headless || parsed.pick) {
-            return Err(Self::invalid(
-                "--workflow runs on its own, without --serve, --headless or --pick",
-            ));
-        }
-        if parsed.exec.is_some() && parsed.headless {
-            return Err(Self::invalid(
-                "exec and --print never draw the terminal UI, so drop --headless; --serve alone serves the run",
-            ));
-        }
-        if parsed.exec.is_some() && (parsed.workflow.is_some() || parsed.pick) {
-            return Err(Self::invalid(
-                "exec and --print run on their own, without --workflow or --pick",
-            ));
-        }
-        let utility = matches!(
-            parsed.command,
-            Some(
-                Command::Identities
-                    | Command::Usage
-                    | Command::Sessions { .. }
-                    | Command::Mcp { .. }
-            )
-        );
-        let attach = matches!(parsed.command, Some(Command::Attach { .. }));
-        if (utility || attach) && (parsed.serve.is_some() || parsed.headless) {
-            return Err(Self::invalid(
-                "--serve and --headless run a session; this command does not start one",
-            ));
-        }
-        if let Some(Command::Serve { open, .. }) = parsed.command {
-            if parsed.serve.is_some() || parsed.headless {
-                return Err(Self::invalid(
-                    "bhai serve is always headless; give the port as bhai serve PORT",
-                ));
-            }
-            if parsed.exec.is_some() || parsed.workflow.is_some() || parsed.pick || parsed.json {
-                return Err(Self::invalid(
-                    "bhai serve opens sessions over HTTP, without exec, --workflow, --pick or --json",
-                ));
-            }
-            let session = parsed.model.is_some()
-                || parsed.effort.is_some()
-                || parsed.flags.mode.is_some()
-                || parsed.resume.is_some()
-                || parsed.identity.is_some()
-                || parsed.trust;
-            if session && !open {
-                return Err(Self::invalid(
-                    "--model, --effort, --mode, --resume, --as and --trust are for the session --open starts; POST /sessions/new takes them per session",
-                ));
-            }
-        }
-        let daemon = matches!(parsed.command, Some(Command::Serve { .. }));
-        if parsed.token_file.is_some() && parsed.serve.is_none() && !attach && !daemon {
-            return Err(Self::invalid(
-                "--token-file goes with --serve, serve or attach",
-            ));
-        }
-        if attach
-            && (parsed.exec.is_some()
-                || parsed.workflow.is_some()
-                || parsed.resume.is_some()
-                || parsed.pick
-                || parsed.json
-                || parsed.tart
-                || parsed.cd.is_some()
-                || parsed.model.is_some()
-                || parsed.effort.is_some()
-                || parsed.identity.is_some()
-                || parsed.flags.mode.is_some()
-                || parsed.trust
-                || parsed.profile
-                || parsed.strict_cache
-                || parsed.flags.no_global
-                || parsed.flags.no_project
-                || parsed.flags.bare)
-        {
-            return Err(Self::invalid(
-                "attach shows a session another bhai runs, so it takes no session options",
-            ));
-        }
-        let models = matches!(parsed.command, Some(Command::Models));
-        if models
-            && (parsed.serve.is_some()
-                || parsed.workflow.is_some()
-                || parsed.resume.is_some()
-                || parsed.pick)
-        {
-            return Err(Self::invalid(
-                "models lists the catalogue without --serve, --workflow, --resume or --pick",
-            ));
-        }
-        if parsed.json && parsed.exec.is_none() && !models {
-            return Err(Self::invalid("--json requires exec, --print or models"));
-        }
-        if parsed.pick && parsed.headless {
+        if args.pick && args.headless {
             return Err(Self::invalid("--pick needs the terminal"));
         }
-        if parsed
+        if args.json && args.exec.is_none() && args.command != Some(Command::Models) {
+            return Err(Self::invalid("--json goes with exec, --print or models"));
+        }
+        if args
             .exec
             .as_deref()
             .is_some_and(|prompt| prompt.trim().is_empty())
         {
             return Err(Self::invalid("the prompt must not be empty"));
         }
-        Ok(parsed)
+        Ok(args)
     }
 
     fn invalid(message: &str) -> clap::Error {
@@ -594,22 +748,24 @@ mod tests {
     #[test]
     fn grammar_is_consistent() {
         Cli::command().debug_assert();
-        Cli::grammar().debug_assert();
     }
 
     #[test]
     fn command_help_shows_only_the_options_that_apply() {
-        // The options section alone: the after_help names other commands' flags.
+        // Up to the after_help, which names other commands' flags.
         let help = |name: &str| {
-            let mut grammar = Cli::grammar();
+            let mut grammar = Cli::command();
             grammar.build();
-            let help = grammar
-                .find_subcommand_mut(name)
-                .unwrap()
-                .render_help()
-                .to_string();
-            let options = help.split("Options:").nth(1).unwrap_or_default();
-            options.split("\n\n").next().unwrap_or_default().to_string()
+            let command = grammar.find_subcommand_mut(name).unwrap();
+            let after = command
+                .get_after_help()
+                .map(|text| text.to_string())
+                .unwrap_or_default();
+            let help = command.render_help().to_string();
+            help.split(after.as_str())
+                .next()
+                .unwrap_or_default()
+                .to_string()
         };
         let attach = help("attach");
         for shown in ["--token-file", "--token ", "--session"] {
@@ -630,15 +786,37 @@ mod tests {
         assert!(
             serve.contains("--open") && serve.contains("--token-file") && serve.contains("--model")
         );
-        for hidden in ["  --tart", "  --json", "--pick", "  --serve", "--headless"] {
+        for hidden in ["  --json", "--pick", "  --serve", "--headless", "--rc"] {
             assert!(!serve.contains(hidden), "{hidden} shown:\n{serve}");
         }
         let exec = help("exec");
         assert!(
             exec.contains("--serve") && !exec.contains("--pick") && !exec.contains("--headless")
         );
-        let top = Cli::grammar().render_help().to_string();
+        let top = Cli::command().render_help().to_string();
         assert!(top.contains("--pick") && top.contains("--headless"));
+        for legacy in [
+            "--relay",
+            "--workflow",
+            "--probe",
+            "--cache-check",
+            "--judge-eval",
+        ] {
+            assert!(!top.contains(legacy), "{legacy} shown:\n{top}");
+        }
+        for name in [
+            "models",
+            "identities",
+            "usage",
+            "relay",
+            "debug",
+            "sessions",
+        ] {
+            let help = help(name);
+            for hidden in ["--model", "--resume", "--serve", "--mode"] {
+                assert!(!help.contains(hidden), "{hidden} shown for {name}:\n{help}");
+            }
+        }
     }
 
     #[test]
@@ -652,9 +830,10 @@ mod tests {
         ] {
             assert_eq!(parse(&args).unwrap_err().kind(), ErrorKind::DisplayHelp);
         }
-        for args in [vec!["--version"], vec!["exec", "--version"]] {
-            assert_eq!(parse(&args).unwrap_err().kind(), ErrorKind::DisplayVersion);
-        }
+        assert_eq!(
+            parse(&["--version"]).unwrap_err().kind(),
+            ErrorKind::DisplayVersion
+        );
     }
 
     #[test]
@@ -756,11 +935,66 @@ mod tests {
     }
 
     #[test]
+    fn ls_is_sessions() {
+        assert_eq!(
+            parse(&["ls"]).unwrap().command,
+            Some(Command::Sessions { command: None })
+        );
+        assert_eq!(
+            parse(&["ls", "minimised"]).unwrap().command,
+            Some(Command::Sessions {
+                command: Some(SessionsCommand::Minimised)
+            })
+        );
+    }
+
+    #[test]
+    fn run_modes_are_commands_and_their_old_flags_still_parse() {
+        assert_eq!(parse(&["relay"]).unwrap(), parse(&["--relay"]).unwrap());
+        assert_eq!(
+            parse(&["relay", "0.0.0.0:9000"]).unwrap(),
+            parse(&["--relay=0.0.0.0:9000"]).unwrap()
+        );
+        assert_eq!(
+            parse(&["workflow", "review", "src", "--yes", "-m", "x"]).unwrap(),
+            parse(&["--workflow", "review", "src", "--workflow-yes", "-m", "x"]).unwrap()
+        );
+        let args = parse(&["workflow", "review"]).unwrap();
+        assert_eq!(args.workflow, Some(("review".into(), String::new())));
+        assert!(!args.workflow_yes && args.command.is_none());
+        assert_eq!(
+            parse(&["debug", "probe", "say ok"]).unwrap(),
+            parse(&["--probe", "say ok"]).unwrap()
+        );
+        assert_eq!(
+            parse(&["debug", "cache-check", "2"]).unwrap().cache_check,
+            Some(Some(std::time::Duration::from_secs(120)))
+        );
+        assert_eq!(
+            parse(&["debug", "judge-eval"]).unwrap().judge_eval,
+            Some(None)
+        );
+        for refused in [
+            vec!["relay", "-m", "x"],
+            vec!["-m", "x", "relay"],
+            vec!["debug", "probe", "-m", "x"],
+            vec!["workflow", "review", "--serve"],
+            vec!["--serve", "workflow", "review"],
+            vec!["--workflow", "review", "--pick"],
+            vec!["--relay", "exec", "hi"],
+            vec!["-m", "x", "sessions"],
+            vec!["-r", "attach", "abc"],
+        ] {
+            assert!(parse(&refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
     fn models_supports_json_without_an_unattended_prompt() {
         let args = parse(&["models", "--json"]).unwrap();
         assert_eq!(args.command, Some(Command::Models));
         assert!(args.json && args.exec.is_none());
-        assert_eq!(parse(&["--json", "models"]).unwrap(), args);
+        assert!(parse(&["--json", "models"]).is_err());
         assert_eq!(
             parse(&["models", "--help"]).unwrap_err().kind(),
             ErrorKind::DisplayHelp

@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-21
 
+- The command line is regrouped: each command takes only its own options, help sections are headed by purpose, and `bhai -h` shows examples while `--help` adds the details. `bhai ls` is `bhai sessions`; `bhai workflow`, `bhai relay` and `bhai debug probe|cache-check|judge-eval` replace the run-mode flags, which still parse but are hidden.
 - `bhai sessions minimised` (or `minimized`) lists only the live native sessions with no terminal attached.
 - A native terminal that falls behind a burst of output stays attached: the host stops reading the session's PTY until the terminal catches up, instead of hanging up on it.
 
