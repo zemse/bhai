@@ -219,6 +219,9 @@ Under systemd, set KillMode=mixed so only the daemon gets the SIGTERM (the READM
 pub(super) enum SessionsCommand {
     /// Remove old sessions, retaining the newest N (default: 20).
     Prune { keep: Option<usize> },
+    /// List only active sessions with no terminal attached.
+    #[command(visible_alias = "minimized")]
+    Minimised,
 }
 
 #[derive(Debug, PartialEq, Subcommand)]
@@ -724,6 +727,14 @@ mod tests {
                 command: Some(SessionsCommand::Prune { keep: Some(5) })
             })
         );
+        for name in ["minimised", "minimized"] {
+            assert_eq!(
+                parse(&["sessions", name]).unwrap().command,
+                Some(Command::Sessions {
+                    command: Some(SessionsCommand::Minimised)
+                })
+            );
+        }
         assert_eq!(
             parse(&["mcp", "approve", "server"]).unwrap().command,
             Some(Command::Mcp {

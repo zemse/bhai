@@ -146,6 +146,14 @@ pub async fn entry() -> Result<()> {
                         keep.unwrap_or(sessions::PRUNE_KEEP)
                     ))
                 ),
+                Some(arguments::SessionsCommand::Minimised) => {
+                    let active = crate::peers::directory()
+                        .context("HOME is needed to find active sessions")?;
+                    print!(
+                        "{}",
+                        crate::peers::minimised_report(&crate::peers::list(&active).await?)
+                    );
+                }
                 None => {
                     if let Some(active) = crate::peers::directory() {
                         print!(

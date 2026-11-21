@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-21
 
+- `bhai sessions minimised` (or `minimized`) lists only the live native sessions with no terminal attached.
 - A native terminal that falls behind a burst of output stays attached: the host stops reading the session's PTY until the terminal catches up, instead of hanging up on it.
 
 ## 2026-11-20

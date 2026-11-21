@@ -366,16 +366,33 @@ pub async fn attachment(dir: &Path, prefix: &str) -> Result<Attachment> {
 }
 
 pub fn report(rows: &[Info]) -> String {
+    if rows.is_empty() {
+        return "No active sessions. Run bhai to start one.\n".to_string();
+    }
+    table("Active sessions (this machine):\n", rows.iter())
+}
+
+/// Native sessions running with no terminal attached, which `bhai attach` returns to.
+pub fn minimised_report(rows: &[Info]) -> String {
+    let mut minimised = rows.iter().filter(|row| minimised(row)).peekable();
+    if minimised.peek().is_none() {
+        return "No minimised sessions.\n".to_string();
+    }
+    table("Minimised sessions (this machine):\n", minimised)
+}
+
+fn minimised(row: &Info) -> bool {
+    row.attachable && row.attached == Some(false)
+}
+
+fn table<'a>(heading: &str, rows: impl Iterator<Item = &'a Info>) -> String {
     fn one_line(text: &str) -> String {
         text.chars()
             .map(|c| if c.is_control() { ' ' } else { c })
             .take(180)
             .collect()
     }
-    if rows.is_empty() {
-        return "No active sessions. Run bhai to start one.\n".to_string();
-    }
-    let mut out = String::from("Active sessions (this machine):\n");
+    let mut out = String::from(heading);
     for row in rows {
         let state = if row.working { "working" } else { "idle" };
         let terminal = match (row.attachable, row.attached) {
@@ -521,6 +538,32 @@ mod tests {
         assert!(attachment(&dir, "session-alpha").await.is_err());
         drop(second);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn minimised_report_lists_only_detached_native_sessions() {
+        let row = |id: &str, attachable, attached| Info {
+            id: id.into(),
+            title: Some(format!("{id} title")),
+            name: None,
+            cwd: "/p".into(),
+            working: false,
+            attached,
+            attachable,
+        };
+        let rows = [
+            row("on-screen", true, Some(true)),
+            row("tucked-away", true, Some(false)),
+            row("headless", true, None),
+            row("older", false, Some(false)),
+        ];
+        let report = minimised_report(&rows);
+        assert!(report.starts_with("Minimised sessions"));
+        assert!(report.contains("tucked-away"));
+        for other in ["on-screen", "headless", "older"] {
+            assert!(!report.contains(other), "{other} listed: {report}");
+        }
+        assert_eq!(minimised_report(&rows[..1]), "No minimised sessions.\n");
     }
 
     #[tokio::test]
