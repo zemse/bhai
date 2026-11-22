@@ -6,6 +6,7 @@ carries the shape of what is there.
 
 ## 2026-11-23
 
+- A streaming frame now lays out only what changed. The transcript's flat columns are grown in place across frames: the prefix up to the first entry that moved is kept, and only the entries from there on are rebuilt, so a redraw costs the one growing entry rather than the whole transcript. The per-entry cache key is a cheap fingerprint (kind, length and ends, or a full hash for a live tool tail) instead of hashing every entry's whole text each frame. A 6 MB transcript streams at 1.3ms a frame, down from 7ms.
 - The transcript redraws at most once every 16ms: a fast stream hands the loop one delta at a time, and each redraw costs the whole transcript, so a burst now shares a single frame instead of drawing one by one.
 
 ## 2026-11-22

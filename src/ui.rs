@@ -1118,21 +1118,36 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
         Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     let width = text_area.width.max(10) as usize;
     let mut cache = std::mem::take(&mut app.drawn);
+    // The flat columns are grown in place across frames: the prefix up to the first entry
+    // whose layout moved is kept, and only the entries from there on are laid out again.
+    let mut plains = std::mem::take(&mut app.lines);
+    let mut joins = std::mem::take(&mut app.joins);
+    let mut margins = std::mem::take(&mut app.margins);
+    let mut sources = std::mem::take(&mut app.sources);
     let entries = app.entries();
     cache.fit(entries.list.len());
+    // A new width lays the whole transcript out again, so the kept columns start empty.
+    let reuse = width == cache.flat_width;
+    if !reuse {
+        plains.clear();
+        joins.clear();
+        margins.clear();
+        sources.clear();
+    }
+    let old_sig = std::mem::take(&mut cache.sig);
+    let mut sig: Vec<(usize, u64, usize)> = Vec::with_capacity(entries.list.len());
     let mut spans = Vec::with_capacity(entries.list.len());
-    let mut plains: Vec<String> = Vec::new();
-    let mut joins: Vec<Join> = Vec::new();
-    let mut margins: Vec<usize> = Vec::new();
-    let mut sources: Vec<Option<Source>> = Vec::new();
     let mut copies = Vec::new();
     let mut named_links = Vec::new();
     let mut diagrams = Vec::new();
     let mut folds = HashMap::new();
     // Each drawn entry and how many of its cached rows it shows.
     let mut parts: Vec<(usize, usize)> = Vec::new();
+    // The first flat row of the entry being laid out, and whether the columns above it are
+    // still the untouched prefix of the last frame.
+    let mut at = 0usize;
+    let mut kept = reuse;
     for (index, entry) in entries.list.iter().enumerate() {
-        let start = plains.len();
         // Only the last entry can be run again: anything after it has moved the history
         // on, and a turn of its own is already running.
         let retryable = index + 1 == entries.list.len() && !app.working;
@@ -1153,41 +1168,66 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
             .list
             .get(index + 1)
             .and_then(|next| shell_result(entry, next));
-        let rows = cache.rows(index, entry, width, expanded, retryable, result);
+        let (stamp, rows) = cache.rows(index, entry, width, expanded, retryable, result);
         // A diff hangs from the command that made it, with no separator between them.
         let hangs = matches!(entries.list.get(index + 1), Some(Entry::Diff(_)));
         let shown = rows.lines.len() - usize::from(hangs);
-        plains.extend(rows.plains[..shown].iter().cloned());
-        joins.extend_from_slice(&rows.joins[..shown]);
-        margins.extend_from_slice(&rows.margins[..shown]);
-        sources.extend(rows.origins[..shown].iter().map(|row| {
-            row.clone().map(|origins| Source {
-                entry: index,
-                origins,
-            })
-        }));
+        // This entry draws exactly as it did last frame only if it sits at the same place
+        // with the same layout and the same height.
+        let same = kept && old_sig.get(sig.len()) == Some(&(index, stamp, shown));
+        if !same && kept {
+            // The first entry that moved: drop the stale tail of the kept columns.
+            plains.truncate(at);
+            joins.truncate(at);
+            margins.truncate(at);
+            sources.truncate(at);
+            kept = false;
+        }
+        if !kept {
+            plains.extend(rows.plains[..shown].iter().cloned());
+            joins.extend_from_slice(&rows.joins[..shown]);
+            margins.extend_from_slice(&rows.margins[..shown]);
+            sources.extend(rows.origins[..shown].iter().map(|row| {
+                row.clone().map(|origins| Source {
+                    entry: index,
+                    origins,
+                })
+            }));
+        }
         copies.extend(
             rows.copies
                 .iter()
-                .map(|(row, chars, code)| (start + row, chars.clone(), code.clone())),
+                .map(|(row, chars, code)| (at + row, chars.clone(), code.clone())),
         );
         named_links.extend(
             rows.links
                 .iter()
-                .map(|(row, chars, target)| (start + row, chars.clone(), target.clone())),
+                .map(|(row, chars, target)| (at + row, chars.clone(), target.clone())),
         );
         diagrams.extend(rows.diagrams.iter().cloned().map(|mut toggle| {
-            toggle.row += start;
+            toggle.row += at;
             (index, toggle)
         }));
         if rows.folded || owner != index {
             folds.insert(index, owner);
         }
+        sig.push((index, stamp, shown));
         parts.push((index, shown));
         // The blank separator line belongs to no entry.
-        spans.push((start..plains.len() - usize::from(!hangs), index));
+        spans.push((at..at + shown - usize::from(!hangs), index));
+        at += shown;
+    }
+    // A transcript that shrank, or one unchanged to the end, leaves the kept columns longer
+    // than the rows now shown.
+    if kept {
+        plains.truncate(at);
+        joins.truncate(at);
+        margins.truncate(at);
+        sources.truncate(at);
     }
     drop(entries);
+    cache.sig = sig;
+    cache.flat_width = width;
     app.folds = folds;
 
     let total = plains.len();
@@ -1218,7 +1258,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::with_capacity(view.len());
     let mut at = 0;
     for (index, shown) in parts {
-        let rows = &cache.slots[index].as_ref().expect("drawn above").1;
+        let rows = &cache.slots[index].as_ref().expect("drawn above").rows;
         let from = view.start.max(at) - at;
         let to = view.end.min(at + shown).saturating_sub(at);
         if from < to {
@@ -1468,11 +1508,25 @@ fn shell_status(result: &Entry) -> Option<(String, Color)> {
 /// little of the transcript moved, and the transcript only grows.
 #[derive(Default)]
 pub struct Drawn {
-    slots: Vec<Option<(Key, Rows)>>,
+    slots: Vec<Option<Slot>>,
+    /// Bumped each time a slot is laid out again, so the flatten below can tell a rebuilt
+    /// entry from a kept one without comparing its rows.
+    stamp: u64,
+    /// `(entry index, stamp, rows shown)` of each shown entry at the last flatten, in
+    /// order. A frame keeps the flat columns up to the first entry whose triple moved.
+    sig: Vec<(usize, u64, usize)>,
+    /// The width the flat columns were built at; a new one lays the whole transcript out.
+    flat_width: usize,
     diagram_views: HashMap<usize, Vec<(usize, bool)>>,
     /// Entries laid out afresh rather than taken from the cache.
     #[cfg(test)]
     built: usize,
+}
+
+struct Slot {
+    key: Key,
+    rows: Rows,
+    stamp: u64,
 }
 
 /// What an entry's rows were drawn from. The entry is fingerprinted rather than given a
@@ -1483,6 +1537,42 @@ struct Key {
     width: usize,
     expanded: bool,
     retryable: bool,
+}
+
+/// A cheap stand-in for hashing an entry's whole text every frame. Every variant but a
+/// Running tail only grows by appending or is replaced whole, so its kind, length and
+/// ends move whenever its text does; a Running tail scrolls in place under a fixed cap,
+/// so it alone is hashed in full.
+fn content_key(entry: &Entry) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    std::mem::discriminant(entry).hash(&mut h);
+    match entry {
+        Entry::Running { .. } => entry.hash(&mut h),
+        _ => {
+            let text = entry.text().as_bytes();
+            text.len().hash(&mut h);
+            text[..text.len().min(32)].hash(&mut h);
+            text[text.len().saturating_sub(32)..].hash(&mut h);
+            // Second fields a single text does not cover, both written once.
+            if let Entry::Command { tool, .. } = entry {
+                tool.hash(&mut h);
+            }
+            if let Entry::Rejected { by, .. } = entry {
+                by.hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
+/// The fingerprint of an entry and the shell result drawn under it.
+fn fingerprint(entry: &Entry, result: Option<&Entry>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    content_key(entry).hash(&mut h);
+    result.map(content_key).hash(&mut h);
+    h.finish()
 }
 
 impl Drawn {
@@ -1509,6 +1599,8 @@ impl Drawn {
         self.slots.resize_with(len, || None);
     }
 
+    /// The entry's rows, laid out again only when its key moved, and the stamp of the
+    /// layout they came from.
     fn rows(
         &mut self,
         index: usize,
@@ -1517,36 +1609,39 @@ impl Drawn {
         expanded: bool,
         retryable: bool,
         result: Option<&Entry>,
-    ) -> &Rows {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::hash::DefaultHasher::new();
-        (entry, result).hash(&mut hasher);
+    ) -> (u64, &Rows) {
         let key = Key {
-            fingerprint: hasher.finish(),
+            fingerprint: fingerprint(entry, result),
             width,
             expanded,
             // Only a failure draws it, so the entry before a new one stays cached.
             retryable: retryable && matches!(entry, Entry::Failed(_)),
         };
-        let slot = &mut self.slots[index];
-        if slot.as_ref().is_none_or(|(drawn, _)| *drawn != key) {
+        if self.slots[index]
+            .as_ref()
+            .is_none_or(|slot| slot.key != key)
+        {
             #[cfg(test)]
             {
                 self.built += 1;
             }
-            *slot = Some((
+            self.stamp += 1;
+            let rows = entry_lines(
+                entry,
+                width,
+                expanded,
+                retryable,
+                result,
+                self.diagram_views.get(&index).map_or(&[], Vec::as_slice),
+            );
+            self.slots[index] = Some(Slot {
                 key,
-                entry_lines(
-                    entry,
-                    width,
-                    expanded,
-                    retryable,
-                    result,
-                    self.diagram_views.get(&index).map_or(&[], Vec::as_slice),
-                ),
-            ));
+                rows,
+                stamp: self.stamp,
+            });
         }
-        &slot.as_ref().expect("filled above").1
+        let slot = self.slots[index].as_ref().expect("filled above");
+        (slot.stamp, &slot.rows)
     }
 }
 
