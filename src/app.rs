@@ -28,7 +28,7 @@ use crate::entries::Entries;
 pub use crate::entries::Entry;
 use crate::input::{Attachments, Editor, History, kept_out, shell_command};
 use crate::limits::{self, RateLimits};
-use crate::markdown::{self, Origin};
+use crate::markdown::{self};
 use crate::models::{Choice, Picker};
 use crate::permissions::{Answer, Mode, Remember};
 use crate::profile::{self, Transcript};
@@ -123,12 +123,13 @@ impl Selection {
     }
 }
 
-/// Where the chars of one transcript row came from in the markdown of the entry that
-/// drew it, `None` for each char the renderer added.
-#[derive(Debug, Clone)]
+/// The entry and the row within its layout that a transcript line was drawn from, so a
+/// copy can read that row's char origins back from the layout cache instead of the flat
+/// column holding a copy of every char's origin.
+#[derive(Debug, Clone, Copy)]
 pub struct Source {
     pub entry: usize,
-    pub origins: Vec<Option<Origin>>,
+    pub row: usize,
 }
 
 /// What a drag's copy left behind: when it happened, how much it took and the cell the
@@ -1617,10 +1618,11 @@ impl App {
             let Some(Some(source)) = self.sources.get(line) else {
                 continue;
             };
-            let Some(range) = selection.on_line(line, source.origins.len()) else {
+            let origins = self.drawn.origins(source.entry, source.row);
+            let Some(range) = selection.on_line(line, origins.len()) else {
                 continue;
             };
-            for origin in source.origins[range].iter().flatten() {
+            for origin in origins[range].iter().flatten() {
                 lo = lo.min(origin.start);
                 hi = hi.max(origin.end);
             }

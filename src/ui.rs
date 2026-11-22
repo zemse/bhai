@@ -1187,11 +1187,10 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &mut App) {
             plains.extend(rows.plains[..shown].iter().cloned());
             joins.extend_from_slice(&rows.joins[..shown]);
             margins.extend_from_slice(&rows.margins[..shown]);
-            sources.extend(rows.origins[..shown].iter().map(|row| {
-                row.clone().map(|origins| Source {
-                    entry: index,
-                    origins,
-                })
+            sources.extend((0..shown).map(|row| {
+                rows.origins[row]
+                    .is_some()
+                    .then_some(Source { entry: index, row })
             }));
         }
         copies.extend(
@@ -1590,6 +1589,18 @@ impl Drawn {
     pub fn clear_diagrams(&mut self) {
         self.diagram_views.clear();
         self.slots.clear();
+    }
+
+    /// Where each char of a shown row came from in its entry's markdown, for a copy. The
+    /// flat column keeps only the entry and row, so the origins are read back from here
+    /// rather than held a second time.
+    pub fn origins(&self, entry: usize, row: usize) -> &[Option<Origin>] {
+        self.slots
+            .get(entry)
+            .and_then(Option::as_ref)
+            .and_then(|slot| slot.rows.origins.get(row))
+            .and_then(Option::as_ref)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// One slot per entry, dropping those past the end of a transcript that shrank.
