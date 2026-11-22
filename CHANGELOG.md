@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-11-23
+
+- The transcript redraws at most once every 16ms: a fast stream hands the loop one delta at a time, and each redraw costs the whole transcript, so a burst now shares a single frame instead of drawing one by one.
+
 ## 2026-11-22
 
 - `bhai completions SHELL` prints a completion script for zsh, bash, fish, elvish or PowerShell, covering every command and option except the hidden legacy flags.

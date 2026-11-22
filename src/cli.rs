@@ -40,6 +40,11 @@ use crate::session::Session;
 /// How often the UI wakes up when nothing is happening (keeps the spinner moving).
 const TICK: Duration = Duration::from_millis(120);
 
+/// The shortest gap between two redraws. A fast stream hands the loop a delta at a time,
+/// and each redraw costs the whole transcript, so bursts are coalesced into one frame
+/// rather than drawn one by one.
+const FRAME: Duration = Duration::from_millis(16);
+
 enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
@@ -2257,15 +2262,34 @@ async fn run(
     } else {
         None
     };
+    let mut last_draw: Option<std::time::Instant> = None;
     while !app.quit {
         if let Some(text) = tab.refresh(tab_state(&app)) {
             title::set(&text);
         }
-        if dirty {
-            terminal.draw(|frame| ui::render(frame, &mut app))?;
-            app.drawn();
-        }
+        // Draw at most once per FRAME: when a redraw is due but too soon, wait out the
+        // rest of the frame instead, so events that land in the meantime share it.
+        let throttle = if dirty {
+            match last_draw.map(|at| at.elapsed()) {
+                Some(since) if since < FRAME => Some(FRAME - since),
+                _ => {
+                    terminal.draw(|frame| ui::render(frame, &mut app))?;
+                    app.drawn();
+                    last_draw = Some(std::time::Instant::now());
+                    dirty = false;
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let event = tokio::select! {
+            _ = async {
+                match throttle {
+                    Some(rest) => tokio::time::sleep(rest).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => continue,
             _ = async {
                 match repaint.as_mut() {
                     Some(signal) => { signal.recv().await; }
