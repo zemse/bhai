@@ -249,6 +249,16 @@ pub const COMMANDS: &[Command] = &[
         help: "show this machine's private remote-control pairing QR",
     },
     Command {
+        name: "remote-key-show",
+        args: "",
+        help: "show the current remote-control key as a pairing QR",
+    },
+    Command {
+        name: "remote-key-rotate",
+        args: "",
+        help: "replace the remote-control key with a fresh one and show it; every paired device must pair again",
+    },
+    Command {
         name: "quit",
         args: "",
         help: "leave bhai",

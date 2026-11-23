@@ -2192,6 +2192,29 @@ impl App {
             }
             return;
         }
+        if message == "/remote-key-show" {
+            match self.rc_relay.as_deref().filter(|relay| !relay.is_empty()) {
+                Some(relay) => {
+                    match crate::relay::Identity::machine().and_then(|key| key.qr(relay)) {
+                        Ok(rows) => self.rc_pairing = Some(rows),
+                        Err(error) => self.note(Entry::Error(error.to_string())),
+                    }
+                }
+                None => self.note(Entry::Error(
+                    "no relay set; use /remote-control <relay URL> first".into(),
+                )),
+            }
+            return;
+        }
+        if message == "/remote-key-rotate" {
+            match self.rc_relay.as_deref().filter(|relay| !relay.is_empty()) {
+                Some(_) => self.rc_request = Some(crate::relay::Change::Rotate),
+                None => self.note(Entry::Error(
+                    "no relay set; use /remote-control <relay URL> first".into(),
+                )),
+            }
+            return;
+        }
         if message == "/help" {
             self.follow = true;
             self.note(Entry::Info(commands::help()));

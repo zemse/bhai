@@ -2366,6 +2366,57 @@ async fn run(
                         ))),
                     }
                 }
+                crate::relay::Change::Rotate => {
+                    match crate::relay::Identity::rotate() {
+                        Err(error) => app.entries().push(app::Entry::Error(format!(
+                            "could not rotate the remote key: {error:#}"
+                        ))),
+                        Ok(_) => {
+                            // The old key is gone from disk. If the session was serving
+                            // under it, reconnect so the live session adopts the new key;
+                            // otherwise a device pairing with the new QR would reach an
+                            // empty machine with no session.
+                            let relay = control
+                                .address()
+                                .map(str::to_string)
+                                .or_else(|| app.rc_relay.clone());
+                            let was_active = control.active();
+                            if was_active {
+                                control.disable();
+                                app.rc_running = false;
+                            }
+                            let reconnected = match (&relay, was_active) {
+                                (Some(relay), true) => control
+                                    .enable(relay, Arc::clone(&session), app.session_id.clone())
+                                    .await
+                                    .map(|()| {
+                                        app.rc_relay = control.address().map(str::to_string);
+                                        app.rc_running = true;
+                                    }),
+                                _ => Ok(()),
+                            };
+                            match (reconnected, relay.as_deref()) {
+                                (Err(error), _) => app.entries().push(app::Entry::Error(format!(
+                                    "key rotated, but could not reconnect remote control: {error}; run /remote-control <relay URL> to re-enable"
+                                ))),
+                                (Ok(()), Some(relay)) => {
+                                    match crate::relay::Identity::machine()
+                                        .and_then(|key| key.qr(relay))
+                                    {
+                                        Ok(rows) => app.rc_pairing = Some(rows),
+                                        Err(error) => {
+                                            app.entries().push(app::Entry::Error(error.to_string()))
+                                        }
+                                    }
+                                    app.entries().push(app::Entry::Info("remote key rotated; every device paired with the old key is now cut off and must pair again with this new code".into()));
+                                }
+                                (Ok(()), None) => app.entries().push(app::Entry::Info(
+                                    "remote key rotated; enable remote control with /remote-control <relay URL> to pair a device".into(),
+                                )),
+                            }
+                        }
+                    }
+                }
             }
             dirty = true;
         }

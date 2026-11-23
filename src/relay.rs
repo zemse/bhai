@@ -95,8 +95,43 @@ impl Identity {
     }
 
     pub fn machine() -> Result<Self> {
-        let home = std::env::var_os("HOME").context("remote control needs HOME")?;
-        Self::load(&PathBuf::from(home).join(".bhai/control-key.pem"))
+        Self::load(&machine_path()?)
+    }
+
+    /// Replace the machine key with a freshly generated one and return it. Every device
+    /// paired with the old key is cut off and must pair again, which is the point: it
+    /// revokes them. The write is atomic, so a crash leaves either the old key or the new.
+    pub fn rotate() -> Result<Self> {
+        let path = machine_path()?;
+        Self::rotate_at(&path)
+    }
+
+    fn rotate_at(path: &Path) -> Result<Self> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let parent = path
+            .parent()
+            .context("control key needs a parent directory")?;
+        std::fs::create_dir_all(parent)?;
+        let key = rcgen::KeyPair::generate()?;
+        let temporary = parent.join(format!(".control-{}.tmp", server::mint()));
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        let result = (|| -> Result<()> {
+            file.write_all(key.serialize_pem().as_bytes())?;
+            file.sync_all()?;
+            // Atomic replace: readers see the whole old file or the whole new one.
+            std::fs::rename(&temporary, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result?;
+        Self::load(path)
     }
 
     pub fn pairing(&self, relay: &str) -> String {
@@ -137,6 +172,12 @@ impl Identity {
             signature: B64.encode(signature),
         })
     }
+}
+
+/// Where the permanent machine key lives.
+fn machine_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("remote control needs HOME")?;
+    Ok(PathBuf::from(home).join(".bhai/control-key.pem"))
 }
 
 /// HTTPS by default; plaintext is only permitted on loopback for offline tests/tunnels.
@@ -656,6 +697,8 @@ fn allowed(path: &str, method: &str) -> bool {
 pub enum Change {
     Enable(String),
     Disable,
+    /// Replace the machine key with a fresh one and reconnect under it.
+    Rotate,
 }
 
 /// Relay tasks belong to the worker, not to a terminal attachment.
@@ -1120,6 +1163,25 @@ mod tests {
         assert!(Identity::load(&linked).is_err());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(Identity::load(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rotating_replaces_the_key_with_a_fresh_private_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("relay-rotate-{}", server::mint()));
+        let path = root.join("control-key.pem");
+        let first = B64.encode(Identity::rotate_at(&path).unwrap().key.public_key_raw());
+        // A second rotation overwrites the file and yields a different key.
+        let second = B64.encode(Identity::rotate_at(&path).unwrap().key.public_key_raw());
+        assert_ne!(first, second);
+        // The fresh key loads and the new one is what is on disk now.
+        let loaded = B64.encode(Identity::load(&path).unwrap().key.public_key_raw());
+        assert_eq!(loaded, second);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
