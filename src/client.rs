@@ -311,6 +311,9 @@ pub enum Delta {
     },
     /// Something about the transport the user should hear once.
     Notice(String),
+    /// A call lost the network (`true`) or reached it again (`false`), for the status
+    /// indicator while the turn waits.
+    Offline(bool),
 }
 
 /// Token counts for one model call, as `response.completed` reports them.
@@ -437,6 +440,9 @@ pub struct Client {
     /// written. Read when a call loses the network, to decide whether a resend still
     /// finds a warm cache. Shared by clones, fresh for each child.
     last_sent: Arc<Mutex<Option<std::time::Instant>>>,
+    /// A child's client: it resumes an offline call once the network is back without
+    /// asking, cache or not, since the parent already consented to the whole task.
+    is_child: bool,
     /// `--profile`: where the rate-limit response headers are logged.
     header_log: Option<PathBuf>,
     /// The turn's first [`TURN_STATE`]; shared by clones, fresh for each child.
@@ -494,6 +500,7 @@ impl Client {
             cache_key: session_id.clone(),
             guard: guard(&session_id, &session_id, false),
             last_sent: Arc::default(),
+            is_child: false,
             session_id,
             model,
             effort,
@@ -709,6 +716,7 @@ impl Client {
         );
         child.turn_state = Arc::default();
         child.last_sent = Arc::default();
+        child.is_child = true;
         if let Some(ws) = &mut child.ws {
             ws.socket = Arc::default();
         }
@@ -798,7 +806,7 @@ impl Client {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .map(|at| at.elapsed());
-                        if self.provider().resume_silently(since_last) {
+                        if self.is_child || self.provider().resume_silently(since_last) {
                             on_delta(Delta::Notice("network back; resuming".to_string()));
                             continue;
                         }
@@ -907,11 +915,25 @@ impl Client {
         on_delta: &mut impl FnMut(Delta),
         cancel: &Arc<AtomicBool>,
     ) -> Offline {
-        let cap = offline_hard_cap();
-        let started = std::time::Instant::now();
+        on_delta(Delta::Offline(true));
         on_delta(Delta::Notice(
             "connection lost; waiting for the network to come back".to_string(),
         ));
+        let outcome = self.probe_until_back(on_delta, cancel).await;
+        // However the wait ended, the indicator is cleared so the turn does not stay
+        // marked offline once it moves on.
+        on_delta(Delta::Offline(false));
+        outcome
+    }
+
+    /// Probe the backend until it answers, the hard cap passes, or an interrupt lands.
+    async fn probe_until_back(
+        &self,
+        on_delta: &mut impl FnMut(Delta),
+        cancel: &Arc<AtomicBool>,
+    ) -> Offline {
+        let cap = offline_hard_cap();
+        let started = std::time::Instant::now();
         let mut backoff = OFFLINE_PROBE_MIN;
         let mut announced = started;
         loop {
@@ -2550,6 +2572,16 @@ mod tests {
     fn a_cacheless_backend_always_resumes_silently() {
         assert!(Provider::Ollama.resume_silently(None));
         assert!(Provider::Ollama.resume_silently(Some(cache::CACHE_TTL * 2)));
+    }
+
+    #[test]
+    fn a_child_resumes_an_offline_call_without_asking() {
+        let parent = Client::new(&Choice::default()).unwrap();
+        assert!(!parent.is_child);
+        let child = parent.for_child(&crate::identity::Identity::default());
+        // The parent already consented to the whole task, so a child never stops to ask
+        // whether to resume once the network is back, cache or not.
+        assert!(child.is_child);
     }
 
     #[test]

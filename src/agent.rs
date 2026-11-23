@@ -56,6 +56,8 @@ pub enum Phase {
     Tools,
     Approval,
     Checking,
+    /// A call lost the network and the turn is waiting for it to come back.
+    Offline,
     WaitingChildren,
     Delivering,
     AwaitingReport,
@@ -71,6 +73,7 @@ impl Phase {
             Self::Tools => "tool",
             Self::Approval => "approval",
             Self::Checking => "checking completion",
+            Self::Offline => "offline, waiting for network",
             Self::WaitingChildren => "waiting for children",
             Self::Delivering => "delivering report",
             Self::AwaitingReport => "report queued",
@@ -2250,6 +2253,10 @@ async fn turn(
                     delay.as_secs_f64()
                 )),
                 Delta::Notice(s) => AgentEvent::Info(s),
+                // On reconnect the phase is restored by the call that follows, so only
+                // the going-offline edge needs its own phase.
+                Delta::Offline(true) => AgentEvent::Phase(Phase::Offline),
+                Delta::Offline(false) => return,
             });
         };
 
