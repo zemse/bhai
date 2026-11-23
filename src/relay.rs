@@ -265,6 +265,24 @@ fn router(hub: Arc<Hub>) -> Router {
                 )
             }),
         )
+        .route(
+            "/static/qrcode-generator.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    include_str!("../assets/vendor/qrcode-generator.js"),
+                )
+            }),
+        )
+        .route(
+            "/static/qrcode-generator.LICENSE",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../assets/vendor/qrcode-generator.LICENSE"),
+                )
+            }),
+        )
         .route("/health", get(|| async { Json(json!({"ok":true})) }))
         .route("/api/challenge", get(nonce))
         .route(

@@ -96,13 +96,15 @@
     body[data-view=chat] .machine-label { display: none; }
     .empty-chat { text-align: center; color: #a8bfd7; padding: 15vh 12px; }
     video { width: 100%; max-height: 45vh; }
+    #export-qr { background: #fff; border-radius: 7px; max-width: 100%; height: auto; display: block; margin: 4px 0; image-rendering: pixelated; }
+    #export-json { overflow-wrap: anywhere; white-space: pre-wrap; }
     [hidden] { display: none !important; }
     @media (max-width: 430px) { body { padding: 12px; padding-bottom: max(24px, env(safe-area-inset-bottom)); } section, details.panel { padding: 12px; } }
     @media (min-width: 800px) { .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; } }
   </style>
 </head>
 <body data-view="connection">
-  <header><div><h1>bhai</h1><span id="status" role="status">Not paired</span></div><nav class="app-nav" aria-label="Remote views"><button id="view-chat" aria-pressed="false">Chat</button><button id="view-tools" aria-pressed="false">Tools</button><button id="view-connection" aria-pressed="true">Connect</button></nav><button id="reconnect" class="connection-action">Reconnect</button><button id="forget" class="danger connection-action">Forget key</button></header>
+  <header><div><h1>bhai</h1><span id="status" role="status">Not paired</span></div><nav class="app-nav" aria-label="Remote views"><button id="view-chat" aria-pressed="false">Chat</button><button id="view-tools" aria-pressed="false">Tools</button><button id="view-connection" aria-pressed="true">Connect</button></nav><button id="reconnect" class="connection-action">Reconnect</button><button id="export" class="connection-action" disabled>Export key</button><button id="forget" class="danger connection-action">Forget key</button></header>
   <p id="notice" role="alert" hidden></p>
   <details id="pairing" class="panel" open>
     <summary>Pair this browser</summary>
@@ -117,6 +119,12 @@
       <button class="primary">Save key and connect</button>
     </form>
   </details>
+  <section id="export-panel" class="panel connection-action" hidden>
+    <div class="row" style="justify-content: space-between; align-items: center;"><h2>Transfer key to another device</h2><button id="export-hide" type="button">Hide</button></div>
+    <p class="muted">Open this relay's bhai website on the other phone and scan this code to copy the controller key. Anyone who scans it gets full control of your sessions. Show it only to a device you trust, then hide it.</p>
+    <canvas id="export-qr" role="img" aria-label="Pairing QR code"></canvas>
+    <details><summary>Can't scan? Copy the pairing data instead</summary><p class="muted">Paste this into the other browser's pairing box. Treat it like a password.</p><button id="export-copy" type="button">Copy pairing data</button><pre id="export-json" aria-label="Pairing data"></pre></details>
+  </section>
   <section id="session-bar">
     <label class="machine-label">Machine <output id="machine">Not connected</output></label>
     <label><span class="machine-label">Session</span><select id="session" aria-label="Session"><option value="">Choose a session</option></select></label>
@@ -163,8 +171,9 @@
     <details class="panel" id="context-panel"><summary>Context, permissions and session state</summary><button id="context-refresh">Load context / permissions</button><pre id="context"></pre><pre id="permissions"></pre><details><summary>Full session state (usage, quota, queue)</summary><pre id="state"></pre></details></details>
     </div>
   </main>
-  <p id="credits" class="muted">QR decoding uses <a href="/static/jsQR.LICENSE">jsQR (Apache-2.0)</a>, bundled locally.</p>
+  <p id="credits" class="muted">QR decoding uses <a href="/static/jsQR.LICENSE">jsQR (Apache-2.0)</a>; QR drawing uses <a href="/static/qrcode-generator.LICENSE">qrcode-generator (MIT)</a>. Both are bundled locally.</p>
   <script src="/static/jsQR.js"></script>
+  <script src="/static/qrcode-generator.js"></script>
   <script>
     'use strict';
     const $ = id => document.getElementById(id);
@@ -254,6 +263,7 @@
       catch { throw new Error('Browser storage is unavailable. Enable storage to save this pairing.'); }
       generation++;
       pairing = prepared.data; privateKey = prepared.key; token = ''; authenticating = null;
+      syncExport();
       selected = ''; resetView(); stopCamera(); $('pair-data').value = ''; $('relay').value = '';
       $('pairing').open = false; notice();
       await authenticate(); await refresh();
@@ -294,7 +304,41 @@
       authenticating = task;
       try { await task; } finally { if (authenticating === task) authenticating = null; }
     }
+    function syncExport() { $('export').disabled = !pairing; }
+    function hideExport() {
+      const canvas = $('export-qr');
+      canvas.width = canvas.height = 0;
+      $('export-json').textContent = '';
+      $('export-panel').hidden = true;
+    }
+    function exportKey() {
+      if (!pairing) throw new Error('Pair this browser first');
+      if (typeof window.qrcode !== 'function') throw new Error('QR drawing unavailable. Reload the page.');
+      // The same shape the machine's pairing QR carries, so the other browser imports it
+      // the same way. The relay is pinned so a scan only works on this origin.
+      const payload = JSON.stringify({ v: 1, relay: pairing.relay, key: pairing.key });
+      const qr = qrcode(0, 'M');
+      qr.addData(payload);
+      qr.make();
+      const count = qr.getModuleCount();
+      const margin = 4;
+      const target = Math.min(340, Math.max(200, (window.innerWidth || 360) - 48));
+      const cell = Math.max(2, Math.floor(target / (count + margin * 2)));
+      const size = (count + margin * 2) * cell;
+      const canvas = $('export-qr');
+      canvas.width = canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, size, size);
+      ctx.fillStyle = '#000000';
+      for (let r = 0; r < count; r++)
+        for (let c = 0; c < count; c++)
+          if (qr.isDark(r, c)) ctx.fillRect((c + margin) * cell, (r + margin) * cell, cell, cell);
+      $('export-json').textContent = payload;
+      $('export-panel').hidden = false;
+      $('export-panel').scrollIntoView({ block: 'nearest' });
+    }
     function resetView() {
+      hideExport();
       rendered.clear(); currentState = {}; $('controls').hidden = true; view('connection');
       $('session').replaceChildren(node('option', 'Choose a session'));
       $('session').firstChild.value = ''; lastSessions = 0;
@@ -656,9 +700,16 @@
     $('context-refresh').onclick = () => run(loadContext, $('context-refresh'));
     $('reconnect').onclick = () => run(async () => { token = ''; await authenticate(); lastSessions = 0; await refresh(); }, $('reconnect'));
     $('pair-form').onsubmit = event => { event.preventDefault(); run(() => importPairing($('pair-data').value.trim()), $('pair-form').querySelector('button')); };
+    $('export').onclick = () => run(exportKey, $('export'));
+    $('export-hide').onclick = hideExport;
+    $('export-copy').onclick = () => run(async () => {
+      await navigator.clipboard.writeText($('export-json').textContent);
+      notice('Pairing data copied. Paste it into the other browser, then clear your clipboard.');
+    }, $('export-copy'));
     $('forget').onclick = () => run(async () => {
       if (!confirm('Forget the saved controller key on this browser? This does not revoke copies on other devices.')) return;
-      localStorage.removeItem(storageKey); generation++; token = ''; pairing = null; privateKey = null; authenticating = null; selected = '';
+      hideExport();
+      localStorage.removeItem(storageKey); generation++; token = ''; pairing = null; privateKey = null; authenticating = null; selected = ''; syncExport();
       stopCamera(); resetView(); $('pairing').open = true; $('pair-data').value = ''; $('relay').value = ''; notice(); status('Key forgotten');
     });
     async function readQR(source) {
@@ -754,6 +805,7 @@
           $('pairing').open = false; await refresh();
         }
       } catch { notice('Could not load saved pairing. Re-pair or forget the saved key.'); }
+      syncExport();
       setInterval(() => { if (!document.hidden) void refresh(); }, 1000);
     }
     document.addEventListener('visibilitychange', () => { if (document.hidden) stopCamera(); else void refresh(); });

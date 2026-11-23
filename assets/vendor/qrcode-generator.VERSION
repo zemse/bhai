@@ -1,0 +1,7 @@
+qrcode-generator 2.0.4
+Latest published version from https://registry.npmjs.org/qrcode-generator/latest
+Source: https://registry.npmjs.org/qrcode-generator/-/qrcode-generator-2.0.4.tgz
+Integrity: sha512-mZSiP6RnbHl4xL2Ap5HfkjLnmxfKcPWpWe/c+5XxCuetEenqmNFf1FH/ftXPCtFG5/TDobjsjz6sSNL0Sr8Z9g==
+SHA512 integrity verified before extracting package/dist/qrcode.js (renamed qrcode-generator.js).
+File is unmodified. License: MIT (declared in package.json and the file header; see qrcode-generator.LICENSE).
+Upstream: https://github.com/kazuhikoarase/qrcode-generator
