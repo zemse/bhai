@@ -45,6 +45,16 @@ const BACKOFF: Duration = Duration::from_millis(500);
 /// The longest `Retry-After` slept inside a turn. Asked for more, the call fails and
 /// says so rather than holding the turn silent for minutes.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
+/// The longest a turn waits for the network to come back before it gives up, when
+/// `BHAI_OFFLINE_WAIT_SECS` does not override it. Past this the turn fails cleanly rather
+/// than holding a headless or `--serve` session open indefinitely.
+const OFFLINE_HARD_CAP: Duration = Duration::from_secs(60 * 60);
+/// The wait between reachability probes while offline: it grows from the first to the
+/// second and is capped there, so a long outage is polled at a steady, cheap rate.
+const OFFLINE_PROBE_MIN: Duration = Duration::from_secs(2);
+const OFFLINE_PROBE_MAX: Duration = Duration::from_secs(15);
+/// How long a reachability probe waits for the backend before it counts as still down.
+const OFFLINE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The error code for a request longer than the model's context window.
 const OVERFLOW_CODE: &str = "context_length_exceeded";
 /// Error codes that fail the same way however often they are sent: the plan is out of
@@ -153,6 +163,25 @@ pub fn auth_failed(e: &anyhow::Error) -> bool {
     e.downcast_ref::<AuthFailed>().is_some()
 }
 
+/// The network came back after the prompt cache's lifetime had already passed, so the
+/// call was not re-sent on its own. The turn owner asks the user before resuming, since
+/// the next call is a cold, full-price one.
+#[derive(Debug)]
+pub struct OfflineResume;
+
+impl std::fmt::Display for OfflineResume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the network returned after the prompt cache expired")
+    }
+}
+
+impl std::error::Error for OfflineResume {}
+
+/// Whether `e` is a call held back for a resume confirmation after a long outage.
+pub fn offline_resume(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<OfflineResume>().is_some()
+}
+
 /// Whether `model` takes an effort change as a `configuration_update` input item, which
 /// leaves the request's own `reasoning.effort`, and so the cached prefix, as it was. The
 /// GPT-6 family only: on any other model the effort is part of the rendered prefix.
@@ -209,6 +238,19 @@ impl Provider {
         match self {
             Provider::Codex => "codex",
             Provider::Ollama => "ollama",
+        }
+    }
+
+    /// Whether a call that lost the network may be re-sent silently once it comes back,
+    /// given how long since this conversation last reached the backend (`None` if it
+    /// never has). Codex resumes on its own only while the prompt cache that a resend
+    /// would reuse is still likely to be there; past that the resend is a cold call, so
+    /// the turn owner asks first. A backend with no prompt cache (Ollama) has nothing to
+    /// lose, so it always resumes silently within the hard cap.
+    fn resume_silently(self, since_last: Option<Duration>) -> bool {
+        match self {
+            Provider::Codex => since_last.is_some_and(|d| d < cache::CACHE_TTL),
+            Provider::Ollama => true,
         }
     }
 }
@@ -391,6 +433,10 @@ pub struct Client {
     window: Option<u64>,
     /// The conversation's cache guard; shared by clones, fresh for each child.
     guard: Arc<Mutex<CacheGuard>>,
+    /// When a call last reached the backend, which is when the prompt cache was last
+    /// written. Read when a call loses the network, to decide whether a resend still
+    /// finds a warm cache. Shared by clones, fresh for each child.
+    last_sent: Arc<Mutex<Option<std::time::Instant>>>,
     /// `--profile`: where the rate-limit response headers are logged.
     header_log: Option<PathBuf>,
     /// The turn's first [`TURN_STATE`]; shared by clones, fresh for each child.
@@ -447,6 +493,7 @@ impl Client {
             http,
             cache_key: session_id.clone(),
             guard: guard(&session_id, &session_id, false),
+            last_sent: Arc::default(),
             session_id,
             model,
             effort,
@@ -661,6 +708,7 @@ impl Client {
             strict,
         );
         child.turn_state = Arc::default();
+        child.last_sent = Arc::default();
         if let Some(ws) = &mut child.ws {
             ws.socket = Arc::default();
         }
@@ -726,9 +774,37 @@ impl Client {
         loop {
             let sent = self.attempt(self.provider(), &body, true, on_delta, cancel);
             let (e, asked) = match sent.await {
-                Ok(items) => return Ok(items),
+                Ok(items) => {
+                    *self.last_sent.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(std::time::Instant::now());
+                    return Ok(items);
+                }
                 Err(Error::Interrupted) => bail!("interrupted"),
                 Err(Error::Fatal(e)) => return Err(e),
+                // Not a retry: the call never left the machine, so it does not count
+                // against the attempt cap. Wait for the network, then re-send from the
+                // top, or hand the resume decision back when the cache has gone stale.
+                Err(Error::Offline(e)) => match self.wait_for_network(on_delta, cancel).await {
+                    Offline::Interrupted => bail!("interrupted"),
+                    Offline::GaveUp(waited) => {
+                        return Err(anyhow!(
+                            "{e} (offline for {}m; giving up, run again to resume)",
+                            waited.as_secs() / 60
+                        ));
+                    }
+                    Offline::Back => {
+                        let since_last = self
+                            .last_sent
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|at| at.elapsed());
+                        if self.provider().resume_silently(since_last) {
+                            on_delta(Delta::Notice("network back; resuming".to_string()));
+                            continue;
+                        }
+                        return Err(OfflineResume.into());
+                    }
+                },
                 Err(Error::Retryable(e)) => (e, None),
                 Err(Error::RetryAfter(e, after)) => (e, Some(after)),
             };
@@ -815,9 +891,73 @@ impl Client {
         {
             Ok(items) => items,
             Err(Error::Interrupted) => bail!("interrupted"),
-            Err(Error::Retryable(e) | Error::RetryAfter(e, _) | Error::Fatal(e)) => return Err(e),
+            Err(
+                Error::Retryable(e) | Error::RetryAfter(e, _) | Error::Offline(e) | Error::Fatal(e),
+            ) => return Err(e),
         };
         Ok((output_text(&items), usage))
+    }
+
+    /// Wait for the backend to come back after a call could not reach it, probing it on a
+    /// steady cadence and reporting the wait so the UI can show it. Gives up after the
+    /// hard cap, and ends at once on an interrupt. The call this follows left no mark in
+    /// the history, so once the network is back it is re-sent whole.
+    async fn wait_for_network(
+        &self,
+        on_delta: &mut impl FnMut(Delta),
+        cancel: &Arc<AtomicBool>,
+    ) -> Offline {
+        let cap = offline_hard_cap();
+        let started = std::time::Instant::now();
+        on_delta(Delta::Notice(
+            "connection lost; waiting for the network to come back".to_string(),
+        ));
+        let mut backoff = OFFLINE_PROBE_MIN;
+        let mut announced = started;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Offline::Interrupted;
+            }
+            if started.elapsed() >= cap {
+                return Offline::GaveUp(started.elapsed());
+            }
+            if self.reachable(cancel).await {
+                return Offline::Back;
+            }
+            // A line once a minute, not on every probe, so a long outage does not flood
+            // the transcript.
+            if announced.elapsed() >= Duration::from_secs(60) {
+                on_delta(Delta::Notice(format!(
+                    "still offline after {}m; waiting",
+                    started.elapsed().as_secs() / 60
+                )));
+                announced = std::time::Instant::now();
+            }
+            if unless_cancelled(tokio::time::sleep(backoff), cancel)
+                .await
+                .is_none()
+            {
+                return Offline::Interrupted;
+            }
+            backoff = (backoff * 2).min(OFFLINE_PROBE_MAX);
+        }
+    }
+
+    /// Whether the backend answers at all, for deciding the network is back. Any reply,
+    /// even an error status, proves the route is open; only a transport failure means it
+    /// is still down. The probe is its own short-lived request, so a hung connect cannot
+    /// hold the wait past its timeout.
+    async fn reachable(&self, cancel: &Arc<AtomicBool>) -> bool {
+        let url = match self.provider() {
+            Provider::Codex => backend(),
+            Provider::Ollama => self.ollama_url.clone(),
+        };
+        let probe = self.http.get(url).timeout(OFFLINE_PROBE_TIMEOUT).send();
+        match unless_cancelled(probe, cancel).await {
+            None => false,
+            Some(Ok(_)) => true,
+            Some(Err(e)) => !offline(&e),
+        }
     }
 
     /// The request body for one call, in whichever shape this client's backend reads.
@@ -1308,7 +1448,13 @@ impl Client {
         let request = self.request(auth, body, turn_state).send();
         watched(request, cancel, "request timed out")
             .await?
-            .map_err(|e| Error::Retryable(anyhow!("request failed: {e}")))
+            .map_err(|e| {
+                let failed = anyhow!("request failed: {e}");
+                match offline(&e) {
+                    true => Error::Offline(failed),
+                    false => Error::Retryable(failed),
+                }
+            })
     }
 
     fn request(
@@ -1580,8 +1726,29 @@ pub(crate) enum Error {
     Retryable(anyhow::Error),
     /// Retryable, once the wait the backend asked for is up.
     RetryAfter(anyhow::Error, Duration),
+    /// The socket would not open: no route, DNS, or connect timeout. The turn waits for
+    /// the network rather than spending a retry on a call that cannot leave the machine.
+    Offline(anyhow::Error),
     Fatal(anyhow::Error),
     Interrupted,
+}
+
+/// How a wait for the network to come back ended.
+enum Offline {
+    /// The backend answered a probe again.
+    Back,
+    /// The user interrupted the wait.
+    Interrupted,
+    /// The hard cap passed with the network still down; this is how long it waited.
+    GaveUp(Duration),
+}
+
+/// Whether a transport failure is the socket not opening, as opposed to the backend
+/// answering with an error. DNS and connect refusals surface as connect errors; a probe
+/// or request that times out at the transport is treated the same, since it never got a
+/// reply either.
+pub(crate) fn offline(e: &reqwest::Error) -> bool {
+    e.is_connect() || e.is_timeout()
 }
 
 /// What a failed call should lead to.
@@ -1734,6 +1901,15 @@ pub(crate) fn configured_model_settings(choice: &Choice) -> (String, String) {
 /// An environment variable, where it is set to something.
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
+}
+
+/// The outer bound on waiting for the network, from `BHAI_OFFLINE_WAIT_SECS` or the
+/// default hard cap. Zero turns the wait off, so the first offline error fails at once.
+fn offline_hard_cap() -> Duration {
+    env("BHAI_OFFLINE_WAIT_SECS")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(OFFLINE_HARD_CAP)
 }
 
 fn toml_string(line: &str, key: &str) -> Option<String> {
@@ -2358,5 +2534,28 @@ mod tests {
         let mut guard = CacheGuard::new("c", None, true);
         guard.check(&body).unwrap();
         assert_eq!(guard.check(&with_tier(body, true)).unwrap(), None);
+    }
+
+    #[test]
+    fn codex_resumes_silently_only_inside_the_cache_window() {
+        let within = cache::CACHE_TTL - Duration::from_secs(1);
+        let past = cache::CACHE_TTL + Duration::from_secs(1);
+        assert!(Provider::Codex.resume_silently(Some(within)));
+        assert!(!Provider::Codex.resume_silently(Some(past)));
+        // No prior send means no warm cache to resume into, so it asks.
+        assert!(!Provider::Codex.resume_silently(None));
+    }
+
+    #[test]
+    fn a_cacheless_backend_always_resumes_silently() {
+        assert!(Provider::Ollama.resume_silently(None));
+        assert!(Provider::Ollama.resume_silently(Some(cache::CACHE_TTL * 2)));
+    }
+
+    #[test]
+    fn offline_resume_is_recognised_through_the_error_chain() {
+        let e = anyhow::Error::from(OfflineResume).context("resuming the turn");
+        assert!(offline_resume(&e));
+        assert!(!offline_resume(&anyhow!("request failed")));
     }
 }

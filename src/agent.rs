@@ -2304,6 +2304,19 @@ async fn turn(
             {
                 continue;
             }
+            // The network came back only after the prompt cache lifetime had passed, so
+            // the resend is a cold, full-price call. Ask before spending it; the failed
+            // call left nothing in the history, so a yes re-runs this step cleanly.
+            Err(e) if client::offline_resume(&e) => match resume_after_offline(tx).await {
+                true => continue,
+                false => {
+                    return Turn {
+                        steps: step,
+                        acted,
+                        result: Err(e),
+                    };
+                }
+            },
             Err(e) => {
                 return Turn {
                     steps: step,
@@ -4092,6 +4105,35 @@ async fn judged(
     judge
         .decide_call(name, args, target, detail, &policy.written(name, args))
         .await
+}
+
+/// Ask whether to resume a turn whose call lost the network for longer than the prompt
+/// cache lives. A plain yes/no, with no rule to remember: the next time is its own
+/// decision. Returns whether the user wants the call re-sent.
+async fn resume_after_offline(tx: &mpsc::UnboundedSender<AgentEvent>) -> bool {
+    let (reply, wait) = oneshot::channel();
+    let _ = tx.send(AgentEvent::Phase(Phase::Approval));
+    if tx
+        .send(AgentEvent::Approval {
+            child: false,
+            tool: "resume".to_string(),
+            command: "network back, but offline past the prompt-cache window; resume? \
+                      (the next call is a full-price, cold-cache one)"
+                .to_string(),
+            preview: None,
+            offers: Offers {
+                exact: None,
+                prefix: None,
+            },
+            reply,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    let resumed = wait.await.map(Answer::accepted).unwrap_or(false);
+    let _ = tx.send(AgentEvent::Phase(Phase::Model));
+    resumed
 }
 
 /// Prompt the user for a call. `None` means approved; otherwise the result to return.

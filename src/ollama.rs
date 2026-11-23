@@ -176,7 +176,13 @@ pub async fn attempt(
         "request timed out",
     )
     .await?
-    .map_err(|e| Error::Retryable(anyhow!("request to {endpoint} failed: {e}")))?;
+    .map_err(|e| {
+        let failed = anyhow!("request to {endpoint} failed: {e}");
+        match client::offline(&e) {
+            true => Error::Offline(failed),
+            false => Error::Retryable(failed),
+        }
+    })?;
 
     let status = resp.status();
     if !status.is_success() {
