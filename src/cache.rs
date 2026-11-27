@@ -188,6 +188,8 @@ pub struct CacheMonitor {
     /// When the latest call was sent, which is when the backend last wrote or reused the
     /// conversation's cached prefix.
     last_sent: Option<Instant>,
+    /// When a call beside the conversation's own, like a summary, last read its prefix.
+    read: Option<Instant>,
     /// Calls finished so far, including the ones too small to judge.
     calls: u64,
     misses: usize,
@@ -203,6 +205,20 @@ impl CacheMonitor {
     /// When the latest call was sent, while what it cached is still the conversation's.
     pub fn last_sent(&self) -> Option<Instant> {
         self.last_sent
+    }
+
+    /// Note a call that read the conversation's prefix without being one of its turns,
+    /// which keeps the prefix cached all the same.
+    pub fn read(&mut self, now: Instant) {
+        self.read = Some(now);
+    }
+
+    /// Whether the cache the conversation's calls left has lapsed by `now`, so the next
+    /// call misses whatever it sends. False when no call is known to have cached one.
+    pub fn cold(&self, now: Instant) -> bool {
+        self.last_sent
+            .max(self.read)
+            .is_some_and(|at| now.saturating_duration_since(at) >= CACHE_TTL)
     }
 
     /// Judge a finished call. Only a call sent within the cache lifetime of the previous
@@ -240,6 +256,7 @@ impl CacheMonitor {
     pub fn forget(&mut self) {
         self.previous = None;
         self.last_sent = None;
+        self.read = None;
     }
 
     /// Whether enough judged calls missed in a row to warn about.
@@ -493,6 +510,22 @@ mod tests {
         let (_, t) = call(&mut monitor, t, usage(1000, 0), false);
         let (small, _) = call(&mut monitor, t, usage(1100, 0), false);
         assert_eq!(small, Hit::default());
+    }
+
+    #[test]
+    fn the_cache_is_cold_a_lifetime_after_the_last_call_that_read_it() {
+        let mut monitor = CacheMonitor::default();
+        let t = Instant::now();
+        assert!(!monitor.cold(t + CACHE_TTL), "no call cached anything");
+        monitor.sent(None, t);
+        assert!(!monitor.cold(t + CACHE_TTL - Duration::from_secs(1)));
+        assert!(monitor.cold(t + CACHE_TTL));
+        // A summary call read the prefix later, which kept it.
+        monitor.read(t + Duration::from_secs(60));
+        assert!(!monitor.cold(t + CACHE_TTL));
+        assert!(monitor.cold(t + CACHE_TTL + Duration::from_secs(60)));
+        monitor.forget();
+        assert!(!monitor.cold(t + 2 * CACHE_TTL));
     }
 
     #[test]

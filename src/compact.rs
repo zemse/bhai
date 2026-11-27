@@ -2,6 +2,7 @@
 //! only when that is not enough are the earlier turns replaced by a summary, or by the
 //! backend's own `compaction` item on a model that compacts on the server.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -36,6 +37,17 @@ pub const FORK_MIN: u64 = 16_000;
 pub const RETAINED: u64 = 64_000;
 /// The most recent tool results are never evicted.
 const KEEP_RESULTS: usize = 6;
+/// A kept result longer than this, in bytes, keeps only its first and last `TRIM_KEEP`:
+/// about 1,000 tokens, past which a log or a file read is mostly middle, while the start
+/// says what ran and the end how it ended. OpenClaw's pruning uses the same pair.
+const TRIM_OVER: usize = 4_000;
+const TRIM_KEEP: usize = 1_500;
+/// An old edit, write or patch body longer than this, in bytes, becomes a stub. The
+/// stub is about 100 bytes, so a shorter body is cheaper to keep than to fetch back.
+const STUB_OVER: usize = 256;
+/// Old tool results are evicted before a call on a cold cache once the last call read
+/// more than this fraction of the window; under it there is too little to save.
+pub const COLD_FLOOR: f64 = 0.3;
 /// How the summary starts in the compacted history.
 pub const SUMMARY_PREFIX: &str = "Summary of earlier conversation:";
 /// What stands in for a summary the summary call could not fit in the window.
@@ -136,40 +148,223 @@ pub fn estimate(items: &[Value], tokenizer: &dyn Tokenizer) -> u64 {
         .sum()
 }
 
-/// Replace the output of the oldest tool results, never the last few, until `excess`
-/// tokens are freed or none are left. The call items stay, so every call keeps its
-/// output. Returns the tokens freed.
-pub fn evict(history: &mut [Value], excess: u64, tokenizer: &dyn Tokenizer) -> u64 {
+/// Evict every old tool result, never the last few or one the model has not read yet:
+/// the output becomes a placeholder naming the `recall` that gets it back, and the bulky
+/// arguments of an old edit, write or patch become a stub. A kept output the model has
+/// read keeps only its start and end when it is long. The call items stay, so every call
+/// keeps its output. Returns the tokens freed.
+///
+/// Everything old goes at once, not just enough to get under the target: the request
+/// misses the cache from the first item changed, and the oldest output sits near the
+/// front, so evicting the rest after it costs nothing more and leaves less to resend.
+pub fn evict(history: &mut [Value], tokenizer: &dyn Tokenizer) -> u64 {
     let results: Vec<usize> = history
         .iter()
         .enumerate()
-        .filter(|(_, item)| is(item, "function_call_output") || is(item, "custom_tool_call_output"))
+        .filter(|(_, item)| is_output(item))
         .map(|(index, _)| index)
         .collect();
+    // Outputs after the model's last item land after the call that reads them.
+    let read = history.iter().rposition(from_model);
+    let unread = |index: usize| read.is_none_or(|read| index > read);
     let old = results.len().saturating_sub(KEEP_RESULTS);
+    let kept: HashSet<String> = results
+        .iter()
+        .enumerate()
+        .filter(|&(n, &index)| n >= old || unread(index))
+        .filter_map(|(_, &index)| history[index]["call_id"].as_str().map(str::to_string))
+        .collect();
     let mut freed = 0;
-    for &index in &results[..old] {
-        if freed >= excess {
-            break;
-        }
-        let item = &mut history[index];
-        let text = tokens::item_text(item).unwrap_or_default();
-        let placeholder = match tokens::images(item) {
-            0 => format!("[output removed to save context: {} bytes]", text.len()),
-            n => format!(
-                "[output removed to save context: {} bytes and {n} image(s)]",
-                text.len()
-            ),
-        };
-        let before = tokens::item_tokens(item, tokenizer).unwrap_or_default();
-        let after = tokenizer.count(&placeholder) as u64;
-        if text.starts_with("[output removed") || after >= before {
+    for (n, &index) in results.iter().enumerate() {
+        if unread(index) {
             continue;
         }
-        item["output"] = json!(placeholder);
-        freed += before - after;
+        let item = &history[index];
+        let id = item["call_id"].as_str().unwrap_or_default();
+        let next = match n >= old {
+            true => trimmed(item, id),
+            false => placeholder(item, id),
+        };
+        if let Some(next) = next {
+            freed += replace(&mut history[index], "output", next, tokenizer);
+        }
+    }
+    for item in history.iter_mut() {
+        let Some(id) = item["call_id"].as_str().map(str::to_string) else {
+            continue;
+        };
+        if kept.contains(&id) {
+            continue;
+        }
+        let (field, next) = match item["type"].as_str() {
+            Some("function_call") => ("arguments", stubbed_arguments(item, &id)),
+            Some("custom_tool_call") => ("input", stubbed_patch(item, &id)),
+            _ => continue,
+        };
+        if let Some(next) = next {
+            freed += replace(item, field, next, tokenizer);
+        }
     }
     freed
+}
+
+/// Whether `text` is the placeholder of an evicted output.
+pub fn evicted(text: &str) -> bool {
+    // The first form is what sessions saved before placeholders named `recall`.
+    text.starts_with("[output removed")
+        || text.starts_with("[output of ") && text.ends_with(" returns it]")
+}
+
+const REMOVED: &str = " removed from context";
+/// What a trimmed output carries where its middle was.
+const TRIMMED: &str = " bytes of this output removed from context; recall ";
+
+/// `item[field]` set to `next` when that reads fewer tokens; the tokens freed.
+fn replace(item: &mut Value, field: &str, next: String, tokenizer: &dyn Tokenizer) -> u64 {
+    let before = tokens::item_tokens(item, tokenizer).unwrap_or_default();
+    let was = std::mem::replace(&mut item[field], json!(next));
+    let after = tokens::item_tokens(item, tokenizer).unwrap_or_default();
+    if after >= before {
+        item[field] = was;
+        return 0;
+    }
+    before - after
+}
+
+/// How the model is told to get back what is gone.
+fn recall(id: &str) -> String {
+    format!("recall {}", json!({ "call_id": id }))
+}
+
+/// The placeholder for an old output, `None` when it already is one.
+fn placeholder(item: &Value, id: &str) -> Option<String> {
+    let text = tokens::item_text(item).unwrap_or_default();
+    if evicted(&text) {
+        return None;
+    }
+    let size = match tokens::images(item) {
+        0 => format!("{} bytes", text.len()),
+        n => format!("{} bytes and {n} image(s)", text.len()),
+    };
+    Some(format!(
+        "[output of {id}{REMOVED} ({size}); {} returns it]",
+        recall(id)
+    ))
+}
+
+/// A kept output over `TRIM_OVER` bytes cut to its first and last `TRIM_KEEP`, with the
+/// `recall` that pages in the middle. Only a plain text output: one with images is left.
+fn trimmed(item: &Value, id: &str) -> Option<String> {
+    let text = item["output"].as_str()?;
+    if text.len() <= TRIM_OVER || evicted(text) || text.contains(TRIMMED) {
+        return None;
+    }
+    let head = text.floor_char_boundary(TRIM_KEEP);
+    let tail = text.ceil_char_boundary(text.len() - TRIM_KEEP);
+    let call = json!({ "call_id": id, "offset": head });
+    Some(format!(
+        "{}\n[... {}{TRIMMED}{call} returns them ...]\n{}",
+        &text[..head],
+        tail - head,
+        &text[tail..]
+    ))
+}
+
+/// An old `edit` or `write` with each long field but its path cut to a stub, still a
+/// JSON object as `arguments` has to be.
+fn stubbed_arguments(item: &Value, id: &str) -> Option<String> {
+    let name = item["name"].as_str()?;
+    if name != crate::tools::edit::NAME && name != crate::tools::write::NAME {
+        return None;
+    }
+    let mut args: Value = serde_json::from_str(item["arguments"].as_str()?).ok()?;
+    let mut changed = false;
+    for (key, value) in args.as_object_mut()? {
+        let Some(text) = value.as_str().filter(|_| key != "path") else {
+            continue;
+        };
+        if text.len() <= STUB_OVER || stubbed(text) {
+            continue;
+        }
+        *value = json!(stub(text.len(), id));
+        changed = true;
+    }
+    changed.then(|| args.to_string())
+}
+
+/// An old `apply_patch` with the body of each file's hunk cut to one stub line, so it
+/// still parses: an added line for a file added, a context line for one updated.
+fn stubbed_patch(item: &Value, id: &str) -> Option<String> {
+    if item["name"].as_str()? != crate::tools::patch::NAME {
+        return None;
+    }
+    let patch = item["input"].as_str()?;
+    if patch.lines().any(stubbed) {
+        return None;
+    }
+    let header = |line: &str| line.starts_with("*** ") && !line.starts_with("*** End of File");
+    let body: usize = patch
+        .lines()
+        .filter(|line| !header(line))
+        .map(|line| line.len() + 1)
+        .sum();
+    if body <= STUB_OVER {
+        return None;
+    }
+    let mut out = String::new();
+    // The current hunk's stub prefix, and the bytes of its body.
+    let mut hunk: Option<(&str, usize)> = None;
+    let flush = |out: &mut String, hunk: &mut Option<(&str, usize)>| {
+        if let Some((prefix, bytes)) = hunk.take().filter(|(_, bytes)| *bytes > 0) {
+            out.push_str(&format!("{prefix}{}\n", stub(bytes, id)));
+        }
+    };
+    for line in patch.lines() {
+        if !header(line) {
+            if let Some((_, bytes)) = &mut hunk {
+                *bytes += line.len() + 1;
+            }
+            continue;
+        }
+        if !line.starts_with("*** Move to: ") {
+            flush(&mut out, &mut hunk);
+            hunk = if line.starts_with("*** Add File: ") {
+                Some(("+", 0))
+            } else if line.starts_with("*** Update File: ") {
+                Some((" ", 0))
+            } else {
+                None
+            };
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    flush(&mut out, &mut hunk);
+    Some(out)
+}
+
+fn stub(bytes: usize, id: &str) -> String {
+    format!("[{bytes} bytes{REMOVED}; {} {STUBBED}", recall(id))
+}
+
+const STUBBED: &str = "gets the call back]";
+
+/// Whether `text` is a stub, or a patch line ending in one.
+fn stubbed(text: &str) -> bool {
+    text.ends_with(STUBBED) && text.contains(REMOVED)
+}
+
+fn is_output(item: &Value) -> bool {
+    is(item, "function_call_output") || is(item, "custom_tool_call_output")
+}
+
+/// What the model wrote, as against what was sent to it.
+fn from_model(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call" | "custom_tool_call" | "tool_search_call" | "reasoning") => true,
+        Some("message") => item["role"] == "assistant",
+        _ => false,
+    }
 }
 
 /// The history after a summary: the environment and instruction updates it told the
@@ -368,25 +563,35 @@ mod tests {
         let mut history = Vec::new();
         turn(&mut history, "one", 5);
         turn(&mut history, "two", 5);
+        turn(&mut history, "three", 5);
         let before = history.clone();
 
-        let freed = evict(&mut history, u64::MAX, &ByteEstimate);
+        // Every old output goes in one pass, not only enough to get under a target.
+        let freed = evict(&mut history, &ByteEstimate);
         assert_eq!(history.len(), before.len());
+        assert_eq!(
+            estimate(&history, &ByteEstimate),
+            estimate(&before, &ByteEstimate) - freed
+        );
         let outputs: Vec<&Value> = history
             .iter()
             .filter(|i| is(i, "function_call_output"))
             .collect();
-        let evicted = outputs
-            .iter()
-            .filter(|o| o["output"] == "[output removed to save context: 400 bytes]")
-            .count();
-        assert_eq!(evicted, 4);
+        for output in &outputs[..9] {
+            let id = output["call_id"].as_str().unwrap();
+            assert_eq!(
+                output["output"],
+                format!(
+                    "[output of {id} removed from context (400 bytes); recall {{\"call_id\":\"{id}\"}} returns it]"
+                )
+            );
+            assert!(evicted(output["output"].as_str().unwrap()));
+        }
         assert!(
-            outputs[4..]
+            outputs[9..]
                 .iter()
                 .all(|o| o["output"].as_str().unwrap().len() == 400)
         );
-        assert_eq!(freed, 4 * (100 - 11));
         // Only outputs changed; calls and their ids are untouched.
         for (old, new) in before.iter().zip(&history) {
             assert_eq!(old["call_id"], new["call_id"]);
@@ -394,11 +599,164 @@ mod tests {
                 assert_eq!(old, new);
             }
         }
+        // Nothing is evicted twice, so the history it left is the prefix from now on.
+        let again = history.clone();
+        assert_eq!(evict(&mut history, &ByteEstimate), 0);
+        assert_eq!(history, again);
+        // A placeholder from before they named `recall` is not replaced either.
+        let mut old = vec![
+            call(0),
+            output(0, "[output removed to save context: 400 bytes]"),
+        ];
+        turn(&mut old, "next", KEEP_RESULTS);
+        assert_eq!(evict(&mut old, &ByteEstimate), 0);
+    }
 
-        // It stops once enough is freed, and never evicts twice.
-        let mut history = before;
-        assert_eq!(evict(&mut history, 1, &ByteEstimate), 89);
-        assert_eq!(evict(&mut history, u64::MAX, &ByteEstimate), 3 * 89);
+    #[test]
+    fn eviction_never_touches_an_output_the_model_has_not_read() {
+        let mut history = Vec::new();
+        turn(&mut history, "one", 3);
+        // One step called ten tools in parallel, and their outputs are not read yet.
+        history.push(json!({"type": "reasoning", "encrypted_content": "gAAA"}));
+        let first = history.len();
+        for id in first..first + 10 {
+            history.push(call(id));
+        }
+        for id in first..first + 10 {
+            history.push(output(id, &"y".repeat(10_000)));
+        }
+        let unread = history[first + 10..].to_vec();
+
+        evict(&mut history, &ByteEstimate);
+        assert_eq!(history[first + 10..], unread[..]);
+        // The earlier turn's outputs are old all the same.
+        let early: Vec<&Value> = history[..first]
+            .iter()
+            .filter(|i| is(i, "function_call_output"))
+            .collect();
+        assert!(early.iter().all(|o| evicted(o["output"].as_str().unwrap())));
+        // Once the model has read them, all but the last six go.
+        history.push(json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}));
+        evict(&mut history, &ByteEstimate);
+        let outputs: Vec<&str> = history[first + 10..first + 20]
+            .iter()
+            .map(|o| o["output"].as_str().unwrap())
+            .collect();
+        assert!(outputs[..4].iter().all(|o| evicted(o)));
+        assert!(outputs[4..].iter().all(|o| !evicted(o)));
+    }
+
+    #[test]
+    fn a_long_kept_output_keeps_its_start_and_end() {
+        let mut history = Vec::new();
+        turn(&mut history, "one", KEEP_RESULTS);
+        let at = history.len() - 2;
+        let id = history[at]["call_id"].as_str().unwrap().to_string();
+        let long = format!(
+            "{}{}{}",
+            "a".repeat(1_500),
+            "m".repeat(7_000),
+            "z".repeat(1_500)
+        );
+        history[at]["output"] = json!(long);
+        let short = history[at - 2].clone();
+
+        let freed = evict(&mut history, &ByteEstimate);
+        let text = history[at]["output"].as_str().unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "{}\n[... 7000 bytes of this output removed from context; recall {{\"call_id\":\"{id}\",\"offset\":1500}} returns them ...]\n{}",
+                "a".repeat(1_500),
+                "z".repeat(1_500)
+            )
+        );
+        assert!(freed > 1_500, "{freed}");
+        // Under the threshold an output stays whole, and a trimmed one is not trimmed again.
+        assert_eq!(history[at - 2], short);
+        let trimmed = history.clone();
+        assert_eq!(evict(&mut history, &ByteEstimate), 0);
+        assert_eq!(history, trimmed);
+    }
+
+    #[test]
+    fn old_edit_write_and_patch_bodies_become_stubs_that_still_parse() {
+        let body = "line of the file\n".repeat(40);
+        let function = |id: &str, name: &str, args: Value| json!({"type": "function_call", "call_id": id, "name": name, "arguments": args.to_string()});
+        let edit = function(
+            "e1",
+            "edit",
+            json!({"path": "/w/a.rs", "old_string": body, "new_string": body, "replace_all": false}),
+        );
+        let small = function(
+            "e2",
+            "edit",
+            json!({"path": "/w/a.rs", "old_string": "x", "new_string": "y"}),
+        );
+        let write = function("w1", "write", json!({"path": "/w/b.rs", "content": body}));
+        let bash = function("b1", "bash", json!({"command": body}));
+        let added: String = body.lines().map(|l| format!("+{l}\n")).collect();
+        let changed: String = body.lines().map(|l| format!("-{l}\n+{l}!\n")).collect();
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: c.rs\n{added}*** Update File: d.rs\n*** Move to: e.rs\n@@ fn main\n{changed}*** End of File\n*** Delete File: f.rs\n*** End Patch"
+        );
+        let custom = json!({"type": "custom_tool_call", "call_id": "p1", "name": "apply_patch", "input": patch});
+        // A recent edit is kept as it is.
+        let recent = function(
+            "e9",
+            "edit",
+            json!({"path": "/w/a.rs", "old_string": body, "new_string": body}),
+        );
+        let mut history = vec![user_message("go")];
+        for call in [&edit, &small, &write, &bash, &custom, &recent] {
+            let kind = match call["type"] == "custom_tool_call" {
+                true => "custom_tool_call_output",
+                false => "function_call_output",
+            };
+            history.push(call.clone());
+            history.push(json!({"type": kind, "call_id": call["call_id"], "output": "done"}));
+        }
+        turn(&mut history, "next", KEEP_RESULTS - 1);
+
+        assert!(evict(&mut history, &ByteEstimate) > 0);
+        let stub = |id: &str, bytes: usize| {
+            format!(
+                "[{bytes} bytes removed from context; recall {{\"call_id\":\"{id}\"}} gets the call back]"
+            )
+        };
+        let args = |i: usize| -> Value {
+            serde_json::from_str(history[i]["arguments"].as_str().unwrap()).unwrap()
+        };
+        assert_eq!(
+            args(1),
+            json!({"path": "/w/a.rs", "old_string": stub("e1", body.len()),
+                "new_string": stub("e1", body.len()), "replace_all": false})
+        );
+        assert_eq!(history[3], small);
+        assert_eq!(
+            args(5),
+            json!({"path": "/w/b.rs", "content": stub("w1", body.len())})
+        );
+        assert_eq!(history[7], bash);
+        assert_eq!(history[11], recent);
+        let input = history[9]["input"].as_str().unwrap();
+        let update = "@@ fn main\n".len() + changed.len() + "*** End of File\n".len();
+        assert_eq!(
+            input,
+            format!(
+                "*** Begin Patch\n*** Add File: c.rs\n+{}\n*** Update File: d.rs\n*** Move to: e.rs\n {}\n*** Delete File: f.rs\n*** End Patch\n",
+                stub("p1", added.len()),
+                stub("p1", update)
+            )
+        );
+        // The stubbed patch still reads as the grammar has it.
+        let cwd = std::env::temp_dir();
+        let paths = crate::tools::patch::paths(&json!({ "input": input }), &cwd).unwrap();
+        assert_eq!(paths.len(), 4, "{paths:?}");
+        // Stubs are not stubbed again.
+        let stubbed = history.clone();
+        assert_eq!(evict(&mut history, &ByteEstimate), 0);
+        assert_eq!(history, stubbed);
     }
 
     #[test]
@@ -412,12 +770,12 @@ mod tests {
         let before = estimate(&history, &ByteEstimate);
         assert!(before > crate::tokens::IMAGE_TOKENS);
 
-        let freed = evict(&mut history, 1, &ByteEstimate);
+        let freed = evict(&mut history, &ByteEstimate);
         assert_eq!(
             history[1]["output"],
-            "[output removed to save context: 22 bytes and 1 image(s)]"
+            "[output of c0 removed from context (22 bytes and 1 image(s)); recall {\"call_id\":\"c0\"} returns it]"
         );
-        assert!(freed > crate::tokens::IMAGE_TOKENS - 20, "{freed}");
+        assert!(freed > crate::tokens::IMAGE_TOKENS - 30, "{freed}");
         assert_eq!(estimate(&history, &ByteEstimate), before - freed);
     }
 
