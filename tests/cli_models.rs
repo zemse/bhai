@@ -167,7 +167,7 @@ async fn cached_codex_results_and_unavailable_backends_are_labelled() {
         codex_models().to_string(),
     )
     .unwrap();
-    let output = harness.run(&["--json", "models"]).await;
+    let output = harness.run(&["models", "--json"]).await;
     assert!(output.status.success(), "{output:?}");
     let body: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(body["models"].as_array().unwrap().len(), 1);
