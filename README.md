@@ -139,6 +139,18 @@ command = 'curl -s -d "$BHAI_NOTIFY_TITLE: $BHAI_NOTIFY_BODY" ntfy.sh/my-topic'
 events = ["approval", "done", "auth", "quota"]
 ```
 
+### command environment
+
+`[bash] path` puts directories in front of `PATH` for every bash command, in order, and `[bash] env` sets variables for them. both reach subagents, background commands and monitors. a path entry is absolute or under `~/`; it is prepended after the login profile runs, so a profile that rebuilds `PATH` does not push it back. `env` may not set `PATH`, the variables bhai fixes for every command (`TERM`, `NO_COLOR`, `PAGER`, `GIT_PAGER`, `GIT_TERMINAL_PROMPT`, `LANG`, `LC_ALL`, anything starting `BHAI_`), or a credential-looking name that `pass_env` does not list.
+
+in `~/.config/bhai/config.toml` they always apply. a project's `.bhai/config.toml` may set them too, but they apply only while the project is trusted (`/trust`), and its directories go before yours and its variables over yours; `/untrust` drops them from the next command.
+
+```toml
+[bash]
+path = ["~/.local/ceremony-tools/node/bin"]
+env = { NODE_OPTIONS = "--max-old-space-size=4096" }
+```
+
 ### remote use
 
 `--serve [port]` starts an HTTP server over the session on `127.0.0.1` only, and `--headless` runs it with no terminal. to drive a session on a remote box from a laptop, tunnel the port over ssh and talk to `localhost` as if it were local:

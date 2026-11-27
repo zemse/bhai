@@ -1211,6 +1211,18 @@ async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> 
     sessions::private_dir(&sessions::scratch_dir(&roots.cwd, session))?;
     let config = Config::load(roots.home.as_deref(), &roots.cwd)?.with_flags(flags);
     childenv::set_pass(&config.pass_env);
+    childenv::set_configured(config.bash_env.clone(), roots.home.as_deref(), {
+        // As hooks: with no home there is no trust store, so nothing the project sets.
+        let trust = roots
+            .home
+            .as_ref()
+            .map(|home| permissions::Trust::new(&home.join(".config/bhai"), &roots.cwd));
+        move || {
+            trust
+                .as_ref()
+                .is_some_and(|trust| trust.matches(&trust.snapshot()))
+        }
+    });
     #[cfg(feature = "dictation")]
     crate::dictation::set(config.dictation.clone());
     notify::set(config.notify.clone(), session, &roots.cwd);

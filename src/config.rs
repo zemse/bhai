@@ -11,6 +11,9 @@
 //! So is `[bash] pass_env`, the credential-looking variables children may still inherit,
 //! and `[bash] writable`; a project file may turn `[bash] sandbox` on and `network` off,
 //! never the reverse. `[bash] sudo` likewise: a project file may turn it off, never on.
+//! A project file's `[bash] env` and `path` apply only while `/trust` holds for the
+//! project, since a repo that put its own directory first on `PATH` could stand in for any
+//! command the user approves.
 //! `[egress]`, the allowlist and secrets of the proxy bash goes out through, is the
 //! global file's alone. So are `[dictation]` and `[notify]`, since they name commands to run.
 //! `web_search` is off unless the global file turns it on, since each search sends the
@@ -82,6 +85,8 @@ pub struct Config {
     pub sandbox: crate::sandbox::Settings,
     /// `[bash] sudo`: `sudo -A` asks for the password in the terminal.
     pub sudo: bool,
+    /// `[bash] env` and `path`: what bash commands get on top of what bhai inherited.
+    pub bash_env: crate::childenv::Settings,
     /// `[egress]`: the proxy bash goes out through, or `None` for none.
     pub egress: Option<crate::egress::Settings>,
     /// `[dictation]`: the recorder and transcriber ctrl+space runs, or `None` for none.
@@ -122,6 +127,7 @@ impl Default for Config {
             pass_env: Vec::new(),
             sandbox: crate::sandbox::Settings::default(),
             sudo: false,
+            bash_env: crate::childenv::Settings::default(),
             egress: None,
             #[cfg(feature = "dictation")]
             dictation: None,
@@ -238,6 +244,10 @@ struct BashLayer {
     #[serde(default)]
     writable: Vec<String>,
     sudo: Option<bool>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    path: Vec<String>,
 }
 
 /// `skills = false`, or a `[skills]` table.
@@ -470,6 +480,27 @@ impl Config {
         {
             self.sudo = sudo;
         }
+        for name in layer.bash.env.keys() {
+            if let Some(why) = crate::childenv::refused(name, &self.pass_env) {
+                return Err(bad(format!("[bash] env: {why}")));
+            }
+        }
+        if let Some(why) = layer
+            .bash
+            .path
+            .iter()
+            .find_map(|d| crate::childenv::refused_dir(d))
+        {
+            return Err(bad(format!("[bash] path: {why}")));
+        }
+        // The project's is kept apart: it applies only while the project is trusted, which
+        // can change during the session.
+        let extra = match trusted {
+            true => &mut self.bash_env.user,
+            false => &mut self.bash_env.project,
+        };
+        extra.env.extend(layer.bash.env.clone());
+        extra.path.extend(layer.bash.path.iter().cloned());
         if trusted {
             if let Some(tart) = &layer.tart {
                 self.tart = tart.clone();
@@ -804,6 +835,56 @@ mod tests {
         write(&global_path(&home), "[bash]\npass_env = [\"NPM_TOKEN\"]\n");
         let config = Config::load(Some(&home), &cwd).unwrap();
         assert_eq!(config.pass_env, ["NPM_TOKEN"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bash_env_keeps_the_project_files_apart() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        write(
+            &global_path(&home),
+            "[bash]\npath = [\"~/.local/node/bin\", \"/opt/tools\"]\n\
+             env = { NODE_ENV = \"development\", LEVEL = \"user\" }\n",
+        );
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[bash]\npath = [\"/repo/bin\"]\n[bash.env]\nLEVEL = \"project\"\n",
+        );
+        let env = Config::load(Some(&home), &cwd).unwrap().bash_env;
+        assert_eq!(env.user.path, ["~/.local/node/bin", "/opt/tools"]);
+        assert_eq!(env.user.env["NODE_ENV"], "development");
+        assert_eq!(env.user.env["LEVEL"], "user");
+        assert_eq!(env.project.path, ["/repo/bin"]);
+        assert_eq!(env.project.env["LEVEL"], "project");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bash_env_may_not_put_back_what_bash_takes_out() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        for (text, says) in [
+            ("[bash.env]\nGITHUB_TOKEN = \"x\"\n", "credential"),
+            ("[bash.env]\nTERM = \"xterm\"\n", "fixed"),
+            ("[bash.env]\nBHAI_SCRATCH_DIR = \"/tmp\"\n", "fixed"),
+            ("[bash.env]\nPATH = \"/bin\"\n", "path"),
+            ("[bash.env]\n\"A B\" = \"x\"\n", "not a variable name"),
+            ("[bash]\npath = [\"bin\"]\n", "neither absolute"),
+            ("[bash]\npath = [\"/a:/b\"]\n", "':'"),
+        ] {
+            write(&cwd.join(".bhai/config.toml"), text);
+            let error = Config::load(Some(&home), &cwd).unwrap_err().to_string();
+            assert!(error.contains(says), "{text}: {error}");
+        }
+        // `pass_env` is the user's way to let a credential through, and so to set one.
+        write(&global_path(&home), "[bash]\npass_env = [\"NPM_TOKEN\"]\n");
+        write(
+            &cwd.join(".bhai/config.toml"),
+            "[bash.env]\nNPM_TOKEN = \"x\"\n",
+        );
+        let env = Config::load(Some(&home), &cwd).unwrap().bash_env;
+        assert_eq!(env.project.env["NPM_TOKEN"], "x");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

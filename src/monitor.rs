@@ -767,13 +767,15 @@ async fn sample(spec: &Spec) -> Result<Snapshot, String> {
     let mut plain = tokio::process::Command::new("bash");
     let command = shell.as_mut().map_or(&mut plain, |s| &mut s.command);
     crate::childenv::scrub(command);
+    let configured = crate::childenv::configured();
+    configured.apply(command);
     crate::childenv::non_interactive(command);
     if let Some(proxy) = crate::egress::active() {
         proxy.apply(command);
     }
     let mut child = command
         .arg("-lc")
-        .arg(&spec.command)
+        .arg(configured.script(&spec.command))
         .current_dir(&spec.workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

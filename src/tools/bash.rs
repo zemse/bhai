@@ -657,6 +657,8 @@ impl Proc {
             None => &mut plain,
         };
         crate::childenv::scrub(bash);
+        let configured = crate::childenv::configured();
+        configured.apply(bash);
         crate::childenv::non_interactive(bash);
         if let Some(session) = session {
             let cwd = std::env::current_dir()?;
@@ -678,7 +680,9 @@ impl Proc {
         if let Some(dir) = workdir {
             bash.current_dir(dir);
         }
-        bash.arg("-lc").arg(command).kill_on_drop(true);
+        bash.arg("-lc")
+            .arg(configured.script(command))
+            .kill_on_drop(true);
         let (child, pipes, input): (Child, Vec<(Pipe, bool)>, _) = if tty {
             let (master, slave) = open_pty()?;
             bash.stdin(Stdio::from(slave.try_clone()?))
@@ -1636,6 +1640,68 @@ mod tests {
         assert!(out.contains("dumb 1 cat cat 0"), "{out}");
         let out = run("echo \"$LANG $LC_ALL\"", None, quiet()).await;
         assert!(out.contains("UTF-8"), "{out}");
+    }
+
+    /// Runs itself as a child, since the configured environment is set once per process.
+    #[tokio::test]
+    async fn the_configured_environment_reaches_the_command_and_the_project_needs_trust() {
+        const NAME: &str = "tools::bash::tests::the_configured_environment_reaches_the_command_and_the_project_needs_trust";
+        if std::env::var_os("BHAI_TEST_CHILD").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("BHAI_TEST_CHILD", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        use crate::childenv::{Extra, Settings};
+        let dir = std::env::temp_dir().join(format!("bhai-bashenv-{}", uuid::Uuid::new_v4()));
+        let (home, repo) = (dir.join("home"), dir.join("repo"));
+        let tool = |bin: &std::path::Path, says: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(bin).unwrap();
+            let path = bin.join("bhai-test-tool");
+            std::fs::write(&path, format!("#!/bin/sh\necho {says}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        tool(&home.join("tools"), "user-tool");
+        tool(&repo.join("tools"), "project-tool");
+        let trust = crate::permissions::Trust::new(&home.join(".config/bhai"), &repo);
+        crate::childenv::set_configured(
+            Settings {
+                user: Extra {
+                    env: [("T_A", "a"), ("T_LEVEL", "user")]
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .into(),
+                    path: vec!["~/tools".to_string()],
+                },
+                project: Extra {
+                    env: [("T_LEVEL".to_string(), "project".to_string())].into(),
+                    path: vec![repo.join("tools").display().to_string()],
+                },
+            },
+            Some(&home),
+            {
+                let trust = trust.clone();
+                move || trust.matches(&trust.snapshot())
+            },
+        );
+        let command = "bhai-test-tool; echo \"$T_A $T_LEVEL $TERM\"";
+        let out = run(command, None, quiet()).await;
+        assert!(out.contains("user-tool\na user dumb"), "{out}");
+        trust.trust().unwrap();
+        let out = run(command, None, quiet()).await;
+        assert!(out.contains("project-tool\na project dumb"), "{out}");
+        trust.untrust().unwrap();
+        let out = run(command, None, quiet()).await;
+        assert!(out.contains("user-tool\na user dumb"), "{out}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
