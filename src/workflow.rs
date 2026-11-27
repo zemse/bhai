@@ -1335,6 +1335,7 @@ async fn step(
         contract: step.contract.clone(),
         history: Vec::new(),
         workdir: None,
+        fork: None,
     })
     .instrument(crate::trace::child(&id, &identity.name))
     .await;

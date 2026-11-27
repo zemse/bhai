@@ -554,6 +554,7 @@ mod tests {
             id: "session-1",
             model: "gpt-5.5",
             history,
+            ..Default::default()
         }
     }
 
@@ -724,6 +725,7 @@ mod tests {
                 id: "s",
                 model: "ollama:qwen3",
                 history: &[],
+                ..Default::default()
             }),
         };
         let (out, ok) = tool.execute_live(&args, live).await;

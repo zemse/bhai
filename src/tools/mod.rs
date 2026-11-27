@@ -300,13 +300,20 @@ pub struct Live<'a> {
 }
 
 /// What a tool that sends some of the conversation along is told about it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Conversation<'a> {
     /// The id the backend knows the conversation by.
     pub id: &'a str,
     pub model: &'a str,
     /// The history up to the call, the call's own response not yet in it.
     pub history: &'a [Value],
+    /// The instructions and tools the request that answered with the call was sent with.
+    pub instructions: &'a str,
+    pub tools: &'a [Value],
+    /// The response the call came in, every item of it.
+    pub response: &'a [Value],
+    /// The call's own id.
+    pub call_id: &'a str,
 }
 
 pub struct Registry {
@@ -607,6 +614,13 @@ impl Registry {
             Some(rooted) => rooted.checked(name, args),
             None => args.clone(),
         }
+    }
+
+    /// Only the tools named in `names`.
+    pub fn only(mut self, names: &[String]) -> Self {
+        self.tools
+            .retain(|t| names.iter().any(|name| name == t.name()));
+        self
     }
 
     /// Tool names in registration order.

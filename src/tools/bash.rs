@@ -1547,6 +1547,7 @@ mod tests {
                 id,
                 model: "test",
                 history: &[],
+                ..Default::default()
             };
             let live = Live {
                 conversation: Some(conversation),
@@ -1589,6 +1590,7 @@ mod tests {
             id: &id,
             model: "test",
             history: &[],
+            ..Default::default()
         };
         let live = Live {
             conversation: Some(conversation),

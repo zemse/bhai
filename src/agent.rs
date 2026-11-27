@@ -342,6 +342,12 @@ pub trait Model: Send + Sync {
     /// The model a child running as `identity` talks to.
     fn child(&self, identity: &Identity) -> Arc<dyn Model>;
 
+    /// The model a fork of this conversation talks to: this one, sent `tool_choice`.
+    /// `None` for a backend with no prompt cache, where a fork only costs more.
+    fn fork(&self, _tool_choice: Value) -> Option<Arc<dyn Model>> {
+        None
+    }
+
     /// The same backend on another model, for `/model`; `None` when it cannot switch.
     fn switch(&self, _model: &str, _effort: &str) -> Option<Arc<dyn Model>> {
         None
@@ -414,6 +420,11 @@ impl Model for Client {
 
     fn child(&self, identity: &Identity) -> Arc<dyn Model> {
         Arc::new(self.for_child(identity))
+    }
+
+    fn fork(&self, tool_choice: Value) -> Option<Arc<dyn Model>> {
+        (self.provider() == crate::client::Provider::Codex)
+            .then(|| Arc::new(self.for_fork(tool_choice)) as Arc<dyn Model>)
     }
 
     fn ollama_url(&self) -> &str {
@@ -2622,6 +2633,10 @@ async fn turn(
             id: model.conversation(),
             model: model.name(),
             history: history.as_slice(),
+            instructions,
+            tools,
+            response: &items,
+            call_id: "",
         };
         // The history index of the first call's result.
         let first = sent + items.len();
@@ -2658,7 +2673,10 @@ async fn turn(
                             policy,
                             judge,
                             run,
-                            Some(conversation),
+                            Some(tools::Conversation {
+                                call_id: &call_id,
+                                ..conversation
+                            }),
                             &events,
                             cancel,
                             &mut images,
@@ -3640,6 +3658,25 @@ pub struct Child<'a> {
     pub history: Vec<Value>,
     /// The worktree its calls are moved into, when it runs in one.
     pub workdir: Option<crate::worktrees::Rooted>,
+    /// What a fork starts from, in place of `prompt`'s text and tools and of `task` as a
+    /// message; `None` for a child with a context of its own.
+    pub fork: Option<Inherited>,
+}
+
+/// What a fork carries over: its parent's last request, which the fork's first request
+/// extends so that it reads the prefix the parent cached.
+#[derive(Debug, Clone)]
+pub struct Inherited {
+    pub instructions: String,
+    pub tools: Vec<Value>,
+    /// The input of that request. The fork's transcript leaves it out, since the parent's
+    /// record holds it.
+    pub history: Vec<Value>,
+    /// What follows it: the response holding the `agent` call, and an output for every
+    /// call in that response.
+    pub appended: Vec<Value>,
+    /// The names in `tools` the fork may call; the rest are refused when it runs them.
+    pub allowed: Vec<String>,
 }
 
 /// How a child agent ended.
@@ -3669,7 +3706,14 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             accepted: Arc::clone(&accepted),
         });
     }
-    let tools = registry.schemas();
+    // A fork sends its parent's tools whole, and runs only the ones it was allowed.
+    let (tools, instructions) = match &child.fork {
+        Some(fork) => {
+            registry = registry.only(&fork.allowed);
+            (fork.tools.clone(), fork.instructions.clone())
+        }
+        None => (registry.schemas(), child.prompt.text.clone()),
+    };
     {
         let mut children = child.children.lock().unwrap_or_else(|e| e.into_inner());
         // A continued child keeps its row, so the profiler adds this run to the last.
@@ -3694,15 +3738,25 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     let (tx_child, mut rx_child) = mpsc::unbounded_channel();
     let (done, mut completed) = oneshot::channel();
     let work = async move {
-        let task = json!({
-            "type": "message",
-            "role": "user",
-            "content": [{ "type": "input_text", "text": child.task }],
-        });
-        let mut history = child.history;
-        history.push(task.clone());
         let mut sink = Sink::from(child.transcript);
-        record(&mut sink, &[task], &tx_child);
+        let mut history = child.history;
+        match child.fork {
+            // The task is in the output of the call that started it.
+            Some(fork) => {
+                history = fork.history;
+                history.extend(fork.appended.iter().cloned());
+                record(&mut sink, &fork.appended, &tx_child);
+            }
+            None => {
+                let task = json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": child.task }],
+                });
+                history.push(task.clone());
+                record(&mut sink, &[task], &tx_child);
+            }
+        }
         let mut ledger = Vec::new();
         let mut monitor = CacheMonitor::default();
         let mut steer = child.steer;
@@ -3712,7 +3766,7 @@ pub async fn run_child(child: Child<'_>) -> Finished {
             child.policy,
             child.judge.as_ref(),
             &tools,
-            &child.prompt.text,
+            &instructions,
             &mut history,
             &tx_child,
             child.cancel,
@@ -4507,6 +4561,8 @@ pub mod fake {
         during: Option<Arc<dyn Fn(usize) + Send + Sync>>,
         /// Answers as a backend with no prompt cache, like Ollama.
         pub uncached: bool,
+        /// A fork's `tool_choice`, sent as the real client sends it.
+        tool_choice: Option<Value>,
     }
 
     impl Fake {
@@ -4529,6 +4585,7 @@ pub mod fake {
                 is_child: false,
                 during: None,
                 uncached: false,
+                tool_choice: None,
             }
         }
 
@@ -4629,13 +4686,16 @@ pub mod fake {
                     .filter_map(|t| t["name"].as_str().map(str::to_string))
                     .collect();
                 self.offered.lock().unwrap().push(names);
-                let body = crate::client::request_body(
-                    &self.model,
-                    &self.effort,
-                    &self.key,
-                    instructions,
-                    tools,
-                    input,
+                let body = crate::client::with_tool_choice(
+                    crate::client::request_body(
+                        &self.model,
+                        &self.effort,
+                        &self.key,
+                        instructions,
+                        tools,
+                        input,
+                    ),
+                    self.tool_choice.as_ref(),
                 );
                 let found = self.guard.lock().unwrap().check(&body)?;
                 self.breaks.lock().unwrap().extend(found.clone());
@@ -4743,6 +4803,25 @@ pub mod fake {
                 is_child: true,
                 ..self.clone()
             })
+        }
+
+        fn fork(&self, tool_choice: Value) -> Option<Arc<dyn Model>> {
+            if self.uncached {
+                return None;
+            }
+            let n = {
+                let mut children = self.children.lock().unwrap();
+                *children += 1;
+                *children
+            };
+            let conversation = format!("fork {n}");
+            Some(Arc::new(Self {
+                guard: Arc::new(Mutex::new(CacheGuard::new(&conversation, None, false))),
+                conversation,
+                is_child: true,
+                tool_choice: Some(tool_choice),
+                ..self.clone()
+            }))
         }
 
         fn switch(&self, model: &str, effort: &str) -> Option<Arc<dyn Model>> {
@@ -5915,6 +5994,7 @@ mod tests {
                     contract: Some(contract),
                     history: Vec::new(),
                     workdir: None,
+                    fork: None,
                 })
                 .await
                 .result
@@ -5956,6 +6036,7 @@ mod tests {
             contract: None,
             history: Vec::new(),
             workdir: None,
+            fork: None,
         })
         .await;
 
@@ -6204,6 +6285,7 @@ mod tests {
             contract: None,
             history: Vec::new(),
             workdir: None,
+            fork: None,
         })
         .await;
         assert_eq!(finished.steps, 2);
@@ -6234,6 +6316,7 @@ mod tests {
             contract: None,
             history: Vec::new(),
             workdir: None,
+            fork: None,
         })
         .await;
         assert_eq!(finished.steps, 1);
@@ -6266,6 +6349,7 @@ mod tests {
             contract: None,
             history: Vec::new(),
             workdir: None,
+            fork: None,
         })
         .await;
 
@@ -6313,6 +6397,7 @@ mod tests {
             contract: None,
             history: Vec::new(),
             workdir: None,
+            fork: None,
         })
         .await;
 
@@ -6352,6 +6437,7 @@ mod tests {
             contract: None,
             history: Vec::new(),
             workdir: None,
+            fork: None,
         })
         .await;
 
@@ -6428,6 +6514,7 @@ mod tests {
             contract: None,
             history: Vec::new(),
             workdir: None,
+            fork: None,
         })
         .await;
 

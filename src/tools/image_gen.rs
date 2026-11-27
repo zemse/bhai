@@ -392,6 +392,7 @@ mod tests {
                 id: "s",
                 model: "ollama:qwen3",
                 history: &[],
+                ..Default::default()
             }),
         };
         let (out, ok, images) = tool.execute_images(&args, live).await;

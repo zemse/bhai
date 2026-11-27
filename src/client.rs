@@ -454,6 +454,9 @@ pub struct Client {
     controls: Controls,
     /// The WebSocket transport, where the config turns it on.
     ws: Option<Ws>,
+    /// A fork's `tool_choice`, in place of `auto`: the parent's tools, of which it may call
+    /// only some.
+    tool_choice: Option<Value>,
 }
 
 /// Request fields the config may add to Codex calls. Unset, a request is what it was
@@ -519,6 +522,7 @@ impl Client {
                 verbosity: choice.verbosity.clone(),
             },
             ws,
+            tool_choice: None,
         })
     }
 
@@ -721,6 +725,33 @@ impl Client {
             ws.socket = Arc::default();
         }
         child
+    }
+
+    /// The client for a fork of this conversation: the same model, effort, cache key and
+    /// session id, so its first request reads the prefix this one cached, with
+    /// `tool_choice` narrowing the tools it may call. Everything a conversation keeps
+    /// between calls is its own, as a child's is.
+    pub fn for_fork(&self, tool_choice: Value) -> Self {
+        let mut fork = self.clone();
+        let strict = self
+            .guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .strict();
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        fork.guard = guard(
+            &format!("{}/fork-{}", self.cache_key, &id[..6]),
+            &self.session_id,
+            strict,
+        );
+        fork.turn_state = Arc::default();
+        fork.last_sent = Arc::default();
+        fork.is_child = true;
+        if let Some(ws) = &mut fork.ws {
+            ws.socket = Arc::default();
+        }
+        fork.tool_choice = Some(tool_choice);
+        fork
     }
 
     /// Start a turn: its calls are routed afresh rather than after the last turn's.
@@ -985,19 +1016,22 @@ impl Client {
     /// The request body for one call, in whichever shape this client's backend reads.
     fn body(&self, instructions: &str, tools: &[Value], input: &[Value]) -> Value {
         match self.provider() {
-            Provider::Codex => with_tier(
-                with_controls(
-                    request_body(
-                        &self.model,
-                        &self.effort,
-                        &self.cache_key,
-                        instructions,
-                        tools,
-                        input,
+            Provider::Codex => with_tool_choice(
+                with_tier(
+                    with_controls(
+                        request_body(
+                            &self.model,
+                            &self.effort,
+                            &self.cache_key,
+                            instructions,
+                            tools,
+                            input,
+                        ),
+                        &self.controls,
                     ),
-                    &self.controls,
+                    self.fast(),
                 ),
-                self.fast(),
+                self.tool_choice.as_ref(),
             ),
             Provider::Ollama => ollama::request_body(
                 &self.model,
@@ -1716,6 +1750,14 @@ pub fn with_tier(mut body: Value, fast: bool) -> Value {
     body
 }
 
+/// `body` with `tool_choice` in place of `auto`, when there is one.
+pub fn with_tool_choice(mut body: Value, tool_choice: Option<&Value>) -> Value {
+    if let Some(choice) = tool_choice {
+        body["tool_choice"] = choice.clone();
+    }
+    body
+}
+
 /// `body` with whichever of `controls` are set.
 pub fn with_controls(mut body: Value, controls: &Controls) -> Value {
     if let Some(context) = &controls.reasoning_context {
@@ -2252,6 +2294,34 @@ mod tests {
         parent.guard.lock().unwrap().check(&body).unwrap();
         let other = request_body("m", "e", "k", "changed", &[], &[]);
         assert_eq!(child.guard.lock().unwrap().check(&other).unwrap(), None);
+    }
+
+    /// The backend serves a cached prefix by the `session-id` header, so a fork keeps it,
+    /// and everything the request body is built from but `tool_choice`.
+    #[test]
+    fn a_fork_sends_the_parents_request_with_its_own_tool_choice_and_guard() {
+        let parent = Client::new(&Choice::default()).unwrap().strict_cache(true);
+        let choice = json!({"type": "allowed_tools", "mode": "auto", "tools": []});
+        let fork = parent.for_fork(choice.clone());
+        assert_eq!(fork.session_id, parent.session_id);
+        assert_eq!(fork.cache_key, parent.cache_key);
+        assert!(fork.is_child && !parent.is_child);
+        assert!(!Arc::ptr_eq(&fork.guard, &parent.guard));
+        assert!(!Arc::ptr_eq(&fork.turn_state, &parent.turn_state));
+        assert!(fork.guard.lock().unwrap().strict());
+        let tools = [json!({"type": "function", "name": "read"})];
+        let input = [json!({"type": "message", "role": "user", "content": "go"})];
+        let sent = parent.body("i", &tools, &input);
+        let forked = fork.body("i", &tools, &input);
+        assert_eq!(forked["tool_choice"], choice);
+        assert_eq!(sent["tool_choice"], "auto");
+        let mut without = forked.as_object().unwrap().clone();
+        without.insert("tool_choice".to_string(), json!("auto"));
+        assert_eq!(Value::Object(without), sent);
+        // Its guard holds `tool_choice` fixed and takes its next request as an append.
+        fork.guard.lock().unwrap().check(&forked).unwrap();
+        let next = fork.body("i", &tools, &[input[0].clone(), input[0].clone()]);
+        assert_eq!(fork.guard.lock().unwrap().check(&next).unwrap(), None);
     }
 
     #[test]

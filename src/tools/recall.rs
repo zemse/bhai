@@ -831,6 +831,7 @@ mod tests {
                 id: "c",
                 model: "m",
                 history: &history,
+                ..Default::default()
             }),
         };
         let privacy = crate::privacy::Privacy::default();
