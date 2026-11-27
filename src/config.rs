@@ -19,7 +19,8 @@
 //! `web_search` is off unless the global file turns it on, since each search sends the
 //! last two user messages and some of the answers between them to the ChatGPT backend's
 //! undocumented search endpoint; a project file may turn it off. `image_gen` likewise,
-//! since every image is spent from the subscription.
+//! since every image is spent from the subscription. `[memory]` likewise: a project file
+//! may turn `consolidate` off, and only the global file sets how often it runs and on what.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -96,6 +97,8 @@ pub struct Config {
     pub notify: Option<crate::notify::Settings>,
     /// `remote_control_relay`: the relay `/remote-control` starts on explicit request.
     pub remote_control_relay: Option<String>,
+    /// `[memory]`: the idle review of `.bhai/MEMORY.md`.
+    pub memory: crate::consolidate::Settings,
 }
 
 impl Default for Config {
@@ -133,6 +136,7 @@ impl Default for Config {
             dictation: None,
             notify: None,
             remote_control_relay: None,
+            memory: crate::consolidate::Settings::default(),
         }
     }
 }
@@ -231,7 +235,18 @@ struct Layer {
     notify: Option<crate::notify::Settings>,
     remote_control_relay: Option<String>,
     #[serde(default)]
+    memory: MemoryLayer,
+    #[serde(default)]
     permissions: RulesLayer,
+}
+
+/// `[memory]`.
+#[derive(Debug, Default, Deserialize)]
+struct MemoryLayer {
+    consolidate: Option<bool>,
+    idle_minutes: Option<u64>,
+    interval_hours: Option<f64>,
+    model: Option<String>,
 }
 
 /// `[bash]`.
@@ -566,7 +581,22 @@ impl Config {
             if let Some(max) = layer.judge_max_per_turn {
                 self.judge.max_per_turn = max;
             }
+            // Each pass is a call on the subscription, so how often is the user's call.
+            if let Some(minutes) = layer.memory.idle_minutes {
+                self.memory.idle = std::time::Duration::from_secs(minutes * 60);
+            }
+            if let Some(Ok(interval)) = layer
+                .memory
+                .interval_hours
+                .map(|hours| std::time::Duration::try_from_secs_f64(hours * 3600.0))
+            {
+                self.memory.interval = interval;
+            }
+            if layer.memory.model.is_some() {
+                self.memory.model = layer.memory.model;
+            }
         }
+        off_only(&mut self.memory.on, layer.memory.consolidate);
         if layer.code_theme.is_some() {
             self.code_theme = layer.code_theme;
         }
@@ -1254,6 +1284,36 @@ mod tests {
         assert_eq!(judge.max_per_turn, 4);
         assert_eq!(judge.effort, crate::judge::Settings::default().effort);
         assert_eq!(judge.timeout, crate::judge::Settings::default().timeout);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_memory_review_is_on_and_a_project_may_only_turn_it_off() {
+        let dir = temp_dir();
+        let (home, cwd) = (dir.join("home"), dir.join("cwd"));
+        let global = home.join(".config/bhai/config.toml");
+        let project = cwd.join(".bhai/config.toml");
+        let memory = Config::load(Some(&home), &cwd).unwrap().memory;
+        assert_eq!(memory, crate::consolidate::Settings::default());
+        assert!(memory.on);
+        write(
+            &global,
+            "[memory]\nidle_minutes = 3\ninterval_hours = 0.5\nmodel = \"gpt-6-mini\"\n",
+        );
+        write(
+            &project,
+            "[memory]\nidle_minutes = 0\ninterval_hours = 0\nmodel = \"gpt-6-max\"\n",
+        );
+        let memory = Config::load(Some(&home), &cwd).unwrap().memory;
+        assert_eq!(memory.idle, std::time::Duration::from_secs(180));
+        assert_eq!(memory.interval, std::time::Duration::from_secs(1800));
+        assert_eq!(memory.model.as_deref(), Some("gpt-6-mini"));
+        assert!(memory.on);
+        write(&project, "[memory]\nconsolidate = false\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().memory.on);
+        write(&global, "[memory]\nconsolidate = false\n");
+        write(&project, "[memory]\nconsolidate = true\n");
+        assert!(!Config::load(Some(&home), &cwd).unwrap().memory.on);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

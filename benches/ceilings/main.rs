@@ -36,6 +36,8 @@ mod commands;
 mod compact;
 #[path = "../../src/config.rs"]
 mod config;
+#[path = "../../src/consolidate.rs"]
+mod consolidate;
 #[path = "../../src/debug.rs"]
 mod debug;
 #[cfg(feature = "dictation")]

@@ -274,6 +274,8 @@ enum Next {
     Fork,
     /// A message to run on the compacted copy rather than on the full history.
     Forked(UserInput),
+    /// The session has sat idle long enough to review the project's memory file.
+    Consolidate,
 }
 
 /// Requests answered by the agent task, which owns the history, even mid-turn.
@@ -320,6 +322,9 @@ pub enum Control {
     /// Ask for the priority tier from the next call on, or stop, for `/fast`. Taken
     /// mid-turn too, since it changes what a call costs, not what it says.
     Fast(bool),
+    /// Review the project's memory file when the session goes idle, as these say. Only
+    /// the main session of a run that stays up is sent it.
+    Memory(crate::consolidate::Settings),
 }
 
 /// A model backend. `Client` is the real one; tests drive the loop with a fake.
@@ -1213,8 +1218,15 @@ pub(crate) async fn run_configured(
     let mut fork: Option<Fork> = None;
     let mut forked_at: Option<Instant> = None;
     let mut title_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut memory: Option<crate::consolidate::Settings> = None;
+    let mut idle = crate::consolidate::Idle::default();
+    // Set by what neither the user nor the session did, so the idle stretch goes on.
+    let mut quiet = false;
 
     loop {
+        if !std::mem::take(&mut quiet) {
+            idle.touch();
+        }
         let wake =
             !cancel.load(Ordering::Relaxed) && crate::privacy::current().ready() && !stop.has_children() && lock_goal(&goal).as_ref().is_some_and(Goal::active);
         if stop.has_children() {
@@ -1235,6 +1247,16 @@ pub(crate) async fn run_configured(
                     .is_some_and(|c| c.usage.input >= compact::FORK_MIN)
             })
             .map(|sent| sent + cache::CACHE_TTL.saturating_sub(compact::FORK_LEAD));
+        // A saved main session, with nothing running and nothing about to.
+        let consolidate_at = memory
+            .as_ref()
+            .filter(|settings| settings.on && writer.is_some() && delegation.is_some())
+            .filter(|_| !wake && !stop.has_children() && !cancel.load(Ordering::Relaxed))
+            .filter(|_| !crate::privacy::active())
+            .filter(|_| {
+                !crate::consolidate::quota_high(quota.latest(), chrono::Utc::now().timestamp())
+            })
+            .and_then(|settings| idle.due(settings));
         let retried = std::mem::take(&mut again);
         let next = tokio::select! {
             // The retry is the same turn going on. Then control, so a `/model` switch is
@@ -1242,9 +1264,18 @@ pub(crate) async fn run_configured(
             biased;
             _ = std::future::ready(()), if retried => Next::Retry,
             Some(control) = rx_control.recv() => {
+                if !matches!(control, Control::Context(_) | Control::Memory(_)) {
+                    idle.cancel();
+                }
                 match control {
+                    Control::Memory(settings) => {
+                        memory = Some(settings);
+                        quiet = true;
+                        continue;
+                    }
                     Control::Context(reply) => {
                         let _ = reply.send(report(&prompt, &history, &calls, tokenizer));
+                        quiet = true;
                         continue;
                     }
                     Control::Fast(on) => {
@@ -1483,7 +1514,41 @@ pub(crate) async fn run_configured(
             // Last: anything the user or a child does first moves the history on.
             _ = tokio::time::sleep_until(fork_at.unwrap_or_else(Instant::now).into()),
                 if fork_at.is_some() => Next::Fork,
+            _ = tokio::time::sleep_until(consolidate_at.unwrap_or_else(tokio::time::Instant::now)),
+                if consolidate_at.is_some() => Next::Consolidate,
         };
+        if let Next::Consolidate = next {
+            quiet = true;
+            if let (Some(settings), Some(writer), Some(delegation)) =
+                (&memory, &writer, &delegation)
+            {
+                let paths = crate::consolidate::Paths {
+                    bhai: cache_root.clone(),
+                    record: sessions::path(&delegation.sessions, &own),
+                    state: writer
+                        .candidates_path()
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default(),
+                };
+                let pass = crate::consolidate::Pass {
+                    model: Arc::clone(&model),
+                    policy: Arc::clone(&policy),
+                    judge: judge.clone(),
+                    settings: settings.clone(),
+                    paths,
+                    notes: crate::notes::lock(&notes).text.clone(),
+                    session: own.clone(),
+                };
+                idle.start(pass, tx.clone());
+            }
+            continue;
+        }
+        // Anything else is the session at work again; the fork is its own idle work.
+        match next {
+            Next::Fork => quiet = true,
+            _ => idle.cancel(),
+        }
         // The summary call only appends to the history, so it reads the cached prefix and
         // refreshes it; the guard is put back on the history after, which the next call
         // on it extends.
@@ -1597,7 +1662,9 @@ pub(crate) async fn run_configured(
                 None => continue,
             },
             // A retry adds nothing: it runs the turn the history already describes.
-            Next::Retry | Next::Compact | Next::Fork | Next::Forked(_) => (None, None, None),
+            Next::Retry | Next::Compact | Next::Fork | Next::Forked(_) | Next::Consolidate => {
+                (None, None, None)
+            }
         };
         // Just before what opens the turn, which is where the API takes an update.
         let opens = landed.is_some() || message.is_some() || on_goal.is_some();
@@ -1758,6 +1825,7 @@ pub(crate) async fn run_configured(
                             let _ = reply.send(report(&prompt, &before, &calls_before, tokenizer));
                         }
                         Control::Fast(on) => set_fast(model.as_ref(), on, &tx),
+                        Control::Memory(settings) => memory = Some(settings),
                         // Never while a tool call may be pending: once the turn is over.
                         Control::Compact(prompt) => {
                             compact_next = true;
@@ -4258,7 +4326,7 @@ not retry it. Try a different approach, or ask the user."
 
 /// The judge's verdict on a call the rules left at `Ask`, or why there is none and the
 /// user must be asked instead.
-async fn judged(
+pub(crate) async fn judged(
     judge: Option<&Judge>,
     policy: &Policy,
     name: &str,

@@ -50,6 +50,7 @@ mod clipboard;
 mod commands;
 pub mod compact;
 pub mod config;
+pub mod consolidate;
 mod daemon;
 mod debug;
 #[cfg(feature = "dictation")]

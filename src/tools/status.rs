@@ -26,6 +26,13 @@ impl Quota {
         *current = Some((limits, chrono::Utc::now().timestamp()));
     }
 
+    pub fn latest(&self) -> Option<crate::limits::RateLimits> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|(limits, _)| limits)
+    }
+
     pub fn snapshot(&self, now: i64) -> Option<Value> {
         let (limits, observed_at) = (*self.0.lock().unwrap_or_else(|e| e.into_inner()))?;
         let mut value = serde_json::to_value(limits).ok()?;

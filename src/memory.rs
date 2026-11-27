@@ -3,7 +3,8 @@
 //! of it through `notes`, so the cached prefix never moves.
 //!
 //! Each session also keeps the facts its summaries proposed for the file, in
-//! `memory-candidates.md` in its state directory, for a later review to promote.
+//! `memory-candidates.md` in its state directory, for the idle review in `consolidate`
+//! to promote.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 pub const FILE: &str = "MEMORY.md";
 
 /// The most of the file the prompt carries, the newest lines kept.
-const MAX_LOAD: usize = 4 * 1024;
+pub const MAX_LOAD: usize = 4 * 1024;
 
 /// The most one note may be.
 pub const MAX_NOTE: usize = 1024;
@@ -137,6 +138,61 @@ pub fn append(path: &Path, line: &str) -> std::io::Result<()> {
     file.write_all(text.as_bytes())
 }
 
+/// The whole file, empty when it is missing; an error when it resolves outside the project.
+pub fn read(path: &Path) -> std::io::Result<String> {
+    if path.symlink_metadata().is_err() {
+        return Ok(String::new());
+    }
+    if !inside(path) {
+        return Err(std::io::Error::other("it resolves outside the project"));
+    }
+    std::fs::read_to_string(path)
+}
+
+/// Replace the file with `text` in one rename, first keeping what it held at `backup`.
+/// Both must resolve inside the project. A file linked elsewhere in the project is
+/// replaced where it lives, so the link stays; a link at `backup` is removed, never
+/// written through.
+pub fn replace(path: &Path, text: &str, backup: &Path) -> std::io::Result<()> {
+    if !inside(path) || !inside(backup) {
+        return Err(std::io::Error::other("it resolves outside the project"));
+    }
+    let real = match path.symlink_metadata() {
+        Ok(_) => path.canonicalize()?,
+        Err(_) => path.to_path_buf(),
+    };
+    let fresh = |at: &Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(at)
+    };
+    match std::fs::read_to_string(&real) {
+        Ok(old) => {
+            match std::fs::remove_file(backup) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            fresh(backup)?.write_all(old.as_bytes())?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let dir = real.parent().unwrap_or(Path::new("."));
+    let temporary = dir.join(format!(".{FILE}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let written = fresh(&temporary).and_then(|mut file| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    });
+    match written.and_then(|()| std::fs::rename(&temporary, &real)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(e)
+        }
+    }
+}
+
 /// Add `facts` to the candidates file at `path` as dated notes, each unless the file
 /// already has it, keeping the newest `MAX_CANDIDATES`. Returns how many were added.
 /// Private mode writes nothing.
@@ -229,6 +285,23 @@ mod tests {
             .await;
         assert_eq!(added, 0);
         assert!(!file.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replace_keeps_the_old_file_as_the_backup() {
+        let dir = crate::tools::temp_dir();
+        let bhai = dir.join(".bhai");
+        std::fs::create_dir_all(&bhai).unwrap();
+        let (file, backup) = (path(&bhai), bhai.join("MEMORY.md.bak"));
+        assert_eq!(read(&file).unwrap(), "");
+        replace(&file, "- first\n", &backup).unwrap();
+        assert!(!backup.exists());
+        replace(&file, "- second\n", &backup).unwrap();
+        assert_eq!(read(&file).unwrap(), "- second\n");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "- first\n");
+        let left: Vec<_> = std::fs::read_dir(&bhai).unwrap().collect();
+        assert_eq!(left.len(), 2, "{left:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -326,10 +399,21 @@ mod tests {
             Err("skipped ./.bhai/MEMORY.md (outside project)".to_string())
         );
         assert!(append(&file, "- note").is_err());
+        assert!(read(&file).is_err());
+        assert!(replace(&file, "- note\n", &repo.join(".bhai/MEMORY.md.bak")).is_err());
         assert_eq!(
             std::fs::read_to_string(&secret).unwrap(),
             "aws_secret_access_key = x\n"
         );
+        // A backup linked out is refused before anything is written.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, "- mine\n").unwrap();
+        let backup = repo.join(".bhai/MEMORY.md.bak");
+        std::os::unix::fs::symlink(&secret, &backup).unwrap();
+        assert!(replace(&file, "- new\n", &backup).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "- mine\n");
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::remove_file(&file).unwrap();
 
         // `.bhai` itself linked out, with no memory file yet.
         let other = dir.join("other");
@@ -354,6 +438,12 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(repo.join("notes.md")).unwrap(),
             "- kept\n- two\n"
+        );
+        replace(&file, "- three\n", &repo.join(".bhai/MEMORY.md.bak")).unwrap();
+        assert!(file.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("notes.md")).unwrap(),
+            "- three\n"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

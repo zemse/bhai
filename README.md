@@ -139,6 +139,20 @@ command = 'curl -s -d "$BHAI_NOTIFY_TITLE: $BHAI_NOTIFY_BODY" ntfy.sh/my-topic'
 events = ["approval", "done", "auth", "quota"]
 ```
 
+### project memory
+
+`.bhai/MEMORY.md` holds dated one-line notes that load into every session's system prompt (the newest 4 KB). the agent adds one with `remember`, after the same review as any other approval. when the main session has sat idle for 10 minutes with something new since the last review (new messages, changed session notes, or facts a summary proposed in `.bhai/sessions/<id>/memory-candidates.md`), bhai reviews the file in one model call with no tools: it reads the file, the candidates, the session notes and the session's own user and assistant messages (never tool output or fetched content), and writes the whole file back within 4 KB, keeping, correcting, merging or dropping lines and adding facts a later session would otherwise rediscover. every added or changed line goes through the rules and, in `auto`, the judge, as a `remember` call would; a line that would need you to approve it is dropped, since the review never asks. a reply that is not dated lines within the caps writes nothing. the previous file is kept as `.bhai/MEMORY.md.bak`, each review is logged with its added, removed and rejected lines in `.bhai/memory-log.jsonl`, and the session says what changed. it runs at most once every 6 hours per project, not in private mode, not for subagents, workflows or `exec`, not while 5h or weekly quota is above 80%, and a prompt or anything else that starts a turn stops it with nothing written.
+
+```toml
+[memory]
+consolidate = true      # false turns the review off
+idle_minutes = 10
+interval_hours = 6
+# model = "..."         # the session's model when unset; a cheaper one from /model is enough
+```
+
+a project file may set `consolidate = false`; only `~/.config/bhai/config.toml` sets the rest.
+
 ### command environment
 
 `[bash] path` puts directories in front of `PATH` for every bash command, in order, and `[bash] env` sets variables for them. both reach subagents, background commands and monitors. a path entry is absolute or under `~/`; it is prepended after the login profile runs, so a profile that rebuilds `PATH` does not push it back. `env` may not set `PATH`, the variables bhai fixes for every command (`TERM`, `NO_COLOR`, `PAGER`, `GIT_PAGER`, `GIT_TERMINAL_PROMPT`, `LANG`, `LC_ALL`, anything starting `BHAI_`), or a credential-looking name that `pass_env` does not list.

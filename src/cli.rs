@@ -330,6 +330,7 @@ async fn command(
         statusline,
         sudo,
         remote_control_relay,
+        memory,
     } = load(args.flags, &name, Some(&session_id)).await?;
     let private = private && resume.is_none();
     if private {
@@ -558,6 +559,8 @@ allow it.",
         delegation,
         saved,
         limits,
+        // Like schedules, only for a run that stays up.
+        (args.workflow.is_none() && args.exec.is_none()).then_some(memory),
     );
     if private {
         start_private(&session).await?;
@@ -1198,6 +1201,8 @@ struct Setup {
     /// `[bash] sudo`.
     sudo: bool,
     remote_control_relay: Option<String>,
+    /// `[memory]`.
+    memory: crate::consolidate::Settings,
 }
 
 /// How a child's system prompt is built: its identity's, on the session's MCP connections
@@ -1293,6 +1298,7 @@ async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> 
     let statusline = config.statusline.clone();
     let sudo = config.sudo;
     let remote_control_relay = config.remote_control_relay.clone();
+    let memory = config.memory.clone();
     let (policy, notices) = permissions(config, roots.home, roots.cwd);
     prompt.skipped.extend(notices);
     startup::mark("prompt");
@@ -1309,6 +1315,7 @@ async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> 
         statusline,
         sudo,
         remote_control_relay,
+        memory,
     })
 }
 
@@ -1461,9 +1468,13 @@ fn start(
     delegation: Delegation,
     saved: Saved,
     limits: Limits,
+    memory: Option<crate::consolidate::Settings>,
 ) -> (Arc<Session>, broadcast::Receiver<session::Event>) {
     let (tx_user, rx_user) = mpsc::channel::<agent::UserInput>(16);
     let (tx_control, rx_control) = mpsc::channel::<Control>(16);
+    if let Some(memory) = memory {
+        let _ = tx_control.try_send(Control::Memory(memory));
+    }
     let (tx_agent, rx_agent) = mpsc::unbounded_channel::<AgentEvent>();
     let cancel = Arc::new(agent::Cancel::default());
     let diagnostics = saved.writer.authorization_path().with_file_name("debug");
