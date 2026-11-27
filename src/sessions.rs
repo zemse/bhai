@@ -806,6 +806,27 @@ pub fn load_child(path: &Path) -> Result<Vec<Value>> {
     Ok(kept)
 }
 
+/// Every item ever appended to a session file or a child transcript, in order, read as it
+/// is iterated. A compaction is passed over, so what it folded away reads as it was said.
+/// A line that does not parse is skipped, so a file still being appended to reads to its
+/// last whole line.
+pub fn all_items(path: &Path) -> std::io::Result<impl Iterator<Item = Value>> {
+    use std::io::BufRead as _;
+    let file = std::io::BufReader::new(std::fs::File::open(path)?);
+    // A session file opens on its header and wraps each item in a record; a child
+    // transcript is bare items.
+    let mut session = None;
+    Ok(file.split(b'\n').filter_map(move |line| {
+        let mut record = serde_json::from_slice::<Value>(&line.ok()?).ok()?;
+        let kind = record.get("type").and_then(Value::as_str);
+        match (*session.get_or_insert(kind == Some("header")), kind) {
+            (true, Some("item")) => Some(record["item"].take()),
+            (true, _) => None,
+            (false, _) => Some(record),
+        }
+    }))
+}
+
 /// How many leading items to keep so every function call has its output.
 fn answered<'a>(items: impl Iterator<Item = &'a Value>) -> usize {
     let mut open: Vec<&str> = Vec::new();

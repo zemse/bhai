@@ -311,7 +311,7 @@ pub(crate) fn typed(text: &str) -> bool {
 
 /// How well `text` matches: 1 for the whole query, else the share of its terms present
 /// when that is at least half, else 0. ASCII case is folded, which keeps byte offsets.
-fn score(text: &str, query: &str, terms: &[String]) -> f64 {
+pub(super) fn score(text: &str, query: &str, terms: &[String]) -> f64 {
     if text.contains(query) {
         return 1.0;
     }
@@ -323,7 +323,7 @@ fn score(text: &str, query: &str, terms: &[String]) -> f64 {
 }
 
 /// `SNIPPET` bytes of `text` around where `at` falls.
-fn snippet(text: &str, at: usize) -> String {
+pub(super) fn snippet(text: &str, at: usize) -> String {
     let start = floor_boundary(text, at.saturating_sub(SNIPPET / 4));
     let end = floor_boundary(text, (start + SNIPPET).min(text.len()));
     let mut out = text[start..end]

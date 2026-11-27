@@ -28,6 +28,7 @@ pub mod patch;
 pub mod peers;
 pub mod plan;
 pub mod read;
+pub mod recall;
 pub mod schedule;
 pub mod skill;
 pub mod ssrf;
@@ -459,6 +460,13 @@ impl Registry {
             current,
         }));
         self.tools.push(Box::new(history::ReadSession { dir }));
+        self
+    }
+
+    /// `recall` over this agent's own record. It is added past the identity's narrowing:
+    /// it reads back only what the session already held.
+    pub fn with_recall(mut self, recall: recall::Recall) -> Self {
+        self.tools.push(Box::new(recall));
         self
     }
 

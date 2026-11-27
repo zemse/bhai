@@ -1027,6 +1027,10 @@ pub(crate) async fn run_configured(
         {
             registry = registry.with_history(delegation.sessions.clone(), own.clone());
         }
+        if let Some(delegation) = &delegation {
+            registry =
+                registry.with_recall(tools::recall::Recall::session(&delegation.sessions, &own));
+        }
         if let Some(dir) = crate::peers::directory() {
             if prompt.identity.allows_tool(tools::peers::LIST) {
                 registry = registry.with_tool(Box::new(tools::peers::List {
@@ -3431,6 +3435,9 @@ pub async fn run_child(child: Child<'_>) -> Finished {
     let mut registry = Registry::for_prompt(&child.prompt);
     if let Some(rooted) = child.workdir.clone() {
         registry = registry.with_workdir(rooted);
+    }
+    if let Some(transcript) = child.transcript {
+        registry = registry.with_recall(tools::recall::Recall::child(transcript));
     }
     if let Some(contract) = &child.contract {
         registry = registry.with_submit(tools::submit::Submit {
@@ -6279,11 +6286,12 @@ mod tests {
             .iter()
             .partition(|names| !names.contains(&"agent".to_string()));
         assert_eq!(narrowed.len(), 2, "{offered:?}");
-        // `write_stdin` comes with `bash`, since it only reaches what `bash` started.
+        // `write_stdin` comes with `bash`, since it only reaches what `bash` started, and
+        // `recall` with any child, since it reads only the session's own record.
         assert!(
             narrowed
                 .iter()
-                .all(|names| *names == &["bash", "read", "view_image", "write_stdin"]),
+                .all(|names| *names == &["bash", "read", "view_image", "write_stdin", "recall"]),
             "{narrowed:?}"
         );
         assert_eq!(full.len(), 3, "{offered:?}");
