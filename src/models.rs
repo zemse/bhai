@@ -29,9 +29,9 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a loaded catalogue answers `cached`. Short, so a model pulled into Ollama
 /// mid-session is servable a minute later rather than at the next run.
 const CACHE_FOR: Duration = Duration::from_secs(60);
-/// The `client_version` the models endpoint insists on, when the Codex CLI's own cache
-/// does not say which version it last asked as.
-const CLIENT_VERSION: &str = "0.154.0";
+/// The lowest `client_version` bhai asks the models endpoint as. The backend lists newer
+/// models only to newer clients, so the Codex CLI's cached version is used only when newer.
+const CLIENT_VERSION: &str = "0.172.0";
 /// The efforts a Codex model takes when the list could not be read; what every model in
 /// the gpt-5 family has offered.
 const FALLBACK_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
@@ -238,11 +238,12 @@ fn codex_reply(
 /// `GET {base}/models`, with the ChatGPT credentials the Codex CLI leaves behind.
 async fn fetch(http: &reqwest::Client, cached: &Option<Value>) -> Result<Value> {
     let auth = crate::auth::load(http).await?;
-    let version = cached
-        .as_ref()
-        .and_then(|body| body.get("client_version"))
-        .and_then(Value::as_str)
-        .unwrap_or(CLIENT_VERSION);
+    let version = client_version(
+        cached
+            .as_ref()
+            .and_then(|body| body.get("client_version"))
+            .and_then(Value::as_str),
+    );
     let mut req = http
         .get(format!(
             "{}/models?client_version={version}",
@@ -260,6 +261,29 @@ async fn fetch(http: &reqwest::Client, cached: &Option<Value>) -> Result<Value> 
         anyhow::bail!("the models endpoint answered {status}");
     }
     serde_json::from_str(&body).context("the models endpoint did not answer JSON")
+}
+
+/// The newer of the Codex CLI's cached version and `CLIENT_VERSION`, by numeric
+/// `major.minor.patch`; a suffix such as `-alpha.1` is ignored.
+fn client_version(cached: Option<&str>) -> &str {
+    let triple = |v: &str| -> Option<[u64; 3]> {
+        let mut parts = v.split(['-', '+']).next()?.split('.');
+        let mut out = [0; 3];
+        for slot in &mut out {
+            *slot = parts.next()?.parse().ok()?;
+        }
+        parts.next().is_none().then_some(out)
+    };
+    match cached {
+        Some(v)
+            if triple(v)
+                .zip(triple(CLIENT_VERSION))
+                .is_some_and(|(a, b)| a > b) =>
+        {
+            v
+        }
+        _ => CLIENT_VERSION,
+    }
 }
 
 /// What the Codex CLI last wrote to `~/.codex/models_cache.json`.
@@ -742,6 +766,39 @@ mod tests {
         assert_eq!(window_of(&body, "gpt-6-astra"), None);
         assert_eq!(window_of(&body, "missing"), None);
         assert_eq!(window_of(&json!({}), "gpt-5.5"), None);
+    }
+
+    #[test]
+    fn an_older_cached_client_version_asks_as_bhai() {
+        assert_eq!(client_version(Some("0.163.0")), CLIENT_VERSION);
+        assert_eq!(client_version(Some(CLIENT_VERSION)), CLIENT_VERSION);
+        assert_eq!(client_version(None), CLIENT_VERSION);
+    }
+
+    #[test]
+    fn a_newer_cached_client_version_wins() {
+        assert_eq!(client_version(Some("0.173.0")), "0.173.0");
+        assert_eq!(client_version(Some("1.0.0")), "1.0.0");
+    }
+
+    #[test]
+    fn a_garbage_cached_client_version_is_ignored() {
+        for v in ["", "latest", "0.999", "0.999.0.1", "0.x.0", "v0.999.0"] {
+            assert_eq!(client_version(Some(v)), CLIENT_VERSION, "{v}");
+        }
+    }
+
+    #[test]
+    fn version_components_compare_as_numbers() {
+        assert_eq!(client_version(Some("0.1000.0")), "0.1000.0");
+        assert_eq!(client_version(Some("0.99.0")), CLIENT_VERSION);
+        assert_eq!(client_version(Some("0.172.10")), "0.172.10");
+    }
+
+    #[test]
+    fn a_pre_release_suffix_compares_by_its_numbers() {
+        assert_eq!(client_version(Some("0.173.0-alpha.1")), "0.173.0-alpha.1");
+        assert_eq!(client_version(Some("0.172.0-alpha.1")), CLIENT_VERSION);
     }
 
     #[test]

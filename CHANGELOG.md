@@ -4,6 +4,10 @@ What has landed, newest first. Add an entry when you land something: one line pe
 grouped under the day. The commit message carries the reasoning and the verification; this
 carries the shape of what is there.
 
+## 2026-11-27
+
+- `/model` and `bhai models` ask the Codex backend for its list as client version 0.172.0, or as the Codex CLI's cached version when that is newer, instead of letting the cache win. The backend lists newer models only to newer clients, so a machine without a Codex CLI cache saw only gpt-6-astra and the 5.6 models; it now sees the gpt-6.1 and gpt-6.2 ones too.
+
 ## 2026-11-23
 
 - `/remote-key-show` reopens the current remote-control key as a pairing QR, and `/remote-key-rotate` replaces the key with a fresh one, reconnects a running session under it, and shows the new QR. Rotation cuts off every device paired with the old key, so it is how they are revoked; the key file is replaced atomically. Both need a relay to be configured.
