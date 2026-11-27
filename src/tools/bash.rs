@@ -16,6 +16,8 @@ use tokio::sync::Notify;
 use super::{BoxFuture, Live, Tool, string_arg, truncate};
 use crate::sandbox::Sandbox;
 
+mod spill;
+
 pub const NAME: &str = "bash";
 
 /// The timeout represented by legacy results and the one-shot test runner.
@@ -320,13 +322,13 @@ impl Typed {
                 }
             }
         };
-        let (stdout, stderr) = proc.take();
+        let taken = proc.take();
         match waited {
-            Ok(None) => running(self.id, &stdout, &stderr, started.elapsed()),
+            Ok(None) => running(self.id, &taken, started.elapsed()),
             result => {
                 sessions().live.remove(&self.id);
                 match result {
-                    Ok(Some(status)) => format_output(&stdout, &stderr, status, started.elapsed()),
+                    Ok(Some(status)) => format_output(&taken, status, started.elapsed()),
                     Err(e) => format!("Could not wait for shell command: {e}"),
                     Ok(None) => unreachable!(),
                 }
@@ -362,21 +364,18 @@ async fn run_in(
     let until = tokio::time::Instant::now() + TIMEOUT;
     match proc.wait(until, live).await {
         Err(e) => format!("{UNSTARTED}: {e}"),
-        Ok(Some(status)) => {
-            let (stdout, stderr) = proc.take();
-            format_output(&stdout, &stderr, status, started.elapsed())
-        }
+        Ok(Some(status)) => format_output(&proc.take(), status, started.elapsed()),
         Ok(None) => {
             kill_group(proc.group);
             proc.status = proc.child.wait().await.ok();
-            let (stdout, stderr) = proc.take();
+            let taken = proc.take();
             // What it printed before the clock ran out is still what it was doing.
             format!(
                 "{TIMED_OUT} after {}s and was killed. Run something shorter, or send it to \
 the background with its output redirected to a file and poll that.\n{}{}",
                 TIMEOUT.as_secs(),
-                truncate(&body(&stdout, &stderr)),
-                trailer(&stdout, &stderr, started.elapsed())
+                body(&taken),
+                trailer(&taken, started.elapsed())
             )
         }
     }
@@ -403,14 +402,11 @@ async fn start(
     };
     match proc.wait(tokio::time::Instant::now() + wait, live).await {
         Err(e) => format!("{UNSTARTED}: {e}"),
-        Ok(Some(status)) => {
-            let (stdout, stderr) = proc.take();
-            format_output(&stdout, &stderr, status, started.elapsed())
-        }
+        Ok(Some(status)) => format_output(&proc.take(), status, started.elapsed()),
         Ok(None) => {
-            let (stdout, stderr) = proc.take();
+            let taken = proc.take();
             let id = keep(command, proc);
-            running(id, &stdout, &stderr, started.elapsed())
+            running(id, &taken, started.elapsed())
         }
     }
 }
@@ -544,6 +540,9 @@ struct Shared {
     recent_cut: bool,
     /// Release a polling wait so the user's stop can acquire the proc.
     stopping: bool,
+    /// Everything both streams printed, redacted, for a result too long to show whole;
+    /// `None` without a session to save it in, in private mode, and on a terminal.
+    spill: Option<spill::Spill>,
 }
 
 /// A running command and the tasks reading its output. Reading goes on between calls,
@@ -660,6 +659,7 @@ impl Proc {
         let configured = crate::childenv::configured();
         configured.apply(bash);
         crate::childenv::non_interactive(bash);
+        let mut spill = None;
         if let Some(session) = session {
             let cwd = std::env::current_dir()?;
             let scratch = crate::sessions::scratch_dir(&cwd, session);
@@ -670,6 +670,10 @@ impl Proc {
             )
             .env("BHAI_SCRATCH_DIR", &scratch)
             .env("TMPDIR", &scratch);
+            // A captured command already saves all of it.
+            if !tty && capture.is_none() && !crate::privacy::active() {
+                spill = Some(spill::Spill::new(scratch.join(spill::OUTPUT)));
+            }
         }
         if let Some(proxy) = crate::egress::active() {
             proxy.apply(bash);
@@ -721,6 +725,7 @@ impl Proc {
             recent: std::collections::VecDeque::new(),
             recent_cut: false,
             stopping: false,
+            spill,
         }));
         let closed = Arc::new(Notify::new());
         let group = child.id();
@@ -815,14 +820,17 @@ impl Proc {
         flush(&mut self.lock().pending, progress, tty);
     }
 
-    /// The output read since the last take.
-    fn take(&mut self) -> (Kept, Kept) {
+    /// The output read since the last take. Reader tasks cannot see the conversation's
+    /// privacy, so it is read here, on the caller's task.
+    fn take(&mut self) -> Taken {
         let tty = self.tty;
+        let private = crate::privacy::active();
         let mut shared = self.lock();
-        (
-            std::mem::replace(&mut shared.stdout, Kept::new(tty)),
-            std::mem::replace(&mut shared.stderr, Kept::new(tty)),
-        )
+        Taken {
+            stdout: std::mem::replace(&mut shared.stdout, Kept::new(tty)),
+            stderr: std::mem::replace(&mut shared.stderr, Kept::new(tty)),
+            saved: shared.spill.as_mut().and_then(|s| s.take(private)),
+        }
     }
 }
 
@@ -840,17 +848,25 @@ fn read_into(
         let mut buf = [0u8; 8192];
         let mut redactor = crate::redact::Stream::default();
         let capturing = capture.is_some();
+        let spilling = shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spill
+            .is_some();
         let mut capture = capture;
         loop {
             let n = pipe.read(&mut buf).await.unwrap_or(0);
-            let text = capturing.then(|| {
+            let text = (capturing || spilling).then(|| {
                 if n == 0 {
                     redactor.finish()
                 } else {
                     redactor.push(&buf[..n])
                 }
             });
-            let bytes = text.as_deref().map(str::as_bytes).unwrap_or(&buf[..n]);
+            let bytes = match capturing {
+                true => text.as_deref().map(str::as_bytes).unwrap_or_default(),
+                false => &buf[..n],
+            };
             if let Some(file) = &capture {
                 if let Err(error) = file.write(text.as_deref().unwrap_or_default()).await {
                     let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -862,6 +878,9 @@ fn read_into(
                 }
             }
             let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if let (Some(spill), Some(text)) = (&mut shared.spill, &text) {
+                spill.push(text.as_bytes());
+            }
             match stderr {
                 true => shared.stderr.push(bytes),
                 false => shared.stdout.push(bytes),
@@ -1221,12 +1240,12 @@ pub(crate) async fn write(id: u32, chars: &str, wait: Duration, live: Live<'_>) 
         }
     }
     let waited = proc.wait(tokio::time::Instant::now() + wait, live).await;
-    let (stdout, stderr) = proc.take();
+    let taken = proc.take();
     match waited {
-        Ok(None) => running(id, &stdout, &stderr, started.elapsed()),
+        Ok(None) => running(id, &taken, started.elapsed()),
         Ok(Some(status)) => {
             sessions().live.remove(&id);
-            format_output(&stdout, &stderr, status, started.elapsed())
+            format_output(&taken, status, started.elapsed())
         }
         Err(e) => {
             sessions().live.remove(&id);
@@ -1352,8 +1371,25 @@ fn die_of(signal: libc::c_int) {
     }
 }
 
+/// What [`Proc::take`] took: each stream's kept ends, and when the whole was too long to
+/// show and is saved, where.
+struct Taken {
+    stdout: Kept,
+    stderr: Kept,
+    saved: Option<spill::Portion>,
+}
+
+/// What the command printed: a summary of the saved output when there is one, otherwise
+/// stdout then stderr, trimmed to [`super::MAX_OUTPUT`].
+fn body(taken: &Taken) -> String {
+    match &taken.saved {
+        Some(saved) => saved.render(),
+        None => truncate(&inline(&taken.stdout, &taken.stderr)),
+    }
+}
+
 /// What the command printed: stdout, then stderr.
-fn body(stdout: &Kept, stderr: &Kept) -> String {
+fn inline(stdout: &Kept, stderr: &Kept) -> String {
     let mut body = stdout.text();
     let stderr = stderr.text();
     if !stderr.is_empty() {
@@ -1369,30 +1405,22 @@ fn body(stdout: &Kept, stderr: &Kept) -> String {
 }
 
 /// The result the model sees: exit status, then stdout, then stderr, then the trailer.
-fn format_output(stdout: &Kept, stderr: &Kept, status: ExitStatus, took: Duration) -> String {
+fn format_output(taken: &Taken, status: ExitStatus, took: Duration) -> String {
     let code = status
         .code()
         .map_or_else(|| KILLED.to_string(), |c| c.to_string());
-    format!(
-        "{EXIT}{code}\n{}{}",
-        truncate(&body(stdout, stderr)),
-        trailer(stdout, stderr, took)
-    )
+    format!("{EXIT}{code}\n{}{}", body(taken), trailer(taken, took))
 }
 
 /// The result for a command still running: its session, then what it printed since it
 /// was last read.
-fn running(id: u32, stdout: &Kept, stderr: &Kept, took: Duration) -> String {
-    format!(
-        "{RUNNING}{id}\n{}{}",
-        truncate(&body(stdout, stderr)),
-        trailer(stdout, stderr, took)
-    )
+fn running(id: u32, taken: &Taken, took: Duration) -> String {
+    format!("{RUNNING}{id}\n{}{}", body(taken), trailer(taken, took))
 }
 
 /// Last, so [`outcome`], which reads the first line, is unaffected.
-fn trailer(stdout: &Kept, stderr: &Kept, took: Duration) -> String {
-    let lines = stdout.lines() + stderr.lines();
+fn trailer(taken: &Taken, took: Duration) -> String {
+    let lines = taken.stdout.lines() + taken.stderr.lines();
     let s = if lines == 1 { "" } else { "s" };
     format!(
         "\n{TRAILER}{lines} line{s}, {:.1}s] [local time: {}]",
@@ -1551,6 +1579,108 @@ mod tests {
             );
             std::fs::remove_dir_all(state).unwrap();
         }
+    }
+
+    /// Run `command` in a session of its own, returning the result and the session's
+    /// output directory, which the caller removes.
+    async fn in_session(command: &str, wait: Duration) -> (String, std::path::PathBuf) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let conversation = super::super::Conversation {
+            id: &id,
+            model: "test",
+            history: &[],
+        };
+        let live = Live {
+            conversation: Some(conversation),
+            ..quiet()
+        };
+        let result = start(command, None, wait, false, live).await;
+        let cwd = std::env::current_dir().unwrap();
+        (
+            result,
+            crate::sessions::scratch_dir(&cwd, &id).join(spill::OUTPUT),
+        )
+    }
+
+    fn saved_path(result: &str) -> std::path::PathBuf {
+        let at = result.find("is saved in ").unwrap() + "is saved in ".len();
+        let rest = &result[at..];
+        let end = rest.find(".log").unwrap() + ".log".len();
+        std::path::PathBuf::from(&rest[..end])
+    }
+
+    #[tokio::test]
+    async fn short_output_in_a_session_is_shown_whole_and_not_saved() {
+        let (result, dir) = in_session("seq 1 500", YIELD).await;
+        let (body, _) = result.rsplit_once('\n').unwrap();
+        let expected: String = (1..=500).map(|n| format!("\n{n}")).collect();
+        assert_eq!(body, format!("exit code: 0{expected}\n"));
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(dir.ancestors().nth(2).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_output_is_saved_whole_and_its_failures_surface() {
+        let command = "for i in $(seq 1 3000); do \
+            if [ $i = 1234 ]; then echo \"error: thing $i broke\"; \
+            else echo \"line $i of a long build log\"; fi; done; exit 1";
+        let (result, dir) = in_session(command, YIELD).await;
+        assert_eq!(outcome(&result), Some(Outcome::Failed(1)), "{result}");
+        let path = saved_path(&result);
+        assert!(path.starts_with(&dir), "{result}");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(saved.lines().count(), 3000);
+        assert_eq!(saved.lines().nth(1233), Some("error: thing 1234 broke"));
+        assert!(
+            result.contains(&format!(
+                "The output was {} bytes over 3000 lines",
+                saved.len()
+            )),
+            "{result}"
+        );
+        assert!(
+            result.contains("look like failures, outside those shown below, 1 of 1:\n1234: error: thing 1234 broke\n"),
+            "{result}"
+        );
+        assert!(result.contains("\nFirst lines:\n1: line 1 of"), "{result}");
+        assert!(
+            result.contains("\n3000: line 3000 of a long build log\n[output: 3000 lines, "),
+            "{result}"
+        );
+        assert!(result.len() < 4096, "{}", result.len());
+        std::fs::remove_dir_all(dir.ancestors().nth(2).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_polled_session_summarises_each_long_stretch() {
+        let command = "seq 1 2000; sleep 0.5; seq 2001 4000";
+        let (result, dir) = in_session(command, Duration::from_millis(300)).await;
+        let id = session_id(&result);
+        let path = saved_path(&result);
+        assert!(result.contains("over 2000 lines"), "{result}");
+        let result = write(id, "", Duration::from_secs(5), quiet()).await;
+        assert_eq!(outcome(&result), Some(Outcome::Succeeded), "{result}");
+        assert_eq!(saved_path(&result), path);
+        assert!(result.contains(" as lines 2001 to 4000; "), "{result}");
+        assert!(result.contains("\nFirst lines:\n2001: 2001\n"), "{result}");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(saved.lines().count(), 4000);
+        std::fs::remove_dir_all(dir.ancestors().nth(2).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_mode_keeps_long_output_inline_and_saves_nothing() {
+        let privacy = Arc::new(crate::privacy::Privacy::default());
+        privacy.begin();
+        let (result, dir) = crate::privacy::CURRENT
+            .scope(std::cell::RefCell::new(privacy), async {
+                in_session("seq 1 10000", YIELD).await
+            })
+            .await;
+        assert!(result.contains("bytes trimmed"), "{result}");
+        assert!(!result.contains("is saved in"), "{result}");
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(dir.ancestors().nth(2).unwrap()).unwrap();
     }
 
     #[test]
@@ -1842,12 +1972,12 @@ mod tests {
         };
         let (body, trailer) = out.rsplit_once('\n').unwrap();
         assert!(trailer.starts_with("[output: 3 lines, "), "{out}");
-        let plain = format_output(
-            &kept(&plain.stdout),
-            &kept(&plain.stderr),
-            plain.status,
-            Duration::ZERO,
-        );
+        let taken = Taken {
+            stdout: kept(&plain.stdout),
+            stderr: kept(&plain.stderr),
+            saved: None,
+        };
+        let plain = format_output(&taken, plain.status, Duration::ZERO);
         assert_eq!(body, plain.rsplit_once('\n').unwrap().0);
         assert_eq!(body, "exit code: 0\na\nb\ne");
     }
@@ -1967,8 +2097,11 @@ mod tests {
         assert!(took >= 0.3, "{out}");
         assert!(
             trailer(
-                &Kept::default(),
-                &Kept::default(),
+                &Taken {
+                    stdout: Kept::default(),
+                    stderr: Kept::default(),
+                    saved: None,
+                },
                 Duration::from_millis(300)
             )
             .starts_with("\n[output: 0 lines, 0.3s] [local time: ")
@@ -2152,6 +2285,7 @@ mod tests {
             recent: "é-tail-secret-0b7d ok".bytes().skip(1).collect(),
             recent_cut: true,
             stopping: false,
+            spill: None,
         };
         assert_eq!(recent(&shared, false), "[REDACTED] ok");
         shared.recent_cut = false;
