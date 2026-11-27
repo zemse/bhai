@@ -53,20 +53,35 @@ pub const SUMMARY_PREFIX: &str = "Summary of earlier conversation:";
 /// What stands in for a summary the summary call could not fit in the window.
 pub const UNSUMMARISED: &str = "The earlier turns were dropped without a summary: the \
 conversation no longer fit in the context window to be summarised.";
-/// What the model is asked for when history is summarised.
-const REQUEST: &str = "Write a concise summary of the conversation so far, for yourself to \
-continue from once the older messages are gone: the user's goals, decisions made, files \
-touched, what is done and what is left. Preserve user authorizations and their scope, verified \
-working procedures, attempted alternatives and their outcomes, and evidence for unresolved \
-blockers. Distinguish explicit user requirements and tool-enforced restrictions from your own \
-inferences; label uncertainty and do not turn an inferred restriction into a user requirement. \
-Carry forward later corrections and resolved blockers rather than stale constraints. Include \
-resource limits only for affected work, with measured capacity and authorized cleanup or artifact \
-rotation options. Do not include secret values. End with a section headed `## For future \
-sessions`: a short list of facts about this project or its environment that a later session, \
-starting without this conversation, would otherwise have to rediscover (setup, conventions, \
-traps), each with why it holds; write `None.` under it when there are none. Do not call any \
-tools; reply with the summary only.";
+/// What the model is asked for when history is summarised. A short request gets a
+/// short summary, and a short summary paraphrases less; the exact text stays in the
+/// record for `recall`.
+const REQUEST: &str = "Summarise the conversation so far for yourself to continue from once the \
+older messages are gone. Keep it short: about 1,000 tokens, in terse bullets. Leave out what is \
+restated beside the summary anyway: the first user message, the latest one and what followed it, \
+the goal, the plan, your session notes, what was remembered, and the instructions. The earlier \
+turns stay in the session's record, where `recall` fetches exact tool output and errors, so name \
+what to recall (a command, a file, a call id) rather than copying long text; if the session is \
+not saved, keep the exact error lines that matter. Keep:
+- the user's requirements and corrections, and each authorization with its scope;
+- decisions made, with why;
+- approaches tried and rejected, with why each failed;
+- unresolved blockers with their evidence; for a resource limit, the measured capacity and any \
+cleanup or artifact rotation the user authorized;
+- what is done, including procedures verified to work, and what is left.
+Keep explicit user requirements and tool-enforced restrictions apart from your own inferences: \
+label uncertainty, and do not turn an inferred restriction into a user requirement. Carry forward \
+later corrections and resolved blockers rather than stale constraints. Do not include secret \
+values. End with a section headed `## For future sessions`: a short list of facts about this \
+project or its environment that a later session, starting without this conversation, would \
+otherwise have to rediscover (setup, conventions, traps), each with why it holds; write `None.` \
+under it when there are none. Do not call any tools; reply with the summary only.";
+
+/// What follows the summary in a folded history, saying where the earlier turns went.
+const POINTER: &str = "The turns before this summary are in the session's record: \
+`recall` searches them, and returns earlier turns, exact tool outputs and errors.";
+const POINTER_LOST: &str = "The turns before this summary are gone: this session is \
+not saved, so earlier turns, exact tool outputs and errors cannot be recalled.";
 
 /// The heading of the summary's last section, which the harness takes out of it.
 const FUTURE: &str = "for future sessions";
@@ -318,11 +333,56 @@ fn placeholder(item: &Value, id: &str, saved: bool) -> Option<String> {
         0 => format!("{} bytes", text.len()),
         n => format!("{} bytes and {n} image(s)", text.len()),
     };
+    let digest = digest(&text).map(|d| format!("{d}; ")).unwrap_or_default();
     let after = match saved {
         true => format!("{} returns it]", recall(id)),
         false => format!("{UNSAVED} it {LOST}"),
     };
-    Some(format!("[output of {id}{REMOVED} ({size}); {after}"))
+    Some(format!(
+        "[output of {id}{REMOVED} ({size}); {digest}{after}"
+    ))
+}
+
+/// The most a digest may be, in bytes.
+const DIGEST: usize = 200;
+
+/// What a command's result said, for its placeholder: how it ended, its first line that
+/// looks like a failure when it failed, and the file its whole output is saved in. A
+/// command may not be cheap or safe to run again, as a read or a search is; those, and
+/// anything else that is not a command's result, get none.
+fn digest(output: &str) -> Option<String> {
+    use crate::tools::bash::{outcome, spill};
+    let outcome = outcome(output)?;
+    let mut digest = outcome.label();
+    let path = spill::saved(output)
+        .map(|path| format!("; saved in {path}"))
+        .filter(|path| digest.len() + path.len() <= DIGEST)
+        .unwrap_or_default();
+    let failure = (!outcome.ok())
+        .then(|| {
+            output
+                .lines()
+                .skip(1)
+                .map(str::trim)
+                .filter(|line| !line.starts_with(spill::FAILURES))
+                .find(|line| spill::looks_failed(line))
+        })
+        .flatten();
+    if let Some(line) = failure {
+        let room = DIGEST.saturating_sub(digest.len() + path.len() + "; first failure: ".len());
+        let line = match line.len() <= room {
+            true => line.to_string(),
+            false => format!(
+                "{}...",
+                &line[..line.floor_char_boundary(room.saturating_sub(3))]
+            ),
+        };
+        if line.len() > 3 {
+            digest.push_str(&format!("; first failure: {line}"));
+        }
+    }
+    digest.push_str(&path);
+    Some(digest)
 }
 
 /// A kept output over `TRIM_OVER` bytes cut to its first and last `TRIM_KEEP`, with the
@@ -448,9 +508,10 @@ fn from_model(item: &Value) -> bool {
 }
 
 /// The history after a summary: the environment and instruction updates it told the
-/// model, the first user message, the summary, and the last user turn onward. `None` when
-/// there is no earlier turn to fold.
-pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
+/// model, the first user message, the summary with where the turns it stands for went,
+/// and the last user turn onward. `saved` says whether a record keeps those turns for
+/// `recall`. `None` when there is no earlier turn to fold.
+pub fn fold(history: &[Value], summary: &str, saved: bool) -> Option<Vec<Value>> {
     let mut users = history
         .iter()
         .enumerate()
@@ -465,6 +526,7 @@ pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
         "{SUMMARY_PREFIX}\n{}",
         summary.trim()
     )));
+    folded.push(pointer(saved));
     folded.extend(crate::goal::restated(history));
     folded.extend(crate::goal::restated_lifecycle(history));
     folded.extend(crate::plan::restated_context(history));
@@ -481,6 +543,14 @@ pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
             .cloned(),
     );
     Some(folded)
+}
+
+/// The developer item after a summary, saying whether `recall` can get the folded turns.
+pub fn pointer(saved: bool) -> Value {
+    let text = if saved { POINTER } else { POINTER_LOST };
+    json!({"type": "message", "role": "developer", "content": [{
+        "type": "input_text", "text": text
+    }]})
 }
 
 /// The history after a server compaction: the environment and instruction updates it
@@ -573,13 +643,14 @@ mod tests {
             let message = request(asked);
             let text = message["content"][0]["text"].as_str().unwrap();
             for instruction in [
-                "Preserve user authorizations and their scope",
-                "verified working procedures",
-                "attempted alternatives and their outcomes",
+                "each authorization with its scope",
+                "procedures verified to work",
+                "approaches tried and rejected, with why each failed",
+                "unresolved blockers with their evidence",
                 "label uncertainty",
                 "do not turn an inferred restriction into a user requirement",
                 "later corrections and resolved blockers rather than stale constraints",
-                "authorized cleanup or artifact rotation options",
+                "cleanup or artifact rotation the user authorized",
                 "Do not include secret values",
             ] {
                 assert!(text.contains(instruction), "{instruction}");
@@ -587,6 +658,149 @@ mod tests {
             if let Some(asked) = asked {
                 assert!(text.ends_with(asked));
             }
+        }
+    }
+
+    #[test]
+    fn the_summary_request_is_short_and_skips_what_is_restated() {
+        let text = request(None)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for kept in [
+            "about 1,000 tokens",
+            "the user's requirements and corrections",
+            "decisions made, with why",
+            "what is done",
+            "what is left",
+            "`recall` fetches exact tool output and errors",
+            "`## For future sessions`",
+        ] {
+            assert!(text.contains(kept), "{kept}");
+        }
+        // Restated after the fold anyway, so not asked for again.
+        assert!(text.contains(
+            "the goal, the plan, your session notes, what was remembered, and the instructions"
+        ));
+        assert!(!text.contains("files touched"), "{text}");
+        assert!(REQUEST.len() < 2_000, "{}", REQUEST.len());
+    }
+
+    #[test]
+    fn a_fold_says_where_the_earlier_turns_went() {
+        let mut history = Vec::new();
+        turn(&mut history, "one", 1);
+        turn(&mut history, "two", 1);
+        let saved = fold(&history, "s", true).unwrap();
+        let text = saved[2]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(saved[2]["role"], "developer");
+        assert!(text.contains("`recall` searches them"), "{text}");
+        assert!(text.contains("exact tool outputs and errors"), "{text}");
+        let unsaved = fold(&history, "s", false).unwrap();
+        let text = unsaved[2]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("are gone: this session is not saved"),
+            "{text}"
+        );
+        assert!(!text.contains("`recall` searches"), "{text}");
+        assert_eq!(saved.len(), unsaved.len());
+        // A server compaction stands in for the turns without a summary to follow.
+        let item = json!({"type": "compaction", "encrypted_content": "opaque"});
+        let installed = install(&history, item, u64::MAX, &ByteEstimate);
+        assert!(!installed.contains(&pointer(true)));
+    }
+
+    /// A history whose first output is `text`, old enough to be evicted.
+    fn evicted_output(text: &str) -> String {
+        let mut history = vec![call(0), output(0, text)];
+        turn(&mut history, "next", KEEP_RESULTS);
+        evict(&mut history, &ByteEstimate, true);
+        let placeholder = history[1]["output"].as_str().unwrap().to_string();
+        assert!(evicted(&placeholder), "{placeholder}");
+        placeholder
+    }
+
+    #[test]
+    fn a_command_placeholder_keeps_how_it_ended_and_its_first_failure() {
+        let failed = format!(
+            "exit code: 101\n   Compiling a v0.1.0\nwarning: unused\n\
+error[E0425]: cannot find value `x` in this scope\nerror: aborting\n{}\n[output: 9 lines, 3.2s]",
+            "x".repeat(400)
+        );
+        let text = evicted_output(&failed);
+        let digest =
+            "failed, exit 101; first failure: error[E0425]: cannot find value `x` in this scope";
+        assert_eq!(
+            text,
+            format!(
+                "[output of c0 removed from context ({} bytes); {digest}; recall {{\"call_id\":\"c0\"}} returns it]",
+                failed.len()
+            )
+        );
+        // A success, or one still running, says only that.
+        let ok = format!(
+            "exit code: 0\nerror: this is just output\n{}",
+            "x".repeat(400)
+        );
+        assert!(evicted_output(&ok).contains("bytes); succeeded; recall"));
+        let running = format!("Process running with session ID 3\n{}", "x".repeat(400));
+        assert!(evicted_output(&running).contains("; still running as session 3; recall"));
+    }
+
+    #[test]
+    fn a_spilled_command_placeholder_keeps_its_file_and_stays_capped() {
+        let path = "/w/.bhai/sessions/s/scratch/output/bash-20261127-101010-42-1.log";
+        let spilled = format!(
+            "exit code: 1\nThe output was 90000 bytes over 2000 lines, too long to show here. \
+All of it is saved in {path}. In bash it is $BHAI_SCRATCH_DIR/output/bash-1.log.\n\n\
+Lines that look like failures, outside those shown below, 1 of 1:\n\
+700: error: {}\n\nFirst lines:\n1: a\n[output: 2000 lines, 9.0s]",
+            "y".repeat(300)
+        );
+        let text = evicted_output(&spilled);
+        let digest = text
+            .split_once("bytes); ")
+            .unwrap()
+            .1
+            .split_once("; recall ")
+            .unwrap()
+            .0;
+        assert!(
+            digest.starts_with("failed, exit 1; first failure: 700: error: yyy"),
+            "{digest}"
+        );
+        assert!(
+            digest.ends_with(&format!("...; saved in {path}")),
+            "{digest}"
+        );
+        assert!(digest.len() <= DIGEST, "{}", digest.len());
+        // Not the heading over the failure lines, which reads like one itself.
+        assert!(!digest.contains("Lines that look"), "{digest}");
+        // Unsaved, the digest stays and only the way back changes.
+        let mut history = vec![call(0), output(0, &spilled)];
+        turn(&mut history, "next", KEEP_RESULTS);
+        evict(&mut history, &ByteEstimate, false);
+        let unsaved = history[1]["output"].as_str().unwrap();
+        assert!(unsaved.contains(digest), "{unsaved}");
+        assert!(unsaved.ends_with("this session is not saved, so it cannot be recovered]"));
+        assert!(evicted(unsaved));
+    }
+
+    #[test]
+    fn read_and_search_placeholders_have_no_digest() {
+        let read = format!(
+            "1\tfn main() {{\n2\t    panic!(\"error\");\n{}",
+            "x".repeat(400)
+        );
+        let search = format!("src/a.rs:3: error handling\n{}", "x".repeat(400));
+        for text in [read, search] {
+            assert_eq!(
+                evicted_output(&text),
+                format!(
+                    "[output of c0 removed from context ({} bytes); recall {{\"call_id\":\"c0\"}} returns it]",
+                    text.len()
+                )
+            );
         }
     }
 
@@ -922,22 +1136,31 @@ mod tests {
         turn(&mut history, "one", 1);
         turn(&mut history, "two", 2);
         turn(&mut history, "three", 1);
-        let folded = fold(&history, " did things \n").unwrap();
+        let folded = fold(&history, " did things \n", true).unwrap();
         assert_eq!(folded[0], history[0]);
         assert_eq!(
             folded[1]["content"][0]["text"],
             "Summary of earlier conversation:\ndid things"
         );
+        assert_eq!(folded[2], pointer(true));
         let last = history.len() - 5;
-        assert_eq!(folded[2], user_message("three"));
-        assert_eq!(&folded[2..], &history[last..]);
+        assert_eq!(folded[3], user_message("three"));
+        assert_eq!(&folded[3..], &history[last..]);
 
-        let dropped = fold(&history, UNSUMMARISED).unwrap();
-        assert_eq!(&dropped[2..], &history[last..]);
+        let dropped = fold(&history, UNSUMMARISED, true).unwrap();
+        assert_eq!(&dropped[3..], &history[last..]);
+        // Folding a folded history again keeps one pointer, after the new summary.
+        let mut again = folded;
+        turn(&mut again, "four", 1);
+        let twice = fold(&again, "more", true).unwrap();
+        let pointers: Vec<usize> = (0..twice.len())
+            .filter(|&i| twice[i] == pointer(true))
+            .collect();
+        assert_eq!(pointers, [2]);
 
         // A single turn has nothing earlier to fold.
-        assert_eq!(fold(&history[..5], "s"), None);
-        assert_eq!(fold(&[], "s"), None);
+        assert_eq!(fold(&history[..5], "s", true), None);
+        assert_eq!(fold(&[], "s", true), None);
     }
 
     #[test]
@@ -992,7 +1215,7 @@ mod tests {
         turn(&mut history, "two", 1);
         history.extend(update(&history, &env("2026-10-03")));
         turn(&mut history, "three", 1);
-        let folded = fold(&history, "s").unwrap();
+        let folded = fold(&history, "s", true).unwrap();
         // One whole item in front, as current as the last diff, and nothing left to send.
         assert_eq!(folded[0], update(&[], &env("2026-10-03")).unwrap());
         assert_eq!(folded[0], restated(&history).unwrap());
@@ -1018,7 +1241,7 @@ mod tests {
                 .to_string()
                 .contains("retrievable check: offline inspection passed")
         );
-        let folded = fold(&history, "summary").unwrap();
+        let folded = fold(&history, "summary", true).unwrap();
         let installed = install(
             &history,
             json!({"type": "compaction", "encrypted_content": "opaque"}),
@@ -1050,7 +1273,7 @@ mod tests {
         goal.note.clear();
         history.push(lifecycle(&history, Some(&goal)).unwrap());
         let expected = restated_lifecycle(&history).unwrap();
-        let folded = fold(&history, "the goal was resumed").unwrap();
+        let folded = fold(&history, "the goal was resumed", true).unwrap();
         let installed = install(
             &history,
             json!({"type": "compaction", "encrypted_content": "opaque"}),
@@ -1091,7 +1314,7 @@ mod tests {
             .push("compare state_4 outputs".to_string());
         history.extend(context(&history, Some(&goal)));
         let expected = crate::goal::restated(&history).unwrap();
-        let folded = fold(&history, "summary omitted all goal details").unwrap();
+        let folded = fold(&history, "summary omitted all goal details", true).unwrap();
         let installed = install(
             &history,
             json!({"type": "compaction", "encrypted_content": "opaque"}),
@@ -1166,7 +1389,7 @@ mod tests {
         assert!(evicted(output.unwrap()["output"].as_str().unwrap()));
         let item = json!({"type": "compaction", "encrypted_content": "opaque"});
         for kept in [
-            fold(&history, "s").unwrap(),
+            fold(&history, "s", true).unwrap(),
             install(&history, item, 0, &ByteEstimate),
         ] {
             let restated: Vec<&Value> = kept.iter().filter(|i| is_context(i)).collect();
@@ -1196,7 +1419,7 @@ mod tests {
         turn(&mut history, "three", 1);
         let item = json!({"type": "compaction", "encrypted_content": "opaque"});
         for kept in [
-            fold(&history, "s").unwrap(),
+            fold(&history, "s", true).unwrap(),
             install(&history, item, u64::MAX, &ByteEstimate),
         ] {
             assert_eq!(

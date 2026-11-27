@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 use super::{BoxFuture, Live, Tool, string_arg, truncate};
 use crate::sandbox::Sandbox;
 
-mod spill;
+pub(crate) mod spill;
 
 pub const NAME: &str = "bash";
 

@@ -29,6 +29,10 @@ const FAILURE_LINES: usize = 10;
 const FAILURE_BYTES: usize = 1200;
 /// Characters of one line shown.
 const LINE_CHARS: usize = 200;
+/// What comes before the file's path in a summary, which [`saved`] reads it back from.
+const SAVED_IN: &str = "All of it is saved in ";
+/// What the heading over the failure lines starts with, a line that itself looks like one.
+pub(crate) const FAILURES: &str = "Lines that look like failures";
 
 /// One command's output as it is saved: held in memory until it passes [`SPILL_AT`],
 /// then written to a file, which every later byte goes to up to [`FILE_CAP`].
@@ -223,8 +227,7 @@ impl Portion {
         let (head, failures, failed) = self.scan(tail_from);
         let name = self.path.file_name().unwrap_or_default().to_string_lossy();
         let mut out = format!(
-            "The output was {} bytes over {} lines, too long to show here. All of it is \
-saved in {}",
+            "The output was {} bytes over {} lines, too long to show here. {SAVED_IN}{}",
             self.end - self.start,
             last + 1 - self.first.min(last + 1),
             self.path.display(),
@@ -259,7 +262,7 @@ range of its lines and `rg -n PATTERN` searches it. The read tool reads it by li
         if failed > 0 {
             let _ = write!(
                 out,
-                "\nLines that look like failures, outside those shown below, {} of {failed}:\n",
+                "\n{FAILURES}, outside those shown below, {} of {failed}:\n",
                 failures.len()
             );
             push_lines(&mut out, &failures);
@@ -366,10 +369,17 @@ fn clip(line: &str) -> String {
     }
 }
 
+/// The file a result's summary says the output is saved in, if it has one.
+pub(crate) fn saved(result: &str) -> Option<&str> {
+    let (_, rest) = result.split_once(SAVED_IN)?;
+    let end = rest.find(".log")? + ".log".len();
+    Some(&rest[..end])
+}
+
 /// Whether `line` reads as reporting a failure: a word such as `error`, `FAILED`,
 /// `panicked` or `Traceback`, or one ending `Error` or `Exception`, that a `0` or `no`
 /// does not come right before. Words keep their `-` and `_`, so `error-chain` is a name.
-pub(super) fn looks_failed(line: &str) -> bool {
+pub(crate) fn looks_failed(line: &str) -> bool {
     let mut previous = String::new();
     let words = line
         .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
@@ -438,6 +448,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&portion.path).unwrap(), text);
         let result = portion.render();
         let path = portion.path.display().to_string();
+        assert_eq!(saved(&result), Some(path.as_str()));
         let name = portion
             .path
             .file_name()

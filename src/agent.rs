@@ -1504,6 +1504,7 @@ pub(crate) async fn run_configured(
                 asked: None,
                 plan: plan.get(),
                 candidates: writer.as_ref().map(Writer::candidates_path),
+                saved: writer.is_some() && !crate::privacy::active(),
             };
             match pass.fork(&history).await {
                 Ok(Some(made)) => {
@@ -1531,17 +1532,18 @@ pub(crate) async fn run_configured(
                     let _ = tx.send(AgentEvent::Fork(None));
                     let before = compact::estimate(&history, tokenizer);
                     let after = compact::estimate(&made.history, tokenizer);
+                    let length = tokenizer.count(&made.summary) as u64;
                     history = made.history;
                     model.reset("compaction: fork");
                     (calls, monitor) = (Vec::new(), CacheMonitor::default());
                     if let Some(writer) = &mut writer
-                        && let Err(e) = writer.compact("fork", before, after, &history)
+                        && let Err(e) = writer.summarised("fork", before, after, length, &history)
                     {
                         let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
                     }
                     let _ = tx.send(AgentEvent::Compacted {
                         notice: format!(
-                            "continuing from the compacted copy: ~{before} -> ~{after} tokens"
+                            "continuing from the compacted copy (a ~{length}-token summary): ~{before} -> ~{after} tokens"
                         ),
                         summary: Some(made.summary),
                         freed: before.saturating_sub(after),
@@ -1573,6 +1575,7 @@ pub(crate) async fn run_configured(
                 asked: asked.take(),
                 plan: plan.get(),
                 candidates: sink.candidates(),
+                saved: sink.saved(),
             };
             if let Err(e) = pass.run(&mut history, Trigger::Asked, &mut sink).await {
                 let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
@@ -1933,6 +1936,7 @@ pub(crate) async fn run_configured(
                 asked: asked.take(),
                 plan: plan.get(),
                 candidates: sink.candidates(),
+                saved: sink.saved(),
             };
             let trigger = match size {
                 _ if overflowed => Trigger::Overflow,
@@ -2658,6 +2662,7 @@ async fn turn(
                 asked,
                 plan: goal_context.and_then(|context| context.plan.get()),
                 candidates: sink.candidates(),
+                saved: sink.saved(),
             };
             if let Err(e) = pass.run(history, Trigger::Asked, sink).await {
                 let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
@@ -3141,6 +3146,8 @@ struct Compaction<'a> {
     /// Where the facts a summary proposes for the project's memory go, for a saved
     /// session's own history.
     candidates: Option<PathBuf>,
+    /// Whether a record keeps the folded turns for `recall`.
+    saved: bool,
 }
 
 impl Compaction<'_> {
@@ -3171,7 +3178,7 @@ impl Compaction<'_> {
             }
             Trigger::Asked => {}
         }
-        if compact::fold(&next, "").is_none() {
+        if compact::fold(&next, "", self.saved).is_none() {
             if next != *history {
                 self.commit(before, before, next, Compacted::Evicted, history, sink);
                 return Ok(true);
@@ -3212,9 +3219,8 @@ impl Compaction<'_> {
         };
         match summary {
             Ok(summary) => {
-                let folded =
-                    compact::fold(&next, &crate::plan::restated(&summary, self.plan.as_ref()))
-                        .expect("checked above");
+                let restated = crate::plan::restated(&summary, self.plan.as_ref());
+                let folded = compact::fold(&next, &restated, self.saved).expect("checked above");
                 let summary = Compacted::Summarised(summary);
                 self.commit(before, read, folded, summary, history, sink);
                 Ok(true)
@@ -3223,7 +3229,8 @@ impl Compaction<'_> {
             // go without a summary. Only for an overflow: a transient failure keeps them.
             Err(e) if crate::client::context_overflow(&e) => {
                 let unsummarised = crate::plan::restated(compact::UNSUMMARISED, self.plan.as_ref());
-                let mut folded = compact::fold(&next, &unsummarised).expect("checked above");
+                let mut folded =
+                    compact::fold(&next, &unsummarised, self.saved).expect("checked above");
                 compact::evict(&mut folded, tokenizer, sink.saved());
                 self.commit(before, read, folded, Compacted::Dropped, history, sink);
                 Ok(true)
@@ -3240,13 +3247,14 @@ impl Compaction<'_> {
     /// A compacted copy of `history`, which is left as it is. `None` when there is no
     /// earlier turn to fold.
     async fn fork(&self, history: &[Value]) -> anyhow::Result<Option<Fork>> {
-        if compact::fold(history, "").is_none() {
+        if compact::fold(history, "", self.saved).is_none() {
             return Ok(None);
         }
         let summary = self.summarize(history).await?;
         let folded = compact::fold(
             history,
             &crate::plan::restated(&summary, self.plan.as_ref()),
+            self.saved,
         )
         .expect("checked above");
         Ok(Some(Fork {
@@ -3354,6 +3362,7 @@ impl Compaction<'_> {
         history: &mut Vec<Value>,
         sink: &mut Sink<'_>,
     ) {
+        let tokenizer = tokens::for_model(self.model.name());
         let (stage, what, summary) = match how {
             Compacted::Summarised(summary) => {
                 ("summary", "summarised earlier turns", Some(summary))
@@ -3366,16 +3375,25 @@ impl Compaction<'_> {
                 None,
             ),
         };
-        let after = compact::estimate(&next, tokens::for_model(self.model.name()));
+        let after = compact::estimate(&next, tokenizer);
+        let length = summary.as_deref().map(|s| tokenizer.count(s) as u64);
         self.model.reset(&format!("compaction: {stage}"));
         *history = next;
-        if let Sink::Session(writer) = sink
-            && let Err(e) = writer.compact(stage, before, after, history)
-        {
-            let _ = self
-                .tx
-                .send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+        if let Sink::Session(writer) = sink {
+            let written = match length {
+                Some(length) => writer.summarised(stage, before, after, length, history),
+                None => writer.compact(stage, before, after, history),
+            };
+            if let Err(e) = written {
+                let _ = self
+                    .tx
+                    .send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+            }
         }
+        let what = match length {
+            Some(length) => format!("{what}, a ~{length}-token summary"),
+            None => what.to_string(),
+        };
         let _ = self.tx.send(AgentEvent::Compacted {
             notice: format!("compacted history ({what}): ~{before} -> ~{after} tokens"),
             summary,
@@ -10339,7 +10357,13 @@ mod tests {
         // history now carries comes with the notice.
         let events = drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
         let (notice, summary) = compacted(&events)[0].clone();
-        assert!(notice.contains("summarised earlier turns"));
+        let length = tokens::for_model(fake.name()).count("the summary");
+        assert!(
+            notice.contains(&format!(
+                "summarised earlier turns, a ~{length}-token summary"
+            )),
+            "{notice}"
+        );
         assert_eq!(summary.as_deref(), Some("the summary"));
         drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
 
@@ -10394,6 +10418,7 @@ mod tests {
                 input[0].clone(),
                 untimed(&input[1..2])[0].clone(),
                 summary,
+                compact::pointer(true),
                 text("second"),
                 say("two"),
                 text("third")
@@ -10413,8 +10438,35 @@ mod tests {
                 input[0].clone(),
                 untimed(&input[1..2])[0].clone(),
                 summary,
+                compact::pointer(true),
                 text("third"),
                 say("three")
+            ]
+        );
+        // The record says how long each summary was; an eviction has no summary.
+        let records = std::fs::read_to_string(sessions::path(&dir, "sess")).unwrap();
+        let stages: Vec<(String, Option<u64>)> = records
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| record["type"] == "compaction")
+            .map(|record| {
+                let stage = record["stage"].as_str().unwrap().to_string();
+                (stage, record["summary_tokens"].as_u64())
+            })
+            .collect();
+        let tokenizer = tokens::for_model(fake.name());
+        assert_eq!(
+            stages,
+            [
+                ("evict".to_string(), None),
+                (
+                    "summary".to_string(),
+                    Some(tokenizer.count("the summary") as u64)
+                ),
+                (
+                    "summary".to_string(),
+                    Some(tokenizer.count("summary two") as u64)
+                ),
             ]
         );
         assert!(loaded.warnings.is_empty());
@@ -10447,7 +10499,7 @@ mod tests {
         assert_eq!(*fake.breaks.lock().unwrap(), []);
         let input = fake.bodies.lock().unwrap()[0].1["input"].clone();
         assert_eq!(
-            &input.as_array().unwrap()[..5],
+            &input.as_array().unwrap()[..6],
             tools::timed_input(&loaded.items).as_slice()
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -10540,8 +10592,9 @@ mod tests {
             third[2]["content"][0]["text"],
             "Summary of earlier conversation:\nthe summary"
         );
-        assert_eq!(third.len(), 6);
-        assert_eq!(third[5]["content"][0]["text"], "third");
+        assert_eq!(third[3], compact::pointer(false));
+        assert_eq!(third.len(), 7);
+        assert_eq!(third[6]["content"][0]["text"], "third");
     }
 
     #[tokio::test(start_paused = true)]
@@ -10650,6 +10703,7 @@ mod tests {
                 sent[0][0].clone(),
                 compact::user_message("one"),
                 summary,
+                compact::pointer(false),
                 compact::user_message("two")
             ]
         );
@@ -10718,6 +10772,7 @@ mod tests {
                 sent[0][0].clone(),
                 compact::user_message("one"),
                 compact::user_message(&dropped),
+                compact::pointer(false),
                 compact::user_message("two")
             ]
         );
@@ -10862,7 +10917,7 @@ mod tests {
             input[2]["content"][0]["text"],
             "Summary of earlier conversation:\nshort"
         );
-        assert_eq!(input.len(), 6);
+        assert_eq!(input.len(), 7);
         // What the user asked for rode along with the request for the summary.
         let request = bodies[2].1["input"].as_array().unwrap().last().unwrap();
         let text = request["content"][0]["text"].as_str().unwrap();
@@ -11588,6 +11643,7 @@ mod tests {
             asked: None,
             plan,
             candidates: None,
+            saved: false,
         };
         let history = vec![compact::user_message("first")];
         let installed = pass.install(&history, compaction());

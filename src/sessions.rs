@@ -174,6 +174,17 @@ pub struct Writer {
     pub last_written: Option<std::time::SystemTime>,
 }
 
+/// The record of a compaction whose `items` replace the history so far.
+fn compaction(stage: &str, before: u64, after: u64, items: &[Value]) -> Value {
+    json!({
+        "type": "compaction",
+        "stage": stage,
+        "before": before,
+        "after": after,
+        "items": items,
+    })
+}
+
 impl Writer {
     pub fn create(dir: &Path, header: Header) -> Self {
         Self {
@@ -364,13 +375,22 @@ impl Writer {
 
     /// Record a compaction: `items` replace the history so far on load.
     pub fn compact(&mut self, stage: &str, before: u64, after: u64, items: &[Value]) -> Result<()> {
-        self.write(json!({
-            "type": "compaction",
-            "stage": stage,
-            "before": before,
-            "after": after,
-            "items": items,
-        }))
+        self.write(compaction(stage, before, after, items))
+    }
+
+    /// Record a compaction that folded the earlier turns into a summary of `summary`
+    /// tokens.
+    pub fn summarised(
+        &mut self,
+        stage: &str,
+        before: u64,
+        after: u64,
+        summary: u64,
+        items: &[Value],
+    ) -> Result<()> {
+        let mut record = compaction(stage, before, after, items);
+        record["summary_tokens"] = json!(summary);
+        self.write(record)
     }
 
     /// Copy `items` and `plan` into a new session file beside this one, on the same
