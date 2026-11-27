@@ -886,6 +886,14 @@ impl<'a> From<Option<&'a Path>> for Sink<'a> {
     }
 }
 
+impl Sink<'_> {
+    /// Whether what is written here stays for `recall` to read back. Private mode writes
+    /// nothing whatever the sink.
+    fn saved(&self) -> bool {
+        !matches!(self, Sink::Discard) && !crate::privacy::active()
+    }
+}
+
 /// `usage_log` is the JSONL file each model call's usage is appended to, if any.
 /// `saved` persists the session and holds the history it resumes from. `limits` say
 /// when history is compacted. `judge` decides the calls `auto` mode would prompt for,
@@ -1163,6 +1171,17 @@ pub(crate) async fn run_configured(
     }
     let mut calls: Vec<Call> = Vec::new();
     let mut monitor = CacheMonitor::default();
+    // A resumed conversation's cache may have lapsed long before this process started,
+    // and its first call then evicts as one in this process would.
+    if let Some(at) = writer.as_ref().and_then(|w| w.last_written)
+        && !history.is_empty()
+    {
+        let idle = std::time::SystemTime::now()
+            .duration_since(at)
+            .unwrap_or_default();
+        let input = prompt_tokens(model.name(), &prompt.text, &tools, &history);
+        monitor.resumed(idle, input, Instant::now());
+    }
 
     let mut compact_next = false;
     // The turn the backend refused as too long runs again on the compacted history, once.
@@ -1373,7 +1392,7 @@ pub(crate) async fn run_configured(
                                     // model reads a cache of its own that is cold.
                                     (calls, monitor) = (Vec::new(), CacheMonitor::default());
                                 } else {
-                                    monitor.forget();
+                                    monitor.effort_change();
                                 }
                                 // Recorded, so a resume comes back on this model rather
                                 // than the one the session opened on.
@@ -2717,8 +2736,9 @@ async fn in_turn(
 }
 
 /// Evict old tool outputs in place before the next call when the last call read past the
-/// trigger, so a long turn does not reach the window before it ends, or when the cache
-/// has lapsed above `COLD_FLOOR`, since that call resends everything uncached anyway.
+/// trigger, so a long turn does not reach the window before it ends, or above
+/// `COLD_FLOOR` when the call misses the cache anyway: the cache has lapsed, or the
+/// effort changed on a model that caches per effort.
 /// Every call in `history` has its output here, and only outputs and call arguments
 /// change, so no pair is split; folding waits for the turn's end.
 #[allow(clippy::too_many_arguments)]
@@ -2732,15 +2752,26 @@ fn evict_between_steps(
     tx: &mpsc::UnboundedSender<AgentEvent>,
     now: Instant,
 ) {
-    let Some(size) = ledger.last().map(|call| call.usage.input) else {
+    let Some(size) = ledger
+        .last()
+        .map(|call| call.usage.input)
+        .or(monitor.resumed_input())
+    else {
         return;
     };
     let name = model.name();
     let floor = compact::COLD_FLOOR * limits.window(name) as f64;
     // Ollama keeps no cache with a lifetime to lapse.
+    let missed = model.reports_cache() && size as f64 > floor;
     let (stage, reason, when) = if limits.over(name, size) {
         ("evict", "compaction: evict mid-turn", "mid-turn")
-    } else if model.reports_cache() && monitor.cold(now) && size as f64 > floor {
+    } else if missed && monitor.effort_changed() {
+        (
+            "evict effort",
+            "compaction: evict on an effort change",
+            "on an effort change",
+        )
+    } else if missed && monitor.cold(now) {
         (
             "evict cold",
             "compaction: evict on a cold cache",
@@ -2751,7 +2782,7 @@ fn evict_between_steps(
     };
     let tokenizer = tokens::for_model(name);
     let before = compact::estimate(history, tokenizer);
-    if compact::evict(history, tokenizer) == 0 {
+    if compact::evict(history, tokenizer, sink.saved()) == 0 {
         return;
     }
     let after = compact::estimate(history, tokenizer);
@@ -3070,7 +3101,7 @@ impl Compaction<'_> {
         match trigger {
             Trigger::Size(size) => {
                 let excess = size.saturating_sub(self.limits.target(name));
-                if compact::evict(&mut next, tokenizer) >= excess {
+                if compact::evict(&mut next, tokenizer, sink.saved()) >= excess {
                     self.commit(before, before, next, Compacted::Evicted, history, sink);
                     return Ok(true);
                 }
@@ -3078,7 +3109,7 @@ impl Compaction<'_> {
             // A refused request reports no size, and the window it overflowed may not be
             // the one assumed, so every old output goes.
             Trigger::Overflow => {
-                compact::evict(&mut next, tokenizer);
+                compact::evict(&mut next, tokenizer, sink.saved());
             }
             Trigger::Asked => {}
         }
@@ -3135,7 +3166,7 @@ impl Compaction<'_> {
             Err(e) if crate::client::context_overflow(&e) => {
                 let unsummarised = crate::plan::restated(compact::UNSUMMARISED, self.plan.as_ref());
                 let mut folded = compact::fold(&next, &unsummarised).expect("checked above");
-                compact::evict(&mut folded, tokenizer);
+                compact::evict(&mut folded, tokenizer, sink.saved());
                 self.commit(before, read, folded, Compacted::Dropped, history, sink);
                 Ok(true)
             }
@@ -9907,8 +9938,236 @@ mod tests {
         assert!(text.contains(r#""stage":"evict cold""#), "{text}");
         let mut loaded = sessions::load(&path).unwrap().items;
         assert_eq!(loaded, history);
-        assert_eq!(compact::evict(&mut loaded, tokens::for_model("fake")), 0);
+        assert_eq!(
+            compact::evict(&mut loaded, tokens::for_model("fake"), true),
+            0
+        );
+
+        // With nothing saved, or in private mode, recall has no original to return.
+        let unsaved = |history: &[Value]| {
+            let first = history[2]["output"].as_str().unwrap().to_string();
+            assert!(compact::evicted(&first), "{first}");
+            assert!(first.ends_with("this session is not saved, so it cannot be recovered]"));
+        };
+        let (evicted, history) = evicts(&fake, 5_000, lapsed, &mut Sink::Discard);
+        assert!(evicted);
+        unsaved(&history);
+        let mut writer =
+            Writer::create(&dir, Header::new("priv", "general", "fake", "medium", &dir));
+        let privacy = crate::privacy::Privacy::default();
+        privacy.begin();
+        let state = std::cell::RefCell::new(Arc::new(privacy));
+        let (evicted, history) = crate::privacy::CURRENT.sync_scope(state, || {
+            evicts(&fake, 5_000, lapsed, &mut Sink::Session(&mut writer))
+        });
+        assert!(evicted);
+        unsaved(&history);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_effort_change_evicts_before_the_next_call_only_on_a_model_that_misses() {
+        use fake::{Fake, call, say};
+
+        for (model, misses) in [("fake", true), ("gpt-6-sol", false)] {
+            let dir = tools::temp_dir();
+            let printf = || call("bash", json!({"command": "printf '%0400d' 0"}));
+            let mut script: Vec<Vec<Value>> = (0..8).map(|_| vec![printf()]).collect();
+            script.push(vec![say("done")]);
+            script.push(vec![say("two")]);
+            let mut fake = Fake::new(script).with_usage(Usage {
+                input: 500,
+                ..Usage::default()
+            });
+            fake.model = model.to_string();
+            // Over the floor of 300 and under the trigger of 800.
+            let limits = Limits {
+                window: Some(1000),
+                ..Limits::default()
+            };
+            let policy = Policy::new(Mode::Bypass, Default::default(), None, dir.clone());
+            let cancel = Arc::new(Cancel::default());
+            let (tx_user, rx_user) = mpsc::channel(1);
+            let (tx_control, rx_control) = mpsc::channel(1);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            tokio::spawn(run_with(
+                Arc::new(fake.clone()),
+                "sess".to_string(),
+                crate::prompt::system_prompt(&[], Vec::new()),
+                Arc::new(policy),
+                None,
+                None,
+                rx_user,
+                None,
+                rx_control,
+                tx,
+                Arc::clone(&cancel),
+                None,
+                None,
+                None,
+                limits,
+            ));
+            let events = drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Compacted { .. })),
+                "{model}"
+            );
+            tx_control
+                .send(Control::Model {
+                    model: model.to_string(),
+                    effort: "low".to_string(),
+                    window: None,
+                })
+                .await
+                .unwrap();
+            let events = drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+            let notices: Vec<&String> = events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Compacted { notice, .. } => Some(notice),
+                    _ => None,
+                })
+                .collect();
+            let reasons: Vec<String> = fake
+                .resets
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, _, reason)| reason.clone())
+                .collect();
+            let bodies = fake.bodies.lock().unwrap();
+            let evicted = bodies.last().unwrap().1["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|i| i["output"].as_str().is_some_and(compact::evicted))
+                .count();
+            match misses {
+                true => {
+                    assert_eq!(notices.len(), 1, "{notices:?}");
+                    assert!(notices[0].starts_with("compacted history on an effort change"));
+                    assert_eq!(
+                        reasons,
+                        [
+                            "the effort changed",
+                            "compaction: evict on an effort change"
+                        ]
+                    );
+                    assert_eq!(evicted, 2);
+                }
+                // GPT-6 takes the change as an update that keeps the prefix.
+                false => {
+                    assert!(notices.is_empty(), "{notices:?}");
+                    assert!(reasons.is_empty(), "{reasons:?}");
+                    assert_eq!(evicted, 0);
+                }
+            }
+            cancel.stop();
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_evicts_before_its_first_call_once_its_cache_has_lapsed() {
+        use crate::sessions::{self, Header};
+        use fake::{Fake, say};
+        use std::time::{Duration, SystemTime};
+
+        let minute = Duration::from_secs(60);
+        for (idle, lapsed) in [(cache::CACHE_TTL + minute, true), (minute, false)] {
+            let dir = tools::temp_dir();
+            let mut writer =
+                Writer::create(&dir, Header::new("sess", "general", "fake", "medium", &dir));
+            writer.append(&compact::user_message("go")).unwrap();
+            for id in 0..10 {
+                writer
+                    .append(
+                        &json!({"type": "function_call", "call_id": format!("c{id}"),
+                        "name": "bash", "arguments": "{}"}),
+                    )
+                    .unwrap();
+                writer
+                    .append(&json!({"type": "function_call_output",
+                        "call_id": format!("c{id}"), "output": "o".repeat(40_000)}))
+                    .unwrap();
+            }
+            writer.append(&say("done")).unwrap();
+            drop(writer);
+            let path = sessions::path(&dir, "sess");
+            let loaded = sessions::load(&path).unwrap();
+            let mut writer = Writer::resume(&dir, &loaded).unwrap();
+            writer.last_written = Some(SystemTime::now() - idle);
+            let saved = Saved {
+                writer,
+                history: loaded.items,
+            };
+            // About 100k tokens of outputs: over the floor of 60k, under the trigger of 160k.
+            let limits = Limits {
+                window: Some(200_000),
+                ..Limits::default()
+            };
+            let fake = Fake::new(vec![vec![say("again")]]);
+            let cancel = Arc::new(Cancel::default());
+            let (tx_user, rx_user) = mpsc::channel(1);
+            let (_tx_control, rx_control) = mpsc::channel(1);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            tokio::spawn(run_with(
+                Arc::new(fake.clone()),
+                "sess".to_string(),
+                crate::prompt::system_prompt(&[], Vec::new()),
+                Arc::new(Policy::default()),
+                None,
+                None,
+                rx_user,
+                None,
+                rx_control,
+                tx,
+                Arc::clone(&cancel),
+                None,
+                None,
+                Some(saved),
+                limits,
+            ));
+            let events = drive(&tx_user, &mut rx, &cancel, "again", &[]).await;
+            let notices = events
+                .iter()
+                .filter(|e| {
+                    matches!(e, AgentEvent::Compacted { notice, .. }
+                    if notice.starts_with("compacted history on a cold cache"))
+                })
+                .count();
+            let bodies = fake.bodies.lock().unwrap();
+            let evicted = bodies[0].1["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|i| i["output"].as_str().is_some_and(compact::evicted))
+                .count();
+            let text = std::fs::read_to_string(&path).unwrap();
+            match lapsed {
+                true => {
+                    assert_eq!(notices, 1, "{events:?}");
+                    assert_eq!(evicted, 4);
+                    assert!(text.contains(r#""stage":"evict cold""#));
+                    assert!(
+                        fake.resets
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(_, _, r)| r == "compaction: evict on a cold cache")
+                    );
+                }
+                false => {
+                    assert_eq!(notices, 0, "{events:?}");
+                    assert_eq!(evicted, 0);
+                    assert!(!text.contains(r#""stage":"evict"#));
+                }
+            }
+            cancel.stop();
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[tokio::test]

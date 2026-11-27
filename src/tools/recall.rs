@@ -21,6 +21,7 @@ const MAX_TERMS: usize = 24;
 /// Bytes of an item's text one fetch returns.
 const PAGE: usize = 16_000;
 /// Bytes of a call's arguments shown beside its output, and of its one-line summary.
+/// Longer arguments are what a fetch pages instead, when the output fits beside them.
 const ARGUMENTS: usize = 1024;
 const SUMMARY: usize = 160;
 /// What a reply stays under, so `truncate` never cuts it in half.
@@ -102,7 +103,8 @@ impl Tool for Recall {
                     },
                     "call_id": {
                         "type": "string",
-                        "description": "A tool call's id: returns its call and full output."
+                        "description": "A tool call's id: returns its call and full output, or its full \
+        arguments when they are long and the output short."
                     },
                     "item": {
                         "type": "integer",
@@ -480,10 +482,28 @@ fn fetch_call(
                 head.insert("tool".into(), json!(name));
                 head.insert("call".into(), json!(line));
             }
+            if arguments.len() > ARGUMENTS {
+                head.insert("item".into(), json!(position));
+                head.insert("kind".into(), json!("call"));
+                head.insert("output".into(), json!("none recorded"));
+                return Ok(page(head, arguments, offset));
+            }
             head.insert("call_item".into(), json!(position));
             head.insert("output".into(), json!("none recorded"));
             arguments_field(&mut head, arguments, *position);
             Ok(serde_json::to_string_pretty(&Value::Object(head)).unwrap_or_default())
+        }
+        // An old edit, write or patch has its body stubbed in the context and a short
+        // output, so the arguments are what is wanted back.
+        (Some((call_position, arguments)), Some((position, item, text)))
+            if arguments.len() > ARGUMENTS && text.len() <= ARGUMENTS =>
+        {
+            head.insert("item".into(), json!(call_position));
+            head.insert("kind".into(), json!("call"));
+            calls.describe(&item, &mut head);
+            head.insert("output_item".into(), json!(position));
+            head.insert("output".into(), json!(text));
+            Ok(page(head, arguments, offset))
         }
         (call, Some((position, item, text))) => {
             head.insert("item".into(), json!(position));
@@ -702,6 +722,47 @@ mod tests {
         // Newest first among equal scores.
         assert_eq!(found["matches"][0]["call_id"], "c59");
         assert!(found["more"].as_str().unwrap().starts_with("30 more"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_stubbed_calls_arguments_come_back_whole_and_paged() {
+        let dir = temp_dir();
+        let body: String = (0..3000).map(|n| format!("line {n} é\n")).collect();
+        assert!(body.len() > PAGE);
+        let arguments = json!({"path": "/w/a.rs", "content": body}).to_string();
+        let mut writer = Writer::create(&dir, Header::new("s3", "general", "gpt-5", "high", &dir));
+        for item in [
+            user("write it"),
+            json!({"type": "function_call", "call_id": "w1", "name": "write", "arguments": arguments}),
+            output("w1", "Wrote /w/a.rs."),
+            json!({"type": "function_call", "call_id": "w2", "name": "write", "arguments": arguments}),
+        ] {
+            writer.append(&item).unwrap();
+        }
+        drop(writer);
+        let recall = Recall::session(&dir, "s3");
+        for (id, output) in [("w1", "Wrote /w/a.rs."), ("w2", "none recorded")] {
+            let mut offset = 0;
+            let mut joined = String::new();
+            for _ in 0..10 {
+                let args = json!({"call_id": id, "offset": offset});
+                let (out, ok) = recall.execute(&args).await;
+                assert!(ok && out.len() <= MAX_OUTPUT, "{out}");
+                let fetched = head(&out);
+                assert_eq!(fetched["kind"], "call");
+                assert_eq!(fetched["tool"], "write");
+                assert_eq!(fetched["output"], output);
+                assert_eq!(fetched["bytes"], arguments.len());
+                let shown = fetched["shown"].as_u64().unwrap() as usize;
+                joined.push_str(&out.split_once(":\n").unwrap().1[..shown]);
+                match fetched["next_offset"].as_u64() {
+                    Some(next) => offset = next as usize,
+                    None => break,
+                }
+            }
+            assert_eq!(joined, arguments);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

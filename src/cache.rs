@@ -190,6 +190,14 @@ pub struct CacheMonitor {
     last_sent: Option<Instant>,
     /// When a call beside the conversation's own, like a summary, last read its prefix.
     read: Option<Instant>,
+    /// A resumed conversation's last call before this process made one: when it was
+    /// resumed and how long the call had been idle by then. Kept as a span, not an
+    /// `Instant` in the past, which may be before the clock's start.
+    resumed: Option<(Instant, Duration)>,
+    /// The input the resumed conversation's next call reads, before a call says.
+    resumed_input: Option<u64>,
+    /// The effort changed on a model that caches per effort, so the next call misses.
+    effort: bool,
     /// Calls finished so far, including the ones too small to judge.
     calls: u64,
     misses: usize,
@@ -200,6 +208,31 @@ impl CacheMonitor {
     pub fn sent(&mut self, found: Option<&CacheBreak>, now: Instant) {
         self.sent = Some((now, found.is_some()));
         self.last_sent = Some(now);
+        self.effort = false;
+    }
+
+    /// Note a conversation resumed at `now` whose last call was `idle` before, and which
+    /// reads about `input` tokens.
+    pub fn resumed(&mut self, idle: Duration, input: u64, now: Instant) {
+        self.resumed = Some((now, idle));
+        self.resumed_input = Some(input);
+    }
+
+    /// The input a resumed conversation reads, until its first call reports one.
+    pub fn resumed_input(&self) -> Option<u64> {
+        self.resumed_input
+    }
+
+    /// The effort changed on a model that caches per effort: the next call misses
+    /// whatever it sends, and is not judged.
+    pub fn effort_change(&mut self) {
+        self.forget();
+        self.effort = true;
+    }
+
+    /// Whether the next call misses because the effort changed.
+    pub fn effort_changed(&self) -> bool {
+        self.effort
     }
 
     /// When the latest call was sent, while what it cached is still the conversation's.
@@ -216,9 +249,13 @@ impl CacheMonitor {
     /// Whether the cache the conversation's calls left has lapsed by `now`, so the next
     /// call misses whatever it sends. False when no call is known to have cached one.
     pub fn cold(&self, now: Instant) -> bool {
-        self.last_sent
-            .max(self.read)
-            .is_some_and(|at| now.saturating_duration_since(at) >= CACHE_TTL)
+        let idle = match self.last_sent.max(self.read) {
+            Some(at) => Some(now.saturating_duration_since(at)),
+            None => self
+                .resumed
+                .map(|(at, idle)| idle + now.saturating_duration_since(at)),
+        };
+        idle.is_some_and(|idle| idle >= CACHE_TTL)
     }
 
     /// Judge a finished call. Only a call sent within the cache lifetime of the previous
@@ -257,6 +294,7 @@ impl CacheMonitor {
         self.previous = None;
         self.last_sent = None;
         self.read = None;
+        self.resumed = None;
     }
 
     /// Whether enough judged calls missed in a row to warn about.
@@ -526,6 +564,36 @@ mod tests {
         assert!(monitor.cold(t + CACHE_TTL + Duration::from_secs(60)));
         monitor.forget();
         assert!(!monitor.cold(t + 2 * CACHE_TTL));
+    }
+
+    #[test]
+    fn a_resumed_conversation_counts_the_idle_time_before_it_was_resumed() {
+        let t = Instant::now();
+        let minute = Duration::from_secs(60);
+        // A week is further back than the clock may reach.
+        let mut monitor = CacheMonitor::default();
+        monitor.resumed(Duration::from_secs(7 * 24 * 3600), 50_000, t);
+        assert!(monitor.cold(t));
+        assert_eq!(monitor.resumed_input(), Some(50_000));
+        let mut monitor = CacheMonitor::default();
+        monitor.resumed(CACHE_TTL - 2 * minute, 50_000, t);
+        assert!(!monitor.cold(t + minute));
+        assert!(monitor.cold(t + 2 * minute));
+        // A call made since is what counts.
+        monitor.sent(None, t + minute);
+        assert!(!monitor.cold(t + 2 * minute));
+    }
+
+    #[test]
+    fn an_effort_change_holds_until_the_next_call() {
+        let t = Instant::now();
+        let mut monitor = CacheMonitor::default();
+        monitor.sent(None, t);
+        monitor.effort_change();
+        assert!(monitor.effort_changed());
+        assert!(monitor.last_sent().is_none(), "the next call is not judged");
+        monitor.sent(None, t);
+        assert!(!monitor.effort_changed());
     }
 
     #[test]

@@ -167,6 +167,9 @@ pub struct Writer {
     pub plan: Option<crate::plan::Plan>,
     /// Source-backed judge authorization, saved independently of history compaction.
     pub authorization: Option<crate::judge::authorization::Memory>,
+    /// For a resumed session, when it last recorded an item, which is about when its
+    /// last call went out.
+    pub last_written: Option<std::time::SystemTime>,
 }
 
 impl Writer {
@@ -180,6 +183,7 @@ impl Writer {
             goal: None,
             plan: None,
             authorization: None,
+            last_written: None,
         }
     }
 
@@ -194,6 +198,9 @@ impl Writer {
         // Before the truncation, so a session another bhai is still appending to is
         // left alone rather than cut back to what this one read.
         hold(&file, &loaded.header.session)?;
+        // Records written before they carried a time have only the file's, read before a
+        // truncation moves it.
+        let modified = file.metadata()?.modified().ok();
         let truncated = file.metadata()?.len() != loaded.len;
         if truncated {
             file.set_len(loaded.len)?;
@@ -211,6 +218,7 @@ impl Writer {
             } else {
                 loaded.authorization.clone()
             },
+            last_written: loaded.last_at.map(Into::into).or(modified),
         };
         if truncated && let Some(memory) = &loaded.authorization {
             writer.authorization(memory)?;
@@ -419,6 +427,7 @@ impl Writer {
         let id = uuid::Uuid::new_v4().simple().to_string();
         record["id"] = json!(id);
         record["parent_id"] = json!(self.last);
+        record["at"] = json!(chrono::Utc::now());
         let mut file = self.open()?;
         writeln!(file, "{record}")?;
         file.flush()?;
@@ -502,6 +511,8 @@ pub struct Loaded {
     pub authorization: Option<crate::judge::authorization::Memory>,
     /// The id of the last record kept.
     pub last: Option<String>,
+    /// When the last item was recorded, if its record says.
+    pub last_at: Option<DateTime<chrono::Utc>>,
     /// Bytes of the file that hold the header and the records kept.
     pub len: u64,
     pub warnings: Vec<String>,
@@ -531,6 +542,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
     let mut legacy_sources = Vec::new();
     let mut preceding_assistant = None;
     let mut child_reports = Vec::new();
+    let mut last_at = None;
     while let Some(line) = lines.next() {
         let record = serde_json::from_str::<Value>(line)
             .ok()
@@ -636,6 +648,9 @@ pub fn load(path: &Path) -> Result<Loaded> {
             let Some(item) = record.get("item") else {
                 bail!("{}: record {id} has no item", path.display());
             };
+            last_at = record
+                .get("at")
+                .and_then(|at| serde_json::from_value(at.clone()).ok());
             if authorizations.is_empty() {
                 if let Some(text) = legacy_user_text(item) {
                     legacy_sources.push(crate::judge::authorization::Source {
@@ -740,6 +755,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
         model,
         effort,
         last: records.last().map(|(id, _)| id.clone()),
+        last_at,
         items: items.into_iter().map(|(item, _)| item).collect(),
         child_reports: child_reports
             .into_iter()
@@ -1240,6 +1256,45 @@ mod tests {
         let mut writer = Writer::resume(&dir, &loaded).unwrap();
         writer.append(&items()[0]).unwrap();
         assert_eq!(load(&path).unwrap().items.len(), 6);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_resume_knows_when_the_last_item_was_written() {
+        let dir = temp_dir();
+        let start = chrono::Utc::now();
+        let path = write(&dir, "s1", &items());
+        let loaded = load(&path).unwrap();
+        let at = loaded.last_at.unwrap();
+        assert!(at >= start && at <= chrono::Utc::now(), "{at}");
+        let writer = Writer::resume(&dir, &loaded).unwrap();
+        assert_eq!(writer.last_written, Some(at.into()));
+        drop(writer);
+
+        // A file from before records carried a time falls back to when it was written.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let untimed: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut record: Value = serde_json::from_str(line).unwrap();
+                if let Some(record) = record.as_object_mut() {
+                    record.remove("at");
+                }
+                record.to_string()
+            })
+            .collect();
+        std::fs::write(&path, untimed.join("\n") + "\n").unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.last_at, None);
+        let writer = Writer::resume(&dir, &loaded).unwrap();
+        assert_eq!(writer.last_written, Some(past));
         let _ = std::fs::remove_dir_all(dir);
     }
 
