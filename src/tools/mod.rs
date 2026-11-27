@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod memory;
 pub mod models;
 pub mod monitor;
+pub mod notes;
 pub mod patch;
 pub mod peers;
 pub mod plan;
@@ -470,9 +471,17 @@ impl Registry {
         self
     }
 
-    /// `remember`, appending to the memory file at `path`, for the main agent.
-    pub fn with_memory(mut self, path: std::path::PathBuf) -> Self {
-        self.tools.push(Box::new(memory::Remember { path }));
+    /// `remember`, appending to the memory file at `path`, for the main agent. What it
+    /// saves goes to `notes` too, so it applies for the rest of the session.
+    pub fn with_memory(mut self, path: std::path::PathBuf, notes: crate::notes::Shared) -> Self {
+        self.tools.push(Box::new(memory::Remember { path, notes }));
+        self
+    }
+
+    /// `update_notes`, for the main agent, past the identity's narrowing like
+    /// `update_plan`: it touches nothing outside the session.
+    pub fn with_notes(mut self, notes: crate::notes::Shared) -> Self {
+        self.tools.push(Box::new(notes::UpdateNotes { notes }));
         self
     }
 

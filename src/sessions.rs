@@ -165,6 +165,8 @@ pub struct Writer {
     pub goal: Option<crate::goal::Goal>,
     /// The `update_plan` checklist as last recorded, which a resume shows again.
     pub plan: Option<crate::plan::Plan>,
+    /// The `update_notes` notes as last recorded, which a resume keeps.
+    pub notes: Option<String>,
     /// Source-backed judge authorization, saved independently of history compaction.
     pub authorization: Option<crate::judge::authorization::Memory>,
     /// For a resumed session, when it last recorded an item, which is about when its
@@ -182,6 +184,7 @@ impl Writer {
             file: None,
             goal: None,
             plan: None,
+            notes: None,
             authorization: None,
             last_written: None,
         }
@@ -213,6 +216,7 @@ impl Writer {
             file: Some(file),
             goal: loaded.goal.clone(),
             plan: loaded.plan.clone(),
+            notes: loaded.notes.clone(),
             authorization: if truncated {
                 None
             } else {
@@ -325,6 +329,21 @@ impl Writer {
         self.write(json!({ "type": "plan", "plan": plan }))?;
         self.plan = plan.clone();
         Ok(())
+    }
+
+    /// Record the notes, when they are not what was last recorded.
+    pub fn notes(&mut self, notes: &Option<String>) -> Result<()> {
+        if self.notes == *notes {
+            return Ok(());
+        }
+        self.write(json!({ "type": "notes", "notes": notes }))?;
+        self.notes = notes.clone();
+        Ok(())
+    }
+
+    /// Facts a summary proposed for the project's memory, for a later review to promote.
+    pub fn candidates_path(&self) -> PathBuf {
+        self.children.join(crate::memory::CANDIDATES)
     }
 
     /// A checkpoint shared with children while this session's writer is idle.
@@ -507,6 +526,8 @@ pub struct Loaded {
     pub goal: Option<crate::goal::Goal>,
     /// The plan as last recorded.
     pub plan: Option<crate::plan::Plan>,
+    /// The notes as last recorded.
+    pub notes: Option<String>,
     /// The authorization snapshot as last recorded, including incomplete updates.
     pub authorization: Option<crate::judge::authorization::Memory>,
     /// The id of the last record kept.
@@ -537,6 +558,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
     let (mut model, mut effort) = (header.model.clone(), header.effort.clone());
     let mut goal: Option<crate::goal::Goal> = None;
     let mut plan = None;
+    let mut notes = None;
     let mut legacy_goal = false;
     let mut authorizations = Vec::new();
     let mut legacy_sources = Vec::new();
@@ -626,6 +648,9 @@ pub fn load(path: &Path) -> Result<Loaded> {
             } else if had_goal {
                 plan = None;
             }
+        } else if kind == Some("notes") {
+            notes = serde_json::from_value(record.get("notes").cloned().unwrap_or_default())
+                .with_context(|| format!("{}: notes record {id} is not text", path.display()))?;
         } else if kind == Some("plan") {
             let saved: Option<crate::plan::Plan> =
                 serde_json::from_value(record.get("plan").cloned().unwrap_or_default())
@@ -764,6 +789,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
             .collect(),
         goal,
         plan,
+        notes,
         authorization,
         len,
         warnings,

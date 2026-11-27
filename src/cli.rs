@@ -1200,6 +1200,27 @@ struct Setup {
     remote_control_relay: Option<String>,
 }
 
+/// How a child's system prompt is built: its identity's, on the session's MCP connections
+/// narrowed to it, with the memory file as the session started. Read-only and never read
+/// again, so every child of an identity sends the same cached prefix whatever is saved
+/// since; a note saved since reaches a child in its task instead.
+fn child_prompts(
+    config: Config,
+    roots: instructions::Roots,
+    hub: Option<Arc<mcp::Hub>>,
+    memory: Option<memory::Memory>,
+    session: &str,
+) -> Arc<dyn Fn(&identity::Identity) -> SystemPrompt + Send + Sync> {
+    let session = session.to_string();
+    Arc::new(move |child: &identity::Identity| {
+        let narrowed = hub.as_ref().map(|hub| Arc::new(hub.narrowed(child)));
+        identity::build(&config, &roots, child, &[])
+            .with_mcp(narrowed)
+            .with_memory(memory.clone())
+            .with_session(&roots.cwd, &session)
+    })
+}
+
 /// Config and instruction files for the working directory, as the system prompt for
 /// the identity called `name`, the permission policy, and what child agents need.
 /// Starts the MCP servers.
@@ -1247,10 +1268,9 @@ async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> 
         Ok(memory) => (memory, None),
         Err(notice) => (None, Some(notice)),
     };
-    // Children are built without it: they neither see the notes nor save one.
     let mut prompt = identity::build(&config, &roots, &identity, &identities)
         .with_mcp(hub.clone())
-        .with_memory(memory)
+        .with_memory(memory.clone())
         .with_session(&roots.cwd, session);
     prompt.skipped.extend(refused);
     let delegation = Delegation {
@@ -1263,16 +1283,7 @@ async fn load(flags: Flags, name: &str, session: Option<&str>) -> Result<Setup> 
         schedules: None,
         monitors: None,
         // Children reuse the session's MCP connections, narrowed to their identity.
-        prompt: {
-            let (config, roots) = (config.clone(), roots.clone());
-            let session = session.to_string();
-            Arc::new(move |child: &identity::Identity| {
-                let narrowed = hub.as_ref().map(|hub| Arc::new(hub.narrowed(child)));
-                identity::build(&config, &roots, child, &[])
-                    .with_mcp(narrowed)
-                    .with_session(&roots.cwd, &session)
-            })
-        },
+        prompt: child_prompts(config.clone(), roots.clone(), hub, memory, session),
     };
     let limits = config.limits;
     let judge = config.judge.clone();
@@ -1947,6 +1958,7 @@ async fn cache_check(setup: Setup, wait: Option<Duration>) -> Result<bool> {
             judge: None,
             results: mpsc::unbounded_channel().0,
             session: client.session_id().to_string(),
+            notes: Default::default(),
         });
         registry = registry.with_models(tools::models::Models {
             current: Arc::new(client.clone()),
@@ -2591,6 +2603,38 @@ fn attention(event: &session::Event, root: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::prompt;
+
+    /// A child reads the memory as the session started, and a note saved since never
+    /// moves its prefix, so every child of an identity shares one cached prefix.
+    #[test]
+    fn children_read_the_session_start_memory_and_share_one_prefix() {
+        let dir = tools::temp_dir();
+        let roots = instructions::Roots {
+            home: None,
+            codex_home: None,
+            cwd: dir.clone(),
+        };
+        let file = memory::path(&dir.join(".bhai"));
+        memory::append(&file, "- 2026-11-26: tests need `--features x`").unwrap();
+        let snapshot = memory::load(&file, "./.bhai/MEMORY.md".to_string()).unwrap();
+        let prompts = child_prompts(Config::default(), roots.clone(), None, snapshot, "s1");
+        let general = identity::find(&identity::discover(&roots), "general").unwrap();
+
+        let first = prompts(&general);
+        memory::append(&file, "- 2026-11-27: saved mid-session").unwrap();
+        let second = prompts(&general);
+        assert!(
+            first
+                .text
+                .contains("# Memory\n\nNotes saved in earlier sessions"),
+            "{}",
+            first.text
+        );
+        assert!(first.text.contains("tests need `--features x`"));
+        assert!(!second.text.contains("saved mid-session"));
+        assert_eq!(first.text, second.text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn native_hosting_only_wraps_interactive_sessions_and_keeps_attach_targets_distinct() {

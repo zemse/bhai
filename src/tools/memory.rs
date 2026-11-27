@@ -1,5 +1,6 @@
 //! `remember`, for the main agent: append a note to `.bhai/MEMORY.md` for later sessions,
-//! after permission-policy approval. A child is never given it.
+//! after permission-policy approval, and keep it in force for the rest of this one. A
+//! child is never given it.
 
 use std::path::PathBuf;
 
@@ -12,6 +13,8 @@ pub const NAME: &str = "remember";
 
 pub struct Remember {
     pub path: PathBuf,
+    /// Where a saved note goes for the rest of the session.
+    pub notes: crate::notes::Shared,
 }
 
 impl Remember {
@@ -34,9 +37,10 @@ impl Tool for Remember {
             "name": NAME,
             "description": "Save one short note to this project's memory file for later \
         sessions: a fact about the project or how the user wants work done that the next \
-        session would otherwise have to rediscover, not a record of this task. The permission policy \
-        reviews each note. Notes load when a session starts, so this one reaches the next \
-        session, not this one.",
+        session would otherwise have to rediscover, not a record of this task, with why it \
+        holds. The permission policy reviews each note. A saved note stays in this session's \
+        context from then on, reaches child agents started after it, and loads when later \
+        sessions start.",
             "strict": false,
             "parameters": {
                 "type": "object",
@@ -85,13 +89,16 @@ impl Tool for Remember {
                 Err(e) => return (e, false),
             };
             match memory::append(&self.path, &line) {
-                Ok(()) => (
-                    format!(
-                        "Saved to {}. It loads when the next session starts.",
-                        self.path.display()
-                    ),
-                    true,
-                ),
+                Ok(()) => {
+                    crate::notes::lock(&self.notes).remembered.push(line);
+                    (
+                        format!(
+                            "Saved to {}. It applies from now on, and loads when later sessions start.",
+                            self.path.display()
+                        ),
+                        true,
+                    )
+                }
                 Err(e) => (
                     format!("Could not write {}: {e}", self.path.display()),
                     false,
@@ -110,6 +117,7 @@ mod tests {
         let dir = super::super::temp_dir();
         let tool = Remember {
             path: memory::path(&dir.join(".bhai")),
+            notes: Default::default(),
         };
         assert!(tool.needs_approval());
         let args = json!({"note": "tests run with\n `cargo nextest`"});
@@ -123,7 +131,7 @@ mod tests {
         assert!(preview.starts_with("@@ -0,0 +1 @@\n+- 20"), "{preview}");
         let (out, ok) = tool.execute(&args).await;
         assert!(ok, "{out}");
-        assert!(out.contains("next session"), "{out}");
+        assert!(out.contains("later sessions"), "{out}");
         let (_, ok) = tool.execute(&json!({"note": "second"})).await;
         assert!(ok);
         let text = std::fs::read_to_string(&tool.path).unwrap();
@@ -131,6 +139,8 @@ mod tests {
         assert_eq!(lines.len(), 2, "{text}");
         assert!(lines[0].ends_with(": tests run with `cargo nextest`"));
         assert!(lines[1].starts_with("- 20") && lines[1].ends_with(": second"));
+        // Both are in force for the rest of the session, as saved.
+        assert_eq!(crate::notes::lock(&tool.notes).remembered, lines);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -139,12 +149,14 @@ mod tests {
         let dir = super::super::temp_dir();
         let tool = Remember {
             path: memory::path(&dir),
+            notes: Default::default(),
         };
         assert!(tool.describe(&json!({})).is_err());
         assert!(tool.describe(&json!({"note": "  "})).is_err());
         let (out, ok) = tool.execute(&json!({"note": ""})).await;
         assert!(!ok && out.contains("empty"), "{out}");
         assert!(!tool.path.exists());
+        assert!(crate::notes::lock(&tool.notes).remembered.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

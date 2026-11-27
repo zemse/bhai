@@ -77,6 +77,7 @@ mod mermaid;
 pub mod models;
 pub mod monitor;
 mod monitorview;
+pub mod notes;
 mod notify;
 mod ollama;
 mod palette;

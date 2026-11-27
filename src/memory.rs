@@ -1,6 +1,9 @@
 //! `.bhai/MEMORY.md`: notes the main agent saves with `remember`, one per line, read into
-//! the system prompt once when a session starts. A note saved mid-session waits for the
-//! next one, so the cached prefix never moves.
+//! the system prompt once when a session starts. A note saved mid-session reaches the rest
+//! of it through `notes`, so the cached prefix never moves.
+//!
+//! Each session also keeps the facts its summaries proposed for the file, in
+//! `memory-candidates.md` in its state directory, for a later review to promote.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +16,12 @@ const MAX_LOAD: usize = 4 * 1024;
 
 /// The most one note may be.
 pub const MAX_NOTE: usize = 1024;
+
+/// The candidates file, in a session's state directory.
+pub const CANDIDATES: &str = "memory-candidates.md";
+
+/// The most candidates a session keeps, the newest kept.
+const MAX_CANDIDATES: usize = 40;
 
 /// Where the memory file of the `.bhai` directory `bhai` is.
 pub fn path(bhai: &Path) -> PathBuf {
@@ -128,9 +137,100 @@ pub fn append(path: &Path, line: &str) -> std::io::Result<()> {
     file.write_all(text.as_bytes())
 }
 
+/// Add `facts` to the candidates file at `path` as dated notes, each unless the file
+/// already has it, keeping the newest `MAX_CANDIDATES`. Returns how many were added.
+/// Private mode writes nothing.
+pub fn propose(path: &Path, facts: &[String], date: &str) -> std::io::Result<usize> {
+    if facts.is_empty() || crate::privacy::active() {
+        return Ok(0);
+    }
+    let old = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut lines: Vec<String> = old.lines().map(str::to_string).collect();
+    // Compared without the date, case or spacing, so the same fact proposed by a later
+    // summary is not added again.
+    let key = |line: &str| {
+        let fact = line.trim_start_matches("- ");
+        let fact = fact.split_once(": ").map_or(fact, |(_, fact)| fact);
+        fact.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let mut seen: std::collections::HashSet<String> = lines.iter().map(|l| key(l)).collect();
+    let mut added = 0;
+    for fact in facts {
+        let Ok(line) = entry(fact, date) else {
+            continue;
+        };
+        if seen.insert(key(&line)) {
+            lines.push(line);
+            added += 1;
+        }
+    }
+    if added == 0 {
+        return Ok(0);
+    }
+    let start = lines.len().saturating_sub(MAX_CANDIDATES);
+    if let Some(dir) = path.parent() {
+        crate::sessions::private_dir(dir)?;
+    }
+    crate::sessions::private_write(path, &(lines[start..].join("\n") + "\n"))?;
+    Ok(added)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidates_are_dated_deduplicated_and_capped() {
+        let dir = crate::tools::temp_dir();
+        let file = dir.join("session").join(CANDIDATES);
+        let facts = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(propose(&file, &[], "d").unwrap(), 0);
+        assert!(!file.exists());
+        let first = facts(&[
+            "tests need `--features x`: the default build skips them",
+            " ",
+        ]);
+        assert_eq!(propose(&file, &first, "2026-11-26").unwrap(), 1);
+        // The same fact, spaced and cased differently, from a later summary.
+        let again = facts(&[
+            "Tests  need `--features x`: the default build skips them",
+            "uses pnpm",
+        ]);
+        assert_eq!(propose(&file, &again, "2026-11-27").unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "- 2026-11-26: tests need `--features x`: the default build skips them\n- 2026-11-27: uses pnpm\n"
+        );
+        let many: Vec<String> = (0..MAX_CANDIDATES).map(|i| format!("fact {i}")).collect();
+        assert_eq!(propose(&file, &many, "d").unwrap(), MAX_CANDIDATES);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text.lines().count(), MAX_CANDIDATES);
+        assert!(text.starts_with("- d: fact 0\n"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn private_mode_proposes_nothing() {
+        let dir = crate::tools::temp_dir();
+        let file = dir.join(CANDIDATES);
+        let privacy = std::sync::Arc::new(crate::privacy::Privacy::default());
+        privacy.begin();
+        let added = crate::privacy::CURRENT
+            .scope(std::cell::RefCell::new(privacy), async {
+                propose(&file, &["uses pnpm".to_string()], "d").unwrap()
+            })
+            .await;
+        assert_eq!(added, 0);
+        assert!(!file.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn a_missing_or_blank_file_loads_nothing() {

@@ -87,6 +87,8 @@ mod models;
 mod monitor;
 #[path = "../../src/monitorview.rs"]
 mod monitorview;
+#[path = "../../src/notes.rs"]
+mod notes;
 #[path = "../../src/notify.rs"]
 mod notify;
 #[path = "../../src/ollama.rs"]

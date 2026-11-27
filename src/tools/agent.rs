@@ -61,6 +61,8 @@ pub struct Agent {
     pub transcripts: PathBuf,
     /// This session's id, which its children's worktrees are registered under.
     pub session: String,
+    /// What each child is told after its task: the notes and what `remember` saved.
+    pub notes: crate::notes::Shared,
 }
 
 impl Tool for Agent {
@@ -284,6 +286,7 @@ impl Agent {
             Some(lease) => format!("{}\n\n{task}", lease.note()),
             None => task.to_string(),
         };
+        let task = crate::notes::task(task, &self.notes);
         let identity = identity.clone();
         let transcript = self.transcripts.join(format!("child-{id}.jsonl"));
         let model = self.model.child(&identity);
@@ -797,6 +800,7 @@ mod tests {
             results: tx_results,
             transcripts: super::super::temp_dir(),
             session: "session-1".to_string(),
+            notes: Default::default(),
         };
         Harness {
             agent,

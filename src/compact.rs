@@ -62,7 +62,72 @@ blockers. Distinguish explicit user requirements and tool-enforced restrictions 
 inferences; label uncertainty and do not turn an inferred restriction into a user requirement. \
 Carry forward later corrections and resolved blockers rather than stale constraints. Include \
 resource limits only for affected work, with measured capacity and authorized cleanup or artifact \
-rotation options. Do not include secret values. Do not call any tools; reply with the summary only.";
+rotation options. Do not include secret values. End with a section headed `## For future \
+sessions`: a short list of facts about this project or its environment that a later session, \
+starting without this conversation, would otherwise have to rediscover (setup, conventions, \
+traps), each with why it holds; write `None.` under it when there are none. Do not call any \
+tools; reply with the summary only.";
+
+/// The heading of the summary's last section, which the harness takes out of it.
+const FUTURE: &str = "for future sessions";
+
+/// `summary` without its `## For future sessions` section, and the facts that section
+/// lists: one per item, an item's continuation lines joined to it.
+pub fn candidates(summary: &str) -> (String, Vec<String>) {
+    let heading = |line: &str| {
+        let line = line.trim();
+        line.starts_with('#')
+            && line
+                .trim_start_matches('#')
+                .trim()
+                .trim_end_matches(':')
+                .eq_ignore_ascii_case(FUTURE)
+    };
+    let lines: Vec<&str> = summary.lines().collect();
+    let Some(start) = lines.iter().rposition(|line| heading(line)) else {
+        return (summary.to_string(), Vec::new());
+    };
+    let level = lines[start]
+        .trim()
+        .chars()
+        .take_while(|&c| c == '#')
+        .count();
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| {
+            let hashes = line.chars().take_while(|&c| c == '#').count();
+            hashes > 0 && hashes <= level && line[hashes..].starts_with(' ')
+        })
+        .map_or(lines.len(), |at| start + 1 + at);
+    let mut facts: Vec<String> = Vec::new();
+    for line in &lines[start + 1..end] {
+        let trimmed = line.trim();
+        let item = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| {
+                let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+                (digits > 0)
+                    .then(|| trimmed[digits..].strip_prefix(". "))
+                    .flatten()
+            });
+        match (item, facts.last_mut()) {
+            (Some(item), _) => facts.push(item.trim().to_string()),
+            (None, Some(last)) if !trimmed.is_empty() && line.starts_with(char::is_whitespace) => {
+                last.push(' ');
+                last.push_str(trimmed);
+            }
+            _ => {}
+        }
+    }
+    facts.retain(|fact| {
+        let bare = fact.trim_end_matches('.').trim();
+        !bare.is_empty() && !bare.eq_ignore_ascii_case("none")
+    });
+    let mut kept: Vec<&str> = lines[..start].to_vec();
+    kept.extend(&lines[end..]);
+    (kept.join("\n").trim().to_string(), facts)
+}
 
 /// When to compact, from the config.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -403,6 +468,7 @@ pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
     folded.extend(crate::goal::restated(history));
     folded.extend(crate::goal::restated_lifecycle(history));
     folded.extend(crate::plan::restated_context(history));
+    folded.extend(crate::notes::restated(history));
     folded.extend(
         history[last..]
             .iter()
@@ -410,6 +476,7 @@ pub fn fold(history: &[Value], summary: &str) -> Option<Vec<Value>> {
                 !crate::goal::is_context(item)
                     && !crate::goal::is_lifecycle(item)
                     && !crate::plan::is_context(item)
+                    && !crate::notes::is_context(item)
             })
             .cloned(),
     );
@@ -454,6 +521,7 @@ pub fn install(
     installed.extend(crate::goal::restated(history));
     installed.extend(crate::goal::restated_lifecycle(history));
     installed.extend(crate::plan::restated_context(history));
+    installed.extend(crate::notes::restated(history));
     installed
 }
 
@@ -1037,6 +1105,77 @@ mod tests {
             let text = specs[0]["content"][0]["text"].as_str().unwrap();
             assert!(text.contains("state_4 directories"));
             assert!(text.contains("compare state_4 outputs"));
+        }
+    }
+
+    #[test]
+    fn the_summary_proposes_facts_for_later_sessions_apart_from_itself() {
+        let text = request(None)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.contains("`## For future sessions`"), "{text}");
+
+        let summary = "Did things.\n\n## Left\nthe tests\n\n## For future sessions\n\
+- `cargo test` needs `--features x`: the default build skips them\n  since 0.3.\n\
+* uses pnpm, not npm\n2. the CI cache is per branch\n";
+        let (kept, facts) = candidates(summary);
+        assert_eq!(kept, "Did things.\n\n## Left\nthe tests");
+        assert_eq!(
+            facts,
+            [
+                "`cargo test` needs `--features x`: the default build skips them since 0.3.",
+                "uses pnpm, not npm",
+                "the CI cache is per branch",
+            ]
+        );
+        // A later section of the same level ends it; `None.` proposes nothing.
+        let (kept, facts) = candidates("s\n### For future sessions:\nNone.\n## After\nmore");
+        assert_eq!((kept.as_str(), facts.len()), ("s\n## After\nmore", 0));
+        let (kept, facts) = candidates("no section\n- a list");
+        assert_eq!((kept.as_str(), facts.len()), ("no section\n- a list", 0));
+    }
+
+    /// A note saved mid-session and the session notes outlive eviction of the calls that
+    /// set them and a fold or a server compaction of the turns they were in.
+    #[test]
+    fn both_compaction_paths_keep_the_notes_and_what_was_remembered() {
+        use crate::notes::{State, context, is_context};
+
+        let mut history = Vec::new();
+        turn(&mut history, "one", 1);
+        let remember = json!({"type": "function_call", "call_id": "r1", "name": "remember",
+            "arguments": json!({"note": "uses pnpm"}).to_string()});
+        history.push(remember);
+        history.push(json!({"type": "function_call_output", "call_id": "r1",
+            "output": format!("Saved to {}/.bhai/MEMORY.md.", "/w".repeat(200))}));
+        let mut state = State {
+            text: Some("## Rejected\nredis: no persistence".to_string()),
+            remembered: vec!["- 2026-11-27: uses pnpm".to_string()],
+        };
+        history.extend(context(&history, &state));
+        turn(&mut history, "two", KEEP_RESULTS);
+        state.text = Some("## Rejected\nredis, then memcached".to_string());
+        history.extend(context(&history, &state));
+        turn(&mut history, "three", 1);
+
+        evict(&mut history, &ByteEstimate, true);
+        let output = history
+            .iter()
+            .find(|i| i["call_id"] == "r1" && is_output(i));
+        assert!(evicted(output.unwrap()["output"].as_str().unwrap()));
+        let item = json!({"type": "compaction", "encrypted_content": "opaque"});
+        for kept in [
+            fold(&history, "s").unwrap(),
+            install(&history, item, 0, &ByteEstimate),
+        ] {
+            let restated: Vec<&Value> = kept.iter().filter(|i| is_context(i)).collect();
+            assert_eq!(restated.len(), 2, "{restated:?}");
+            let text = Value::from(kept.clone()).to_string();
+            assert!(text.contains("redis, then memcached"));
+            assert!(!text.contains("no persistence"));
+            assert!(text.contains("2026-11-27: uses pnpm"));
+            assert!(context(&kept, &state).is_empty());
         }
     }
 

@@ -892,6 +892,14 @@ impl Sink<'_> {
     fn saved(&self) -> bool {
         !matches!(self, Sink::Discard) && !crate::privacy::active()
     }
+
+    /// The candidates file of the session written here; none for a child's transcript.
+    fn candidates(&self) -> Option<PathBuf> {
+        match self {
+            Sink::Session(writer) => Some(writer.candidates_path()),
+            _ => None,
+        }
+    }
 }
 
 /// `usage_log` is the JSONL file each model call's usage is appended to, if any.
@@ -995,6 +1003,7 @@ pub(crate) async fn run_configured(
     }
     let goal_requested = Arc::new(AtomicBool::new(false));
     let plan = crate::plan::Shared::new(Arc::clone(&goal));
+    let notes = crate::notes::Shared::default();
     let title_updated = Arc::new(std::sync::Mutex::new(false));
     let compact_requested: tools::compact::Requested = Arc::default();
     let context_usage: tools::status::Context = Arc::default();
@@ -1025,6 +1034,7 @@ pub(crate) async fn run_configured(
                 judge: judge.clone(),
                 results: tx_results.clone(),
                 session: session_id.clone(),
+                notes: Arc::clone(&notes),
             });
             registry = registry.with_models(tools::models::Models {
                 current: Arc::clone(model),
@@ -1056,7 +1066,10 @@ pub(crate) async fn run_configured(
         if let Some(delegation) = &delegation
             && prompt.identity.allows_tool(tools::memory::NAME)
         {
-            registry = registry.with_memory(crate::memory::path(&delegation.cache_root));
+            registry = registry.with_memory(
+                crate::memory::path(&delegation.cache_root),
+                Arc::clone(&notes),
+            );
         }
         if let Some(schedules) = delegation.as_ref().and_then(|d| d.schedules.clone())
             && prompt.identity.allows_tool(tools::schedule::NAME)
@@ -1099,6 +1112,7 @@ pub(crate) async fn run_configured(
                 plan: plan.clone(),
                 tx: tx.clone(),
             })
+            .with_notes(Arc::clone(&notes))
             .with_tool(Box::new(tools::title::UpdateTitle {
                 updated: Arc::clone(&title_updated),
                 tx: tx.clone(),
@@ -1169,6 +1183,12 @@ pub(crate) async fn run_configured(
     if let Some(was) = plan.get() {
         let _ = tx.send(AgentEvent::Plan(Some(was)));
     }
+    // The lines `remember` saved before are in this process's system prompt, so only the
+    // notes carry on. A fork copies the history without the record.
+    crate::notes::lock(&notes).text = writer
+        .as_ref()
+        .and_then(|w| w.notes.clone())
+        .or_else(|| crate::notes::from_history(&history));
     let mut calls: Vec<Call> = Vec::new();
     let mut monitor = CacheMonitor::default();
     // A resumed conversation's cache may have lapsed long before this process started,
@@ -1287,6 +1307,9 @@ pub(crate) async fn run_configured(
                         steer_goal(&goal, &plan, goal::Command::Clear, &tx);
                         persist(&goal, writer.as_mut(), &tx);
                         persist_plan(&plan, writer.as_mut(), &tx);
+                        // So are the notes; what `remember` saved is still in force.
+                        crate::notes::lock(&notes).text = None;
+                        persist_notes(&notes, writer.as_mut(), &tx);
                         (calls, monitor) = (Vec::new(), CacheMonitor::default());
                         model.reset("cleared");
                         let mut refreshed = prompt.clone();
@@ -1317,7 +1340,7 @@ pub(crate) async fn run_configured(
                         if private {
                             if let Some(judge) = &judge { judge.clear_conversation(); }
                             if let Some(writer) = &mut writer {
-                                writer.goal = None; writer.plan = None; writer.authorization = None;
+                                writer.goal = None; writer.plan = None; writer.notes = None; writer.authorization = None;
                             }
                             crate::privacy::current().clear();
                             let _ = tx.send(AgentEvent::Private { active: false, ready: true });
@@ -1480,6 +1503,7 @@ pub(crate) async fn run_configured(
                 cancel: &cancel,
                 asked: None,
                 plan: plan.get(),
+                candidates: writer.as_ref().map(Writer::candidates_path),
             };
             match pass.fork(&history).await {
                 Ok(Some(made)) => {
@@ -1548,6 +1572,7 @@ pub(crate) async fn run_configured(
                 cancel: &cancel,
                 asked: asked.take(),
                 plan: plan.get(),
+                candidates: sink.candidates(),
             };
             if let Err(e) = pass.run(&mut history, Trigger::Asked, &mut sink).await {
                 let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
@@ -1687,6 +1712,7 @@ pub(crate) async fn run_configured(
             children: Some(&stop),
             goal: &goal,
             plan: &plan,
+            notes: &notes,
             compact_requested: &compact_requested,
             context_usage: &context_usage,
             quota: &quota,
@@ -1906,6 +1932,7 @@ pub(crate) async fn run_configured(
                 cancel: &cancel,
                 asked: asked.take(),
                 plan: plan.get(),
+                candidates: sink.candidates(),
             };
             let trigger = match size {
                 _ if overflowed => Trigger::Overflow,
@@ -1938,6 +1965,7 @@ pub(crate) async fn run_configured(
         announce(&goal, &mut shown, &tx);
         persist(&goal, writer.as_mut(), &tx);
         persist_plan(&plan, writer.as_mut(), &tx);
+        persist_notes(&notes, writer.as_mut(), &tx);
         sync(writer.as_ref(), &tx);
         let _ = tx.send(AgentEvent::TurnEnd);
     }
@@ -1957,6 +1985,20 @@ fn persist_plan(
     let now = plan.get();
     if let Some(writer) = writer
         && let Err(e) = writer.plan(&now)
+    {
+        let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
+    }
+}
+
+/// Record the session notes, so a resume keeps them.
+fn persist_notes(
+    notes: &crate::notes::Shared,
+    writer: Option<&mut Writer>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    let now = crate::notes::lock(notes).text.clone();
+    if let Some(writer) = writer
+        && let Err(e) = writer.notes(&now)
     {
         let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
     }
@@ -2031,6 +2073,7 @@ struct GoalContext<'a> {
     children: Option<&'a Cancel>,
     goal: &'a goal::Shared,
     plan: &'a crate::plan::Shared,
+    notes: &'a crate::notes::Shared,
     compact_requested: &'a tools::compact::Requested,
     context_usage: &'a tools::status::Context,
     quota: &'a tools::status::Quota,
@@ -2215,6 +2258,17 @@ async fn turn(
                 let from = history.len();
                 history.push(context);
                 record(sink, &history[from..], tx);
+            }
+            let notes = crate::notes::lock(context.notes).clone();
+            let from = history.len();
+            history.extend(crate::notes::context(history, &notes));
+            if history.len() > from {
+                record(sink, &history[from..], tx);
+            }
+            if let Sink::Session(writer) = sink
+                && let Err(e) = writer.notes(&notes.text)
+            {
+                let _ = tx.send(AgentEvent::Error(format!("{TRANSCRIPT_ERROR}{e:#}")));
             }
         }
         if let Some(limits) = limits {
@@ -2603,6 +2657,7 @@ async fn turn(
                 cancel,
                 asked,
                 plan: goal_context.and_then(|context| context.plan.get()),
+                candidates: sink.candidates(),
             };
             if let Err(e) = pass.run(history, Trigger::Asked, sink).await {
                 let _ = tx.send(AgentEvent::Error(format!("compaction: {e:#}")));
@@ -3083,6 +3138,9 @@ struct Compaction<'a> {
     asked: Option<String>,
     /// The plan the summary restates, since the call that set it may be folded away.
     plan: Option<crate::plan::Plan>,
+    /// Where the facts a summary proposes for the project's memory go, for a saved
+    /// session's own history.
+    candidates: Option<PathBuf>,
 }
 
 impl Compaction<'_> {
@@ -3197,15 +3255,30 @@ impl Compaction<'_> {
         }))
     }
 
-    /// One model call on `history` with a request for a summary appended.
+    /// One model call on `history` with a request for a summary appended. The facts it
+    /// proposes for later sessions go to the candidates file, not into the summary.
     async fn summarize(&self, history: &[Value]) -> anyhow::Result<String> {
         let mut input = history.to_vec();
         input.push(compact::request(self.asked.as_deref()));
         let items = self.call(&input).await?;
-        final_text(&items)
+        let text = final_text(&items)
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty())
-            .ok_or_else(|| anyhow!("the model wrote no summary"))
+            .ok_or_else(|| anyhow!("the model wrote no summary"))?;
+        let (summary, facts) = compact::candidates(&text);
+        if let Some(path) = &self.candidates {
+            let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+            if let Err(e) = crate::memory::propose(path, &facts, &date) {
+                let _ = self.tx.send(AgentEvent::Error(format!(
+                    "could not save memory candidates to {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+        match summary.is_empty() {
+            true => Ok(text),
+            false => Ok(summary),
+        }
     }
 
     /// One call on `history` with a `compaction_trigger` after it, and the one
@@ -5076,6 +5149,7 @@ mod tests {
                 children: None,
                 goal: &goal,
                 plan: &plan,
+                notes: &Default::default(),
                 compact_requested: &requested,
                 context_usage: &context_usage,
                 quota: &quota,
@@ -5883,6 +5957,7 @@ mod tests {
             children: Some(&cancel),
             goal: &shared,
             plan: &plan,
+            notes: &Default::default(),
             compact_requested: &requested,
             context_usage: &context_usage,
             quota: &quota,
@@ -7524,6 +7599,7 @@ mod tests {
             children: None,
             goal: &shared,
             plan: &plan,
+            notes: &Default::default(),
             compact_requested: &requested,
             context_usage: &context_usage,
             quota: &quota,
@@ -10872,6 +10948,186 @@ mod tests {
         );
     }
 
+    /// The notes outlive a fold and a resume, and the facts the summary proposes for later
+    /// sessions go to the candidates file rather than into the folded history.
+    #[tokio::test]
+    async fn the_notes_outlive_a_compaction_and_a_resume_and_the_summary_proposes_facts() {
+        use crate::sessions::{Header, Writer, load, path};
+        use fake::{Fake, call, say};
+
+        let dir = tools::temp_dir();
+        let fake = Fake::new(vec![
+            vec![call(
+                tools::notes::NAME,
+                json!({"notes": "## Rejected\nredis: no persistence"}),
+            )],
+            vec![say("one")],
+            vec![say("two")],
+            vec![say(
+                "short\n\n## For future sessions\n- uses pnpm: the lockfile is pnpm's",
+            )],
+            vec![say("three")],
+        ]);
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::default()),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            None,
+            Some(Saved {
+                writer: Writer::create(
+                    &dir,
+                    Header::new("sess", "general", "fake", "medium", &dir),
+                ),
+                history: Vec::new(),
+            }),
+            Limits::default(),
+        ));
+        drive(&tx_user, &mut rx, &cancel, "first", &[]).await;
+        drive(&tx_user, &mut rx, &cancel, "second", &[]).await;
+        tx_control.send(Control::Compact(None)).await.unwrap();
+        settle(&mut rx).await;
+        drive(&tx_user, &mut rx, &cancel, "third", &[]).await;
+        {
+            let bodies = fake.bodies.lock().unwrap();
+            // The call right after the one that wrote them reads them.
+            let input = bodies[1].1["input"].as_array().unwrap();
+            assert!(crate::notes::is_context(input.last().unwrap()), "{input:?}");
+            let input = bodies[4].1["input"].as_array().unwrap();
+            assert!(!input.iter().any(|i| i["name"] == tools::notes::NAME));
+            let notes: Vec<&Value> = input
+                .iter()
+                .filter(|i| crate::notes::is_context(i))
+                .collect();
+            assert_eq!(notes.len(), 1);
+            assert!(notes[0].to_string().contains("redis: no persistence"));
+            let summary = input[2]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(summary, "Summary of earlier conversation:\nshort");
+        }
+        let candidates =
+            std::fs::read_to_string(dir.join("sess").join(crate::memory::CANDIDATES)).unwrap();
+        assert!(
+            candidates.ends_with(": uses pnpm: the lockfile is pnpm's\n"),
+            "{candidates}"
+        );
+        cancel.stop();
+        let loaded = load(&path(&dir, "sess")).unwrap();
+        assert_eq!(
+            loaded.notes.as_deref(),
+            Some("## Rejected\nredis: no persistence")
+        );
+        assert_eq!(
+            crate::notes::from_history(&loaded.items),
+            loaded.notes,
+            "the compacted history carries them too"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A child started after the notes change, or after `remember` saved a line, is told
+    /// them after its task; its system prompt stays as it was.
+    #[tokio::test]
+    async fn a_child_started_after_a_save_is_told_it_in_its_task() {
+        use crate::permissions::Rules;
+        use fake::{Fake, call, say};
+
+        let dir = tools::temp_dir();
+        let fake = Fake::new(vec![
+            vec![
+                call(
+                    tools::notes::NAME,
+                    json!({"notes": "rejected: a cache file"}),
+                ),
+                call(tools::memory::NAME, json!({"note": "uses pnpm"})),
+            ],
+            vec![call(
+                "agent",
+                json!({"description": "look", "prompt": "go"}),
+            )],
+            vec![say("started")],
+        ])
+        .with_children(vec![fake::step(fake::HANG)]);
+        let cancel = Arc::new(Cancel::default());
+        let (tx_user, rx_user) = mpsc::channel(1);
+        let (_tx_control, rx_control) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_with(
+            Arc::new(fake.clone()),
+            "sess".to_string(),
+            crate::prompt::system_prompt(&[], Vec::new()),
+            Arc::new(Policy::new(
+                Mode::Bypass,
+                Rules::default(),
+                None,
+                dir.clone(),
+            )),
+            None,
+            None,
+            rx_user,
+            None,
+            rx_control,
+            tx,
+            Arc::clone(&cancel),
+            None,
+            Some(Delegation {
+                identities: vec![Identity::default()],
+                prompt: Arc::new(|identity: &Identity| SystemPrompt {
+                    identity: identity.clone(),
+                    ..crate::prompt::system_prompt(&[], Vec::new())
+                }),
+                sessions: dir.clone(),
+                cache_root: dir.join(".bhai"),
+                mailboxes: Default::default(),
+                schedules: None,
+                monitors: None,
+            }),
+            None,
+            Limits::default(),
+        ));
+        drive(&tx_user, &mut rx, &cancel, "go", &[]).await;
+        let child = || {
+            fake.bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| id != "parent")
+                .map(|(_, body)| body.clone())
+        };
+        for _ in 0..1000 {
+            if child().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let body = child().unwrap();
+        let task = body["input"].to_string();
+        assert!(
+            task.contains("go\\n\\nNotes saved to the project's memory file"),
+            "{task}"
+        );
+        assert!(task.contains(": uses pnpm"), "{task}");
+        assert!(task.contains("rejected: a cache file"), "{task}");
+        assert!(
+            std::fs::read_to_string(dir.join(".bhai").join(crate::memory::FILE))
+                .unwrap()
+                .ends_with(": uses pnpm\n")
+        );
+        cancel.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Children keep running across a model switch, and new children start too.
     #[tokio::test]
     async fn a_model_switch_keeps_children_running_and_starts_new_ones() {
@@ -11331,6 +11587,7 @@ mod tests {
             cancel: &cancel,
             asked: None,
             plan,
+            candidates: None,
         };
         let history = vec![compact::user_message("first")];
         let installed = pass.install(&history, compaction());
