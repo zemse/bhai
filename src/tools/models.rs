@@ -25,8 +25,7 @@ impl Tool for Models {
             "type": "function",
             "name": NAME,
             "description": "List the models available to this session, with the reasoning \
-        efforts each takes and its context window. Use it before putting a child agent on a model \
-        other than this one: an id that is not on the list is not a model either backend will serve.",
+        efforts each takes and its context window.",
             "strict": false,
             "parameters": {
                 "type": "object",

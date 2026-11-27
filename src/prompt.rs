@@ -115,9 +115,7 @@ back: what you have already read, or could read in a few calls, is cheaper to do
 It is judged on its own task with a budget of its own, so it can run what you could. Pick the identity whose tools and skills fit the task; one with \
 no model of its own runs on yours, at your effort. An identity's model is its default and \
 not a ceiling: pass `model` to put this one child on another, and `effort` with it, which \
-is how a task that wants a model this session is not on gets one. The ids are the ones the \
-`models` tool lists, so read that list rather than guessing a name; a model you have heard \
-of elsewhere is not necessarily one either backend here will serve. Do not delegate edits \
+is how a task that wants a model this session is not on gets one. Do not delegate edits \
 that depend on each other.\n\nA child runs detached: the call hands back its id and returns at once, and \
 the report arrives later as a message. Start everything you want running in one go rather \
 than one at a time, then either carry on with work that does not depend on them or say \
@@ -431,6 +429,13 @@ mod tests {
             assert!(text.contains(instruction), "{instruction}");
         }
         assert!(!text.contains("Never invent private entropy"));
+    }
+
+    #[test]
+    fn delegation_does_not_send_the_model_to_the_models_list_first() {
+        let prompt = system_prompt(&[], Vec::new()).with_agents(&[Identity::default()]);
+        assert!(prompt.text.contains("# Delegation"));
+        assert!(!prompt.text.contains("`models` tool"));
     }
 
     #[test]

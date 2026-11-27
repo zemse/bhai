@@ -92,7 +92,8 @@ impl Tool for Goal {
         you can generate are work, not blockers. Resource limits affect individual items: measure \
         capacity, try smaller work and authorized cleanup or sequential artifact rotation. Reassess \
         when user replies change resources or authorization. Use null blocker unless blocking and \
-        null spec for complete/blocked. Never ask for a routine 'do it'.",
+        null spec for complete/blocked. Never ask for a routine 'do it'. \
+        It can run in the same step as the next action; calls in one step run in order.",
             "strict": true,
             "parameters": {
                 "type": "object",

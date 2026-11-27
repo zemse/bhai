@@ -1058,7 +1058,11 @@ pub(crate) async fn run_configured(
         if let Some(monitors) = delegation.as_ref().and_then(|d| d.monitors.clone())
             && prompt.identity.allows_tool(tools::monitor::NAME)
         {
-            registry = registry.with_tool(Box::new(tools::monitor::Monitor { monitors }));
+            registry = registry.with_tool(Box::new(tools::monitor::Monitor {
+                monitors,
+                context: Arc::clone(&context_usage),
+                seen: Default::default(),
+            }));
         }
         if prompt.identity.allows_tool(tools::status::NAME) {
             registry = registry.with_tool(Box::new(tools::status::Status {
@@ -1067,11 +1071,13 @@ pub(crate) async fn run_configured(
                 monitors: delegation.as_ref().and_then(|d| d.monitors.clone()),
                 context: Arc::clone(&context_usage),
                 quota: Arc::clone(&quota),
+                seen: Default::default(),
             }));
         }
         if prompt.identity.allows_tool(tools::compact::NAME) {
             registry = registry.with_tool(Box::new(tools::compact::Compact {
                 requested: Arc::clone(&compact_requested),
+                context: Arc::clone(&context_usage),
             }));
         }
         registry
@@ -2275,7 +2281,8 @@ async fn turn(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(tools::status::context(
                 prompt,
-                limits.unwrap_or_default().window(model.name()),
+                limits.unwrap_or_default(),
+                model.name(),
                 true,
             ));
         }
@@ -2352,7 +2359,8 @@ async fn turn(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(tools::status::context(
                     usage.input,
-                    limits.unwrap_or_default().window(model.name()),
+                    limits.unwrap_or_default(),
+                    model.name(),
                     false,
                 ));
             }
@@ -4991,7 +4999,10 @@ mod tests {
     async fn model_compaction_records_the_whole_step_then_continues() {
         use fake::{Fake, call, say};
 
-        for args in [json!({}), json!({"prompt": "preserve decisions"})] {
+        for args in [
+            json!({"force": true}),
+            json!({"prompt": "preserve decisions", "force": true}),
+        ] {
             let requested: tools::compact::Requested = Arc::default();
             let context_usage: tools::status::Context = Arc::default();
             let quota = Arc::new(tools::status::Quota::default());
@@ -5008,6 +5019,7 @@ mod tests {
             let registry = Registry::new(Vec::new())
                 .with_tool(Box::new(tools::compact::Compact {
                     requested: Arc::clone(&requested),
+                    context: Arc::clone(&context_usage),
                 }))
                 .with_tool(Box::new(tools::status::Status {
                     children: Arc::default(),
@@ -5015,6 +5027,7 @@ mod tests {
                     monitors: None,
                     context: Arc::clone(&context_usage),
                     quota: Arc::clone(&quota),
+                    seen: Default::default(),
                 }));
             let compact_call = call("compact", args.clone());
             let status_call = call("status", json!({}));
@@ -5101,7 +5114,15 @@ mod tests {
                 serde_json::from_str(&tools::output_text(&status["output"])).unwrap();
             assert_eq!(
                 output["context"],
-                tools::status::context(fake::USAGE.input, 1000, false)
+                tools::status::context(
+                    fake::USAGE.input,
+                    Limits {
+                        window: Some(1000),
+                        ..Limits::default()
+                    },
+                    "fake",
+                    false
+                )
             );
             let mut compacted = false;
             while let Ok(event) = rx.try_recv() {
@@ -6757,7 +6778,7 @@ mod tests {
 
         let fake = Fake::new(vec![
             (0..30).map(|_| say("earlier context")).collect(),
-            vec![call("compact", json!({}))],
+            vec![call("compact", json!({"force": true}))],
             vec![say("the summary")],
             vec![say("still working")],
             vec![
@@ -7964,6 +7985,8 @@ mod tests {
             let monitors = crate::monitor::Monitors::new(std::sync::Weak::new());
             let registry = Registry::new(Vec::new()).with_tool(Box::new(tools::monitor::Monitor {
                 monitors: Arc::clone(&monitors),
+                context: Arc::default(),
+                seen: Default::default(),
             }));
             let args = json!({
                 "action":"create", "name":"progress", "command":"cat progress.json", "workdir":dir,

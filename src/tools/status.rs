@@ -1,6 +1,7 @@
 //! A pull-only glance at context, subscription quota and background work.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
@@ -34,13 +35,49 @@ impl Quota {
     }
 }
 
-pub fn context(input: u64, window: u64, estimated: bool) -> Value {
+pub fn context(input: u64, limits: crate::compact::Limits, model: &str, estimated: bool) -> Value {
+    let window = limits.window(model);
     json!({
         "input_tokens": input,
         "window_tokens": window,
         "percent": 100.0 * input as f64 / window.max(1) as f64,
+        "auto_compact_tokens": (limits.compact_at * window as f64).round() as u64,
         "estimated": estimated,
     })
+}
+
+/// The input tokens and window of the latest context reading.
+pub fn reading(context: &Context) -> Option<(u64, u64)> {
+    let context = context.lock().unwrap_or_else(|e| e.into_inner());
+    let context = context.as_ref()?;
+    Some((
+        context["input_tokens"].as_u64()?,
+        context["window_tokens"].as_u64()?,
+    ))
+}
+
+/// What a pull-only read last answered in full, so an unchanged repeat can be brief.
+#[derive(Default)]
+pub struct Seen(std::sync::Mutex<Option<(Value, Instant, Option<u64>)>>);
+
+impl Seen {
+    /// The seconds since the last full answer when `key` is what it showed and context
+    /// grew by less than `step`; otherwise `key` becomes the last full answer. Context
+    /// that shrank means compaction may have folded that answer out of the conversation.
+    pub fn repeat(&self, key: Value, input: Option<u64>, step: u64) -> Option<u64> {
+        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((seen, at, before)) = last.as_ref()
+            && *seen == key
+            && match (*before, input) {
+                (Some(before), Some(now)) => now >= before && now - before < step,
+                (before, now) => before == now,
+            }
+        {
+            return Some(at.elapsed().as_secs());
+        }
+        *last = Some((key, Instant::now(), input));
+        None
+    }
 }
 
 pub struct Status {
@@ -49,6 +86,7 @@ pub struct Status {
     pub monitors: Option<Arc<Monitors>>,
     pub context: Context,
     pub quota: Arc<Quota>,
+    pub seen: Seen,
 }
 
 impl Tool for Status {
@@ -64,7 +102,8 @@ impl Tool for Status {
         rate_limits, when available, reports subscription window used_percent, window_minutes, resets_at (Unix seconds), credits, observed_at and age_seconds from this agent's latest quota report, not a live fetch. \
         Commands include running sessions and exited ones with next: collect (use write_stdin with that id). \
         Children include running assignments and report_queued outcomes not yet consumed by the parent. Monitors include state and a short summary. \
-        Empty sections are omitted. Reads do not wait, collect results or change anything; push updates arrive separately.",
+        Empty sections are omitted. A read that finds nothing changed since the last one says so briefly. \
+        Reads do not wait, collect results or change anything; push updates arrive separately.",
             "strict": true,
             "parameters": {
                 "type": "object",
@@ -118,9 +157,54 @@ impl Tool for Status {
             if let Some(quota) = self.quota.snapshot(chrono::Utc::now().timestamp()) {
                 out["rate_limits"] = quota;
             }
-            (out.to_string(), true)
+            let reading = reading(&self.context);
+            let step = reading.map_or(u64::MAX, |(_, window)| window / CONTEXT_STEP);
+            match self.seen.repeat(key(&out), reading.map(|r| r.0), step) {
+                Some(secs) => (unchanged(secs, reading), true),
+                None => (out.to_string(), true),
+            }
         })
     }
+}
+
+/// Context growth, as a fraction of the window, that a brief repeat may not hide.
+const CONTEXT_STEP: u64 = 20;
+
+/// The parts of a snapshot whose change is news: ages and observation times tick on
+/// their own, context is compared apart, and quota counts only whole percents.
+fn key(snapshot: &Value) -> Value {
+    let mut key = snapshot.clone();
+    if let Some(object) = key.as_object_mut() {
+        object.remove("context");
+    }
+    if let Some(rows) = key.get_mut("bash").and_then(Value::as_array_mut) {
+        for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+            row.remove("age_s");
+        }
+    }
+    if let Some(limits) = key.get_mut("rate_limits").and_then(Value::as_object_mut) {
+        limits.remove("observed_at");
+        limits.remove("age_seconds");
+        for window in ["primary", "secondary"] {
+            if let Some(used) = limits
+                .get_mut(window)
+                .and_then(|w| w.get_mut("used_percent"))
+            {
+                *used = json!(used.as_f64().unwrap_or_default().floor());
+            }
+        }
+    }
+    key
+}
+
+fn unchanged(secs: u64, reading: Option<(u64, u64)>) -> String {
+    let context = reading.map_or_else(String::new, |(input, window)| {
+        format!(" apart from context, now {input} of {window} tokens")
+    });
+    format!(
+        "Unchanged since the status read {secs}s ago{context}. Child reports and monitor hooks \
+arrive as messages without polling."
+    )
 }
 
 fn brief(text: &str) -> String {
@@ -181,10 +265,15 @@ mod tests {
             monitors: None,
             context: Arc::default(),
             quota: Arc::default(),
+            seen: Seen::default(),
         };
         for (input, window, estimated, percent) in [(25, 100, false, 25.0), (120, 100, true, 120.0)]
         {
-            *status.context.lock().unwrap() = Some(context(input, window, estimated));
+            let limits = crate::compact::Limits {
+                window: Some(window),
+                ..crate::compact::Limits::default()
+            };
+            *status.context.lock().unwrap() = Some(context(input, limits, "any", estimated));
             let (text, ok) = status.execute(&json!({})).await;
             assert!(ok);
             let value: Value = serde_json::from_str(&text).unwrap();
@@ -192,6 +281,7 @@ mod tests {
             assert_eq!(value["context"]["estimated"], json!(estimated));
             assert_eq!(value["context"]["input_tokens"], json!(input));
             assert_eq!(value["context"]["window_tokens"], json!(window));
+            assert_eq!(value["context"]["auto_compact_tokens"], json!(80));
         }
     }
 
@@ -205,6 +295,7 @@ mod tests {
             monitors: None,
             context: Arc::default(),
             quota: Arc::default(),
+            seen: Seen::default(),
         };
         let (text, ok) = status.execute(&json!({})).await;
         assert!(ok);
@@ -284,6 +375,68 @@ mod tests {
         assert!(quota.snapshot(0).is_none());
     }
 
+    #[tokio::test]
+    async fn a_repeat_is_brief_until_work_or_context_changes() {
+        let status = Status {
+            children: Arc::default(),
+            cancel: Arc::default(),
+            monitors: None,
+            context: Arc::default(),
+            quota: Arc::default(),
+            seen: Seen::default(),
+        };
+        let limits = crate::compact::Limits {
+            window: Some(200_000),
+            ..crate::compact::Limits::default()
+        };
+        let args = json!({});
+        let read = |input| {
+            *status.context.lock().unwrap() = Some(context(input, limits, "any", false));
+            status.execute(&args)
+        };
+        let full = |text: &str| serde_json::from_str::<Value>(text).is_ok();
+        let child = status.cancel.child("c1");
+        status.children.lock().unwrap().push(ChildUsage {
+            id: "c1".into(),
+            description: "review".into(),
+            ..ChildUsage::default()
+        });
+        assert!(full(&read(50_000).await.0));
+        let (brief, ok) = read(59_000).await;
+        assert!(ok);
+        assert_eq!(
+            brief,
+            "Unchanged since the status read 0s ago apart from context, now 59000 of 200000 \
+tokens. Child reports and monitor hooks arrive as messages without polling."
+        );
+        // A twentieth of the window since the last full read is news, and so is less context.
+        assert!(full(&read(60_000).await.0));
+        assert!(!full(&read(60_500).await.0));
+        assert!(full(&read(30_000).await.0));
+        assert!(!full(&read(30_000).await.0));
+        drop(child);
+        let (text, _) = read(30_000).await;
+        assert!(full(&text) && !text.contains("c1"), "{text}");
+        status.quota.observe(crate::limits::RateLimits {
+            primary: Some(crate::limits::Window {
+                used_percent: 40.2,
+                window_minutes: None,
+                resets_at: None,
+            }),
+            ..crate::limits::RateLimits::default()
+        });
+        assert!(full(&read(30_000).await.0));
+        status.quota.observe(crate::limits::RateLimits {
+            primary: Some(crate::limits::Window {
+                used_percent: 40.7,
+                window_minutes: None,
+                resets_at: None,
+            }),
+            ..crate::limits::RateLimits::default()
+        });
+        assert!(!full(&read(30_000).await.0));
+    }
+
     #[test]
     fn empty_sections_are_omitted() {
         assert_eq!(snapshot(Vec::new(), Vec::new(), Vec::new()), json!({}));
@@ -348,6 +501,7 @@ mod tests {
             monitors: None,
             context: Arc::default(),
             quota: Arc::default(),
+            seen: Seen::default(),
         };
         let active = status.cancel.child("active");
         status.children.lock().unwrap().extend([
@@ -362,17 +516,21 @@ mod tests {
                 ..ChildUsage::default()
             },
         ]);
-        for _ in 0..2 {
-            let (text, success) = status.execute(&json!({})).await;
-            assert!(success);
-            let value: Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(
-                value["children"],
-                json!([
-                    {"id": "active", "task": "review changes", "state": "running"}
-                ])
-            );
-        }
+        let (text, success) = status.execute(&json!({})).await;
+        assert!(success);
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["children"],
+            json!([
+                {"id": "active", "task": "review changes", "state": "running"}
+            ])
+        );
+        let (text, success) = status.execute(&json!({})).await;
+        assert!(success);
+        assert!(
+            text.starts_with("Unchanged since the status read"),
+            "{text}"
+        );
         assert_eq!(status.children.lock().unwrap().len(), 2);
         assert!(status.cancel.running("active"));
         drop(active);
@@ -389,6 +547,7 @@ mod tests {
             monitors: None,
             context: Arc::default(),
             quota: Arc::default(),
+            seen: Seen::default(),
         };
         status.children.lock().unwrap().push(ChildUsage {
             id: "abcdef".into(),
@@ -429,12 +588,16 @@ mod tests {
             monitors: None,
             context: Arc::default(),
             quota: Arc::default(),
+            seen: Seen::default(),
         };
         let begun = std::time::Instant::now();
         loop {
             let (text, success) = status.execute(&json!({})).await;
             assert!(success);
-            let value: Value = serde_json::from_str(&text).unwrap();
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
             let row = value["bash"]
                 .as_array()
                 .unwrap()
@@ -475,6 +638,7 @@ mod tests {
             monitors: None,
             context: Arc::default(),
             quota: Arc::default(),
+            seen: Seen::default(),
         }));
         let tool = registry.get(NAME).unwrap();
         assert!(!tool.needs_approval());

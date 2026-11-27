@@ -42,7 +42,8 @@ impl Tool for UpdatePlan {
         steps `skipped` with a reason instead of dropping them. Up to 500 steps, one in_progress. \
         Adapt affected steps when goal requirements change. Completing the plan does not \
         complete the goal or replace verification. With no edits, read steps using offset \
-        (zero-based) and limit (default 20, maximum 50). Empty plan clears standalone lists only.",
+        (zero-based) and limit (default 20, maximum 50). Empty plan clears standalone lists only. \
+        It can run in the same step as the next action; calls in one step run in order.",
             "strict": false,
             "parameters": {
                 "type": "object",

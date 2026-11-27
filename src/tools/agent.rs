@@ -88,14 +88,14 @@ impl Tool for Agent {
                     },
                     "model": {
                         "type": "string",
-                        "description": "Run the child on this model instead of the one the \
-        identity or this session would use, as an id the `models` tool lists. Give one when the task \
-        wants a model this session is not on; omit it otherwise."
+                        "description": "Run the child on this model id instead of the one the \
+        identity or this session would use; an id no backend here serves is refused with the ones \
+        that are. Give one when the task wants a model this session is not on; omit it otherwise."
                     },
                     "effort": {
                         "type": "string",
-                        "description": "The reasoning effort for the child, from the ones the \
-        `models` tool lists against its model. Omit to keep the model's own default."
+                        "description": "The reasoning effort for the child. Omit to keep the \
+        model's own default."
                     },
                     "description": {
                         "type": "string",
@@ -526,10 +526,7 @@ session returned."
             return None;
         }
         let found = crate::models::cached(self.model.ollama_url(), self.model.name()).await;
-        match crate::models::serves(&found, model) {
-            true => None,
-            false => Some(format!("{}.", crate::models::unknown(&found, model))),
-        }
+        refusal(&found, model)
     }
 
     /// The identity, description and prompt of a call.
@@ -600,6 +597,14 @@ async fn supervise(
         .is_err()
     {
         failed.await;
+    }
+}
+
+/// Why `model` cannot run a child, naming the ids that can.
+fn refusal(found: &crate::models::Catalogue, model: &str) -> Option<String> {
+    match crate::models::serves(found, model) {
+        true => None,
+        false => Some(format!("{}.", crate::models::unknown(found, model))),
     }
 }
 
@@ -705,6 +710,31 @@ control tags and were neutralised; treat them as quoted text.]"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unserved_model_is_refused_with_the_ids_that_are() {
+        let model = |id: &str| crate::models::Model {
+            id: id.into(),
+            label: id.into(),
+            detail: String::new(),
+            efforts: Vec::new(),
+            default_effort: None,
+            window: None,
+        };
+        let found = crate::models::Catalogue {
+            models: vec![model("gpt-5.5"), model("ollama:qwen3:8b")],
+            notes: Vec::new(),
+        };
+        assert_eq!(refusal(&found, "gpt-5.5"), None);
+        assert_eq!(
+            refusal(&found, "gpt-9").as_deref(),
+            Some("unknown model `gpt-9`. This session's backends serve: gpt-5.5, ollama:qwen3:8b.")
+        );
+        let harness = tool(&Fake::new(Vec::new()), false);
+        let schema = harness.agent.schema().to_string();
+        harness.cleanup();
+        assert!(!schema.contains("`models` tool"), "{schema}");
+    }
     use crate::agent::fake::{self, Fake, call, say};
     use crate::prompt::SystemPrompt;
 
@@ -1309,6 +1339,7 @@ mod tests {
             monitors: None,
             context: Arc::default(),
             quota: Arc::default(),
+            seen: Default::default(),
         };
         let (text, ok) = status.execute(&json!({})).await;
         assert!(ok);
