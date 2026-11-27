@@ -116,7 +116,9 @@ It is judged on its own task with a budget of its own, so it can run what you co
 no model of its own runs on yours, at your effort. An identity's model is its default and \
 not a ceiling: pass `model` to put this one child on another, and `effort` with it, which \
 is how a task that wants a model this session is not on gets one. Do not delegate edits \
-that depend on each other.\n\nA child runs detached: the call hands back its id and returns at once, and \
+that depend on each other. Brief a child with paths, `file:line` ranges and the decisions \
+already made rather than pasted file contents; it is also shown what earlier children \
+reported. For a follow-up on what a child just worked on, `continue` that child.\n\nA child runs detached: the call hands back its id and returns at once, and \
 the report arrives later as a message. Start everything you want running in one go rather \
 than one at a time, then either carry on with work that does not depend on them or say \
 what you have started and stop. The user has the session back either way, and a report \
